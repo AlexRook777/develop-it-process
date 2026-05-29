@@ -10,7 +10,7 @@ If you find yourself reading an artifact, drafting review feedback, editing the 
 
 - An already-written draft spec at `docs/superpowers/specs/<YYYY-MM-DD>-<slug>-design.md` (or the user provides another path).
 - Both `claude` and `codex` CLIs available on PATH.
-- A git repository (most actions are tolerant of non-git; Phase 7 is skipped when not in a repo).
+- A git repository (most actions are tolerant of non-git; Phase 8 is skipped when not in a repo).
 
 ## Orchestration contract
 
@@ -20,15 +20,15 @@ You are a strict orchestrator. You sequence subprocess agents. You do not do the
 
 - Invoke `claude` and `codex` CLIs as subprocesses, passing prompt content via stdin or `-p` and capturing stdout/stderr to disk under `<feature-folder>/transcripts/`.
 - Read short STATUS files written by subagents (specifically `STATUS.md` files and the per-phase summary files those STATUS files reference for the final readiness writer).
-- Read this file (`develop-it.md`) — including appendices — and extract per-role appendix bodies with read-only shell (`cat`, `awk`, `sed`, `grep`). Appendix content is NEVER written to disk.
+- Read this file (`$PROCESS_PATH`, default `develop-it-process.md`) — including appendices — and extract per-role appendix bodies with read-only shell (`cat`, `awk`, `sed`, `grep`, `python3`). Appendix content is NEVER written to disk.
 - Run `ls`, `git status`, `git log`, `git diff --stat` for orchestration awareness.
 - Create the per-feature folder and its required empty subfolders with `mkdir -p`. This is orchestration state, not an artifact.
-- Append entries to your own `RUN_LOG.md` inside the feature folder.
+- Append entries to `RUN_LOG.md` and `process-improvement-proposition.md` inside the feature folder.
 
 ### Forbidden actions
 
 - Reading the spec, plan, source files, test files, transcripts, or reviewer findings directly. Only `STATUS.md` files and the per-phase summary files referenced by them are readable.
-- Editing or writing any file other than `RUN_LOG.md`. The only filesystem mutation allowed beyond that is `mkdir -p`.
+- Editing or writing any file other than `RUN_LOG.md` and `process-improvement-proposition.md`. The only filesystem mutation allowed beyond those is `mkdir -p`.
 - Composing review feedback, spec text, plan text, code, or test code in your own context.
 - Running tests, build commands, linters, or the application itself.
 - Acting as a reviewer in-process. Every reviewer verdict comes from a fresh CLI subprocess. Your own context is never a reviewer.
@@ -38,32 +38,52 @@ You are a strict orchestrator. You sequence subprocess agents. You do not do the
 For every step that produces or modifies an artifact:
 
 1. Pick the role: which CLI (`claude` or `codex`), which model (Opus / Sonnet / GPT-5.5), which appendix in this file defines its prompt, and which Superpowers skill it must load.
-2. Extract the appendix body with `awk`, substitute orchestration variables (paths, model name, iteration number), and pipe it into the subprocess. Example:
+2. Extract the appendix body with `awk`, substitute orchestration variables (paths, model name, iteration number), and pipe it into the subprocess. **Use the helpers from the "Runtime cookbook & guardrails" section** — they handle multi-line values (e.g. `$FINDINGS_PATHS`) correctly and use the right CLI option ordering for each vendor. Example (Claude reviewer, single-line values only):
 
    ```bash
    # Each appendix below is delimited by HTML-comment markers using the BEGIN-role and END-role
    # phrasing (with full HTML comment syntax). The example regex below escapes those markers so
    # this prompt's own marker count stays accurate; awk treats `\!` as `!`, so the regex still
    # matches the real markers in the file.
-   awk '/<\!-- BEGIN: spec-reviewer-claude -\->/,/<\!-- END: spec-reviewer-claude -\->/' develop-it.md \
+   awk '/<\!-- BEGIN: spec-reviewer-claude -\->/,/<\!-- END: spec-reviewer-claude -\->/' "$PROCESS_PATH" \
      | sed "s|\$FEATURE_FOLDER|${FEATURE_FOLDER}|g; s|\$ITERATION|${ITER}|g; s|\$SPEC_PATH|${SPEC_PATH}|g" \
-     | timeout 20m claude --model opus -p - \
+     | timeout 20m claude --model opus -p --output-format=json - \
        1> "${FEATURE_FOLDER}/transcripts/spec-review-iter${ITER}-claude.out" \
        2> "${FEATURE_FOLDER}/transcripts/spec-review-iter${ITER}-claude.err"
    ```
 
+   **For Codex subprocesses**, global options like `-a never` must appear BEFORE `exec`. The Codex CLI rejects `codex exec ... -a never` with `error: unexpected argument '-a' found`. Use the form:
+
+   ```bash
+   timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --json - \
+     1> "${FEATURE_FOLDER}/transcripts/<phase>-<iter>-codex.out" \
+     2> "${FEATURE_FOLDER}/transcripts/<phase>-<iter>-codex.err"
+   ```
+
+   For appendices that substitute multi-line values (any list-shaped variable: `$FINDINGS_PATHS`, multi-line summaries, etc.), use the `render_prompt` python3 helper from the cookbook — `sed` on a multi-line value will either break or silently mangle the result.
+
 3. The subagent writes its artifact and a short `STATUS.md` to a pre-agreed path inside the feature folder. STATUS.md is written LAST and atomically (the subagent writes `STATUS.md.tmp` and renames).
 4. You read ONLY `STATUS.md` (and, for the final readiness writer, the per-phase summary files referenced by STATUS.md). You do not open the artifact, the findings file, or the transcripts. The only exception is surfacing a transcript path to the user when a failure halts the run.
 5. Branch on the verdict. If `CHANGES_REQUESTED`, re-dispatch the relevant fixer subagent with the reviewer findings paths as input. If `BLOCKED`, halt and surface to the user.
-6. Append one line to `RUN_LOG.md` for every dispatch:
+6. Append one multi-line block to `RUN_LOG.md` for every dispatch (see **Resumability** below for the full grammar — blocks are separated by blank lines and start with `--- <ISO-timestamp>  dispatch` or `--- <ISO-timestamp>  event=<NAME>`). Every dispatch block MUST include the nine usage-telemetry fields produced by `parse_usage` (see "Parsing usage from JSON output" in the cookbook). Call `parse_usage` immediately after the subprocess returns and before composing the RUN_LOG block. On parse failure the helper returns `usage_status=unavailable` with zeros; write those into the block unchanged — telemetry parsing failure NEVER blocks dispatch logging.
 
    ```
-   <ISO-timestamp>  phase=<n>  iteration=<n>  role=<role>  vendor=<cli>
-                    appendix=<name>  develop_it_sha=<git-sha>
-                    status_path=<path>  verdict=<verdict>
+   --- <ISO-timestamp>  dispatch
+   phase:                    <n>
+   iteration:                <n>
+   role:                     <role>
+   vendor:                   <cli>
+   appendix:                 <name>
+   develop_it_git_sha:       <git HEAD of process file>
+   develop_it_file_sha256:   <sha256sum of $PROCESS_PATH>
+   develop_it_dirty:         yes | no
+   status_path:              <path>
+   verdict:                  <verdict>
    ```
 
-Failure events (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`) append the same format plus `failure_mode=<n>`.
+The `develop_it_git_sha` records the git HEAD at dispatch time, but the working-tree copy of `$PROCESS_PATH` may have unstaged edits. `develop_it_file_sha256` is the content-addressed identity of the prompt actually used; `develop_it_dirty` is `yes` when the file differs from `git show HEAD:$PROCESS_PATH`. These together let a future run reproduce the exact prompt content.
+
+Failure events (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`) use the event-tagged variant with `failure_mode: <n>`.
 
 ## Review-gate severity policy
 
@@ -85,27 +105,35 @@ Stopping at "no BLOCKER" is NOT acceptable. The gate must also resolve MAJOR fin
 
 All non-orchestrator roles run as fresh subprocesses with isolated context. You never produce content a worker or reviewer would produce.
 
-| Role                              | Vendor / CLI       | Model              | Notes                                                                 |
-|-----------------------------------|--------------------|--------------------|-----------------------------------------------------------------------|
-| Orchestrator                       | (the running LLM)  | (whatever runs this prompt; expected: Codex / GPT-5.5) | Sequences subprocesses. Never reviews. Never writes artifacts. |
-| Phase-0 context discovery          | `claude`           | Opus               | Single dispatch.                                                       |
-| Spec reviewer (primary)            | `claude`           | Opus               | Per gate iteration.                                                    |
-| Spec reviewer (cross-vendor)       | `codex`            | GPT-5.5            | Soft-skipped on failure (see Failure handling).                        |
-| Spec fixer                         | `claude`           | Opus               | Patches spec from reviewer findings.                                   |
-| Plan writer                        | `claude`           | Opus               | Loads `superpowers:writing-plans`.                                     |
-| Plan reviewer (primary)            | `claude`           | Opus               |                                                                        |
-| Plan reviewer (cross-vendor)       | `codex`            | GPT-5.5            | Soft-skipped on failure.                                               |
-| Plan fixer                         | `claude`           | Opus               |                                                                        |
-| Implementer                        | `claude`           | Sonnet             | Loads `superpowers:subagent-driven-development`. One supervising subagent per Phase 4 run; dispatches its own sub-subagents per task. |
-| Debugger                           | `claude`           | Sonnet             | Loads `superpowers:systematic-debugging`. Dispatched on verification failure. |
-| Final reviewer (primary)           | `claude`           | Opus               |                                                                        |
-| Final reviewer (cross-vendor)      | `codex`            | GPT-5.5            | Soft-skipped on failure.                                               |
-| Git finalizer                      | `claude`           | Sonnet             | Loads `superpowers:finishing-a-development-branch`.                    |
-| Summarizers (spec / plan / final)  | `claude`           | Opus               | One per gate, reads iteration verdicts and findings.                   |
-| Implementation summarizer          | (folded)           | —                  | The Implementer subagent writes its own summary as part of Phase 4.    |
-| Final readiness writer             | `claude`           | Opus               | Reads all per-phase summaries; writes `<feature-folder>/final-readiness-report.md`. |
+**Default model resolution.** The role table below names model *classes* (Opus / Sonnet / GPT-5.5). At preflight time you resolve each class to the **latest available concrete model id** for that family, in this priority order:
 
-If the runtime environment uses different model names, you map each role to the closest available equivalent at preflight time. The implementer must remain on a Sonnet-class Claude model.
+1. **Claude Opus** → latest available; today: `claude-opus-4-7`. If unavailable, fall back to the most recent Opus-class id reported by `claude --help` / model listing.
+2. **Claude Sonnet** → latest available; today: `claude-sonnet-4-6`. The implementer must remain on a Sonnet-class Claude model.
+3. **Codex (GPT-5.5)** → use the exact literal id `gpt-5.5` (configured as the default in `~/.codex/config.toml`). If `gpt-5.5` is not listed in `~/.codex/models_cache.json` for the active account, fall back in this order: `gpt-5.4` → `gpt-5.3-codex` → `gpt-5.2`.
+
+**Forbidden codex models.** Do NOT pass `-m`, `--model`, or `-c model=...` with any of: `gpt-5.1-codex-max`, `gpt-5-codex-max`, `o3`, `o3-mini`, or any other `*-codex-max` / `o*` id. These require an OpenAI API key; the user's auth is a ChatGPT subscription and the request will fail with HTTP 400 `"model is not supported when using Codex with a ChatGPT account"`. The safest invocation is to omit `-m` entirely and let `~/.codex/config.toml` supply the model.
+
+| Role                              | Vendor / CLI       | Model class        | Concrete id (today)   | Notes                                                                 |
+|-----------------------------------|--------------------|--------------------|-----------------------|-----------------------------------------------------------------------|
+| Orchestrator                       | (the running LLM)  | (whatever runs this prompt; expected: Codex / GPT-5.5 or Claude Opus) | — | Sequences subprocesses. Never reviews. Never writes artifacts. |
+| Phase-0 context discovery          | `claude`           | Opus               | `claude-opus-4-7`     | Single dispatch.                                                       |
+| Spec reviewer (primary)            | `claude`           | Opus               | `claude-opus-4-7`     | Per gate iteration.                                                    |
+| Spec reviewer (cross-vendor)       | `codex`            | GPT-5.5            | `gpt-5.5`             | Soft-skipped on failure (see Failure handling).                        |
+| Spec fixer                         | `claude`           | Opus               | `claude-opus-4-7`     | Patches spec from reviewer findings.                                   |
+| Plan writer                        | `claude`           | Opus               | `claude-opus-4-7`     | Loads `superpowers:writing-plans`.                                     |
+| Plan reviewer (primary)            | `claude`           | Opus               | `claude-opus-4-7`     |                                                                        |
+| Plan reviewer (cross-vendor)       | `codex`            | GPT-5.5            | `gpt-5.5`             | Soft-skipped on failure.                                               |
+| Plan fixer                         | `claude`           | Opus               | `claude-opus-4-7`     |                                                                        |
+| Implementer                        | `claude`           | Sonnet             | `claude-sonnet-4-6`   | Loads `superpowers:subagent-driven-development`. One supervising subagent per Phase 6 run; dispatches its own sub-subagents per task. |
+| Debugger                           | `claude`           | Sonnet             | `claude-sonnet-4-6`   | Loads `superpowers:systematic-debugging`. Dispatched on verification failure. |
+| Final reviewer (primary)           | `claude`           | Opus               | `claude-opus-4-7`     |                                                                        |
+| Final reviewer (cross-vendor)      | `codex`            | GPT-5.5            | `gpt-5.5`             | Soft-skipped on failure.                                               |
+| Git finalizer                      | `claude`           | Sonnet             | `claude-sonnet-4-6`   | Loads `superpowers:finishing-a-development-branch`.                    |
+| Summarizers (spec / plan / final)  | `claude`           | Opus               | `claude-opus-4-7`     | One per gate, reads iteration verdicts and findings.                   |
+| Implementation summarizer          | n/a                | —                  | —                     | The Implementer subagent writes its own summary as part of Phase 6.    |
+| Final readiness writer             | `claude`           | Opus               | `claude-opus-4-7`     | Reads all per-phase summaries; writes `<feature-folder>/final-readiness-report.md`. |
+
+When you write the role-to-concrete-id map to `2-context-discovery/status.md` under `resolved_models:`, use the concrete ids above (unchanged unless preflight discovers a newer Opus / Sonnet / Codex release in the runtime environment).
 
 ## Skill selection rule
 
@@ -113,13 +141,13 @@ Skills are the source of truth. You do not invent your own processing.
 
 Mandatory mapping (encoded into the appendices — you do not override):
 
-- Context discovery (Phase 0): subagent loads only the read-only discovery skills it needs to enumerate Superpowers skills present in the environment and to read `CLAUDE.md`. No editing.
+- Context discovery (Phase 2): subagent loads only the read-only discovery skills it needs to enumerate Superpowers skills present in the environment and to read `CLAUDE.md`. No editing.
 - Spec, plan, final review: the relevant appendix in this file is the entire instruction set. Reviewers do NOT load `subagent-driven-development` as an orchestration skill; they treat this file's appendix as their orchestration.
-- Plan writing (Phase 2): subagent loads `superpowers:writing-plans` and writes the plan at the skill's default location.
-- Implementation (Phase 4): subagent loads `superpowers:subagent-driven-development` and runs its full per-task loop internally.
-- Debugging on verification failure: debugger subagent loads `superpowers:systematic-debugging`.
+- Plan writing (Phase 4): subagent loads `superpowers:writing-plans` and writes the plan at the skill's default location. The subagent additionally loads `context7` and uses it to look up authoritative current documentation for every external library, framework, SDK, API, or CLI tool referenced in the plan. Always `resolve-library-id` first, then `get-library-docs`.
+- Implementation (Phase 6): subagent loads `superpowers:subagent-driven-development` and runs its full per-task loop internally. Implementation sub-subagents additionally load `context7` and use it BEFORE writing or modifying code that touches any external library, framework, SDK, API, or CLI tool (Google ADK, httpx, click, etc.). Always `resolve-library-id` first, then `get-library-docs`.
+- Debugging on verification failure: debugger subagent loads `superpowers:systematic-debugging` and additionally `context7` whenever the failure signature points at an external library or framework — verify against authoritative current docs rather than relying on training-data recollections.
 - Web/browser deliverables: implementer additionally loads `dogfood` (or equivalent) if the plan requires browser QA.
-- Git finalization (Phase 7): subagent loads `superpowers:finishing-a-development-branch`.
+- Git finalization (Phase 8): subagent loads `superpowers:finishing-a-development-branch`.
 
 You never load any of these skills yourself. You only dispatch subagents whose appendices instruct them to load the relevant skill.
 
@@ -143,19 +171,30 @@ spec:    docs/superpowers/specs/2026-05-25-v2-canonical-response-shape-design.md
 folder:  docs/superpowers/specs/2026-05-25-v2-canonical-response-shape-artifacts/
 ```
 
-If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatch a one-shot `claude` subagent (use the `phase-0-context` appendix) to propose a folder name. The subagent writes its proposal to STATUS.md. You then HALT and ask the user to confirm or override before proceeding.
+If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatch a one-shot `claude` subagent (use the `context-discovery` appendix) to propose a folder name. The subagent writes its proposal to STATUS.md. You then HALT and ask the user to confirm or override before proceeding.
 
 ### Folder layout
 
 ```
 <feature-folder>/
   RUN_LOG.md
-  preflight/
-    claude-check-status.md
-    codex-check-status.md
-  phase-0-context/
+  process-improvement-proposition.md   # optional; created lazily on first append
+  1-preflight/                          # Phase 1 staging area (transient after relocation by Step 1.2)
+    phase-1/                            # Phase 1 canonical artifacts (relocated post-Phase 1)
+      claude-check-status.md
+      codex-check-status.md
+    # NOTE: the parent `1-preflight/` directory may also contain transient
+    # claude-check-status.md / codex-check-status.md files that are the
+    # most recent per-phase appendix output mid-move. Downstream consumers
+    # MUST NOT read from `1-preflight/<vendor>-check-status.md` directly;
+    # read from `1-preflight/phase-1/` for Phase 1 verdicts and from
+    # `<N>-<phase>/preflight/` for per-phase verdicts.
+  2-context-discovery/
     status.md
-  spec-review/
+  3-spec-review/
+    preflight/                          # Phase 3 per-phase preflight (Step 3.0)
+      claude-check-status.md
+      codex-check-status.md
     iteration-01/
       claude-opus-verdict.md
       codex-verdict.md
@@ -165,21 +204,34 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
       …
     spec-review-summary.md
     summarizer-status.md
-  plan-review/
+  4-plan-writing/
+    plan-status.md
+  5-plan-review/
+    preflight/                          # Phase 5 per-phase preflight (Step 5.0)
+      claude-check-status.md
+      codex-check-status.md
     iteration-01/
       …
     plan-review-summary.md
     summarizer-status.md
-  implementation/
-    plan-status.md
+  6-implementation/
+    preflight/                          # Phase 6 per-phase preflight (Step 6.−1)
+      claude-check-status.md
+      codex-check-status.md
     implementation-summary.md
     implementer-status.md
+    debugger-status.md
+    summarizer-status.md
     subagent-logs/
-  final-review/
+  7-code-review/
+    preflight/                          # Phase 7 per-phase preflight (Step 7.0)
+      claude-check-status.md
+      codex-check-status.md
     iteration-01/
       …
-    final-review-summary.md
+    code-review-summary.md
     summarizer-status.md
+  8-git-finalization/
     git-status.md
   final-readiness-report.md
   readiness-status.md
@@ -187,6 +239,8 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     <phase>-<iteration>-<role>.out
     <phase>-<iteration>-<role>.err
 ```
+
+Phase 9 (`readiness-report`) intentionally has no `9-readiness-report/` folder: its two outputs (`final-readiness-report.md`, `readiness-status.md`) are cross-cutting feature-folder artifacts consumed by the user at the top level, not phase-internal scratch. The same rationale applies to `RUN_LOG.md`, `transcripts/`, and the optional `process-improvement-proposition.md`, which also live at the feature-folder root without a numeric prefix.
 
 ### Files that stay outside the feature folder
 
@@ -201,9 +255,425 @@ Skill defaults are not overridden by orchestration.
 
 `docs/superpowers/specs/` may contain orphaned files from prior runs of an older version of this prompt (`spec-review-summary.md`, `plan-review-summary.md`, `implementation-summary.md`, `final-readiness-report.md`, etc., directly in the specs folder rather than inside a feature `-artifacts/` folder). These belong to prior features. They are cleaned up by the user, not by this orchestration. You do NOT touch them.
 
-## Phase −1 — Preflight skill availability check
+## Runtime cookbook & guardrails
 
-Goal: confirm both worker CLIs can load every Superpowers skill this orchestration depends on. If any skill is missing, HALT with a clear remediation message — Phase 0 does not start.
+This section is the orchestrator's operational toolkit. The phases above describe *what* to dispatch and *when*; this section gives the *exact* shell forms, helper functions, and classification rules learned from prior runs. Use these helpers verbatim — improvising on CLI invocation syntax, Python interpreter names, or substitution mechanics has reliably wasted dispatch budget in real runs.
+
+### Orchestration variables
+
+Set these once at the top of the run. All later examples refer to them.
+
+```bash
+# Process file (this document)
+PROCESS_PATH="${PROCESS_PATH:-/home/worker/repos/GCP/develop-it-process.md}"
+REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+
+# Feature folder (derived from the input spec; see Per-feature artifacts folder)
+FEATURE_FOLDER="${FEATURE_FOLDER:?must be set before dispatching any phase}"
+
+# Python interpreter detection — this environment has python3, not python
+PYTHON_BIN="$(command -v python3 || command -v python || true)"
+if [ -z "$PYTHON_BIN" ]; then
+  echo "No python3/python found on PATH; refusing to proceed (multi-line variable" \
+       "substitution requires python3)." >&2
+  exit 1
+fi
+
+# Process-file content identity (logged in every dispatch RUN_LOG entry)
+PROCESS_FILE_SHA256="$(sha256sum "$PROCESS_PATH" | cut -d' ' -f1)"
+PROCESS_GIT_HEAD="$(git rev-parse HEAD 2>/dev/null || echo non-git)"
+if git -C "$REPO_ROOT" diff --quiet -- "$PROCESS_PATH" 2>/dev/null \
+   && git -C "$REPO_ROOT" diff --cached --quiet -- "$PROCESS_PATH" 2>/dev/null; then
+  PROCESS_DIRTY=no
+else
+  PROCESS_DIRTY=yes
+fi
+```
+
+All examples below use `python3` (never the bare `python`) and `$PROCESS_PATH` (never the literal `develop-it.md`).
+
+### Appendix extraction helper
+
+```bash
+extract_appendix() {
+  # Print the full appendix body (including BEGIN/END markers) for a given role name.
+  # Usage: extract_appendix spec-reviewer-claude
+  local name="$1"
+  awk "/<!-- BEGIN: ${name} -->/,/<!-- END: ${name} -->/" "$PROCESS_PATH"
+}
+```
+
+The `awk` range is sufficient for extraction. The BEGIN and END markers are HTML comments, so an extra layer of escaping is not required when the marker string is built dynamically.
+
+### Appendix substitution helper (handles multi-line values)
+
+`sed` is fine for single-line scalars (`$ITERATION`, `$SPEC_PATH`, `$PLAN_PATH`). It breaks or silently mangles output for multi-line values like `$FINDINGS_PATHS` (a newline-separated list). For any role that consumes a list-shaped variable, use this `render_prompt` helper instead:
+
+```bash
+render_prompt() {
+  # Usage: render_prompt <appendix-name>
+  # Reads $PROCESS_PATH, extracts the appendix, substitutes every $VARNAME that
+  # is exported in the environment, prints the result to stdout.
+  local appendix="$1"
+  APPENDIX="$appendix" PROCESS_PATH="$PROCESS_PATH" "$PYTHON_BIN" - <<'PY'
+import os
+
+process = os.environ["PROCESS_PATH"]
+name = os.environ["APPENDIX"]
+
+text = open(process).read()
+start = f"<!-- BEGIN: {name} -->"
+end = f"<!-- END: {name} -->"
+
+body = text[text.index(start):text.index(end) + len(end)]
+
+# Substitute every known orchestration variable. Multi-line values (e.g.
+# FINDINGS_PATHS) are preserved verbatim — no shell quoting concerns.
+for key in [
+    "FEATURE_FOLDER",
+    "ITERATION",
+    "SPEC_PATH",
+    "PLAN_PATH",
+    "FINDINGS_PATHS",
+    "IMPLEMENTATION_BASE_SHA",
+    "IMPLEMENTATION_SUMMARY_PATH",
+    "DEBUGGER_STATUS_PATH",
+    "REPO_ROOT",
+]:
+    value = os.environ.get(key)
+    if value is not None:
+        body = body.replace(f"${key}", value)
+
+print(body)
+PY
+}
+```
+
+Export each `$VARNAME` the appendix expects, then pipe `render_prompt <name>` into the subprocess. Treat the `sed` shortcut shown in the Delegation pattern example as legal only when every substituted value is a single line.
+
+### CLI invocation forms
+
+The two vendors take different option orders. Memorise both — getting them wrong wastes a dispatch attempt and pollutes the failure log.
+
+```bash
+# Claude — prompt via stdin, model selected via --model.
+# --output-format=json emits a single final JSON record on stdout (telemetry).
+timeout 20m claude --model "$CLAUDE_MODEL" -p --output-format=json - \
+  1> "$OUT_PATH" \
+  2> "$ERR_PATH"
+
+# Codex — global options (-a, -C, -s) appear BEFORE the `exec` subcommand.
+# --json emits JSONL on stdout; the final `turn.completed` event carries usage.
+# Do NOT use `codex exec ... -a never` — that prints "unexpected argument '-a' found".
+timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --json - \
+  1> "$OUT_PATH" \
+  2> "$ERR_PATH"
+```
+
+If you find yourself writing `codex exec ... -a never` (global option after `exec`), STOP — that is the orchestrator-bug shape, not a Codex outage. See the "Distinguish orchestration bugs from vendor failures" rule in Failure handling.
+
+### CLI canary preflight
+
+Run BEFORE Phase 1 (skill probes) to catch missing binaries and CLI syntax mismatches with harmless invocations. This costs nothing and would have caught real failures observed in prior runs.
+
+```bash
+canary_preflight() {
+  local missing=()
+  for bin in claude timeout awk sed jq; do
+    command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
+  done
+  # codex is optional — its absence triggers the asymmetric failover, not a halt.
+  local codex_present=yes
+  command -v codex >/dev/null 2>&1 || codex_present=no
+  command -v python3 >/dev/null 2>&1 || echo "warn: python3 missing — multi-line substitution will fail" >&2
+
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "halt: required binaries missing: ${missing[*]}" >&2
+    return 1
+  fi
+
+  # Syntax sanity-check both CLIs (no model call, no token spend).
+  claude --help >/dev/null 2>&1 || { echo "halt: 'claude --help' failed" >&2; return 1; }
+  claude --help 2>&1 | grep -q -- '--output-format' \
+    || { echo "halt: 'claude' CLI does not support --output-format; upgrade Claude Code" >&2; return 1; }
+  if [ "$codex_present" = yes ]; then
+    if ! codex exec --help >/dev/null 2>&1; then
+      echo "warn: 'codex exec --help' failed — Codex CLI may be incompatible; failover applies" >&2
+      codex_present=no
+    elif ! codex exec --help 2>&1 | grep -q -- '--json'; then
+      echo "warn: 'codex exec --help' lacks --json; usage telemetry for codex unavailable; failover applies" >&2
+      codex_present=no
+    fi
+  fi
+
+  # Echo result so the caller can branch.
+  printf 'canary_ok codex_present=%s\n' "$codex_present"
+}
+```
+
+If `canary_preflight` halts, do NOT proceed to Phase 1 — the failure mode is environmental, not skill-related, and skill probes would obscure the real cause.
+
+### Parsing usage from JSON output
+
+Every successful dispatch emits a final JSON record carrying token counts and (for Claude) cost. The orchestrator parses this record immediately after the subprocess returns and includes the values in the RUN_LOG dispatch entry. Parsing failure NEVER blocks the dispatch entry from being written — set `usage_status: unavailable` and write zeros instead.
+
+The output of this helper is a single line: nine `key=value` pairs space-separated. The orchestrator pastes these into the RUN_LOG block (one field per line, formatted as `key: value`).
+
+```bash
+# parse_usage <vendor> <stdout-path> <wall-duration-ms> <fallback-model>
+# Prints: model=<m> duration_ms=<n> tokens_input_new=<n> tokens_input_cached=<n> tokens_cache_write=<n> tokens_output=<n> tokens_reasoning=<n> cost_usd=<n|n/a> usage_status=<ok|unavailable>
+parse_usage() {
+  local vendor="$1" out_path="$2" wall_ms="$3" fallback_model="$4"
+  local model dur in_new in_cached cache_w out reasoning cost status
+
+  if [ ! -s "$out_path" ]; then
+    printf 'model=unknown duration_ms=%s tokens_input_new=0 tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 cost_usd=n/a usage_status=unavailable\n' "$wall_ms"
+    return 0
+  fi
+
+  if [ "$vendor" = "claude" ]; then
+    # Single JSON object on stdout.
+    local parsed
+    parsed=$(jq -r '
+      [
+        (.modelUsage | keys | .[0] // "unknown"),
+        (.duration_ms // 0),
+        (.usage.input_tokens // 0),
+        (.usage.cache_read_input_tokens // 0),
+        (.usage.cache_creation_input_tokens // 0),
+        (.usage.output_tokens // 0),
+        0,
+        (.total_cost_usd // "n/a")
+      ] | @tsv
+    ' "$out_path" 2>/dev/null) || parsed=""
+    if [ -z "$parsed" ]; then
+      printf 'model=unknown duration_ms=%s tokens_input_new=0 tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 cost_usd=n/a usage_status=unavailable\n' "$wall_ms"
+      return 0
+    fi
+    IFS=$'\t' read -r model dur in_new in_cached cache_w out reasoning cost <<< "$parsed"
+    status="ok"
+  elif [ "$vendor" = "codex" ]; then
+    # JSONL; last `turn.completed` carries the usage.
+    local parsed
+    parsed=$(jq -s -r '
+      (map(select(.type == "turn.completed")) | last | .usage) as $u
+      | [
+        "codex",
+        ($u.input_tokens // 0) - ($u.cached_input_tokens // 0),
+        ($u.cached_input_tokens // 0),
+        0,
+        ($u.output_tokens // 0),
+        ($u.reasoning_output_tokens // 0)
+      ] | @tsv
+    ' "$out_path" 2>/dev/null) || parsed=""
+    if [ -z "$parsed" ]; then
+      printf 'model=unknown duration_ms=%s tokens_input_new=0 tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 cost_usd=n/a usage_status=unavailable\n' "$wall_ms"
+      return 0
+    fi
+    IFS=$'\t' read -r _ in_new in_cached cache_w out reasoning <<< "$parsed"
+    # Codex JSON has no model field; use the orchestrator-resolved model id.
+    model="$fallback_model"
+    dur="$wall_ms"
+    cost="n/a"
+    status="ok"
+  else
+    printf 'model=unknown duration_ms=%s tokens_input_new=0 tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 cost_usd=n/a usage_status=unavailable\n' "$wall_ms"
+    return 0
+  fi
+
+  printf 'model=%s duration_ms=%s tokens_input_new=%s tokens_input_cached=%s tokens_cache_write=%s tokens_output=%s tokens_reasoning=%s cost_usd=%s usage_status=%s\n' \
+    "$model" "$dur" "$in_new" "$in_cached" "$cache_w" "$out" "$reasoning" "$cost" "$status"
+}
+```
+
+**Wall-duration measurement.** Codex emits no `duration_ms` field, so the orchestrator times its own dispatches:
+
+```bash
+local t0=$(date +%s%3N)
+# ... run the CLI ...
+local t1=$(date +%s%3N)
+local wall_ms=$((t1 - t0))
+```
+
+Pass `$wall_ms` to `parse_usage` as the third argument. For Claude, the function prefers the CLI-reported `duration_ms` (more accurate; excludes shell overhead); for Codex it returns `$wall_ms`.
+
+**Resolved-model fallback for Codex.** Codex JSON does not carry the model id. Pass the resolved-model id from `2-context-discovery/status.md`'s `resolved_models:` map as the fourth argument to `parse_usage`. For pre-Phase-0 dispatches (canary, preflight) where `resolved_models:` is not yet known, pass `"codex"` literally.
+
+**Failure handling.** The function ALWAYS exits 0 and ALWAYS prints a complete nine-field record. On any parse error or missing file, it prints `usage_status=unavailable` with zeros. The orchestrator never branches on `parse_usage` exit code — it always uses the output.
+
+### Dirty-tree gate (early — runs at the very top of Phase 1, before any folder creation)
+
+A clean working tree is required for Phase 6 to capture an unambiguous implementation baseline. Discovering the tree is dirty after hours of reviews is wasteful. Check it FIRST.
+
+```bash
+dirty_tree_check() {
+  # Allowed dirty paths during a run:
+  #   - $PROCESS_PATH itself (orchestrator may have intentional edits in flight)
+  #   - the canonical spec path (the user may be iterating on it)
+  #   - the canonical plan path AFTER Phase 4 produces it (caller manages this)
+  #   - the per-feature artifacts folder (orchestration state, gitignored or excluded)
+  # Anything else dirty here halts the run — the user must commit or stash.
+  local allow_re
+  allow_re="$(printf '%s|' \
+    "$PROCESS_PATH" \
+    "$SPEC_PATH" \
+    "$FEATURE_FOLDER" \
+    | sed 's/|$//')"
+
+  local offenders
+  offenders="$(git status --porcelain 2>/dev/null \
+    | awk '{print $2}' \
+    | grep -Ev "^(${allow_re})" || true)"
+
+  if [ -n "$offenders" ]; then
+    echo "halt: working tree has uncommitted changes outside allowed paths:" >&2
+    printf '  %s\n' $offenders >&2
+    echo "Commit or stash these, then re-run." >&2
+    return 1
+  fi
+  return 0
+}
+```
+
+Run this twice:
+1. At the very start of Phase 1, **before** creating the feature folder — `$FEATURE_FOLDER` is not yet in the allow-list because it doesn't exist; that's fine, `grep -Ev` returns no offenders for a non-existent path.
+2. Again inside Phase 6 Step 6.0 with the artifacts folder included in the allow-list (orchestration artifacts inside `$FEATURE_FOLDER` are expected to be untracked / dirty by that point).
+
+### Gitignore guard for the artifacts folder
+
+The feature folder accumulates orchestration state (`RUN_LOG.md`, STATUS files, transcripts). If these files are tracked, they pollute the Phase 6 dirty check and the Phase 8 staging scope. The orchestrator does NOT auto-edit `.gitignore`, but at Phase 1 it MUST verify one of the following is true:
+
+- `docs/superpowers/specs/*-artifacts/` (or the equivalent pattern matching `$FEATURE_FOLDER`) is ignored by `.gitignore`, **or**
+- The orchestrator explicitly excludes `$FEATURE_FOLDER` from the Phase 6 dirty check (already true via `dirty_tree_check`'s allow-list).
+
+If neither holds, surface a one-line note to the user during Phase 1: "Recommend adding `docs/superpowers/specs/*-artifacts/` to `.gitignore` so orchestration artifacts do not pollute commits." This is a warning, not a halt — the allow-list in `dirty_tree_check` handles the runtime risk.
+
+### Reading the right files at the right time
+
+The strict orchestrator rules say "STATUS files only." During failure handling you may need a few more bytes. Distinguish carefully:
+
+- **On subprocess SUCCESS** (`rc == 0` AND `STATUS.md` exists AND parses): read ONLY `STATUS.md`. Do NOT tail transcripts "out of curiosity" — the verdict is whatever STATUS.md says.
+- **On subprocess FAILURE** (`rc != 0` OR `STATUS.md` missing OR malformed): read up to 40 lines of stderr to classify the failure mode. Surface that tail to the user when halting.
+
+```bash
+post_dispatch() {
+  local rc="$1" status_path="$2" err_path="$3"
+  if [ "$rc" -ne 0 ] || [ ! -f "$status_path" ]; then
+    echo "subprocess failed (rc=$rc, status_present=$( [ -f "$status_path" ] && echo yes || echo no ))" >&2
+    tail -n 40 "$err_path" >&2
+    return 1
+  fi
+  return 0
+}
+```
+
+This is the only sanctioned reason to touch a transcript file. Successful-run transcripts exist for the user's diagnostic use, not yours.
+
+### STATUS.md validation
+
+The STATUS.md contract is enforced by the orchestrator, not assumed. A malformed STATUS is Mode 4 (retry once, then halt or degrade). Apply these checks for every STATUS the orchestrator consumes:
+
+1. **File exists** at the agreed path.
+2. **Has `verdict:` key** with a value from the allowed set for that role.
+3. **For reviewer roles**: `blockers:`, `majors:`, `minors:` keys all present, all parse as non-negative integers, and `findings:` points to an existing file.
+4. **When `verdict` is anything other than `PASS` / `READY` / `DONE`**: `reason:` is present and non-empty.
+5. **For implementer**: `verification:` key with value in `{PASS, FAIL, PARTIAL}`.
+
+A minimal validator:
+
+```bash
+validate_status() {
+  # Usage: validate_status <status_path> <role>
+  local path="$1" role="$2"
+  [ -f "$path" ] || { echo "missing: $path" >&2; return 1; }
+  grep -qE '^verdict:[[:space:]]*\S' "$path" || { echo "no verdict: $path" >&2; return 1; }
+  local verdict
+  verdict="$(awk -F: '/^verdict:/{print $2; exit}' "$path" | xargs)"
+
+  case "$role" in
+    reviewer-*)
+      for k in blockers majors minors findings; do
+        grep -qE "^${k}:[[:space:]]*\S" "$path" || { echo "no ${k}: $path" >&2; return 1; }
+      done
+      for k in blockers majors minors; do
+        local v
+        v="$(awk -F: "/^${k}:/{print \$2; exit}" "$path" | xargs)"
+        case "$v" in ''|*[!0-9]*) echo "bad ${k}=${v}: $path" >&2; return 1 ;; esac
+      done
+      ;;
+    implementer)
+      grep -qE '^verification:[[:space:]]*(PASS|FAIL|PARTIAL)' "$path" \
+        || { echo "bad verification: $path" >&2; return 1; }
+      ;;
+  esac
+
+  case "$verdict" in
+    PASS|READY|DONE) : ;;
+    *)
+      grep -qE '^reason:[[:space:]]*\S' "$path" \
+        || { echo "missing reason for verdict=$verdict: $path" >&2; return 1; }
+      ;;
+  esac
+  return 0
+}
+```
+
+If `validate_status` returns nonzero, the dispatch is Mode 4. Apply the policy from the mode table (retry once, then halt for Claude / degrade for Codex).
+
+### Reviewer parallelization
+
+The two reviewers at each gate (Claude + Codex) read the same inputs and produce independent STATUS files. They have no inter-dependency. Dispatch them in parallel — sequential dispatch wastes wall-clock and adds nothing.
+
+```bash
+dispatch_reviewers_parallel() {
+  local phase="$1" iter="$2"
+
+  # Claude reviewer in the background.
+  (
+    render_prompt "${phase}-reviewer-claude" \
+      | timeout 20m claude --model "$CLAUDE_MODEL" -p --output-format=json - \
+        1> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.out" \
+        2> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.err"
+    echo "$?" > "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.rc"
+  ) &
+  local claude_pid=$!
+
+  # Codex reviewer in the background (only if available).
+  local codex_pid=
+  if [ "$codex_available" = "true" ]; then
+    (
+      render_prompt "${phase}-reviewer-codex" \
+        | timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --json - \
+          1> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.out" \
+          2> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.err"
+      echo "$?" > "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.rc"
+    ) &
+    codex_pid=$!
+  fi
+
+  # Wait for both, then validate and apply per-vendor failover.
+  wait "$claude_pid"
+  [ -n "$codex_pid" ] && wait "$codex_pid"
+}
+```
+
+Validation, RUN_LOG appends, and failover decisions still run sequentially after the parallel wait — they touch shared state. Only the dispatch and the wait are parallel.
+
+Same pattern applies to Phase 1 preflight: dispatch `preflight-claude` and `preflight-codex` in parallel, then validate both STATUS files.
+
+## Phase 1 — Preflight skill availability check
+
+Goal: confirm the environment is sound (binaries, CLI syntax, working tree) AND that both worker CLIs can load every Superpowers skill this orchestration depends on. If any preflight step fails, HALT with a clear remediation message — Phase 2 does not start.
+
+### Step 1.0 — CLI canary + clean-tree gate (before any subprocess dispatch)
+
+These checks are free (no token spend) and catch environmental issues that previously consumed real dispatch attempts. Run them BEFORE creating the feature folder or invoking skill probes.
+
+1. Initialise the orchestration variables from the "Runtime cookbook & guardrails" section (`PROCESS_PATH`, `REPO_ROOT`, `PYTHON_BIN`, `PROCESS_FILE_SHA256`, `PROCESS_GIT_HEAD`, `PROCESS_DIRTY`).
+2. Run `canary_preflight` (see cookbook). It checks: `claude`, `codex`, `timeout`, `awk`, `sed` are on PATH; `python3` is on PATH (warn-only); `claude --help` and `codex exec --help` succeed. On halt, surface the missing binary or syntax-check failure to the user and STOP — do not proceed to skill probes.
+3. Run `dirty_tree_check` (see cookbook). Allowed dirty paths at this stage: `$PROCESS_PATH` only (the spec is provided by the user but may still be in the working tree; that is OK because the spec path is added to the allow-list once derived). On halt, list the offending files and ask the user to commit or stash before re-running.
+4. Verify the gitignore guard: confirm that `docs/superpowers/specs/*-artifacts/` (or the equivalent pattern matching the eventual `$FEATURE_FOLDER`) is either listed in `.gitignore` OR that the orchestrator's runtime dirty-check allow-list covers it (the cookbook's `dirty_tree_check` does cover it). If neither holds, emit a one-line warning recommending the `.gitignore` addition; do NOT halt.
+5. If `canary_preflight` returned `codex_present=no` (Mode 0 — binary missing, environmental), HALT unconditionally. Surface the remediation message ("Install the Codex CLI and re-run") and STOP. Do NOT prompt the user, do NOT continue in claude-only mode, do NOT proceed to Step 1.1. A missing Codex binary at Phase 1 is an environment defect that must be fixed before the run can proceed in any mode; the previous silent-degrade behavior masked broken setups. This matches the Phase 1 row of the Mode-specific response table (Mode 0 → HALT) and Step 1.1 step 6's Mode 0 branch — Phase 1 Mode 0 is the only failure mode at Phase 1 that bypasses the user consent prompt, because there is no working Codex CLI to even produce a meaningful stderr tail for the user to consent on. Log `event=CODEX_UNAVAILABLE` with `phase: 1`, `phase_name: preflight`, `failure_mode: 0`, and `stderr_tail: <canary output>` to `RUN_LOG.md` immediately before STOP so the HALT is auditable.
 
 ### Required skills
 
@@ -222,175 +692,376 @@ Codex CLI must be able to load:
 - `superpowers:subagent-driven-development` (read-only)
 - `superpowers:verification-before-completion`
 
-### Flow
+### Step 1.1 — Skill probe flow
 
-1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `preflight/` subfolder with `mkdir -p`.
-2. Dispatch a `claude` subprocess using the `preflight-claude` appendix. Output: `<feature-folder>/preflight/claude-check-status.md`. Timeout: 2 min.
-3. Dispatch a `codex` subprocess using the `preflight-codex` appendix. Output: `<feature-folder>/preflight/codex-check-status.md`. Timeout: 2 min.
-4. Read only the two STATUS files.
+1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `1-preflight/` subfolder with `mkdir -p`.
+2. Dispatch a `claude` subprocess using the `preflight-claude` appendix. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Timeout: 2 min.
+3. If `codex_available` is still `true`, dispatch a `codex` subprocess using the `preflight-codex` appendix. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Timeout: 2 min. **Dispatch in parallel with step 2** using the pattern in the "Reviewer parallelization" cookbook entry (preflight has no shared state between vendors).
+4. Read only the two STATUS files. Validate each with `validate_status` (see cookbook).
 5. If either reports `verdict=MISSING_SKILLS`, print to the user: which CLI is missing which skills, plus an install hint ("Install the Superpowers plugin (e.g. `claude plugin install superpowers`) and re-run this prompt against the same feature folder"). HALT.
-6. If the `codex` check fails with any error (Modes 1/2/3/4/5 from Failure handling), set `codex_available = false`, log `CODEX_UNAVAILABLE` to `RUN_LOG.md`, and PROCEED to Phase 0 with Claude-only mode for the rest of the run.
-7. If the `claude` check fails, HALT.
-8. If both report `READY`, append one `RUN_LOG.md` entry per subprocess and proceed to Phase 0.
+6. If the `codex` check fails, apply the "Distinguish orchestration bugs from vendor failures" filter from Failure handling first. If the captured stderr indicates a local CLI usage error (`unexpected argument`, `Usage:`, `unknown option`), this is an orchestration bug, not a Codex outage — correct the invocation per the cookbook's "CLI invocation forms" and retry once. Otherwise branch on the failure mode:
+   - **Mode 0 (binary missing — environmental):** HALT unconditionally. Surface the remediation message ("Install the Codex CLI and re-run") and STOP. Do NOT prompt the user. A missing binary is an environment defect that must be fixed before the run can proceed in any mode; silently degrading would mask a broken setup.
+   - **Modes 1, 2, 3, 4 (after the one allowed Mode-4 retry), or 5:** prompt the user interactively: `Codex is unavailable (mode=<N>, stderr=<tail>). Continue in claude-only mode for this run? [y/N]`.
+     - On `y`: set the run-scoped flag `codex_disabled_by_user = true` (see "Run-scoped user opt-out: `codex_disabled_by_user`" below), set `codex_available = false`, append one `event=CODEX_DISABLED_BY_USER_CONSENT` entry to `RUN_LOG.md` (see RUN_LOG additions below), and PROCEED to Step 1.2 (artifact relocation, defined below) with Claude-only mode for the rest of the run. The relocation step's conditional `[ -f … ]` guards handle the absent-codex STATUS case. After Step 1.2 completes, proceed to Phase 2.
+     - On `N`, EOF (non-interactive session), or any non-`y` response: HALT and surface the same remediation as Mode 0.
+7. If the `claude` check fails, HALT. Claude is required for every phase — there is no claude-less degraded mode and no user prompt.
+8. If both report `READY`, append one `RUN_LOG.md` entry per subprocess and proceed to Step 1.2 (artifact relocation, defined immediately below). After Step 1.2 completes, proceed to Phase 2.
+
+### Step 1.2 — Relocate Phase 1 STATUS artifacts
+
+Step 1.2 runs on **every** Phase 1 completion path that proceeds onward to Phase 2:
+- the dual-READY success path (step 8 above), AND
+- the Mode 1–5 user-consent path (step 6 `y` branch — `codex_disabled_by_user = true`, claude `READY`).
+
+It does NOT run on the HALT paths (Mode 0 codex failure, claude failure, `N`/EOF consent response) — those terminate the run before Phase 2.
+
+Immediately after step 8 completes (or immediately after the consented-degradation branch in step 6 completes), and BEFORE Phase 2 begins or any per-phase preflight gate can run, relocate Phase 1's STATUS files:
+
+```bash
+mkdir -p "$FEATURE_FOLDER/1-preflight/phase-1"
+[ -f "$FEATURE_FOLDER/1-preflight/claude-check-status.md" ] && \
+  mv "$FEATURE_FOLDER/1-preflight/claude-check-status.md" \
+     "$FEATURE_FOLDER/1-preflight/phase-1/claude-check-status.md"
+[ -f "$FEATURE_FOLDER/1-preflight/codex-check-status.md" ] && \
+  mv "$FEATURE_FOLDER/1-preflight/codex-check-status.md" \
+     "$FEATURE_FOLDER/1-preflight/phase-1/codex-check-status.md"
+```
+
+The conditional `[ -f … ]` guards handle the consented-degradation case (codex STATUS file may not exist when `codex_disabled_by_user=true` was set above, or when codex Mode 0/1/2/3/5 killed the subprocess before any STATUS write — see "File policy for non-READY paths" below). No synthetic STATUS file is fabricated for absent codex outputs; the absence plus the corresponding `CODEX_DISABLED_BY_USER_CONSENT` or `CODEX_UNAVAILABLE` event in RUN_LOG is the canonical Phase 1 codex verdict.
+
+This relocation frees the canonical `$FEATURE_FOLDER/1-preflight/<vendor>-check-status.md` slot to be reused as a transient staging area by per-phase preflight gates without clobbering the Phase 1 record. Downstream consumers of Phase 1 verdicts (notably the readiness writer) MUST read from `1-preflight/phase-1/`, NOT from the bare `1-preflight/<vendor>-check-status.md` slot.
+
+### Run-scoped user opt-out: `codex_disabled_by_user`
+
+If the user consented to a claude-only run at the Phase 1 prompt above, the orchestrator sets a run-scoped flag `codex_disabled_by_user = true`. This flag:
+
+- Persists for the entire run, including across resumes. RUN_LOG is the canonical storage; there is no separate state file.
+- Suppresses per-phase codex re-probes at Phases 3, 5, 6, 7 (each per-phase preflight emits `CODEX_SKIPPED_BY_USER_CONSENT` instead of running the probe — see the per-phase preflight Step 0 in each gate below).
+- Forces `codex_available = false` at every gate.
+- Is recorded in the RUN_LOG at the time of consent (`event=CODEX_DISABLED_BY_USER_CONSENT`) and re-asserted at each per-phase preflight entry (`event=CODEX_SKIPPED_BY_USER_CONSENT`).
+
+**Resume reconstitution.** On resume, reconstitute the flag by scanning the current run's `RUN_LOG.md` (top-to-bottom) for entries whose first-line tag is exactly `event=CODEX_DISABLED_BY_USER_CONSENT`. The flag is `true` if at least one such entry exists and no later entry carries the tag `event=CODEX_RE_ENABLED_BY_USER` (re-enabling is out of scope; the tag is reserved). Match on the full first-line tag, NOT on `phase` / `phase_name`, since the event is unique per run. Resume does NOT re-prompt the user — the original consent stands. Clearing the flag mid-run is out of scope; the only way to clear it is to start a fresh `develop-it` run.
 
 ### Preflight cache
 
-On a re-run within 24 hours of a previous successful preflight (mtime of `claude-check-status.md` and `codex-check-status.md` both indicate `READY` and are < 24 h old), skip preflight and reuse the cached status. Outside 24 hours, preflight runs again. `codex_available` is re-probed on every fresh preflight.
+Phase 1 always runs in full on a fresh invocation. There is no cross-run preflight cache. Per-phase preflight (Phases 3, 5, 6, 7) handles per-gate re-probing — see the per-phase Step 0 in each gate below. Within a single gate's iteration loop, the preflight verdict is reused for all iterations of that gate; it is NOT re-probed between iterations.
 
-## Phase 0 — Context discovery (delegated)
+## Phase 2 — Context discovery (delegated)
 
-Dispatch one `claude` Opus subprocess with the `phase-0-context` appendix. The subagent:
+Dispatch one `claude` Opus subprocess with the `context-discovery` appendix. The subagent:
 - Lists available Superpowers skills in the environment.
 - Reads `CLAUDE.md` (and any nested `CLAUDE.md` files).
 - Identifies project conventions relevant to the SDLC flow.
-- Writes a short context summary file at `<feature-folder>/phase-0-context/status.md` with `verdict=READY` plus the resolved skill names per phase.
+- Writes a short context summary file at `<feature-folder>/2-context-discovery/status.md` with `verdict=READY` plus the resolved skill names per phase.
 
 Timeout: 5 min.
 
-You read only `phase-0-context/status.md`. On `READY`, proceed to Phase 1. On any other verdict, HALT and surface to user.
+You read only `2-context-discovery/status.md`. On `READY`, proceed to Phase 3. On any other verdict, HALT and surface to user.
 
-## Phase 1 — Spec review gate (delegated, two reviewers, severity-gated)
+## Phase 3 — Spec review gate (delegated, two reviewers, severity-gated)
+
+### Step 3.0 — Per-phase preflight
+
+Before iter 01's first reviewer dispatch (the gate's **first work dispatch**, defined as the first dispatch of that gate's iteration loop across the entire run as a whole), run the per-phase preflight:
+
+1. `mkdir -p <feature-folder>/3-spec-review/preflight`.
+2. Reset `codex_available = true` for the phase.
+3. If `codex_disabled_by_user = true` (run-scoped flag from Phase 1; reconstitute by scanning RUN_LOG per the rule in "Run-scoped user opt-out"):
+   - Dispatch `preflight-claude` only.
+   - Append one `event=CODEX_SKIPPED_BY_USER_CONSENT` entry to `RUN_LOG.md` with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `role: preflight-codex`, `vendor: codex` (see RUN_LOG additions for the full block shape).
+   - Set `codex_available = false`.
+4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`), so the two parallel writes do not collide.
+5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
+
+   ```bash
+   [ -f "$FEATURE_FOLDER/1-preflight/claude-check-status.md" ] && \
+     mv "$FEATURE_FOLDER/1-preflight/claude-check-status.md" \
+        "$FEATURE_FOLDER/3-spec-review/preflight/claude-check-status.md"
+   [ -f "$FEATURE_FOLDER/1-preflight/codex-check-status.md" ] && \
+     mv "$FEATURE_FOLDER/1-preflight/codex-check-status.md" \
+        "$FEATURE_FOLDER/3-spec-review/preflight/codex-check-status.md"
+   ```
+
+   Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" below). Order of the two moves is irrelevant. Do not read any STATUS verdict until both moves (or their no-op equivalents) complete.
+
+6. Append one RUN_LOG dispatch entry per probe with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 3-spec-review/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
+7. Branch on the verdicts:
+   - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
+   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** set `codex_available = false` for the remainder of Phase 3 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `failure_mode: <N>`, and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase, matching every other vendor-side failure mid-run. Proceed to step 1 of the iteration loop with `codex_available = false`.
+   - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed).
+
+### File policy for non-READY paths (applies to every per-phase preflight gate)
+
+Per the design's "File policy for non-READY paths" section, the orchestrator's contract is:
+
+- **Claude STATUS file missing for a phase that ran a claude probe** → orchestration bug; readiness writer reports `INVALID_ORCHESTRATION`. Claude failures HALT unconditionally, so on HALT the readiness writer does not run and a post-HALT absence is not observable as `INVALID_ORCHESTRATION`; the HALTed run is evidenced only by the RUN_LOG entry and the surfaced stderr.
+- **Codex STATUS file missing because `codex_disabled_by_user = true`** → expected. No synthetic STATUS written. Evidence is the `CODEX_SKIPPED_BY_USER_CONSENT` event for the same `(phase, iteration)`. Downstream consumers treat the missing file as `SKIPPED`.
+- **Codex STATUS file missing because the probe failed in any of Modes 0, 1, 2, 3, or 5** → expected; the subprocess commonly dies before any STATUS write. No synthetic STATUS written. Evidence is the `CODEX_UNAVAILABLE` event with the corresponding `failure_mode`. Downstream consumers treat the missing file as `FAILED` with that mode.
+- **Codex STATUS file present but malformed (Mode 4 after the one allowed retry)** → expected; the move step still runs because the file exists. Downstream consumers treat it as `FAILED` (mode 4).
+- **Codex STATUS file missing with no corresponding `CODEX_SKIPPED_BY_USER_CONSENT` or `CODEX_UNAVAILABLE` event for that `(phase, iteration)`** → orchestration bug; readiness writer reports `INVALID_ORCHESTRATION` and fails the readiness check.
+
+### Step 3.1 — Iteration loop
 
 For each iteration N (start at 1, hard cap at 5):
 
-1. `mkdir -p <feature-folder>/spec-review/iteration-NN`.
-2. Dispatch a `claude` Opus reviewer subprocess with the `spec-reviewer-claude` appendix. Inputs (substituted): `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `spec-review/iteration-NN/claude-opus-verdict.md` (STATUS) and `claude-opus-findings.md` (full findings). Timeout: 20 min.
-3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer subprocess with the `spec-reviewer-codex` appendix. Outputs: `spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min.
+1. `mkdir -p <feature-folder>/3-spec-review/iteration-NN`.
+2. Dispatch a `claude` Opus reviewer subprocess with the `spec-reviewer-claude` appendix. Inputs (substituted): `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `3-spec-review/iteration-NN/claude-opus-verdict.md` (STATUS) and `claude-opus-findings.md` (full findings). Timeout: 20 min.
+3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer subprocess with the `spec-reviewer-codex` appendix. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min.
 4. Read only the verdict files.
 5. If `blockers + majors > 0` from any active reviewer:
    - Dispatch a `claude` Opus spec-fixer subprocess with the `spec-fixer` appendix. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (newline-separated list of findings files from this iteration). The fixer edits the canonical spec in place. Timeout: 20 min.
    - Increment N. Loop from step 1.
 6. When all active reviewers report `blockers=0, majors=0`:
-   - Dispatch a `claude` Opus summarizer with the `summarizer-spec` appendix. Inputs: `$FEATURE_FOLDER`. Outputs: `spec-review/spec-review-summary.md` and `spec-review/summarizer-status.md`. Timeout: 10 min.
-   - You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 2.
+   - Dispatch a `claude` Opus summarizer with the `summarizer-spec` appendix. Inputs: `$FEATURE_FOLDER`. Outputs: `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md`. Timeout: 10 min.
+   - You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 4.
 
 If iteration cap (5) trips without convergence, HALT and surface to user with residual findings paths and the spec path.
 
-## Phase 2 — Plan writing (delegated)
+## Phase 4 — Plan writing (delegated)
 
 Dispatch one `claude` Opus subprocess with the `plan-writer` appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`. The subagent loads `superpowers:writing-plans` and produces the plan at the skill's default location (`docs/superpowers/plans/<YYYY-MM-DD>-<slug>-plan.md`).
 
-Output: `<feature-folder>/implementation/plan-status.md` with `verdict=DONE` and `plan_path=<absolute-path>`. Timeout: 30 min.
+Output: `<feature-folder>/4-plan-writing/plan-status.md` with `verdict=DONE` and `plan_path=<absolute-path>`. Timeout: 30 min.
 
-You read only `plan-status.md`. On `DONE`, proceed to Phase 3.
+You read only `plan-status.md`. On `DONE`, proceed to Phase 5.
 
-## Phase 3 — Plan review gate (delegated, two reviewers, severity-gated)
+## Phase 5 — Plan review gate (delegated, two reviewers, severity-gated)
 
-Same shape as Phase 1, applied to the plan.
+Same shape as Phase 3, applied to the plan.
+
+### Step 5.0 — Per-phase preflight
+
+Before iter 01's first reviewer dispatch (the gate's first work dispatch — see "Terminology gloss" in Resumability), run the per-phase preflight:
+
+1. `mkdir -p <feature-folder>/5-plan-review/preflight`.
+2. Reset `codex_available = true` for the phase.
+3. If `codex_disabled_by_user = true` (run-scoped flag from Phase 1; reconstitute by scanning RUN_LOG per the rule in "Run-scoped user opt-out"):
+   - Dispatch `preflight-claude` only.
+   - Append one `event=CODEX_SKIPPED_BY_USER_CONSENT` entry to `RUN_LOG.md` with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `role: preflight-codex`, `vendor: codex` (see RUN_LOG additions for the full block shape).
+   - Set `codex_available = false`.
+4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`), so the two parallel writes do not collide.
+5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
+
+   ```bash
+   [ -f "$FEATURE_FOLDER/1-preflight/claude-check-status.md" ] && \
+     mv "$FEATURE_FOLDER/1-preflight/claude-check-status.md" \
+        "$FEATURE_FOLDER/5-plan-review/preflight/claude-check-status.md"
+   [ -f "$FEATURE_FOLDER/1-preflight/codex-check-status.md" ] && \
+     mv "$FEATURE_FOLDER/1-preflight/codex-check-status.md" \
+        "$FEATURE_FOLDER/5-plan-review/preflight/codex-check-status.md"
+   ```
+
+   Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" in Step 1.0). Order of the two moves is irrelevant. Do not read any STATUS verdict until both moves (or their no-op equivalents) complete.
+
+6. Append one RUN_LOG dispatch entry per probe with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 5-plan-review/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
+7. Branch on the verdicts:
+   - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
+   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** set `codex_available = false` for the remainder of Phase 5 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `failure_mode: <N>`, and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase. Proceed to step 1 of the iteration loop with `codex_available = false`.
+   - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed).
+
+The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this gate.
+
+### Step 5.1 — Iteration loop
 
 For each iteration N (start at 1, hard cap at 5):
 
-1. `mkdir -p <feature-folder>/plan-review/iteration-NN`.
-2. Dispatch a `claude` Opus reviewer with the `plan-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `implementation/plan-status.md`), `$SPEC_PATH`. Outputs: `plan-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 20 min.
-3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer with the `plan-reviewer-codex` appendix. Outputs: `plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min.
+1. `mkdir -p <feature-folder>/5-plan-review/iteration-NN`.
+2. Dispatch a `claude` Opus reviewer with the `plan-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Outputs: `5-plan-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 20 min.
+3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer with the `plan-reviewer-codex` appendix. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min.
 4. Read only verdict files.
 5. If `blockers + majors > 0` from any active reviewer:
    - Dispatch a `claude` Opus plan-fixer with the `plan-fixer` appendix. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS`. Timeout: 20 min.
    - Increment N. Loop.
 6. When all active reviewers report `blockers=0, majors=0`:
-   - Dispatch a `claude` Opus summarizer with the `summarizer-plan` appendix. Outputs: `plan-review/plan-review-summary.md` and `plan-review/summarizer-status.md`. Timeout: 10 min.
-   - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 4.
+   - Dispatch a `claude` Opus summarizer with the `summarizer-plan` appendix. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. Timeout: 10 min.
+   - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 6.
 
 If iteration cap (5) trips, HALT and surface to user.
 
-## Phase 4 — Implementation (delegated, single supervising subagent)
+## Phase 6 — Implementation (delegated, single supervising subagent)
 
-### Step 4.0 — Capture implementation baseline
+### Step 6.−1 — Per-phase preflight
 
-Before dispatching the implementer, record the repository baseline so Phase 6 reviewers and the git finalizer have a stable diff scope. Read-only git is allowed for you; you are NOT making commits here.
+Before Step 6.0 (the gate's first work dispatch is the implementer dispatch in Step 6.1; this preflight precedes the baseline capture in Step 6.0 so the user is warned upfront if Codex is gone before sinking time into the long implementer run, per the spec's Phase 6 trade-off):
+
+1. `mkdir -p <feature-folder>/6-implementation/preflight`.
+2. Reset `codex_available = true` for the phase.
+3. If `codex_disabled_by_user = true` (run-scoped flag from Phase 1; reconstitute by scanning RUN_LOG per the rule in "Run-scoped user opt-out"):
+   - Dispatch `preflight-claude` only.
+   - Append one `event=CODEX_SKIPPED_BY_USER_CONSENT` entry to `RUN_LOG.md` with `phase: 6`, `phase_name: implementation`, `iteration: 00`, `role: preflight-codex`, `vendor: codex` (see RUN_LOG additions for the full block shape).
+   - Set `codex_available = false`.
+4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`).
+5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
+
+   ```bash
+   [ -f "$FEATURE_FOLDER/1-preflight/claude-check-status.md" ] && \
+     mv "$FEATURE_FOLDER/1-preflight/claude-check-status.md" \
+        "$FEATURE_FOLDER/6-implementation/preflight/claude-check-status.md"
+   [ -f "$FEATURE_FOLDER/1-preflight/codex-check-status.md" ] && \
+     mv "$FEATURE_FOLDER/1-preflight/codex-check-status.md" \
+        "$FEATURE_FOLDER/6-implementation/preflight/codex-check-status.md"
+   ```
+
+   Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" in Step 1.0).
+
+6. Append one RUN_LOG dispatch entry per probe with `phase: 6`, `phase_name: implementation`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 6-implementation/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
+7. Branch on the verdicts:
+   - **Claude probe fails (any mode):** HALT unconditionally (same rule as every gate). No user prompt; claude is required for every phase.
+   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** **non-blocking.** Append `event=CODEX_UNAVAILABLE` with `phase: 6`, `phase_name: implementation`, `iteration: 00`, `failure_mode: <N>`, and the stderr tail. Surface a one-line warning to the dispatch event stream. **Do NOT prompt the user. Do NOT HALT. Proceed directly to Step 6.0.** Codex is not dispatched downstream in Phase 6, so the codex verdict is informational only — the probe runs only to give the user early warning of a vendor outage before the long implementer run starts. The Phase 6 carve-out applies to all of Modes 0–5 alike: at this gate alone, Mode 0 does not HALT; it logs and proceeds.
+   - **Both READY (or claude READY and codex skipped via consent):** proceed to Step 6.0.
+
+The "File policy for non-READY paths" rules from Step 1.0 apply unchanged.
+
+### Step 6.0 — Capture implementation baseline
+
+Before dispatching the implementer, record the repository baseline so Phase 7 reviewers and the git finalizer have a stable diff scope. Read-only git is allowed for you; you are NOT making commits here.
 
 The order of operations matters: the working-tree cleanliness check runs BEFORE the `IMPLEMENTATION_BASELINE` event is written, so a dirty halt never leaves a stale baseline in `RUN_LOG.md`.
 
 ```bash
 # 1. Determine the candidate baseline SHA and tree state.
 IMPLEMENTATION_BASE_SHA=$(git rev-parse HEAD 2>/dev/null || echo non-git)
-UNCOMMITTED=$([ -n "$(git status --porcelain 2>/dev/null)" ] && echo yes || echo no)
 
-# 2. Gate on tree cleanliness BEFORE writing the baseline event.
+# 2. Determine "dirty outside the implementation slice."
+#    We EXPECT $FEATURE_FOLDER (orchestration artifacts) to be untracked/dirty by this point,
+#    and the spec and plan paths may still be working-tree-only if the user hasn't committed
+#    them yet. Use the cookbook's `dirty_tree_check`, which has those paths in its allow-list,
+#    OR replicate the exclusion inline:
+EXCLUDED_PATHS=(
+  "$PROCESS_PATH"
+  "$SPEC_PATH"
+  "$PLAN_PATH"
+  "$FEATURE_FOLDER"
+)
+OFFENDERS=$(git status --porcelain 2>/dev/null \
+  | awk '{print $2}' \
+  | grep -Fvxf <(printf '%s\n' "${EXCLUDED_PATHS[@]}") \
+  | grep -Fv "$FEATURE_FOLDER/" \
+  || true)
+UNCOMMITTED=$([ -n "$OFFENDERS" ] && echo yes || echo no)
+
+# 3. Gate on tree cleanliness BEFORE writing the baseline event.
 if [ "$UNCOMMITTED" = "yes" ]; then
   # Optional advisory log entry, distinct from the consumable baseline event:
-  printf '%s  event=IMPLEMENTATION_BASELINE_BLOCKED  candidate_sha=%s  reason=dirty-tree\n' \
+  printf '%s  event=IMPLEMENTATION_BASELINE_BLOCKED  candidate_sha=%s  reason=dirty-tree  offenders=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$IMPLEMENTATION_BASE_SHA" \
+    "$(echo "$OFFENDERS" | tr '\n' ',' | sed 's/,$//')" \
     >> "$FEATURE_FOLDER/RUN_LOG.md"
   # HALT — see narrative below for what to tell the user.
   exit 1
 fi
 
-# 3. Tree is clean (or non-git). Write the consumable baseline event.
+# 4. Tree is clean of out-of-scope changes (or non-git). Write the consumable baseline event.
 printf '%s  event=IMPLEMENTATION_BASELINE  base_sha=%s  uncommitted_changes=no\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$IMPLEMENTATION_BASE_SHA" \
   >> "$FEATURE_FOLDER/RUN_LOG.md"
 ```
 
-If `UNCOMMITTED=yes`, HALT and surface to user. Pre-existing uncommitted changes would pollute the Phase 6 diff scope and the Phase 7 staging scope (the finalizer cannot reliably distinguish "implementer-produced uncommitted changes" from "user's pre-existing uncommitted changes" without external knowledge). The user must resolve before proceeding by committing or stashing. The orchestrator does NOT auto-stash and does NOT accept "proceed anyway" — re-run this prompt after the working tree is clean.
+If `UNCOMMITTED=yes` (i.e. offenders exist outside the allowed paths), HALT and surface to user with the offender list. Pre-existing uncommitted changes outside the implementation slice would pollute the Phase 6 diff scope and the Phase 8 staging scope (the finalizer cannot reliably distinguish "implementer-produced uncommitted changes" from "user's pre-existing uncommitted changes" without external knowledge). The user must resolve before proceeding by committing or stashing. The orchestrator does NOT auto-stash and does NOT accept "proceed anyway" — re-run this prompt after the working tree is clean of out-of-scope changes.
+
+Files INSIDE `$FEATURE_FOLDER` (RUN_LOG, STATUS files, transcripts) are expected to be untracked. They are excluded from the dirty check. If `.gitignore` does not yet ignore the `*-artifacts/` pattern, the user was warned in Phase 1; the runtime exclusion above keeps the run unblocked regardless.
 
 The dirty halt writes `event=IMPLEMENTATION_BASELINE_BLOCKED` (advisory, never consumed by downstream subagents) so the audit trail records the attempt. Only `event=IMPLEMENTATION_BASELINE` is the consumable event. Downstream consumers must read the LATEST `event=IMPLEMENTATION_BASELINE` entry in `RUN_LOG.md` (in case a prior failed/aborted run left one or the user resumes).
 
-If `IMPLEMENTATION_BASE_SHA=non-git`, Phase 7 will be SKIPPED and the final reviewers inspect the working tree directly. Pass `non-git` as the input value to downstream subagents that expect this variable. The baseline event is still written with `base_sha=non-git, uncommitted_changes=no` so consumers have a single source.
+If `IMPLEMENTATION_BASE_SHA=non-git`, Phase 8 will be SKIPPED and the code reviewers inspect the working tree directly. Pass `non-git` as the input value to downstream subagents that expect this variable. The baseline event is still written with `base_sha=non-git, uncommitted_changes=no` so consumers have a single source.
 
-### Step 4.1 — Dispatch implementer
+### Step 6.1 — Dispatch implementer
 
-Dispatch one `claude` Sonnet subprocess with the `implementer` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$SPEC_PATH`, `$IMPLEMENTATION_BASE_SHA`. The subagent loads `superpowers:subagent-driven-development` and runs the full per-task implementation loop internally (it dispatches its own sub-subagents per plan task as the skill prescribes). Per-task logs go under `implementation/subagent-logs/`. Timeout: 300 min (5 hours; the implementer may take this long on large features).
+Dispatch one `claude` Sonnet subprocess with the `implementer` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$SPEC_PATH`, `$IMPLEMENTATION_BASE_SHA`. The subagent loads `superpowers:subagent-driven-development` and runs the full per-task implementation loop internally (it dispatches its own sub-subagents per plan task as the skill prescribes). Per-task logs go under `6-implementation/subagent-logs/`. Timeout: 300 min (5 hours; the implementer may take this long on large features).
 
 Outputs (written by the implementer at the end):
-- `<feature-folder>/implementation/implementation-summary.md` — task count, commits, verification result, any DONE_WITH_CONCERNS notes.
-- `<feature-folder>/implementation/implementer-status.md` — STATUS with `verdict ∈ {DONE, FAILED, NEEDS_DEBUG, BLOCKED}` and `verification ∈ {PASS, FAIL, PARTIAL}`.
+- `<feature-folder>/6-implementation/implementation-summary.md` — task count, commits, verification result, any DONE_WITH_CONCERNS notes.
+- `<feature-folder>/6-implementation/implementer-status.md` — STATUS with `verdict ∈ {DONE, FAILED, NEEDS_DEBUG, BLOCKED}` and `verification ∈ {PASS, FAIL, PARTIAL}`.
 
-You read only `implementer-status.md`. On `DONE` with `verification=PASS`, proceed to Phase 6 (Phase 5 is folded into Phase 4 by the implementer skill).
+You read only `implementer-status.md`. On `DONE` with `verification=PASS`, proceed to Phase 7.
 
-### Step 4.2 — Debugger pass and reconciliation (only if implementer reports NEEDS_DEBUG or verification != PASS)
+### Step 6.2 — Debugger pass and reconciliation (only if implementer reports NEEDS_DEBUG or verification != PASS)
 
-debugger-status.md is ADVISORY: the canonical implementation status remains `implementer-status.md`. The orchestrator does NOT gate Phase 6 on `debugger-status.md` directly.
+debugger-status.md is ADVISORY: the canonical implementation status remains `implementer-status.md`. The orchestrator does NOT gate Phase 7 on `debugger-status.md` directly.
 
-1. Dispatch a `claude` Sonnet debugger subprocess with the `debugger` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_SUMMARY_PATH`, `$IMPLEMENTATION_BASE_SHA`. The debugger loads `superpowers:systematic-debugging`. It edits source/tests as needed and writes `<feature-folder>/implementation/debugger-status.md`. Timeout: 60 min.
+1. Dispatch a `claude` Sonnet debugger subprocess with the `debugger` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_SUMMARY_PATH`, `$IMPLEMENTATION_BASE_SHA`. The debugger loads `superpowers:systematic-debugging`. It edits source/tests as needed and writes `<feature-folder>/6-implementation/debugger-status.md`. Timeout: 60 min.
 2. On debugger `verdict=DONE`:
-   - **Re-dispatch the implementer** with the `implementer` appendix, additionally passing `$DEBUGGER_STATUS_PATH=<feature-folder>/implementation/debugger-status.md`. The implementer re-runs the plan's verification (it does NOT re-do task work), appends the post-debug verification result to `implementation-summary.md`, and atomically rewrites `implementer-status.md`. Timeout: 60 min for this re-run.
-   - Read the rewritten `implementer-status.md`. Proceed to Phase 6 only when `verdict=DONE` and `verification=PASS`.
-   - If the re-run still reports `verification != PASS`, loop back to Step 4.2 step 1 (debugger). Cap at 3 debugger→re-verify iterations; on cap, HALT.
+   - **Re-dispatch the implementer** with the `implementer` appendix, additionally passing `$DEBUGGER_STATUS_PATH=<feature-folder>/6-implementation/debugger-status.md`. The implementer re-runs the plan's verification (it does NOT re-do task work), appends the post-debug verification result to `implementation-summary.md`, and atomically rewrites `implementer-status.md`. Timeout: 60 min for this re-run.
+   - Read the rewritten `implementer-status.md`. Proceed to Phase 7 only when `verdict=DONE` and `verification=PASS`.
+   - If the re-run still reports `verification != PASS`, loop back to Step 6.2 step 1 (debugger). Cap at 3 debugger→re-verify iterations; on cap, HALT.
 3. On debugger `verdict=BLOCKED`, HALT.
 
-On `BLOCKED` directly from the implementer in Step 4.1, HALT.
+On `BLOCKED` directly from the implementer in Step 6.1, HALT.
 
-## Phase 5 — Verification (folded into Phase 4)
+### Step 6.3 — Dispatch summarizer-implementation
 
-The implementer subagent runs the plan's verification as part of Phase 4 (per `superpowers:verification-before-completion`). You do not re-run verification separately; you inspect `implementer-status.md` for `verification=PASS`.
+After the implementer reports `DONE` with `verification=PASS` (Step 6.1 or, after debugger reconciliation, Step 6.2), dispatch one `claude` Opus summarizer subprocess with the `summarizer-implementation` appendix. Inputs: `$FEATURE_FOLDER`. The subagent reads phase=6 dispatches from `RUN_LOG.md` and appends a `## Usage` section to `6-implementation/implementation-summary.md` (the file already exists; the summarizer appends, does not rewrite). Outputs: `<feature-folder>/6-implementation/summarizer-status.md`. Timeout: 10 min.
 
-If the deliverable is a browser/web-app flow and the plan calls for it, the implementer subagent additionally loads `dogfood` (or whatever browser-QA skill the environment provides) and records browser-QA results inside `implementation/implementation-summary.md`. The implementer's STATUS.md still gates progression.
+Proceed to Phase 7 only after the summarizer reports `DONE`. If the summarizer fails (Mode 1/2/3/4/5), HALT — the readiness report depends on this `## Usage` section.
 
-## Phase 6 — Final implementation review gate (delegated, two reviewers, severity-gated)
+## Phase 7 — Code review gate (delegated, two reviewers, severity-gated)
 
-Same shape as Phase 1, applied to the implementation diff and behavior.
+Same shape as Phase 3, applied to the implementation diff and behavior.
+
+### Step 7.0 — Per-phase preflight
+
+Before iter 01's first reviewer dispatch (the gate's first work dispatch — see "Terminology gloss" in Resumability), run the per-phase preflight:
+
+1. `mkdir -p <feature-folder>/7-code-review/preflight`.
+2. Reset `codex_available = true` for the phase.
+3. If `codex_disabled_by_user = true` (run-scoped flag from Phase 1; reconstitute by scanning RUN_LOG per the rule in "Run-scoped user opt-out"):
+   - Dispatch `preflight-claude` only.
+   - Append one `event=CODEX_SKIPPED_BY_USER_CONSENT` entry to `RUN_LOG.md` with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `role: preflight-codex`, `vendor: codex` (see RUN_LOG additions for the full block shape).
+   - Set `codex_available = false`.
+4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`).
+5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
+
+   ```bash
+   [ -f "$FEATURE_FOLDER/1-preflight/claude-check-status.md" ] && \
+     mv "$FEATURE_FOLDER/1-preflight/claude-check-status.md" \
+        "$FEATURE_FOLDER/7-code-review/preflight/claude-check-status.md"
+   [ -f "$FEATURE_FOLDER/1-preflight/codex-check-status.md" ] && \
+     mv "$FEATURE_FOLDER/1-preflight/codex-check-status.md" \
+        "$FEATURE_FOLDER/7-code-review/preflight/codex-check-status.md"
+   ```
+
+   Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" in Step 1.0).
+
+6. Append one RUN_LOG dispatch entry per probe with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 7-code-review/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
+7. Branch on the verdicts:
+   - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
+   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** set `codex_available = false` for the remainder of Phase 7 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `failure_mode: <N>`, and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1. Proceed to step 1 of the iteration loop with `codex_available = false`.
+   - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed).
+
+The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this gate.
+
+### Step 7.1 — Iteration loop
 
 For each iteration N (start at 1, hard cap at 5):
 
-1. `mkdir -p <feature-folder>/final-review/iteration-NN`.
-2. Dispatch a `claude` Opus reviewer with the `final-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `final-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 60 min.
-3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer with the `final-reviewer-codex` appendix. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `final-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 60 min.
+1. `mkdir -p <feature-folder>/7-code-review/iteration-NN`.
+2. Dispatch a `claude` Opus reviewer with the `code-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 60 min.
+3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer with the `code-reviewer-codex` appendix. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 60 min.
 4. Read only verdict files.
 5. If `blockers + majors > 0` from any active reviewer:
-   - Re-dispatch the implementer subagent (Phase 4 appendix) with `$FINDINGS_PATHS` so it patches the implementation. Timeout: 300 min.
+   - Re-dispatch the implementer subagent (Phase 6 appendix) with `$FINDINGS_PATHS` so it patches the implementation. Timeout: 300 min.
    - Increment N. Loop.
 6. When all active reviewers report `blockers=0, majors=0`:
-   - Dispatch a `claude` Opus summarizer with the `summarizer-final` appendix. Outputs: `final-review/final-review-summary.md` and `final-review/summarizer-status.md`. Timeout: 10 min.
-   - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 7.
+   - Dispatch a `claude` Opus summarizer with the `summarizer-code-review` appendix. Outputs: `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`. Timeout: 10 min.
+   - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 8.
 
 If iteration cap (5) trips, HALT.
 
-## Phase 7 — Git finalization (delegated)
+## Phase 8 — Git finalization (delegated)
 
-Skip this phase entirely if the working directory is not a git repository (detected via `git status` exit code != 0). In that case, write `<feature-folder>/final-review/git-status.md` with `verdict=SKIPPED` and `reason=not-a-git-repo` by dispatching a one-shot `claude` Sonnet subprocess with the `finishing-branch` appendix — the appendix detects the no-git case and writes SKIPPED itself.
+Skip this phase entirely if the working directory is not a git repository (detected via `git status` exit code != 0). In that case, write `<feature-folder>/8-git-finalization/git-status.md` with `verdict=SKIPPED` and `reason=not-a-git-repo` by dispatching a one-shot `claude` Sonnet subprocess with the `finishing-branch` appendix — the appendix detects the no-git case and writes SKIPPED itself.
 
 Otherwise:
 
 Dispatch one `claude` Sonnet subprocess with the `finishing-branch` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. The subagent loads `superpowers:finishing-a-development-branch`, reviews the diff against the captured baseline, stages only intended files (no `.env`, secrets, or large binaries; nothing outside the implementation slice), and commits per the plan's git rules and the project's `CLAUDE.md` git policy.
 
-Output: `<feature-folder>/final-review/git-status.md` with `verdict ∈ {DONE, SKIPPED, FAILED}`, `implementation_base_sha`, plus commit SHAs (if any). Timeout: 30 min.
+Output: `<feature-folder>/8-git-finalization/git-status.md` with `verdict ∈ {DONE, SKIPPED, FAILED}`, `implementation_base_sha`, plus commit SHAs (if any). Timeout: 30 min.
 
 You read only `git-status.md`.
 
-## Phase 8 — Final readiness report (delegated)
+## Phase 9 — Final readiness report (delegated)
 
-Dispatch one `claude` Opus subprocess with the `readiness-writer` appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`, `$PLAN_PATH`. The subagent reads every per-phase summary file inside the feature folder (preflight statuses, phase-0 status, spec-review summary, plan-review summary, implementation summary, final-review summary, git status) and writes:
+Dispatch one `claude` Opus subprocess with the `readiness-writer` appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`, `$PLAN_PATH`. The subagent reads every per-phase summary file inside the feature folder (preflight statuses, phase-0 status, spec-review summary, plan-review summary, implementation summary, code-review summary, git status) and writes:
 
 - `<feature-folder>/final-readiness-report.md` — the human-facing report covering: artifacts, reviewer verdicts (including `partial_review` flag if Codex was unavailable), implementation result, verification result, git result, skipped optional steps, residual MINOR/NIT items, and overall readiness verdict.
 - `<feature-folder>/readiness-status.md` — STATUS with `verdict=DONE` and `report_path=<absolute>`.
@@ -401,10 +1072,10 @@ You read only `readiness-status.md`. After it reports `DONE`:
 
 Print to the user a concise message containing the following paths:
 - `<feature-folder>/final-readiness-report.md`
-- `<feature-folder>/spec-review/spec-review-summary.md`
-- `<feature-folder>/plan-review/plan-review-summary.md`
-- `<feature-folder>/implementation/implementation-summary.md`
-- `<feature-folder>/final-review/final-review-summary.md`
+- `<feature-folder>/3-spec-review/spec-review-summary.md`
+- `<feature-folder>/5-plan-review/plan-review-summary.md`
+- `<feature-folder>/6-implementation/implementation-summary.md`
+- `<feature-folder>/7-code-review/code-review-summary.md`
 - Canonical spec path and plan path
 - Test summary, git summary, skipped optional steps, `partial_review` flag if any, overall readiness verdict.
 
@@ -418,11 +1089,32 @@ Subprocess subagents can fail in five ways. You detect each and respond per the 
 
 | # | Mode                              | Detection                                                          |
 |---|-----------------------------------|--------------------------------------------------------------------|
+| 0 | Environmental (binary missing)    | `command -v <cli>` returned nothing during canary preflight        |
 | 1 | CLI subprocess non-zero exit      | Shell exit code != 0                                               |
 | 2 | Subprocess timed out              | Wrapped in `timeout <N>m`; exit code 124                           |
 | 3 | STATUS.md missing                 | Path doesn't exist after subprocess returns                        |
-| 4 | STATUS.md malformed               | Required keys missing or unparseable                               |
+| 4 | STATUS.md malformed               | Required keys missing or unparseable (see `validate_status`)       |
 | 5 | Quota / rate-limit signal         | Stderr contains vendor-specific quota markers                      |
+
+### Distinguish orchestration bugs from vendor failures
+
+Before classifying a Mode 1 failure as a vendor outage, inspect the last 40 lines of stderr for **local CLI usage errors**. These are orchestrator bugs (wrong option order, unknown flag, typo in subcommand), not vendor failures:
+
+- `error: unexpected argument '<flag>' found`
+- `error: unrecognized argument: ...`
+- `Usage: <cli> ...` (when followed by a hint about the failing invocation)
+- `unknown option <flag>`
+- `error: the following required arguments were not provided`
+
+If any of these appear, do NOT mark the vendor unavailable. The dispatch failed because the orchestrator built an invalid command line. Correct the invocation per the cookbook's "CLI invocation forms" entry, then retry **once**. Only if the corrected command also fails do you classify the failure per the table below.
+
+Concretely for Codex: the most common orchestration bug is `codex exec ... -a never` (global option after `exec`). The right form is `codex -a never exec ... -` — see the cookbook. Do not mark Codex unavailable on the first attempt of this shape.
+
+### Transcript-read policy
+
+The orchestrator must NOT inspect transcript stdout/stderr after a successful subprocess (`rc=0` AND STATUS.md exists AND `validate_status` returns clean). The verdict is whatever STATUS.md says. Tailing transcripts "out of curiosity" or "to confirm" leaks the orchestrator into the subagent's reasoning and routinely creates the temptation to override a STATUS.
+
+Transcript tails are read ONLY when classifying a failure (`rc != 0`, missing STATUS, or malformed STATUS — Modes 1–5). The `post_dispatch` helper from the cookbook implements this rule. Surface the tail only when halting the run or logging a vendor-failover event.
 
 ### STATUS.md contract
 
@@ -444,7 +1136,7 @@ Phase-0 context discovery:   5 min
 Spec reviewer (per call):    20 min
 Plan writer:                 30 min
 Plan reviewer:               20 min
-Implementer (per Phase 4):   300 min   (5 hours)
+Implementer (per Phase 6):   300 min   (5 hours)
 Debugger:                    60 min
 Final reviewer:              60 min
 Git finalizer:               30 min
@@ -460,13 +1152,16 @@ Every subprocess wrapped: `timeout <N>m <cli> -p -`. Exit code 124 = Mode 2.
 
 On ANY failure mode of a `codex` subprocess:
 - Append `CODEX_UNAVAILABLE` to `RUN_LOG.md` with failure mode, phase/iteration, and the last 40 lines of stderr.
-- Set in-run flag `codex_available = false`.
+- **Before** setting `codex_available = false`, scan the captured stderr for the literal substring `is not supported when using Codex with a ChatGPT account`. If found, this is a model-resolution bug, NOT a Codex outage: HALT, surface the offending model id and the active model list from `~/.codex/models_cache.json`, and prompt the user to fix the resolved-model map in `2-context-discovery/status.md` (typically: drop `-m` so config.toml supplies the default, or pin `gpt-5.5`). Do not silently degrade.
+- Otherwise, set in-run flag `codex_available = false`.
 - Proceed with the Claude reviewer's verdict alone.
 - The active gate's summarizer (and the final readiness writer) record `partial_review = true` and `codex_unavailable_reason = <mode>` in their summaries.
 
-Once `codex_available = false`, no further `codex` subprocesses are dispatched for the remainder of the run. You do not re-probe mid-run. The user is NOT prompted; this is silent automatic degradation.
+Once `codex_available = false`, no further `codex` subprocesses are dispatched for the remainder of the **phase**. The flag is scoped to the current phase only — at the next per-phase preflight gate (Phases 3, 5, 6, 7), `codex_available` is reset to `true` and the codex probe re-runs, unless the run-scoped `codex_disabled_by_user` flag is set (see "Run-scoped user opt-out: `codex_disabled_by_user`" in the Phase 1 section), in which case the per-phase codex probe is skipped and `codex_available` stays `false` for that phase too. Within a phase's iteration loop the sticky rule still holds: a codex failure during, say, spec-review iter 02 keeps codex disabled through iter 03+, but does NOT carry into the next phase's preflight.
 
-On a subsequent re-run (resume), `codex_available` resets to `true` at preflight time. Preflight is the new probe — if Codex quota has replenished, the resumed run uses Codex from that point.
+The Phase 1 user prompt described in Step 1.1 step 6 is the ONLY automatic-degradation prompt; per-phase preflight failures (Modes 0–5 at Phases 3, 5, 7) silently degrade the phase to claude-only without prompting. At Phase 6 the codex preflight failure is non-blocking and also does not prompt (codex is not dispatched downstream).
+
+On a process resume that lands inside a gated phase, the orchestrator re-runs that phase's per-phase preflight before the next dispatch in the session — see "Resume semantics" below for the full branch.
 
 **Claude (heavy-work) — hard halt on any failure.**
 
@@ -477,54 +1172,162 @@ On ANY failure mode of a `claude` subprocess:
 
 ### Mode-specific response table
 
-| Mode | Claude subprocess           | Codex subprocess                       |
-|------|------------------------------|----------------------------------------|
-| 1    | HALT, surface stderr tail   | Set `codex_available=false`, log, continue Claude-only |
-| 2    | HALT, surface               | Set `codex_available=false`, log, continue |
-| 3    | HALT, surface, hint at token/quota hard stop | Set `codex_available=false`, log, continue |
-| 4    | Retry ONCE same prompt. If still malformed, HALT | Retry ONCE. If still malformed, set `codex_available=false`, continue |
-| 5    | HALT, surface, suggest quota-reset wait | Set `codex_available=false`, log, continue |
+For each row, **first** apply the "Distinguish orchestration bugs from vendor failures" rule above — only proceed to the table action if the failure is genuinely on the vendor side.
+
+The "Codex subprocess" column below applies AT A PER-PHASE GATE (Phases 3, 5, 6, 7) and INSIDE A PHASE'S ITERATION LOOP. At **Phase 1** the codex column is overridden by Step 1.1 step 6 (Mode 0 HALTs unconditionally; Modes 1–5 prompt the user and set the run-scoped `codex_disabled_by_user` flag on consent). At **Phase 6** Mode 0–5 all degrade non-blocking (the probe is informational; no implementer-blocking action).
+
+| Mode | Claude subprocess           | Codex subprocess (per-phase / in-iteration)                 |
+|------|------------------------------|--------------------------------------------------------------|
+| 0    | HALT (binary missing — environmental) | Set `codex_available=false` for the phase, log `CODEX_UNAVAILABLE` with `failure_mode=0` and `phase=<n>`, continue Claude-only for the phase |
+| 1    | HALT, surface stderr tail   | Set `codex_available=false` for the phase, log with `phase=<n>`, continue Claude-only for the phase |
+| 2    | HALT, surface               | Set `codex_available=false` for the phase, log with `phase=<n>`, continue for the phase |
+| 3    | HALT, surface, hint at token/quota hard stop | Set `codex_available=false` for the phase, log with `phase=<n>`, continue for the phase |
+| 4    | Retry ONCE same prompt. If still malformed, HALT | Retry ONCE. If still malformed, set `codex_available=false` for the phase, continue for the phase |
+| 5    | HALT, surface, suggest quota-reset wait | Set `codex_available=false` for the phase, log with `phase=<n>`, continue for the phase |
 
 ### Iteration cap
 
-Each review gate (Phase 1, Phase 3, Phase 6) has a hard cap of 5 fix→re-review iterations. After 5 iterations with any active reviewer still reporting `blockers > 0` or `majors > 0`, HALT and surface residual findings paths plus the artifact path. The user decides: override (accept and proceed) or take the work back.
+Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 15 fix→re-review iterations. After 15 iterations with any active reviewer still reporting `blockers > 0` or `majors > 0`, HALT and surface residual findings paths plus the artifact path. The user decides: override (accept and proceed) or take the work back.
 
 ### Resumability
 
-`RUN_LOG.md` is append-only and is the source of truth for where the run stopped. There are three entry shapes, distinguishable by which keys are present:
+`RUN_LOG.md` is append-only and is the source of truth for where the run stopped. **Each entry is a multi-line YAML-ish block separated from the next by a blank line.** Entries are read top-to-bottom; key order within an entry is fixed (as shown below) so humans can scan it. The first line of every entry is `--- <ISO-timestamp>  <event-or-dispatch-tag>` so blocks are visually distinct. There are four block shapes, distinguishable by their tag:
 
 **Dispatch entries** (one per subprocess invocation):
 
 ```
-<ISO-timestamp>  phase=<n>  iteration=<n>  role=<role>  vendor=<cli>
-                 appendix=<name>  develop_it_sha=<git-sha>
-                 status_path=<path>  verdict=<verdict>
+--- 2026-05-28T17:48:45Z  dispatch
+phase:                    3
+phase_name:               spec-review
+iteration:                01
+role:                     spec-reviewer-claude
+vendor:                   claude
+appendix:                 spec-reviewer-claude
+develop_it_git_sha:       fd705aef83efe207cf12f668980544576b8849bc
+develop_it_file_sha256:   8c2f6bf5e9d3a4b1f5c7d8e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9
+develop_it_dirty:         no
+status_path:              3-spec-review/iteration-01/claude-opus-verdict.md
+verdict:                  CHANGES_REQUESTED
+model:                    claude-opus-4-7
+duration_ms:              241830
+tokens_input_new:         18430
+tokens_input_cached:      0
+tokens_cache_write:       54200
+tokens_output:            6210
+tokens_reasoning:         0
+cost_usd:                 0.4823
+usage_status:             ok
 ```
 
-**Failure events** (CODEX_UNAVAILABLE, CLAUDE_FAILED) — dispatch shape plus `failure_mode=<n>` and `event=<NAME>`:
+(Relative `status_path` is encouraged; absolute is allowed when ambiguous. `develop_it_git_sha` is `git rev-parse HEAD` at dispatch; `develop_it_file_sha256` is `sha256sum $PROCESS_PATH | cut -d' ' -f1` at dispatch; `develop_it_dirty` is `yes` when the working-tree copy of the file differs from `git show HEAD:$PROCESS_PATH`.)
+
+**Usage telemetry fields.** Every dispatch entry MUST carry the nine telemetry fields shown above (`model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`, `usage_status`). Values come from `parse_usage` (see cookbook). Field semantics:
+
+- All token counts are integers; `0` when not applicable to the vendor (`tokens_reasoning` is `0` for Claude; `tokens_cache_write` is `0` for Codex).
+- `cost_usd` is numeric for Claude; the literal string `n/a` for Codex (subscription-priced, no per-call cost).
+- `usage_status` is `ok` or `unavailable`. When `unavailable`, all token fields are `0` and `cost_usd` is `n/a` — but the dispatch entry itself is still written normally. Telemetry parsing failure NEVER blocks logging.
+- `model` is the resolved concrete model id (e.g. `claude-opus-4-7`). For Codex, use the value from `2-context-discovery/status.md`'s `resolved_models:` map; for pre-Phase-0 dispatches (canary, preflight), use the literal string `codex`.
+- `duration_ms` is the CLI-reported wall time for Claude (`duration_ms` field in the JSON), and the orchestrator-measured wall time for Codex (Codex JSON omits a duration field).
+
+Existing entries written by prior versions of this process file MAY lack the nine fields. Readers (summarizers, readiness writer) MUST tolerate missing fields by treating them as `usage_status=unavailable` with zero values.
+
+**`phase_name` field.** Every entry that carries a `phase:` number MUST also carry a `phase_name:` immediately below it. The number stays for machine filtering; the name makes the log human-readable. Use these canonical names exactly:
+
+| `phase` | `phase_name` |
+|---|---|
+| 1 | `preflight` |
+| 2 | `context-discovery` |
+| 3 | `spec-review` |
+| 4 | `plan-writing` |
+| 5 | `plan-review` |
+| 6 | `implementation` |
+| 7 | `code-review` |
+| 8 | `git-finalization` |
+| 9 | `readiness-report` |
+
+`phase_name` applies to every dispatch entry and to every event entry that carries `phase:` (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE`). Events that do not carry `phase:` (`IMPLEMENTATION_BASELINE`, `IMPLEMENTATION_BASELINE_BLOCKED`) do not need `phase_name`. Existing entries in already-written RUN_LOGs are not back-filled — readers MUST tolerate entries that lack `phase_name`.
+
+**Failure events** (CODEX_UNAVAILABLE, CLAUDE_FAILED) — dispatch shape plus `failure_mode` and `event`:
 
 ```
-<ISO-timestamp>  event=CODEX_UNAVAILABLE  phase=<n>  iteration=<n>  role=<role>  vendor=codex
-                 failure_mode=<n>  status_path=<path-or-missing>  verdict=<verdict-or-none>
+--- 2026-05-28T17:43:16Z  event=CODEX_UNAVAILABLE
+phase:                    1
+phase_name:               preflight
+iteration:                00
+role:                     preflight-codex
+vendor:                   codex
+failure_mode:             1
+status_path:              missing
+verdict:                  none
 ```
 
-**Baseline event** (written before Phase 4 dispatch, only after the orchestrator confirms the working tree is clean):
+**Baseline event** (written before Phase 6 dispatch, only after the orchestrator confirms the working tree is clean):
 
 ```
-<ISO-timestamp>  event=IMPLEMENTATION_BASELINE  base_sha=<sha-or-non-git>
-                 uncommitted_changes=no
+--- 2026-05-28T18:30:00Z  event=IMPLEMENTATION_BASELINE
+base_sha:               <sha-or-non-git>
+uncommitted_changes:    no
 ```
 
-A consumable `IMPLEMENTATION_BASELINE` entry always has `uncommitted_changes=no` by construction — the orchestrator halts before writing it if the tree is dirty (the dirty halt instead writes the advisory `event=IMPLEMENTATION_BASELINE_BLOCKED`).
+A consumable `IMPLEMENTATION_BASELINE` entry always has `uncommitted_changes: no` by construction — the orchestrator halts before writing it if the tree is dirty (the dirty halt instead writes the advisory `event=IMPLEMENTATION_BASELINE_BLOCKED`).
 
 **Baseline-blocked event** (advisory only, never consumed):
 
 ```
-<ISO-timestamp>  event=IMPLEMENTATION_BASELINE_BLOCKED  candidate_sha=<sha>
-                 reason=dirty-tree
+--- 2026-05-28T18:25:00Z  event=IMPLEMENTATION_BASELINE_BLOCKED
+candidate_sha:  <sha>
+reason:         dirty-tree
 ```
 
-This exists for the audit trail. Downstream subagents (summarizers, readiness writer, final reviewers) MUST ignore it.
+This exists for the audit trail. Downstream subagents (summarizers, readiness writer, code reviewers) MUST ignore it.
+
+**`CODEX_DISABLED_BY_USER_CONSENT` event** (emitted exactly once per run, at Phase 1, immediately after the user consents to claude-only via the Step 1.1 step 6 prompt):
+
+```
+--- 2026-05-28T17:43:25Z  event=CODEX_DISABLED_BY_USER_CONSENT
+phase:                    1
+phase_name:               preflight
+iteration:                00
+role:                     preflight-codex
+vendor:                   codex
+failure_mode:             <0..5>
+stderr_tail:              |
+  <last 40 lines of probe stderr>
+```
+
+`CODEX_DISABLED_BY_USER_CONSENT` is the canonical storage for the run-scoped `codex_disabled_by_user` flag. To reconstitute the flag on resume, scan `RUN_LOG.md` top-to-bottom for entries whose first-line tag is exactly `event=CODEX_DISABLED_BY_USER_CONSENT`. The flag is `true` if at least one such entry exists and no later entry carries the tag `event=CODEX_RE_ENABLED_BY_USER` (re-enabling is out of scope; the tag is reserved). Readers MUST match on the full first-line tag, NOT on `phase` / `phase_name`, since the event is unique per run.
+
+**`CODEX_SKIPPED_BY_USER_CONSENT` event** (emitted at the entry of each per-phase preflight gate — Phases 1, 3, 4, 6 — when `codex_disabled_by_user = true`):
+
+```
+--- 2026-05-28T20:31:00Z  event=CODEX_SKIPPED_BY_USER_CONSENT
+phase:                    5
+phase_name:               plan-review
+iteration:                00
+role:                     preflight-codex
+vendor:                   codex
+```
+
+Downstream consumers (notably the readiness writer) treat a missing per-phase codex STATUS file plus a matching `CODEX_SKIPPED_BY_USER_CONSENT` event for the same `(phase, iteration)` as `SKIPPED`, not as an orchestration bug.
+
+**Per-phase preflight dispatch entries** use the standard dispatch shape with `iteration: 00` to mark them as pre-iteration-loop work. Example:
+
+```
+--- 2026-05-28T20:31:00Z  dispatch
+phase:                    5
+phase_name:               plan-review
+iteration:                00
+role:                     preflight-claude
+vendor:                   claude
+appendix:                 preflight-claude
+develop_it_git_sha:       <sha>
+develop_it_file_sha256:   <hash>
+develop_it_dirty:         no
+status_path:              5-plan-review/preflight/claude-check-status.md
+verdict:                  READY
+```
+
+Summarizer appendices already filter by `phase=<n>`, so per-phase preflight events appear in each phase's existing summary scope automatically — no summarizer changes are required. Phase 1 verdicts continue to be read by summarizers from RUN_LOG dispatch entries for Phase 1 (the same source they use today), not from the relocated `1-preflight/phase-1/` STATUS files. The relocated STATUS files are consumed only by the readiness writer and by ad-hoc human inspection.
 
 **Consumer rule for downstream readers:** when locating the implementation baseline, scan `RUN_LOG.md` for entries matching `event=IMPLEMENTATION_BASELINE` (NOT `IMPLEMENTATION_BASELINE_BLOCKED`) and use the LATEST one (last by file order). This handles the case where a user resumed a run multiple times — only the most recent clean baseline is authoritative. Failover events use the same `event=` key approach; baselines and failovers are independent.
 
@@ -532,8 +1335,18 @@ On re-run of this prompt against the same feature folder:
 1. Detect the feature folder exists.
 2. Read `RUN_LOG.md` only.
 3. Determine the last completed phase/iteration.
-4. Resume from the next un-completed step.
-5. Skip preflight if the previous `READY` statuses are < 24 h old.
+4. Reconstitute the run-scoped `codex_disabled_by_user` flag by scanning RUN_LOG for `event=CODEX_DISABLED_BY_USER_CONSENT` (see "`CODEX_DISABLED_BY_USER_CONSENT` event" above). Resume does NOT re-prompt the user.
+5. Branch by the phase being resumed into:
+   - **Resuming before Phase 2** (no phases have started yet — RUN_LOG contains no dispatch entries past Phase 1, or RUN_LOG is empty / has only Phase 1 entries with no `READY` verdict): run Phase 1 in full as if a fresh invocation. Phase 1 itself is not "gated" by per-phase preflight — the Phase 1 logic *is* the preflight. The Step 1.2 relocation runs again on success.
+   - **Resuming into Phase N where N ∈ {3, 5, 6, 7}** (a gated phase): the orchestrator runs (or re-runs) Phase N's per-phase preflight before the **next dispatch in the session** (defined as the next dispatch after the process resume, even if Phase N's first work dispatch already executed in a prior session), regardless of whether Phase N's preflight ran in the pre-resume session, and regardless of whether the resume happens before Phase N's first dispatch, between iterations, during a fixer dispatch, or immediately after one. Re-run STATUS files OVERWRITE the prior session's `<phase>/preflight/<vendor>-check-status.md` artifacts — overwrite (not versioned filenames) is the intentional policy: the per-phase preflight verdict is the **current** truth. Pre-resume preflight history is preserved indirectly via the RUN_LOG dispatch entries (each retains `develop_it_git_sha`, timestamp, and verdict). After the resume preflight completes, the per-phase cache applies normally for any further iterations in that session until the next phase transition or halt.
+   - **Resuming into a non-gated phase** (Phase 2, 4, 8, 9, or any future phase not in {3, 5, 6, 7}): no preflight runs on resume. The orchestrator picks up where it left off using the most recent applicable preflight verdict from RUN_LOG (Phase 1 for Phases 2 and 4, or the most recent per-phase preflight for Phase 8 or 9 (and analogously for any future non-gated phase)) and any in-scope flags such as `codex_disabled_by_user`. This is a direct consequence of the "gated set is exactly {3, 5, 6, 7}" rule, not a violation of it.
+6. Resume from the next un-completed step.
+
+**Terminology gloss** (used in this section and in acceptance criteria):
+- *first work dispatch* = the very first dispatch of a gate's iteration loop across the entire run as a whole (e.g., for Phase 3, the iter 01 spec-reviewer-claude dispatch). The per-phase preflight (Step 3.0 / 5.0 / 6.−1 / 7.0) is the dispatch immediately preceding the first work dispatch.
+- *next dispatch in the session* = the next dispatch after a process resume, regardless of whether earlier dispatches in that phase already ran in a prior session.
+
+The legacy "skip preflight if previous READY statuses are < 24 h old" rule is removed. Resume never skips preflight on the basis of recent READY-artifact age.
 
 If `RUN_LOG.md` is corrupt, HALT and ask the user whether to rename the feature folder with a `-stale-<timestamp>` suffix and start fresh, or repair manually.
 
@@ -554,18 +1367,19 @@ If you (the orchestrator) catch yourself doing any of the following, STOP immedi
 - Opening the plan file with Read.
 - Opening any source file under `src/`, `tests/`, or any application code.
 - Opening reviewer findings files. Only STATUS.md and the per-phase summary files (when explicitly needed by the final readiness writer) are readable.
-- Opening transcripts. They are written for the user's diagnostic use, not yours.
+- Opening transcripts after a successful dispatch (`rc=0` AND STATUS.md present AND `validate_status` clean). Transcripts are written for the user's diagnostic use, not yours. The single sanctioned exception is the failure-classification tail described in the "Transcript-read policy" subsection of Failure handling — and only when the dispatch actually failed.
+- Reading `process-improvement-proposition.md` during the current run. (This file is written by the orchestrator but is read only by *future* runs; reading it now would violate the non-influence guarantee.)
 
 ### Writing red flags
 - Calling Edit or Write on the spec, plan, source code, test code, or reviewer findings.
-- Composing summary text and writing any of: `spec-review-summary.md`, `plan-review-summary.md`, `implementation-summary.md`, `final-review-summary.md`, `final-readiness-report.md`. All are produced by delegated subagents.
+- Composing summary text and writing any of: `spec-review-summary.md`, `plan-review-summary.md`, `implementation-summary.md`, `code-review-summary.md`, `final-readiness-report.md`. All are produced by delegated subagents.
 - Writing any file outside the feature folder, with the sole exception of files the standard skills (`brainstorming`, `writing-plans`) place at their canonical paths via delegated subagents.
 - Writing inside the feature folder beyond `RUN_LOG.md` and `mkdir -p`.
 
 ### Running red flags
 - Invoking `pytest`, `ruff`, `npm`, `make`, the application, or any build/test tool directly.
-- Running `git add`, `git commit`, `git checkout`. These belong to the Phase 7 subagent.
-- Read-only git is allowed: `git status`, `git log`, `git diff --stat`, `git rev-parse HEAD` (the last is used to record the develop-it.md SHA in RUN_LOG).
+- Running `git add`, `git commit`, `git checkout`. These belong to the Phase 8 subagent.
+- Read-only git is allowed: `git status`, `git log`, `git diff --stat`, `git rev-parse HEAD` (the last is used to record the `$PROCESS_PATH` git SHA in RUN_LOG; the file's content SHA-256 is recorded separately — see the dispatch entry shape in the orchestration contract).
 
 ### Reasoning leaks
 - Forming an opinion on a verdict's correctness ("this looks fine to me, I'll pass the gate"). The verdict is whatever STATUS.md says.
@@ -577,34 +1391,152 @@ If you (the orchestrator) catch yourself doing any of the following, STOP immedi
 
 Before transitioning to the next phase, you must answer YES to all of:
 - Did I read only STATUS.md files (and explicitly-needed summary files) to make the gate decision?
+- Did I validate every consumed STATUS.md with `validate_status` (or equivalent checks for verdict / blockers / majors / minors / findings / reason)?
 - Did every artifact in this phase get produced by a subprocess?
-- Did I record every dispatch in RUN_LOG.md?
+- Did I record every dispatch in RUN_LOG.md with `develop_it_git_sha`, `develop_it_file_sha256`, AND `develop_it_dirty`?
 - Was the gate decision based on the severity counts in STATUS.md, not my impression of the work?
+- Did I refrain from tailing transcripts after every successful dispatch (only failures grant transcript-tail access)?
 
 If any answer is NO, the phase is invalid. Re-dispatch the appropriate subagent before proceeding.
+
+### Proposition file content rules
+
+Entries in `process-improvement-proposition.md` follow the same content rules as `RUN_LOG.md` and transcripts:
+
+- Do NOT quote source code in entries.
+- Do NOT quote credentials, secrets, or environment variable values.
+- Do NOT include the spec, plan, source diff, reviewer findings, or any user-private content. Entries are about *the process file*, not about the work the process is producing.
+- When citing a stderr tail to illustrate an event, truncate as you would in RUN_LOG, and elide any obvious secret patterns.
+
+## Process self-observation
+
+The orchestrator writes one additional file at the feature folder root: `process-improvement-proposition.md`. It is an append-only log of friction, ambiguity, failures, and good patterns the orchestrator encounters while executing this process file. It is read only by *future* runs that want to improve the process file. It is NEVER read by the current run; writing here cannot influence current execution.
+
+### File
+
+Path: `<feature-folder>/process-improvement-proposition.md`
+
+- Lives at the feature folder root, alongside `RUN_LOG.md`, `final-readiness-report.md`, `readiness-status.md`. No numeric prefix (cross-cutting artifact).
+- Append-only. Never rewritten. History preserved.
+- Created lazily on the first append — the orchestrator does NOT preemptively `touch` it.
+- Survives resume — the same file is appended to throughout.
+- Listed in the **Folder layout** as an optional top-level artifact.
+
+### Mandatory triggers
+
+The orchestrator **MUST append an entry** on each of these events:
+
+1. Any `event=CODEX_UNAVAILABLE` (regardless of phase or failure_mode).
+2. Any `event=CLAUDE_FAILED`.
+3. Any retry of a dispatch within the same iteration (e.g. Mode 4 retry-once policy after a transient failure). Normal next-iteration progression of an iteration loop (spec-review, plan-review, code-review) is NOT a "retry" for this purpose — iteration number is already recorded in `RUN_LOG.md` and need not be re-logged here unless the orchestrator has a specific observation to record. The iteration-cap trigger (#5) covers the terminal case. Concretely: a "retry within iteration" is identified in `RUN_LOG.md` by a second `dispatch` entry whose `iteration:` field is unchanged from the immediately preceding failed dispatch in the same `phase:` AND whose `role:` matches that preceding failed dispatch; the completion-check uses this pair as the countable event. Phases without an iteration loop (preflight, context-discovery, plan-writing, implementation, git-finalization, readiness-report) only trigger this rule when the same `role:` is dispatched a second time within the same `phase:` after a failed first dispatch — the `iteration:` field, if present at all in those phases, is treated as trivially satisfied and the `role:` equality check is the load-bearing condition. **Example exclusion:** a `debugger` dispatch after a failed `implementer` dispatch in Phase 6 is NOT a retry — different roles, so trigger #3 does not fire (this is structured remediation, not a retry). A second `implementer` dispatch after a failed `implementer` dispatch in Phase 6 IS a retry and DOES fire trigger #3. The same logic applies to Phase 8 (`finishing-branch`): trigger #3 fires only on a second `finishing-branch` dispatch after a failed first one.
+4. Any `event=HALT` (graceful or otherwise).
+5. Any `event=ITERATION_CAP_REACHED` AND any `event=ITERATION_CAP_OVERRIDE`. These two are counted **independently** — when a cap is reached and then overridden, that incident yields two distinct `RUN_LOG.md` events and therefore requires two distinct entries in `process-improvement-proposition.md`. A single entry cannot cover both.
+6. Any deviation from this process file's prescribed shape — when the orchestrator interprets an ambiguous instruction, works around an undocumented CLI quirk, or has to compose behavior the process file did not explicitly cover. Illustrative (non-exhaustive) examples: "had to choose between two readings of `Step 6.−1` vs `Step 6.0`"; "process file did not specify behavior when summarizer returns empty output, composed best-effort fallback"; "CLI emitted an undocumented stderr warning that required ad-hoc handling". Deviation is NOT a structured `RUN_LOG.md` event type — it is recognized only by the orchestrator's own judgment at the moment it makes the deviating choice. Because it has no countable RUN_LOG counterpart, deviation entries are explicitly excluded from the strict 1:1 count check in Completion criteria (see that section for the exhaustive list of count-matched event types); deviation remains a mandatory append trigger here regardless.
+
+**Scope guardrail for deviation entries.** When a deviation is triggered by ambiguity in the spec/plan/diff being processed (rather than ambiguity in the process file itself), describe the deviation in terms of the *process-file instruction the orchestrator was trying to follow*, not in terms of the spec/plan/diff content. If the deviation is fundamentally about spec/plan/diff content and not about a process-file instruction, it is out of scope for `process-improvement-proposition.md` — record it in `RUN_LOG.md` instead. This mirrors the `kind: idea` rule (below) and the general anti-leak guidance.
+
+The orchestrator **MAY append an entry** spontaneously whenever else it notices something worth recording (smooth run with a notable pattern, a phase taking surprisingly long, a successful failover that worked exactly as documented, etc.).
+
+### Entry format
+
+Each entry is a markdown section with three required fields and a free-form body inside `Context` and `Proposed improvement`. Mandatory-trigger entries (triggers #1–#5 above) MUST include a `trigger:` tag in the header so the structured RUN_LOG event type is recoverable directly from the entry without re-deriving it from the body text:
+
+```markdown
+## <ISO-8601-timestamp> — phase <N> (<phase_name>) — kind: <kind> — trigger: <TRIGGER_TYPE>
+
+**Context:** <one or two sentences describing what happened, where in the process, what the orchestrator did or had to decide>
+
+**Proposed improvement:** <one or two sentences suggesting how the process file could change to prevent the friction next time, or to make the success reproducible>
+```
+
+The `trigger: <TRIGGER_TYPE>` segment is REQUIRED on mandatory entries (triggers #1–#5) and OMITTED on spontaneous entries and on deviation entries (trigger #6). Spontaneous and deviation entry headers stop at `kind: <kind>`.
+
+`<kind>` is one of:
+- `friction` — something the orchestrator had to work around
+- `ambiguity` — instruction in the process file that admits two readings
+- `failure` — an event that broke flow (failover, HALT, cap reached)
+- `success` — pattern worth preserving
+- `idea` — orchestrator's own suggestion not tied to a specific incident. Must still be a statement about `develop-it-process.md` itself; do not motivate ideas by quoting the spec, plan, diff, or any other content of the current run.
+
+If a kind does not fit, choose the closest match — do not invent new kinds. (Future cycles may extend the enum; today's set is fixed.)
+
+### Trigger → kind mapping (mandatory entries)
+
+Each of the five structured mandatory triggers maps to a fixed `kind` value AND a fixed `trigger:` tag value. The mapping is prescriptive — the orchestrator MUST use the values in this table so that the trigger-coverage check in Completion criteria is deterministic:
+
+| Mandatory trigger (RUN_LOG event)                  | `kind`    | `trigger:` tag value     |
+|---|---|---|
+| `CODEX_UNAVAILABLE`                                 | `failure` | `CODEX_UNAVAILABLE`       |
+| `CLAUDE_FAILED`                                     | `failure` | `CLAUDE_FAILED`           |
+| retry-within-iteration (see trigger #3 definition) | `failure` | `RETRY_WITHIN_ITERATION`  |
+| `HALT`                                              | `failure` | `HALT`                    |
+| `ITERATION_CAP_REACHED`                             | `failure` | `ITERATION_CAP_REACHED`   |
+| `ITERATION_CAP_OVERRIDE`                            | `failure` | `ITERATION_CAP_OVERRIDE`  |
+
+Deviation (trigger #6) is NOT in this table — it is uncounted and carries no `trigger:` tag.
+
+### First-write header
+
+On the first append in a run, the orchestrator emits a fixed header before the first entry:
+
+```markdown
+# Process improvement propositions
+
+Auto-generated by the develop-it orchestrator during a real run. Entries here are observations about the develop-it process itself — they are written *during* the current run but only *read* by future runs that want to improve the process file.
+
+The orchestrator never reads back from this file in the current run. Writing here cannot influence current execution.
+
+Mining for improvement: grep `^## ` for entry headers, `kind: friction` etc. for category filters.
+
+---
+```
+
+Subsequent appends just add new `## ` entry sections (no extra horizontal rules between entries).
+
+### Resume semantics
+
+Before each append, the orchestrator performs a filesystem-existence check on `<feature-folder>/process-improvement-proposition.md` (presence/absence only — the file's content is NOT read, in keeping with the non-influence guarantee). Any tool that reports existence without reading content satisfies this — e.g. a `Glob` for the path, or a shell `[ -f <path> ]` test; this section does not prescribe a specific tool. If the file does not exist, the orchestrator emits header and first entry as **one `Write` tool call whose content is `<header>\n\n<first-entry>`** — this is the prescribed concrete pattern, so the "single append" invariant is enforced by the choice of tool rather than left implicit. Do not use `Edit` or two separate appends for the first write. If the file already exists, the header is skipped and the new entry is appended directly using a single `Bash` invocation of the form `printf '%s' "$ENTRY" >> <feature-folder>/process-improvement-proposition.md` (one tool call, one atomic shell-level append; do not use `Edit` or multiple appends). This makes header emission idempotent across resumes without violating the no-read rule, and a mid-write harness crash cannot leave a half-written file with a header but no first entry (or vice versa).
+
+### Non-influence guarantee
+
+To enforce "writing here cannot influence current execution":
+
+- The orchestrator MUST NOT read `process-improvement-proposition.md` during the run that wrote it. The reading-red-flags section above lists this as a forbidden action.
+- The file content does NOT contribute to any verdict, summary, gate decision, or readiness classification.
+- The readiness-writer subagent (Phase 9) lists the file in the **Artifacts** section of `final-readiness-report.md` (so the user knows the file exists), but does NOT read its content for verdict purposes. If the file does not exist at Phase 9 (no mandatory triggers fired and no spontaneous entries were emitted), readiness-writer lists it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
+- The orchestrator MUST NOT cite the file's content in any other `RUN_LOG.md` entry, STATUS file, or user-facing message.
+
+### Privacy / anti-leak
+
+The Proposition file content rules in the Anti-leak red flags section apply to this file. In summary: no source code, no credentials, no spec/plan/diff content, no user-private content. Entries are about *the process file*, not about the work the process is producing.
 
 ## Completion criteria
 
 This Develop-It SDLC step is complete only when ALL of the following hold:
 
-- Phase −1 preflight passed (`preflight/claude-check-status.md` and `preflight/codex-check-status.md` both `READY`, OR codex check failed and `codex_available=false` is recorded in RUN_LOG).
-- Phase 0 context discovery passed (`phase-0-context/status.md` = `READY`).
-- Spec review gate passed with `blockers=0, majors=0` from all active reviewers; `spec-review/spec-review-summary.md` exists.
-- Implementation plan was written by the `plan-writer` subagent (`implementation/plan-status.md` = `DONE`).
-- Plan review gate passed with `blockers=0, majors=0`; `plan-review/plan-review-summary.md` exists.
-- Implementer subagent completed Phase 4 (`implementation/implementer-status.md` = `DONE`, `verification=PASS`); `implementation/implementation-summary.md` exists.
+- Phase 1 preflight passed: `1-preflight/phase-1/claude-check-status.md` is `READY`, AND the readiness writer's classification for the Phase 1 codex slot is one of: (a) `READY` (codex STATUS present with `verdict: READY`), (b) `SKIPPED` consented via `event=CODEX_DISABLED_BY_USER_CONSENT` (codex STATUS absent), or (c) `FAILED` with a present codex STATUS file carrying `verdict: FAILED` / non-`READY` (Mode 4 malformed STATUS may legitimately remain at the relocated path). A Phase 1 codex classification of `INVALID_ORCHESTRATION` blocks completion — this includes both (i) STATUS absent with NO corresponding event, AND (ii) STATUS absent with `event=CODEX_UNAVAILABLE` but no `event=CODEX_DISABLED_BY_USER_CONSENT` (per spec, Phase 1 Mode 0 HALTs unconditionally and Modes 1–5 require user consent — reaching completion without one of those events is an orchestration violation). The Phase 1 path is stricter than per-phase gates: an unavailable codex at Phase 1 is passable ONLY with recorded user consent.
+- Per-phase preflight passed for every phase in {3, 5, 6, 7}: `<phase-dir>/preflight/claude-check-status.md` is `READY`, AND the readiness writer's classification for that phase's codex slot is `READY`, `SKIPPED` (matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for `(phase=<P>, iteration=00)`), or `FAILED` (matching `event=CODEX_UNAVAILABLE` for `(phase=<P>, iteration=00)`, OR a present codex STATUS file with `verdict: FAILED` / non-`READY` — Mode 4 malformed STATUS may legitimately remain). Only an `INVALID_ORCHESTRATION` classification blocks completion. `FAILED` codex per-phase verdicts surface in the readiness report's `partial_review` / `codex_unavailable_reason` notes but do not gate completion. For Phase 6 specifically, this is explicit: Phase 6 codex probe failure is non-blocking by design — see Step 6.−1. Unlike Phase 1, per-phase gates do not require user consent for codex degradation; the per-phase preflight model trades that prompt for fast automatic degradation since the user has already opted into the run.
+- Phase 2 context discovery passed (`2-context-discovery/status.md` = `READY`).
+- Spec review gate passed with `blockers=0, majors=0` from all active reviewers; `3-spec-review/spec-review-summary.md` exists.
+- Implementation plan was written by the `plan-writer` subagent (`4-plan-writing/plan-status.md` = `DONE`).
+- Plan review gate passed with `blockers=0, majors=0`; `5-plan-review/plan-review-summary.md` exists.
+- Implementer subagent completed Phase 6 (`6-implementation/implementer-status.md` = `DONE`, `verification=PASS`); `6-implementation/implementation-summary.md` exists.
 - No-secret checks ran (delegated to implementer/debugger; recorded in implementation summary) when the feature touches credentials, config, notebooks, examples, generated artifacts, or deployment files.
 - Credential-dependent checks ran or were safely skipped per the plan.
-- Final implementation review gate passed with `blockers=0, majors=0`; `final-review/final-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
-- Phase 7 git result is `DONE` or `SKIPPED` with a clear reason; `final-review/git-status.md` exists.
-- Phase 8 readiness report exists (`<feature-folder>/final-readiness-report.md`) and `<feature-folder>/readiness-status.md` = `DONE`.
+- Code review gate passed with `blockers=0, majors=0`; `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
+- Phase 8 git result is `DONE` or `SKIPPED` with a clear reason; `8-git-finalization/git-status.md` exists.
+- Phase 9 readiness report exists (`<feature-folder>/final-readiness-report.md`) and `<feature-folder>/readiness-status.md` = `DONE`.
 - The final user-facing message lists all artifact paths, the test summary, git summary, skipped optional steps, `partial_review` flag if any, and readiness verdict.
+- Every dispatch entry in `RUN_LOG.md` carries the nine usage-telemetry fields (`model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`, `usage_status`).
+- Every phase summary file (`spec-review-summary.md`, `plan-review-summary.md`, `implementation-summary.md`, `code-review-summary.md`) ends with a `## Usage` section containing phase total, per-vendor, and per-role × iteration tables.
+- `final-readiness-report.md` ends with a `## Usage rollup` section containing grand total, per-phase table, per-vendor grand total, and top-5 most expensive dispatches.
+- For every mandatory-trigger event recorded in `RUN_LOG.md` during the run (the six structured RUN_LOG event types covered by mandatory triggers #1–#5: `CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, retry-within-iteration, `HALT`, `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE` — note `ITERATION_CAP_REACHED` and `ITERATION_CAP_OVERRIDE` count independently per the rule in trigger #5 of the Process self-observation section), a corresponding entry must exist in `process-improvement-proposition.md`, matched by phase + `trigger:` tag value + close-in-time timestamp (the proposition entry's ISO-8601 timestamp falls within ±60 seconds of the RUN_LOG event timestamp, or strictly between the RUN_LOG event timestamp and the next mandatory RUN_LOG event timestamp for the same phase, whichever window is tighter). The `trigger:` tag in the entry header is the load-bearing match key (recovered directly from the header, not inferred from prose); `kind` is always `failure` for mandatory entries per the Trigger → kind mapping table and is therefore not discriminating. The completion check is: count of these six structured event types in `RUN_LOG.md` equals count of corresponding mandatory entries (entries whose header carries a `trigger:` tag) in `process-improvement-proposition.md`, with per-event-type counts matching as well as the overall total. (One entry per event instance — a single entry cannot 'cover' multiple later events.) Deviation entries (trigger #6) are mandatory to write but are NOT counted in this 1:1 match because deviation has no structured RUN_LOG event type and carries no `trigger:` tag; they appear as additional entries beyond the matched count.
 
 Partial completion: if Codex was unavailable for part of the run, the run still completes, with `partial_review = true` flagged in summaries and the final readiness report.
 
 # Appendices — subagent prompts
 
-Each appendix below is delimited by HTML comment markers of the form `BEGIN: <role>` / `END: <role>` (full HTML-comment syntax). The orchestrator extracts each on demand with read-only shell (`awk` range pattern between the BEGIN and END markers — see the Delegation pattern example) and pipes the result into the subprocess invocation. Appendix content is never written to disk.
+Each appendix below is delimited by HTML comment markers of the form `BEGIN: <role>` / `END: <role>` (full HTML-comment syntax). The orchestrator extracts each on demand using the `extract_appendix` / `render_prompt` helpers from the "Runtime cookbook & guardrails" section — `extract_appendix` for raw extraction, `render_prompt` for extraction + multi-line-safe variable substitution. Use `sed`-only substitution only when every value being substituted is a single line. Appendix content is never written to disk.
 
 <!-- BEGIN: preflight-claude -->
 # Role: preflight-claude
@@ -631,7 +1563,7 @@ Do NOT execute any other actions. Do NOT read project files. Do NOT write any fi
 
 ## Output
 
-Write `$FEATURE_FOLDER/preflight/claude-check-status.md` LAST and atomically (write `.tmp` then rename):
+Write `$FEATURE_FOLDER/1-preflight/claude-check-status.md` LAST and atomically (write `.tmp` then rename):
 
 ```
 verdict: READY | MISSING_SKILLS
@@ -664,7 +1596,7 @@ Do NOT execute any other actions. Do NOT read project files. Do NOT write any fi
 
 ## Output
 
-Write `$FEATURE_FOLDER/preflight/codex-check-status.md` LAST and atomically:
+Write `$FEATURE_FOLDER/1-preflight/codex-check-status.md` LAST and atomically:
 
 ```
 verdict: READY | MISSING_SKILLS
@@ -676,8 +1608,8 @@ reason: <one line if verdict != READY>
 Exit 0 on successful write.
 <!-- END: preflight-codex -->
 
-<!-- BEGIN: phase-0-context -->
-# Role: phase-0-context
+<!-- BEGIN: context-discovery -->
+# Role: context-discovery
 
 You are dispatched by the develop-it orchestrator to discover the project's environment, skills, and conventions. You have no shared context.
 
@@ -694,11 +1626,11 @@ Use only read-only inspection. You do NOT load `subagent-driven-development` her
 1. Enumerate Superpowers skills available in the environment. Use the platform's skill-listing mechanism.
 2. Read the root `CLAUDE.md` and any nested `CLAUDE.md` files relevant to the SDLC flow. Summarize project conventions in one paragraph.
 3. Inspect the input spec path (the orchestrator records this in `RUN_LOG.md` and the feature folder name encodes the slug — derive the spec path: take the feature folder name, strip `-artifacts`, append `-design.md`, prepend `docs/superpowers/specs/`). Confirm the spec exists. Do NOT read its body.
-4. Resolve concrete model names for each role given the runtime environment (e.g. if `claude-opus-4-7` is current, that's "Opus"; "Sonnet" → latest Sonnet; "GPT-5.5" → closest Codex model). Record the resolved map.
+4. Resolve concrete model ids for each role per the **Default model resolution** policy in the Models section. Defaults today: Opus → `claude-opus-4-7`, Sonnet → `claude-sonnet-4-6`, GPT-5.5 → `gpt-5.5`. Only deviate if the runtime environment lists a strictly newer Opus/Sonnet/Codex release. **Never** resolve GPT-5.5 to `gpt-5.1-codex-max`, `gpt-5-codex-max`, `o3`, `o3-mini`, or any other `*-codex-max` / `o*` id — those require an OpenAI API key and will 400 on a ChatGPT-account auth. Record the resolved map.
 
 ## Output
 
-Write `$FEATURE_FOLDER/phase-0-context/status.md` LAST and atomically:
+Write `$FEATURE_FOLDER/2-context-discovery/status.md` LAST and atomically:
 
 ```
 verdict: READY | BLOCKED
@@ -714,7 +1646,7 @@ reason: <one line if BLOCKED>
 ```
 
 Exit 0 on successful write.
-<!-- END: phase-0-context -->
+<!-- END: context-discovery -->
 
 <!-- BEGIN: spec-reviewer-claude -->
 # Role: spec-reviewer-claude
@@ -745,7 +1677,7 @@ You are a spec reviewer invoked as a fresh subprocess by the develop-it orchestr
 4. Write the full findings file:
 
 ```
-Path: $FEATURE_FOLDER/spec-review/iteration-$ITERATION/claude-opus-findings.md
+Path: $FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/claude-opus-findings.md
 ```
 
 Format for each finding:
@@ -761,7 +1693,7 @@ Format for each finding:
 5. Write STATUS.md LAST and atomically:
 
 ```
-Path: $FEATURE_FOLDER/spec-review/iteration-$ITERATION/claude-opus-verdict.md
+Path: $FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/claude-opus-verdict.md
 ```
 
 ```
@@ -797,9 +1729,9 @@ Do NOT read or reference the primary reviewer's findings. Your judgement must be
 
 ## Output
 
-Findings: `$FEATURE_FOLDER/spec-review/iteration-$ITERATION/codex-findings.md` (same finding format as the claude reviewer).
+Findings: `$FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/codex-findings.md` (same finding format as the claude reviewer).
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/spec-review/iteration-$ITERATION/codex-verdict.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/codex-verdict.md`
 
 ```
 verdict: PASS | CHANGES_REQUESTED
@@ -841,7 +1773,7 @@ You are a spec patcher invoked as a fresh subprocess. You have no shared context
 Write STATUS.md LAST and atomically:
 
 ```
-Path: $FEATURE_FOLDER/spec-review/iteration-$ITERATION/spec-fixer-status.md
+Path: $FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/spec-fixer-status.md
 ```
 
 ```
@@ -865,23 +1797,25 @@ You are a plan author invoked as a fresh subprocess. You have no shared context.
 - `$FEATURE_FOLDER`
 - `$SPEC_PATH` — absolute path to the approved spec
 
-## Required skill
+## Required skills
 
-Load `superpowers:writing-plans` and follow it exactly. Do not invent your own plan structure.
+- Load `superpowers:writing-plans` and follow it exactly. Do not invent your own plan structure.
+- Load `context7`. Use it to fetch authoritative current documentation for every external library, framework, SDK, API, CLI tool, or cloud service the plan will touch — even well-known ones (React, Next.js, Django, etc.). Your training data may not reflect recent changes. Always `resolve-library-id` first, then `get-library-docs`. Prefer this over web search for library docs. Skip context7 only for: refactoring without new library usage, pure business-logic scripts, or general programming concepts.
 
 ## Behavior
 
 1. Read `$SPEC_PATH` in full.
-2. Produce the implementation plan at the skill's default location: `docs/superpowers/plans/<spec-basename-without-design>-plan.md`. Determine the exact filename from the spec basename (strip `-design.md`, append `-plan.md`).
-3. The plan must satisfy every "No Placeholders" rule from `superpowers:writing-plans` (no TBD, no "implement later", exact file paths, full code per step, etc.).
-4. The plan must cover every requirement / acceptance criterion in the spec.
+2. Enumerate every external library / framework / SDK / API / CLI tool implied by the spec. For each, use `context7` to resolve the library ID and fetch the relevant docs (API syntax, configuration, version migration notes, setup instructions). Cite the specific symbol/method names, version, and any pitfalls inside the plan tasks so the implementer does not have to re-research them.
+3. Produce the implementation plan at the skill's default location: `docs/superpowers/plans/<spec-basename-without-design>-plan.md`. Determine the exact filename from the spec basename (strip `-design.md`, append `-plan.md`).
+4. The plan must satisfy every "No Placeholders" rule from `superpowers:writing-plans` (no TBD, no "implement later", exact file paths, full code per step, etc.). Code snippets in the plan must reflect current library APIs as confirmed via `context7`, not training-data guesses.
+5. The plan must cover every requirement / acceptance criterion in the spec.
 
 ## Output
 
 Write STATUS LAST and atomically:
 
 ```
-Path: $FEATURE_FOLDER/implementation/plan-status.md
+Path: $FEATURE_FOLDER/4-plan-writing/plan-status.md
 ```
 
 ```
@@ -922,9 +1856,9 @@ You are a plan reviewer invoked as a fresh subprocess. You have no shared contex
 
 ## Output
 
-Findings: `$FEATURE_FOLDER/plan-review/iteration-$ITERATION/claude-opus-findings.md`
+Findings: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/claude-opus-findings.md`
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/plan-review/iteration-$ITERATION/claude-opus-verdict.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/claude-opus-verdict.md`
 
 ```
 verdict: PASS | CHANGES_REQUESTED
@@ -972,7 +1906,7 @@ You are a cross-vendor plan reviewer invoked as a fresh subprocess by the develo
 
 ## Output
 
-Findings: `$FEATURE_FOLDER/plan-review/iteration-$ITERATION/codex-findings.md`. Format per finding:
+Findings: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/codex-findings.md`. Format per finding:
 
 ```
 ### Finding N — <one-line summary>
@@ -982,7 +1916,7 @@ Findings: `$FEATURE_FOLDER/plan-review/iteration-$ITERATION/codex-findings.md`. 
 - **Recommendation:** <concrete change suggested>
 ```
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/plan-review/iteration-$ITERATION/codex-verdict.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/codex-verdict.md`
 
 ```
 verdict: PASS | CHANGES_REQUESTED
@@ -1020,7 +1954,7 @@ You are a plan patcher invoked as a fresh subprocess. You have no shared context
 
 ## Output
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/plan-review/iteration-$ITERATION/plan-fixer-status.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/plan-fixer-status.md`
 
 ```
 verdict: DONE | BLOCKED
@@ -1044,14 +1978,19 @@ You are the implementation supervisor for this feature, invoked as a fresh subpr
 - `$PLAN_PATH` — absolute path to the approved plan
 - `$SPEC_PATH` — absolute path to the approved spec (for cross-reference only)
 - `$IMPLEMENTATION_BASE_SHA` — git SHA captured before any implementer dispatch (or the literal `non-git` if outside a git repo)
-- `$FINDINGS_PATHS` — newline-separated absolute paths to final-review findings (only set during Phase 6 re-dispatch)
+- `$FINDINGS_PATHS` — newline-separated absolute paths to code-review findings (only set during Phase 7 re-dispatch)
 - `$DEBUGGER_STATUS_PATH` — absolute path to `debugger-status.md` (only set during a post-debug re-verification dispatch)
 
-## Required skill
+## Required skills
 
 Load `superpowers:subagent-driven-development` and follow it exactly. You run its full per-task loop internally — extracting tasks, dispatching one implementation subagent per task, dispatching spec compliance and code quality reviewer subagents per task, looping on review issues, then dispatching the final code-reviewer.
 
-Additional skills the subagents you dispatch must load: `superpowers:test-driven-development`, `superpowers:verification-before-completion`, `superpowers:requesting-code-review`, `superpowers:receiving-code-review`.
+Additional skills the subagents you dispatch must load:
+- `superpowers:test-driven-development`
+- `superpowers:verification-before-completion`
+- `superpowers:requesting-code-review`
+- `superpowers:receiving-code-review`
+- `context7` — implementation sub-subagents MUST consult `context7` BEFORE writing or modifying code that touches any external library, framework, SDK, API, CLI tool, or cloud service. Always `resolve-library-id` first, then `get-library-docs`. The plan should already cite the relevant APIs (the plan-writer used `context7` too); the sub-subagent re-verifies any API not already covered or any usage that drifts from the plan. Skip context7 only for pure refactoring of internal code, business-logic-only changes, or general programming work that does not touch external dependencies.
 
 If the plan requires browser/UI QA, also load `dogfood` (or the closest available browser-QA skill) for the verification step.
 
@@ -1065,7 +2004,7 @@ Three modes, mutually exclusive — determined by which optional inputs are set:
 2. Execute the plan task-by-task using `subagent-driven-development`. Commit per task per the plan's TDD shape.
 3. Run the plan's verification at the end (and per the verification skill).
 4. Apply no-secret checks when the feature touches credentials, config, notebooks, examples, generated artifacts, or deployment files. Record the no-secret check result in the summary.
-5. Track per-task progress in `$FEATURE_FOLDER/implementation/subagent-logs/` (one file per task).
+5. Track per-task progress in `$FEATURE_FOLDER/6-implementation/subagent-logs/` (one file per task).
 6. Write the summary and status (see Output section).
 
 ### Mode B — Post-debug re-verification (`$DEBUGGER_STATUS_PATH` is set)
@@ -1074,10 +2013,10 @@ You are being re-dispatched after the debugger has applied fixes. Your job is ON
 
 1. Read `$DEBUGGER_STATUS_PATH`. Note the debugger's reported root cause and fix summary.
 2. Run the plan's verification commands in full. Run no-secret checks if applicable.
-3. APPEND a new section to `$FEATURE_FOLDER/implementation/implementation-summary.md` headed "Post-debug verification (timestamp)" with: debugger root cause, debugger fix summary, the verification commands run, their results, any DONE_WITH_CONCERNS notes.
-4. ATOMICALLY rewrite `$FEATURE_FOLDER/implementation/implementer-status.md` reflecting the post-debug state. Set `verdict=DONE` only if verification now passes; otherwise `NEEDS_DEBUG` (orchestrator will loop) or `BLOCKED`.
+3. APPEND a new section to `$FEATURE_FOLDER/6-implementation/implementation-summary.md` headed "Post-debug verification (timestamp)" with: debugger root cause, debugger fix summary, the verification commands run, their results, any DONE_WITH_CONCERNS notes.
+4. ATOMICALLY rewrite `$FEATURE_FOLDER/6-implementation/implementer-status.md` reflecting the post-debug state. Set `verdict=DONE` only if verification now passes; otherwise `NEEDS_DEBUG` (orchestrator will loop) or `BLOCKED`.
 
-### Mode C — Phase 6 fix (`$FINDINGS_PATHS` is set)
+### Mode C — Phase 7 fix (`$FINDINGS_PATHS` is set)
 
 1. Read each findings file. Treat each BLOCKER/MAJOR finding as an additional task to address.
 2. For each finding, dispatch a sub-implementer subagent (per `subagent-driven-development`) to fix it. Commit per fix.
@@ -1089,7 +2028,7 @@ You are being re-dispatched after the debugger has applied fixes. Your job is ON
 Write the human-facing summary FIRST:
 
 ```
-Path: $FEATURE_FOLDER/implementation/implementation-summary.md
+Path: $FEATURE_FOLDER/6-implementation/implementation-summary.md
 ```
 
 Contents:
@@ -1104,7 +2043,7 @@ Contents:
 Then write STATUS LAST and atomically:
 
 ```
-Path: $FEATURE_FOLDER/implementation/implementer-status.md
+Path: $FEATURE_FOLDER/6-implementation/implementer-status.md
 ```
 
 ```
@@ -1131,26 +2070,28 @@ You are a debugger invoked as a fresh subprocess when the implementer reports `N
 
 ## Status semantics
 
-Your debugger-status.md is ADVISORY. The canonical implementation status is `implementer-status.md`, which is rewritten by a subsequent implementer re-dispatch (Mode B) that re-runs verification. The orchestrator does NOT gate Phase 6 on your status file — it gates on the rewritten `implementer-status.md`.
+Your debugger-status.md is ADVISORY. The canonical implementation status is `implementer-status.md`, which is rewritten by a subsequent implementer re-dispatch (Mode B) that re-runs verification. The orchestrator does NOT gate Phase 7 on your status file — it gates on the rewritten `implementer-status.md`.
 
 ## Inputs
 
 - `$FEATURE_FOLDER`
 - `$PLAN_PATH`
-- `$IMPLEMENTATION_SUMMARY_PATH` — absolute path to `implementation/implementation-summary.md`
+- `$IMPLEMENTATION_SUMMARY_PATH` — absolute path to `6-implementation/implementation-summary.md`
 - `$IMPLEMENTATION_BASE_SHA` — git SHA captured before any implementer dispatch (or `non-git`)
 
-## Required skill
+## Required skills
 
-Load `superpowers:systematic-debugging`. Follow it strictly.
+- Load `superpowers:systematic-debugging`. Follow it strictly.
+- Load `context7` and use it whenever the failure signature points at an external library, framework, SDK, API, CLI tool, or cloud service. Verify the expected behavior against authoritative current docs (always `resolve-library-id` first, then `get-library-docs`) before forming a hypothesis based on training-data recall. Library APIs change between versions; do not debug against an outdated mental model.
 
 ## Behavior
 
 1. Read the implementation summary to identify the failure signature.
 2. Read the plan's verification section to understand what should pass.
-3. Apply systematic debugging: hypothesis → minimal repro → root cause → fix.
-4. Re-run the plan's verification commands to spot-check your fix (you may not have full coverage; the canonical re-verification is performed by the implementer re-dispatch after you).
-5. If the fix changes source/tests, commit per the project's git policy and the plan's TDD shape.
+3. If the failure touches an external library / framework / SDK, consult `context7` for the relevant API to confirm correct usage in the version the project pins.
+4. Apply systematic debugging: hypothesis → minimal repro → root cause → fix.
+5. Re-run the plan's verification commands to spot-check your fix (you may not have full coverage; the canonical re-verification is performed by the implementer re-dispatch after you).
+6. If the fix changes source/tests, commit per the project's git policy and the plan's TDD shape.
 
 You may use `$IMPLEMENTATION_BASE_SHA` to constrain `git log`/`git diff` scope to commits the implementer made (e.g. `git log $IMPLEMENTATION_BASE_SHA..HEAD`).
 
@@ -1159,7 +2100,7 @@ You may use `$IMPLEMENTATION_BASE_SHA` to constrain `git log`/`git diff` scope t
 STATUS LAST and atomically:
 
 ```
-Path: $FEATURE_FOLDER/implementation/debugger-status.md
+Path: $FEATURE_FOLDER/6-implementation/debugger-status.md
 ```
 
 ```
@@ -1176,10 +2117,10 @@ reason: <one line if BLOCKED>
 Exit 0 on STATUS write.
 <!-- END: debugger -->
 
-<!-- BEGIN: final-reviewer-claude -->
-# Role: final-reviewer-claude
+<!-- BEGIN: code-reviewer-claude -->
+# Role: code-reviewer-claude
 
-You are a final implementation reviewer invoked as a fresh subprocess. You have no shared context.
+You are a code reviewer invoked as a fresh subprocess. You have no shared context.
 
 ## Inputs
 
@@ -1187,7 +2128,7 @@ You are a final implementation reviewer invoked as a fresh subprocess. You have 
 - `$ITERATION`
 - `$SPEC_PATH`
 - `$PLAN_PATH`
-- `$IMPLEMENTATION_BASE_SHA` — git SHA captured before Phase 4 dispatch (or the literal `non-git`)
+- `$IMPLEMENTATION_BASE_SHA` — git SHA captured before Phase 6 dispatch (or the literal `non-git`)
 
 ## Behavior
 
@@ -1207,9 +2148,9 @@ You are a final implementation reviewer invoked as a fresh subprocess. You have 
 
 ## Output
 
-Findings: `$FEATURE_FOLDER/final-review/iteration-$ITERATION/claude-opus-findings.md`
+Findings: `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/claude-opus-findings.md`
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/final-review/iteration-$ITERATION/claude-opus-verdict.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/claude-opus-verdict.md`
 
 ```
 verdict: PASS | CHANGES_REQUESTED
@@ -1223,12 +2164,12 @@ reason: <one line if CHANGES_REQUESTED>
 Verdict: `PASS` iff `blockers=0 AND majors=0`.
 
 Exit 0 on STATUS write.
-<!-- END: final-reviewer-claude -->
+<!-- END: code-reviewer-claude -->
 
-<!-- BEGIN: final-reviewer-codex -->
-# Role: final-reviewer-codex
+<!-- BEGIN: code-reviewer-codex -->
+# Role: code-reviewer-codex
 
-You are a cross-vendor final implementation reviewer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context. You produce an independent assessment — do NOT attempt to read the primary reviewer's verdict or findings.
+You are a cross-vendor code reviewer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context. You produce an independent assessment — do NOT attempt to read the primary reviewer's verdict or findings.
 
 ## Inputs
 
@@ -1236,7 +2177,7 @@ You are a cross-vendor final implementation reviewer invoked as a fresh subproce
 - `$ITERATION`
 - `$SPEC_PATH`
 - `$PLAN_PATH`
-- `$IMPLEMENTATION_BASE_SHA` — git SHA captured before Phase 4 dispatch (or the literal `non-git`)
+- `$IMPLEMENTATION_BASE_SHA` — git SHA captured before Phase 6 dispatch (or the literal `non-git`)
 
 ## Behavior
 
@@ -1260,7 +2201,7 @@ You are a cross-vendor final implementation reviewer invoked as a fresh subproce
 
 ## Output
 
-Findings: `$FEATURE_FOLDER/final-review/iteration-$ITERATION/codex-findings.md`. Format per finding:
+Findings: `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/codex-findings.md`. Format per finding:
 
 ```
 ### Finding N — <one-line summary>
@@ -1270,7 +2211,7 @@ Findings: `$FEATURE_FOLDER/final-review/iteration-$ITERATION/codex-findings.md`.
 - **Recommendation:** <concrete change suggested>
 ```
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/final-review/iteration-$ITERATION/codex-verdict.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/codex-verdict.md`
 
 ```
 verdict: PASS | CHANGES_REQUESTED
@@ -1284,7 +2225,7 @@ reason: <one line if CHANGES_REQUESTED>
 Verdict rule: `PASS` iff `blockers=0 AND majors=0`.
 
 Exit 0 on STATUS write.
-<!-- END: final-reviewer-codex -->
+<!-- END: code-reviewer-codex -->
 
 <!-- BEGIN: finishing-branch -->
 # Role: finishing-branch
@@ -1295,7 +2236,7 @@ You are a git finalizer invoked as a fresh subprocess. You have no shared contex
 
 - `$FEATURE_FOLDER`
 - `$PLAN_PATH`
-- `$IMPLEMENTATION_BASE_SHA` — git SHA captured before Phase 4 dispatch (or `non-git`)
+- `$IMPLEMENTATION_BASE_SHA` — git SHA captured before Phase 6 dispatch (or `non-git`)
 
 ## Required skill
 
@@ -1313,7 +2254,7 @@ Load `superpowers:finishing-a-development-branch` and follow it.
 
 ## Output
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/final-review/git-status.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/8-git-finalization/git-status.md`
 
 ```
 verdict: DONE | SKIPPED | FAILED
@@ -1338,9 +2279,9 @@ You are a gate summarizer invoked as a fresh subprocess. You have no shared cont
 
 ## Behavior
 
-1. Enumerate iteration folders under `$FEATURE_FOLDER/spec-review/iteration-*`.
+1. Enumerate iteration folders under `$FEATURE_FOLDER/3-spec-review/iteration-*`.
 2. For each iteration, read the verdict files (`claude-opus-verdict.md`, `codex-verdict.md` if present) and findings files.
-3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=1` (spec review). For each such entry, capture the `failure_mode=<n>` and the iteration number. These give you the reason Codex was unavailable.
+3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=3` (spec review). For each such entry, capture the `failure_mode=<n>` and the iteration number. These give you the reason Codex was unavailable.
 4. Aggregate statistics:
    - Number of iterations run.
    - Total findings per severity (BLOCKER / MAJOR / MINOR) per iteration.
@@ -1348,20 +2289,30 @@ You are a gate summarizer invoked as a fresh subprocess. You have no shared cont
    - Residual MINOR/NIT items at the final iteration.
    - `partial_review = true` if ANY iteration was Claude-only (codex verdict absent), else `false`.
    - `codex_unavailable_reason` if any CODEX_UNAVAILABLE event applies: format `mode=<n>;iteration=<NN>` (concatenate multiple events with `|` if needed). If no event but codex verdict is missing, use `mode=unknown`.
-5. Write the summary file at `$FEATURE_FOLDER/spec-review/spec-review-summary.md` with:
+5. Aggregate usage (read every dispatch entry in `RUN_LOG.md` where `phase=3`):
+   - Skip entries with `usage_status=unavailable` from per-row detail tables, but count them in a footnote.
+   - For each remaining entry, read `model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`.
+   - Compute phase total (sum across all entries), per-vendor subtotal (sum split by `vendor`), and per-role × iteration detail (one row per entry).
+   - Sum `cost_usd` only across rows whose value is numeric; rows with `n/a` are excluded from the cost sum but counted in dispatch counts.
+6. Write the summary file at `$FEATURE_FOLDER/3-spec-review/spec-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), with one sentence of human-readable context per mode (e.g. "mode=5: Codex hit a rate-limit / quota signal in iteration 02").
    - Final verdict (`PASS`) and final iteration number.
+   - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
+     - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).
+     - Per-role detail: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
+     - Format numeric columns with thousands separators. Cost as `$0.81` or `n/a`. Durations as `mm Xs` or `Xs`. Right-align numeric columns in the markdown table.
+   - If any rows were skipped due to `usage_status=unavailable`, append after the detail table: `_Skipped N dispatches with unavailable telemetry._`
 
 ## Output
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/spec-review/summarizer-status.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/3-spec-review/summarizer-status.md`
 
 ```
 verdict: DONE
-summary_path: <absolute, e.g. $FEATURE_FOLDER/spec-review/spec-review-summary.md>
+summary_path: <absolute, e.g. $FEATURE_FOLDER/3-spec-review/spec-review-summary.md>
 iterations: <int>
 total_blockers: <int>
 total_majors: <int>
@@ -1385,9 +2336,9 @@ You are a gate summarizer invoked as a fresh subprocess by the develop-it orches
 
 ## Behavior
 
-1. Enumerate iteration folders under `$FEATURE_FOLDER/plan-review/iteration-*`.
+1. Enumerate iteration folders under `$FEATURE_FOLDER/5-plan-review/iteration-*`.
 2. For each iteration, read the verdict files (`claude-opus-verdict.md`, `codex-verdict.md` if present) and findings files.
-3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=3` (plan review). Capture `failure_mode=<n>` and the iteration number from each such entry.
+3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=5` (plan review). Capture `failure_mode=<n>` and the iteration number from each such entry.
 4. Aggregate statistics:
    - Number of iterations run.
    - Total findings per severity (BLOCKER / MAJOR / MINOR) per iteration.
@@ -1395,20 +2346,30 @@ You are a gate summarizer invoked as a fresh subprocess by the develop-it orches
    - Residual MINOR/NIT items at the final iteration.
    - `partial_review = true` if any iteration was Claude-only.
    - `codex_unavailable_reason` derived from the CODEX_UNAVAILABLE events (same format as summarizer-spec).
-5. Write the summary file at `$FEATURE_FOLDER/plan-review/plan-review-summary.md` with:
+5. Aggregate usage (read every dispatch entry in `RUN_LOG.md` where `phase=5`):
+   - Skip entries with `usage_status=unavailable` from per-row detail tables, but count them in a footnote.
+   - For each remaining entry, read `model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`.
+   - Compute phase total (sum across all entries), per-vendor subtotal (sum split by `vendor`), and per-role × iteration detail (one row per entry).
+   - Sum `cost_usd` only across rows whose value is numeric; rows with `n/a` are excluded from the cost sum but counted in dispatch counts.
+6. Write the summary file at `$FEATURE_FOLDER/5-plan-review/plan-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
    - Final verdict (`PASS`) and final iteration number.
+   - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
+     - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).
+     - Per-role detail: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
+     - Format numeric columns with thousands separators. Cost as `$0.81` or `n/a`. Durations as `mm Xs` or `Xs`. Right-align numeric columns in the markdown table.
+   - If any rows were skipped due to `usage_status=unavailable`, append after the detail table: `_Skipped N dispatches with unavailable telemetry._`
 
 ## Output
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/plan-review/summarizer-status.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/5-plan-review/summarizer-status.md`
 
 ```
 verdict: DONE
-summary_path: <absolute, e.g. $FEATURE_FOLDER/plan-review/plan-review-summary.md>
+summary_path: <absolute, e.g. $FEATURE_FOLDER/5-plan-review/plan-review-summary.md>
 iterations: <int>
 total_blockers: <int>
 total_majors: <int>
@@ -1420,10 +2381,52 @@ codex_unavailable_reason: <mode=N;iteration=NN or empty>
 Exit 0 on STATUS write.
 <!-- END: summarizer-plan -->
 
-<!-- BEGIN: summarizer-final -->
-# Role: summarizer-final
+<!-- BEGIN: summarizer-implementation -->
+# Role: summarizer-implementation
 
-You are a gate summarizer for the final implementation review, invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
+You are a phase summarizer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
+
+## Inputs
+
+- `$FEATURE_FOLDER`
+- `$FEATURE_FOLDER/RUN_LOG.md`
+- `$FEATURE_FOLDER/6-implementation/implementation-summary.md` (already written by the implementer; you APPEND a `## Usage` section to it)
+
+## Behavior
+
+1. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter dispatch entries (NOT event entries) where `phase=6`.
+2. For each entry, read `vendor`, `role`, `iteration`, `model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`, `usage_status`.
+3. Entries with `usage_status=unavailable` are skipped from the per-role detail table but counted in a footnote.
+4. Compute:
+   - Phase total (sum across all entries).
+   - Per-vendor subtotal (sum split by `vendor`).
+   - Per-role × iteration detail (one row per entry).
+   - `cost_usd` sum across only rows whose value is numeric (claude rows); rows with `n/a` excluded from the cost sum but counted in dispatch counts.
+5. APPEND a new section to `$FEATURE_FOLDER/6-implementation/implementation-summary.md` headed `## Usage` containing three markdown tables in this order:
+   - **Phase total** (one row) — columns: `Phase`, `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration`.
+   - **Per-vendor subtotal** (one row per vendor used) — same columns except `Phase` replaced by `Vendor`.
+   - **Per-role × iteration detail** (one row per dispatch) — columns: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
+   - Numeric columns use thousands separators; cost as `$0.81` or `n/a`; durations as `mm Xs` or `Xs`.
+   - If any rows were skipped due to `usage_status=unavailable`, append after the detail table: `_Skipped N dispatches with unavailable telemetry._`
+
+## Output
+
+STATUS LAST and atomically: `$FEATURE_FOLDER/6-implementation/summarizer-status.md`
+
+```
+verdict: DONE
+summary_path: <absolute path to 6-implementation/implementation-summary.md>
+dispatches: <int>
+skipped_unavailable: <int>
+```
+
+Exit 0 on STATUS write.
+<!-- END: summarizer-implementation -->
+
+<!-- BEGIN: summarizer-code-review -->
+# Role: summarizer-code-review
+
+You are a gate summarizer for the code review, invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
 
 ## Inputs
 
@@ -1432,9 +2435,9 @@ You are a gate summarizer for the final implementation review, invoked as a fres
 
 ## Behavior
 
-1. Enumerate iteration folders under `$FEATURE_FOLDER/final-review/iteration-*`.
+1. Enumerate iteration folders under `$FEATURE_FOLDER/7-code-review/iteration-*`.
 2. For each iteration, read the verdict files (`claude-opus-verdict.md`, `codex-verdict.md` if present) and findings files.
-3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=6` (final review). Capture `failure_mode=<n>` and the iteration number from each such entry. Also locate the LATEST `event=IMPLEMENTATION_BASELINE` entry (exact match — ignore any `IMPLEMENTATION_BASELINE_BLOCKED` advisory entries) and record `base_sha`. If multiple `IMPLEMENTATION_BASELINE` entries exist (from a resumed run), the LAST one in file order is authoritative.
+3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=7` (code review). Capture `failure_mode=<n>` and the iteration number from each such entry. Also locate the LATEST `event=IMPLEMENTATION_BASELINE` entry (exact match — ignore any `IMPLEMENTATION_BASELINE_BLOCKED` advisory entries) and record `base_sha`. If multiple `IMPLEMENTATION_BASELINE` entries exist (from a resumed run), the LAST one in file order is authoritative.
 4. Aggregate statistics:
    - Number of iterations run.
    - Total findings per severity (BLOCKER / MAJOR / MINOR) per iteration.
@@ -1442,21 +2445,31 @@ You are a gate summarizer for the final implementation review, invoked as a fres
    - Residual MINOR/NIT items at the final iteration.
    - `partial_review = true` if any iteration was Claude-only.
    - `codex_unavailable_reason` derived from the CODEX_UNAVAILABLE events (same format as summarizer-spec).
-5. Write the summary file at `$FEATURE_FOLDER/final-review/final-review-summary.md` with:
+5. Aggregate usage (read every dispatch entry in `RUN_LOG.md` where `phase=7`):
+   - Skip entries with `usage_status=unavailable` from per-row detail tables, but count them in a footnote.
+   - For each remaining entry, read `model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`.
+   - Compute phase total (sum across all entries), per-vendor subtotal (sum split by `vendor`), and per-role × iteration detail (one row per entry).
+   - Sum `cost_usd` only across rows whose value is numeric; rows with `n/a` are excluded from the cost sum but counted in dispatch counts.
+6. Write the summary file at `$FEATURE_FOLDER/7-code-review/code-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
    - Residual MINOR/NIT list.
    - `implementation_base_sha` from RUN_LOG (so readers can re-derive the reviewed diff).
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
    - Final verdict (`PASS`) and final iteration number.
+   - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
+     - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).
+     - Per-role detail: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
+     - Format numeric columns with thousands separators. Cost as `$0.81` or `n/a`. Durations as `mm Xs` or `Xs`. Right-align numeric columns in the markdown table.
+   - If any rows were skipped due to `usage_status=unavailable`, append after the detail table: `_Skipped N dispatches with unavailable telemetry._`
 
 ## Output
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/final-review/summarizer-status.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/7-code-review/summarizer-status.md`
 
 ```
 verdict: DONE
-summary_path: <absolute, e.g. $FEATURE_FOLDER/final-review/final-review-summary.md>
+summary_path: <absolute, e.g. $FEATURE_FOLDER/7-code-review/code-review-summary.md>
 iterations: <int>
 total_blockers: <int>
 total_majors: <int>
@@ -1467,7 +2480,7 @@ implementation_base_sha: <sha or non-git>
 ```
 
 Exit 0 on STATUS write.
-<!-- END: summarizer-final -->
+<!-- END: summarizer-code-review -->
 
 <!-- BEGIN: readiness-writer -->
 # Role: readiness-writer
@@ -1483,25 +2496,49 @@ You are the final readiness reporter. You have no shared context.
 ## Behavior
 
 1. Read the following files inside `$FEATURE_FOLDER`:
-   - `preflight/claude-check-status.md`
-   - `preflight/codex-check-status.md` (may be absent if Codex was unavailable from the start)
-   - `phase-0-context/status.md`
-   - `spec-review/spec-review-summary.md` and `spec-review/summarizer-status.md` (for `codex_unavailable_reason`)
-   - `plan-review/plan-review-summary.md` and `plan-review/summarizer-status.md`
-   - `implementation/implementation-summary.md`
-   - `implementation/implementer-status.md`
-   - `final-review/final-review-summary.md` and `final-review/summarizer-status.md`
-   - `final-review/git-status.md` (for `implementation_base_sha` and commit SHAs)
-   - `RUN_LOG.md` (for failure events, resume history, and the LATEST `event=IMPLEMENTATION_BASELINE` — ignore any `IMPLEMENTATION_BASELINE_BLOCKED` advisory entries; the latest consumable baseline is authoritative)
-2. Compose `$FEATURE_FOLDER/final-readiness-report.md` with these sections:
-   - **Artifacts** — paths to canonical spec, canonical plan, all summary files.
+   - `1-preflight/phase-1/claude-check-status.md` (Phase 1 claude verdict; relocated from the canonical slot by Step 1.2)
+   - `1-preflight/phase-1/codex-check-status.md` (Phase 1 codex verdict; may be absent if Codex failed at Phase 1 or `codex_disabled_by_user` was set there)
+   - For each phase P in {3, 5, 6, 7}, read both:
+     - `<phase-dir>/preflight/claude-check-status.md`
+     - `<phase-dir>/preflight/codex-check-status.md`
+     where `<phase-dir>` ∈ {`3-spec-review`, `5-plan-review`, `6-implementation`, `7-code-review`} corresponding to phases {3, 5, 6, 7}. The codex file may be absent per the file-policy rules (see step 2 of this appendix for the classification).
+   - `2-context-discovery/status.md`
+   - `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md` (for `codex_unavailable_reason`)
+   - `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`
+   - `6-implementation/implementation-summary.md`
+   - `6-implementation/implementer-status.md`
+   - `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`
+   - `8-git-finalization/git-status.md` (for `implementation_base_sha` and commit SHAs)
+   - `RUN_LOG.md` (for failure events, resume history, the LATEST `event=IMPLEMENTATION_BASELINE` — ignore any `IMPLEMENTATION_BASELINE_BLOCKED` advisory entries — every `event=CODEX_DISABLED_BY_USER_CONSENT`, `event=CODEX_SKIPPED_BY_USER_CONSENT`, and `event=CODEX_UNAVAILABLE` entry, indexed by `(phase, iteration)`, AND every dispatch entry's nine usage-telemetry fields for the `## Usage rollup` section).
+
+2. **Classify each preflight verdict** before composing the report. For each `(phase ∈ {1, 3, 5, 6, 7}, vendor ∈ {claude, codex})` pair:
+   - **File present, `verdict: READY`** → `READY`.
+   - **File present, any other verdict (e.g. `MISSING_SKILLS`, `FAILED`)** → `FAILED`, with the in-file `reason:` / `failure_mode:` carried into the report.
+   - **Claude file absent for a phase that ran a claude probe** → `INVALID_ORCHESTRATION`. Set the overall readiness verdict to `NOT_READY` with reason `invalid_orchestration: claude preflight STATUS missing for phase=<P>`. (Claude failures HALT the run, so on HALT the readiness writer does not execute and this branch is only reached when the orchestrator silently dropped a claude STATUS write — a bug.)
+   - **(Phase 1 only) Codex file absent AND there is an `event=CODEX_DISABLED_BY_USER_CONSENT` in RUN_LOG** → `SKIPPED` (consented degradation at Phase 1). Not a failure. This event is unique per run (no `(phase, iteration)` match required — match on the full first-line tag) and is the canonical Phase 1 user-consent signal; `CODEX_SKIPPED_BY_USER_CONSENT` is NOT logged at Phase 1, so do not look for it there.
+   - **(Phases 3, 5, 6, 7) Codex file absent AND there is a matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for the same `(phase, iteration=00)` in RUN_LOG** → `SKIPPED`. Not a failure.
+   - **(Phase 1 only) Codex file absent AND there is a matching `event=CODEX_UNAVAILABLE` for `phase: 1` BUT NO `event=CODEX_DISABLED_BY_USER_CONSENT` in RUN_LOG** → `INVALID_ORCHESTRATION`. Per the spec, Phase 1 requires Mode 0 to HALT and Modes 1–5 to proceed only after recorded user consent. Reaching the readiness writer with a Phase 1 codex `CODEX_UNAVAILABLE` and no consent event means the orchestrator violated the Phase 1 HALT-or-prompt rule (e.g., resumed past a HALT it should have honored). Set the overall readiness verdict to `NOT_READY` with reason `invalid_orchestration: Phase 1 codex CODEX_UNAVAILABLE without user consent — run should have HALTed`.
+   - **(Phases 3, 5, 6, 7) Codex file absent AND there is a matching `event=CODEX_UNAVAILABLE` for the same `(phase, iteration=00)`** → `FAILED` with `failure_mode` taken from the event. Per-phase Mode 0–5 failures at these gates are passable degradation per the spec (claude-only for the phase, or non-blocking at Phase 6); no user consent is required at per-phase gates.
+   - **Codex file absent AND no matching `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (per-phase) or `CODEX_UNAVAILABLE` event** → `INVALID_ORCHESTRATION`. Set the overall readiness verdict to `NOT_READY` with reason `invalid_orchestration: codex preflight STATUS missing for phase=<P> with no corresponding event`.
+
+   The classification per `(phase, vendor)` is reported in the new "Preflight verdicts" section (see step 3 below).
+3. Compose `$FEATURE_FOLDER/final-readiness-report.md` with these sections:
+   - **Artifacts** — paths to canonical spec, canonical plan, all summary files, AND `<feature-folder>/process-improvement-proposition.md`. The proposition file is listed by path only — its content is NOT read for verdict purposes. If the file does not exist at Phase 9 (no mandatory triggers fired and no spontaneous entries were emitted), list it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
+   - **Preflight verdicts** — per `(phase, vendor)` table for phases in {1, 3, 5, 6, 7}: each row reports `phase`, `vendor`, classification (`READY` / `SKIPPED` / `FAILED` / `INVALID_ORCHESTRATION`), and `failure_mode` (if `FAILED`) or skip-reason (if `SKIPPED`). Phase 1 rows are read from `1-preflight/phase-1/`; per-phase rows from `<phase-dir>/preflight/`. Any `INVALID_ORCHESTRATION` row forces the overall readiness verdict to `NOT_READY`.
    - **Reviewer verdicts** — per-gate iteration counts, final verdicts, `partial_review` flag with per-gate `codex_unavailable_reason` if any.
    - **Implementation result** — task count, commits, `implementation_base_sha`, verification, no-secret check, browser-QA result if applicable. If a post-debug re-verification occurred, note it.
    - **Git result** — commit SHAs or `SKIPPED` reason.
    - **Skipped optional steps** — list anything bypassed and why.
    - **Residual MINOR/NIT items** — total count + per-gate breakdown.
    - **Run history** — number of resumes, vendor failover events from RUN_LOG, baseline SHA capture.
-   - **Readiness verdict** — `READY` if all gates passed with `blockers=0, majors=0` (per active reviewers) and verification=PASS; `READY_WITH_NOTES` if Codex was unavailable for one or more gates; `NOT_READY` otherwise with the specific blockers.
+   - **Readiness verdict** — `READY` if all gates passed with `blockers=0, majors=0` (per active reviewers), verification=PASS, AND every preflight verdict is `READY` or `SKIPPED`; `READY_WITH_NOTES` if Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)); `NOT_READY` otherwise — specifically including any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent) or any claude preflight that is not `READY`.
+   - **Usage rollup** — emit a final `## Usage rollup` section containing four parts in this order:
+     1. **Grand total** (one row) — columns: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration`. Sum across every dispatch entry in `RUN_LOG.md`.
+     2. **Per-phase table** — one row per phase that ran (use `phase_name` for the row label). Same columns as grand total, plus a leading `Phase` column. Include a final `TOTAL` row that matches the grand total.
+     3. **Per-vendor grand total** — one row per vendor used. Columns: `Vendor`, `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`.
+     4. **Top 5 most expensive dispatches** — sort all `usage_status=ok` rows by `cost_usd` descending (treating `n/a` as below any numeric value). For codex rows with `cost_usd=n/a`, rank them after all numeric rows by `tokens_output` descending. Columns: `#`, `Phase`, `Iter`, `Role`, `Vendor`, `Cost`, `Out`, `Cache W`.
+     - Numeric columns use thousands separators. Cost as `$0.81` or `n/a`. Durations as `mm Xs` or `Xs`.
+     - If any dispatch had `usage_status=unavailable`, append after the Top-5 table: `_Excluded N dispatches with unavailable telemetry from this rollup._`
 
 ## Output
 
