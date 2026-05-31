@@ -48,7 +48,7 @@ For every step that produces or modifies an artifact:
    awk '/<\!-- BEGIN: spec-reviewer-claude -\->/,/<\!-- END: spec-reviewer-claude -\->/' "$PROCESS_PATH" \
      | sed "s|\$FEATURE_FOLDER|${FEATURE_FOLDER}|g; s|\$ITERATION|${ITER}|g; s|\$SPEC_PATH|${SPEC_PATH}|g" \
      | timeout 20m claude --model opus -p --output-format=json - \
-       1> "${FEATURE_FOLDER}/transcripts/spec-review-iter${ITER}-claude.out" \
+       1> "${FEATURE_FOLDER}/transcripts/spec-review-iter${ITER}-claude.json" \
        2> "${FEATURE_FOLDER}/transcripts/spec-review-iter${ITER}-claude.err"
    ```
 
@@ -56,7 +56,7 @@ For every step that produces or modifies an artifact:
 
    ```bash
    timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --json - \
-     1> "${FEATURE_FOLDER}/transcripts/<phase>-<iter>-codex.out" \
+     1> "${FEATURE_FOLDER}/transcripts/<phase>-<iter>-codex.json" \
      2> "${FEATURE_FOLDER}/transcripts/<phase>-<iter>-codex.err"
    ```
 
@@ -259,7 +259,7 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
   final-readiness-report.md
   readiness-status.md
   transcripts/
-    <phase>-<iteration>-<role>.out
+    <phase>-<iteration>-<role>.json
     <phase>-<iteration>-<role>.err
 ```
 
@@ -697,7 +697,7 @@ dispatch_reviewers_parallel() {
   (
     render_prompt "${phase}-reviewer-claude" \
       | timeout 20m claude --model "$CLAUDE_MODEL" -p --output-format=json - \
-        1> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.out" \
+        1> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.json" \
         2> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.err"
     echo "$?" > "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.rc"
   ) &
@@ -709,7 +709,7 @@ dispatch_reviewers_parallel() {
     (
       render_prompt "${phase}-reviewer-codex" \
         | timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --json - \
-          1> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.out" \
+          1> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.json" \
           2> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.err"
       echo "$?" > "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.rc"
     ) &
