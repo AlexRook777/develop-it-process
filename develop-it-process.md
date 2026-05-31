@@ -107,31 +107,33 @@ All non-orchestrator roles run as fresh subprocesses with isolated context. You 
 
 **Default model resolution.** The role table below names model *classes* (Opus / Sonnet / GPT-5.5). At preflight time you resolve each class to the **latest available concrete model id** for that family, in this priority order:
 
-1. **Claude Opus** → latest available; today: `claude-opus-4-7`. If unavailable, fall back to the most recent Opus-class id reported by `claude --help` / model listing.
+1. **Claude Opus** → latest available; today: `claude-opus-4-8`. If unavailable, fall back to the most recent Opus-class id reported by `claude --help` / model listing.
 2. **Claude Sonnet** → latest available; today: `claude-sonnet-4-6`. The implementer must remain on a Sonnet-class Claude model.
 3. **Codex (GPT-5.5)** → use the exact literal id `gpt-5.5` (configured as the default in `~/.codex/config.toml`). If `gpt-5.5` is not listed in `~/.codex/models_cache.json` for the active account, fall back in this order: `gpt-5.4` → `gpt-5.3-codex` → `gpt-5.2`.
 
 **Forbidden codex models.** Do NOT pass `-m`, `--model`, or `-c model=...` with any of: `gpt-5.1-codex-max`, `gpt-5-codex-max`, `o3`, `o3-mini`, or any other `*-codex-max` / `o*` id. These require an OpenAI API key; the user's auth is a ChatGPT subscription and the request will fail with HTTP 400 `"model is not supported when using Codex with a ChatGPT account"`. The safest invocation is to omit `-m` entirely and let `~/.codex/config.toml` supply the model.
 
-| Role                              | Vendor / CLI       | Model class        | Concrete id (today)   | Notes                                                                 |
-|-----------------------------------|--------------------|--------------------|-----------------------|-----------------------------------------------------------------------|
-| Orchestrator                       | (the running LLM)  | (whatever runs this prompt; expected: Codex / GPT-5.5 or Claude Opus) | — | Sequences subprocesses. Never reviews. Never writes artifacts. |
-| Phase-0 context discovery          | `claude`           | Opus               | `claude-opus-4-7`     | Single dispatch.                                                       |
-| Spec reviewer (primary)            | `claude`           | Opus               | `claude-opus-4-7`     | Per gate iteration.                                                    |
-| Spec reviewer (cross-vendor)       | `codex`            | GPT-5.5            | `gpt-5.5`             | Soft-skipped on failure (see Failure handling).                        |
-| Spec fixer                         | `claude`           | Opus               | `claude-opus-4-7`     | Patches spec from reviewer findings.                                   |
-| Plan writer                        | `claude`           | Opus               | `claude-opus-4-7`     | Loads `superpowers:writing-plans`.                                     |
-| Plan reviewer (primary)            | `claude`           | Opus               | `claude-opus-4-7`     |                                                                        |
-| Plan reviewer (cross-vendor)       | `codex`            | GPT-5.5            | `gpt-5.5`             | Soft-skipped on failure.                                               |
-| Plan fixer                         | `claude`           | Opus               | `claude-opus-4-7`     |                                                                        |
-| Implementer                        | `claude`           | Sonnet             | `claude-sonnet-4-6`   | Loads `superpowers:subagent-driven-development`. One supervising subagent per Phase 6 run; dispatches its own sub-subagents per task. |
-| Debugger                           | `claude`           | Sonnet             | `claude-sonnet-4-6`   | Loads `superpowers:systematic-debugging`. Dispatched on verification failure. |
-| Final reviewer (primary)           | `claude`           | Opus               | `claude-opus-4-7`     |                                                                        |
-| Final reviewer (cross-vendor)      | `codex`            | GPT-5.5            | `gpt-5.5`             | Soft-skipped on failure.                                               |
-| Git finalizer                      | `claude`           | Sonnet             | `claude-sonnet-4-6`   | Loads `superpowers:finishing-a-development-branch`.                    |
-| Summarizers (spec / plan / final)  | `claude`           | Opus               | `claude-opus-4-7`     | One per gate, reads iteration verdicts and findings.                   |
-| Implementation summarizer          | n/a                | —                  | —                     | The Implementer subagent writes its own summary as part of Phase 6.    |
-| Final readiness writer             | `claude`           | Opus               | `claude-opus-4-7`     | Reads all per-phase summaries; writes `<feature-folder>/final-readiness-report.md`. |
+| Role                              | Vendor / CLI       | Model class        | Concrete id (today)   | Effort | Notes                                                                 |
+|-----------------------------------|--------------------|--------------------|-----------------------|--------|-----------------------------------------------------------------------|
+| Orchestrator                       | (the running LLM)  | (whatever runs this prompt; expected: Codex / GPT-5.5 or Claude Opus) | — | n/a | Sequences subprocesses. Never reviews. Never writes artifacts. |
+| Phase-0 context discovery          | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Single dispatch.                                                       |
+| Spec reviewer (primary)            | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Per gate iteration.                                                    |
+| Spec reviewer (cross-vendor)       | `codex`            | GPT-5.5            | `gpt-5.5`             | medium | Cheap mode. Soft-skipped on failure (see Failure handling).            |
+| Spec fixer                         | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Patches spec from reviewer findings.                                   |
+| Plan writer                        | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Loads `superpowers:writing-plans`.                                     |
+| Plan reviewer (primary)            | `claude`           | Opus               | `claude-opus-4-8`     | n/a |                                                                        |
+| Plan reviewer (cross-vendor)       | `codex`            | GPT-5.5            | `gpt-5.5`             | medium | Cheap mode. Soft-skipped on failure.                                   |
+| Plan fixer                         | `claude`           | Opus               | `claude-opus-4-8`     | n/a |                                                                        |
+| Implementer                        | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Loads `superpowers:subagent-driven-development`. One supervising subagent per Phase 4 run; dispatches its own sub-subagents per task. |
+| Debugger                           | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Loads `superpowers:systematic-debugging`. Dispatched on verification failure. |
+| Final reviewer (primary)           | `claude`           | Opus               | `claude-opus-4-8`     | n/a |                                                                        |
+| Final reviewer (cross-vendor)      | `codex`            | GPT-5.5            | `gpt-5.5`             | high | Deep mode. Soft-skipped on failure.                                    |
+| Git finalizer                      | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Loads `superpowers:finishing-a-development-branch`.                    |
+| Summarizers (spec / plan / final)  | `claude`           | Opus               | `claude-opus-4-8`     | n/a | One per gate, reads iteration verdicts and findings.                   |
+| Implementation summarizer          | (folded)           | —                  | —                     | n/a | The Implementer subagent writes its own summary as part of Phase 4.    |
+| Final readiness writer             | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Reads all per-phase summaries; writes `<feature-folder>/final-readiness-report.md`. |
+
+**Effort column.** This is set per-dispatch via Codex's `-c model_reasoning_effort=<value>` flag, NOT read from `~/.codex/config.toml`. Cheap-mode Codex reviewers (spec, plan, preflight) run at `medium`; deep-mode (final implementation review) runs at `high`. Claude has no equivalent knob in this orchestration, hence `n/a`. See "Codex reviewer modes" in the cookbook for the full mode contract.
 
 When you write the role-to-concrete-id map to `2-context-discovery/status.md` under `resolved_models:`, use the concrete ids above (unchanged unless preflight discovers a newer Opus / Sonnet / Codex release in the runtime environment).
 
@@ -150,6 +152,21 @@ Mandatory mapping (encoded into the appendices — you do not override):
 - Git finalization (Phase 8): subagent loads `superpowers:finishing-a-development-branch`.
 
 You never load any of these skills yourself. You only dispatch subagents whose appendices instruct them to load the relevant skill.
+
+### Codex appendix preamble (used by every Codex review appendix)
+
+Every Codex review appendix (`preflight-codex`, `spec-reviewer-codex`, `plan-reviewer-codex`, `final-reviewer-codex`) opens with the following preamble, immediately under its `# Role: ...` heading. Treat this block as the canonical text; do not paraphrase it inside the appendices.
+
+```text
+You are a dispatched subprocess. Do NOT load, read, or invoke Superpowers skills.
+Do NOT read ~/.codex/skills, ~/.claude/skills, .claude/skills, or any skill
+directory. This appendix is your complete instruction set.
+
+Independence means independent judgment over the supplied artifact, not
+independent repository discovery.
+```
+
+Codex review subprocesses (preflight, spec, plan, final) do NOT load any Superpowers skills. The appendix is the complete instruction set. This is enforced by the shared preamble in every Codex appendix and by the per-dispatch command budget (cheap mode: max 4 commands; deep mode: max 20). The Codex CLI sandbox is not a layer here — `-s workspace-write` does not restrict reads outside the workspace.
 
 ## Per-feature artifacts folder
 
@@ -353,7 +370,7 @@ Export each `$VARNAME` the appendix expects, then pipe `render_prompt <name>` in
 
 ### CLI invocation forms
 
-The two vendors take different option orders. Memorise both — getting them wrong wastes a dispatch attempt and pollutes the failure log.
+The two vendors take different option orders. Codex additionally distinguishes cheap vs. deep mode via reasoning effort. Memorise all three forms — getting them wrong wastes a dispatch attempt and pollutes the failure log.
 
 ```bash
 # Claude — prompt via stdin, model selected via --model.
@@ -362,15 +379,57 @@ timeout 20m claude --model "$CLAUDE_MODEL" -p --output-format=json - \
   1> "$OUT_PATH" \
   2> "$ERR_PATH"
 
-# Codex — global options (-a, -C, -s) appear BEFORE the `exec` subcommand.
-# --json emits JSONL on stdout; the final `turn.completed` event carries usage.
-# Do NOT use `codex exec ... -a never` — that prints "unexpected argument '-a' found".
-timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --json - \
+# Codex CHEAP — Phase −1 preflight, Phase 1 spec review, Phase 3 plan review.
+# Global options (-a, -c) appear BEFORE the `exec` subcommand.
+timeout 20m codex -a never \
+  -c model_reasoning_effort="medium" \
+  exec -C "$REPO_ROOT" -s workspace-write - \
+  1> "$OUT_PATH" \
+  2> "$ERR_PATH"
+
+# Codex DEEP — Phase 6 final implementation review only.
+timeout 60m codex -a never \
+  -c model_reasoning_effort="high" \
+  exec -C "$REPO_ROOT" -s workspace-write - \
   1> "$OUT_PATH" \
   2> "$ERR_PATH"
 ```
 
 If you find yourself writing `codex exec ... -a never` (global option after `exec`), STOP — that is the orchestrator-bug shape, not a Codex outage. See the "Distinguish orchestration bugs from vendor failures" rule in Failure handling.
+
+**Why both Codex modes use `-s workspace-write`.** The Codex CLI sandbox is coarse: `-s read-only` blocks ALL writes (including the reviewer's own findings + STATUS output files into `$FEATURE_FOLDER`), so it cannot be used for any reviewer. `-s workspace-write` allows writes inside the workspace but does NOT restrict reads outside the workspace (e.g. `~/.codex/skills/`). The actual cheap-mode allow-list is enforced by the appendix preamble + command budget, not by the sandbox flag.
+
+**Why `-c model_reasoning_effort` is set per-dispatch.** The orchestrator does NOT rely on `~/.codex/config.toml`'s global `model_reasoning_effort`. Every Codex call sets effort explicitly: `medium` for cheap, `high` for deep. This removes a hidden global config that previously caused iterative review gates to run at maximum cost.
+
+**Helper for picking the right form:**
+
+```bash
+codex_invoke() {
+  # Usage: codex_invoke <mode> <out_path> <err_path>
+  # mode is "cheap" or "deep". Reads the prompt from stdin.
+  local mode="$1" out="$2" err="$3"
+  case "$mode" in
+    cheap)
+      timeout 20m codex -a never \
+        -c model_reasoning_effort="medium" \
+        exec -C "$REPO_ROOT" -s workspace-write - \
+        1> "$out" 2> "$err"
+      ;;
+    deep)
+      timeout 60m codex -a never \
+        -c model_reasoning_effort="high" \
+        exec -C "$REPO_ROOT" -s workspace-write - \
+        1> "$out" 2> "$err"
+      ;;
+    *)
+      echo "codex_invoke: bad mode '$mode' (expected cheap|deep)" >&2
+      return 1
+      ;;
+  esac
+}
+```
+
+Pick the mode using the "Codex reviewer modes" table above: cheap for Phase −1 / 1 / 3, deep for Phase 6.
 
 ### CLI canary preflight
 
@@ -661,7 +720,24 @@ Validation, RUN_LOG appends, and failover decisions still run sequentially after
 
 Same pattern applies to Phase 1 preflight: dispatch `preflight-claude` and `preflight-codex` in parallel, then validate both STATUS files.
 
-## Phase 1 — Preflight skill availability check
+### Codex reviewer modes (cheap vs. deep)
+
+Codex review subprocesses run in one of two modes. The mode is **fixed by the phase**, with no user override and no auto-escalation. The cheap mode is the default; deep mode is only used by the Phase 6 final implementation reviewer.
+
+| Phase | Codex mode | Filesystem allow-list | Command budget | Reasoning effort | Findings cap |
+|---|---|---|---|---|---|
+| Phase −1 preflight | Cheap (micro) | Skill directory listing only (no contents) | 2 | medium | — |
+| Phase 1 spec review | Cheap | `$SPEC_PATH` only | 4 | medium | 5 BLOCKER/MAJOR + 5 MINOR, ≤150 words each |
+| Phase 3 plan review | Cheap | `$SPEC_PATH` + `$PLAN_PATH` | 4 | medium | 5 BLOCKER/MAJOR + 5 MINOR, ≤150 words each |
+| Phase 6 final review | Deep | `$SPEC_PATH`, `$PLAN_PATH`, files inside `git diff $IMPLEMENTATION_BASE_SHA...HEAD` | 20 | high | 5 BLOCKER/MAJOR + 5 MINOR, ≤150 words each |
+
+All modes also allow writing to the reviewer's own output files (findings + STATUS) inside `$FEATURE_FOLDER`. All modes forbid loading any Superpowers skill — enforced by the shared preamble in every Codex appendix.
+
+Justification for the mapping: Phase 1 has no code to cross-check yet (the spec must stand on its own; brownfield code-mismatch issues are caught in Phase 6). Phase 3 plans should be self-contained per `superpowers:writing-plans` "no placeholders" rule and the plan-writer already cited library APIs via `context7`. Phase 6 reads the diff because that IS the review.
+
+Enforcement layering: the appendix preamble is the primary control. The per-dispatch command budget is the secondary control. Codex's `-s workspace-write` sandbox is NOT a layer here — it does not restrict reads outside the workspace. Acceptance criterion #4 in the design spec verifies enforcement empirically by grepping for skill-directory reads in transcripts.
+
+## Phase −1 — Preflight skill availability check
 
 Goal: confirm the environment is sound (binaries, CLI syntax, working tree) AND that both worker CLIs can load every Superpowers skill this orchestration depends on. If any preflight step fails, HALT with a clear remediation message — Phase 2 does not start.
 
@@ -696,7 +772,7 @@ Codex CLI must be able to load:
 
 1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `1-preflight/` subfolder with `mkdir -p`.
 2. Dispatch a `claude` subprocess using the `preflight-claude` appendix. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Timeout: 2 min.
-3. If `codex_available` is still `true`, dispatch a `codex` subprocess using the `preflight-codex` appendix. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Timeout: 2 min. **Dispatch in parallel with step 2** using the pattern in the "Reviewer parallelization" cookbook entry (preflight has no shared state between vendors).
+3. If `codex_available` is still `true`, dispatch a `codex` subprocess using the `preflight-codex` appendix. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Timeout: 2 min. **Dispatch in parallel with step 2** using the pattern in the "Reviewer parallelization" cookbook entry (preflight has no shared state between vendors). Use the **cheap** Codex invocation form (`codex_invoke cheap`) — preflight runs in cheap micro-mode per the "Codex reviewer modes" table.
 4. Read only the two STATUS files. Validate each with `validate_status` (see cookbook).
 5. If either reports `verdict=MISSING_SKILLS`, print to the user: which CLI is missing which skills, plus an install hint ("Install the Superpowers plugin (e.g. `claude plugin install superpowers`) and re-run this prompt against the same feature folder"). HALT.
 6. If the `codex` check fails, apply the "Distinguish orchestration bugs from vendor failures" filter from Failure handling first. If the captured stderr indicates a local CLI usage error (`unexpected argument`, `Usage:`, `unknown option`), this is an orchestration bug, not a Codex outage — correct the invocation per the cookbook's "CLI invocation forms" and retry once. Otherwise branch on the failure mode:
@@ -806,7 +882,7 @@ For each iteration N (start at 1, hard cap at 5):
 
 1. `mkdir -p <feature-folder>/3-spec-review/iteration-NN`.
 2. Dispatch a `claude` Opus reviewer subprocess with the `spec-reviewer-claude` appendix. Inputs (substituted): `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `3-spec-review/iteration-NN/claude-opus-verdict.md` (STATUS) and `claude-opus-findings.md` (full findings). Timeout: 20 min.
-3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer subprocess with the `spec-reviewer-codex` appendix. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min.
+3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer subprocess with the `spec-reviewer-codex` appendix. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min. Use the **cheap** Codex invocation form (`codex_invoke cheap`) — Phase 1 spec review runs in cheap mode per the "Codex reviewer modes" table.
 4. Read only the verdict files.
 5. If `blockers + majors > 0` from any active reviewer:
    - Dispatch a `claude` Opus spec-fixer subprocess with the `spec-fixer` appendix. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (newline-separated list of findings files from this iteration). The fixer edits the canonical spec in place. Timeout: 20 min.
@@ -867,7 +943,7 @@ For each iteration N (start at 1, hard cap at 5):
 
 1. `mkdir -p <feature-folder>/5-plan-review/iteration-NN`.
 2. Dispatch a `claude` Opus reviewer with the `plan-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Outputs: `5-plan-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 20 min.
-3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer with the `plan-reviewer-codex` appendix. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min.
+3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer with the `plan-reviewer-codex` appendix. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min. Use the **cheap** Codex invocation form (`codex_invoke cheap`) — Phase 3 plan review runs in cheap mode per the "Codex reviewer modes" table.
 4. Read only verdict files.
 5. If `blockers + majors > 0` from any active reviewer:
    - Dispatch a `claude` Opus plan-fixer with the `plan-fixer` appendix. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS`. Timeout: 20 min.
@@ -1036,7 +1112,7 @@ For each iteration N (start at 1, hard cap at 5):
 
 1. `mkdir -p <feature-folder>/7-code-review/iteration-NN`.
 2. Dispatch a `claude` Opus reviewer with the `code-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 60 min.
-3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer with the `code-reviewer-codex` appendix. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 60 min.
+3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer with the `code-reviewer-codex` appendix. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 60 min. Use the **deep** Codex invocation form (`codex_invoke deep`) — Phase 6 final implementation review runs in deep mode per the "Codex reviewer modes" table.
 4. Read only verdict files.
 5. If `blockers + majors > 0` from any active reviewer:
    - Re-dispatch the implementer subagent (Phase 6 appendix) with `$FINDINGS_PATHS` so it patches the implementation. Timeout: 300 min.
@@ -1208,7 +1284,7 @@ develop_it_file_sha256:   8c2f6bf5e9d3a4b1f5c7d8e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4
 develop_it_dirty:         no
 status_path:              3-spec-review/iteration-01/claude-opus-verdict.md
 verdict:                  CHANGES_REQUESTED
-model:                    claude-opus-4-7
+model:                    claude-opus-4-8
 duration_ms:              241830
 tokens_input_new:         18430
 tokens_input_cached:      0
@@ -1226,7 +1302,7 @@ usage_status:             ok
 - All token counts are integers; `0` when not applicable to the vendor (`tokens_reasoning` is `0` for Claude; `tokens_cache_write` is `0` for Codex).
 - `cost_usd` is numeric for Claude; the literal string `n/a` for Codex (subscription-priced, no per-call cost).
 - `usage_status` is `ok` or `unavailable`. When `unavailable`, all token fields are `0` and `cost_usd` is `n/a` — but the dispatch entry itself is still written normally. Telemetry parsing failure NEVER blocks logging.
-- `model` is the resolved concrete model id (e.g. `claude-opus-4-7`). For Codex, use the value from `2-context-discovery/status.md`'s `resolved_models:` map; for pre-Phase-0 dispatches (canary, preflight), use the literal string `codex`.
+- `model` is the resolved concrete model id (e.g. `claude-opus-4-8`). For Codex, use the value from `2-context-discovery/status.md`'s `resolved_models:` map; for pre-Phase-0 dispatches (canary, preflight), use the literal string `codex`.
 - `duration_ms` is the CLI-reported wall time for Claude (`duration_ms` field in the JSON), and the orchestrator-measured wall time for Codex (Codex JSON omits a duration field).
 
 Existing entries written by prior versions of this process file MAY lack the nine fields. Readers (summarizers, readiness writer) MUST tolerate missing fields by treating them as `usage_status=unavailable` with zero values.
@@ -1578,25 +1654,36 @@ Exit 0 on successful write of the status file (regardless of READY vs MISSING_SK
 <!-- BEGIN: preflight-codex -->
 # Role: preflight-codex
 
+You are a dispatched subprocess. Do NOT load, read, or invoke Superpowers skills.
+Do NOT read ~/.codex/skills, ~/.claude/skills, .claude/skills, or any skill
+directory. This appendix is your complete instruction set.
+
+Independence means independent judgment over the supplied artifact, not
+independent repository discovery.
+
 You are a one-shot preflight checker invoked by the develop-it orchestrator. You have no shared context.
 
 ## Inputs
 
 - `$FEATURE_FOLDER`
 
+## Mode
+
+Cheap (micro). Filesystem reads: skill directory listing only (existence check); do NOT read skill file contents. Command budget: max 2 shell or read commands.
+
 ## Required skill probes
 
-- superpowers:writing-plans (read-only is enough)
-- superpowers:subagent-driven-development (read-only is enough)
-- superpowers:verification-before-completion
+- `superpowers:writing-plans`
+- `superpowers:subagent-driven-development`
+- `superpowers:verification-before-completion`
 
-For each, report `LOADED` or `MISSING`.
+For each, report `LOADED` if the skill's directory or `SKILL.md` file exists, or `MISSING` if it does not. Do NOT read the contents of `SKILL.md`. Do NOT load the skill. A path existence check is sufficient.
 
-Do NOT execute any other actions. Do NOT read project files. Do NOT write any file other than the status file below.
+Do NOT execute any other actions. Do NOT read project files. Do NOT run broad `find` or `rg` over the repo. Do NOT write any file other than the status file below.
 
 ## Output
 
-Write `$FEATURE_FOLDER/1-preflight/codex-check-status.md` LAST and atomically:
+Write `$FEATURE_FOLDER/1-preflight/codex-check-status.md` LAST and atomically (write `.tmp` then rename):
 
 ```
 verdict: READY | MISSING_SKILLS
@@ -1626,7 +1713,7 @@ Use only read-only inspection. You do NOT load `subagent-driven-development` her
 1. Enumerate Superpowers skills available in the environment. Use the platform's skill-listing mechanism.
 2. Read the root `CLAUDE.md` and any nested `CLAUDE.md` files relevant to the SDLC flow. Summarize project conventions in one paragraph.
 3. Inspect the input spec path (the orchestrator records this in `RUN_LOG.md` and the feature folder name encodes the slug — derive the spec path: take the feature folder name, strip `-artifacts`, append `-design.md`, prepend `docs/superpowers/specs/`). Confirm the spec exists. Do NOT read its body.
-4. Resolve concrete model ids for each role per the **Default model resolution** policy in the Models section. Defaults today: Opus → `claude-opus-4-7`, Sonnet → `claude-sonnet-4-6`, GPT-5.5 → `gpt-5.5`. Only deviate if the runtime environment lists a strictly newer Opus/Sonnet/Codex release. **Never** resolve GPT-5.5 to `gpt-5.1-codex-max`, `gpt-5-codex-max`, `o3`, `o3-mini`, or any other `*-codex-max` / `o*` id — those require an OpenAI API key and will 400 on a ChatGPT-account auth. Record the resolved map.
+4. Resolve concrete model ids for each role per the **Default model resolution** policy in the Models section. Defaults today: Opus → `claude-opus-4-8`, Sonnet → `claude-sonnet-4-6`, GPT-5.5 → `gpt-5.5`. Only deviate if the runtime environment lists a strictly newer Opus/Sonnet/Codex release. **Never** resolve GPT-5.5 to `gpt-5.1-codex-max`, `gpt-5-codex-max`, `o3`, `o3-mini`, or any other `*-codex-max` / `o*` id — those require an OpenAI API key and will 400 on a ChatGPT-account auth. Record the resolved map.
 
 ## Output
 
@@ -1713,6 +1800,13 @@ Exit 0 on successful write of STATUS.
 <!-- BEGIN: spec-reviewer-codex -->
 # Role: spec-reviewer-codex
 
+You are a dispatched subprocess. Do NOT load, read, or invoke Superpowers skills.
+Do NOT read ~/.codex/skills, ~/.claude/skills, .claude/skills, or any skill
+directory. This appendix is your complete instruction set.
+
+Independence means independent judgment over the supplied artifact, not
+independent repository discovery.
+
 You are a cross-vendor spec reviewer (the "second opinion") invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context with the primary reviewer; produce an independent assessment.
 
 ## Inputs
@@ -1721,15 +1815,53 @@ You are a cross-vendor spec reviewer (the "second opinion") invoked as a fresh s
 - `$ITERATION`
 - `$SPEC_PATH`
 
+## Mode
+
+Cheap (spec-only). Filesystem allow-list: `$SPEC_PATH` plus your own output files inside `$FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/`. Command budget: max 4 shell or read commands per dispatch.
+
+## Forbidden reads
+
+You may NOT read any of the following, even if you believe it would improve the review:
+
+- source files (`*.py`, `*.ts`, `*.tsx`, `*.js`, etc.) anywhere in the repo
+- test files
+- transcripts (`$FEATURE_FOLDER/transcripts/*`)
+- `RUN_LOG.md`
+- `2-context-discovery/status.md` (the orchestrator passes you everything you need)
+- previous reviewer findings (your verdict must be independent)
+- skill directories (`~/.codex/skills`, `~/.claude/skills`, `.claude/skills`, any path containing `/skills/`)
+- `~/.codex/config.toml`
+- arbitrary repo files via broad `rg` or `find`
+
+If the spec references existing implementation that you cannot verify under this allow-list, surface that as a MAJOR finding ("spec references existing implementation X but reviewer cannot verify without code access; recommend spec author either inline the relevant detail or mark for code-aware review") instead of breaking the allow-list.
+
 ## Behavior
 
-Identical evaluation framework to `spec-reviewer-claude` (completeness, consistency, ambiguity, scope, acceptance criteria, constraints/risk) and the same BLOCKER / MAJOR / MINOR severity ladder.
+1. Read `$SPEC_PATH` in full (counts as 1 of your 4 commands).
+2. Evaluate against these dimensions using the BLOCKER / MAJOR / MINOR severity ladder (same definitions as `spec-reviewer-claude`):
+   - Completeness: are all stated goals covered? Are non-goals explicit?
+   - Internal consistency: do sections contradict each other?
+   - Ambiguity: could any requirement be interpreted two ways?
+   - Scope: is this focused enough for one implementation plan?
+   - Acceptance criteria: are they testable?
+   - Constraints / risk: are dependencies, threats, and constraints surfaced?
+3. Classify every finding into exactly one severity. Do NOT label obvious correctness/coverage issues as MINOR.
 
-Do NOT read or reference the primary reviewer's findings. Your judgement must be independent.
+## Findings budget
+
+Max 5 BLOCKER/MAJOR findings + max 5 MINOR findings per iteration. Each finding ≤ 150 words. If more issues exist, prioritise by severity and late-surfacing risk; remaining issues can be surfaced in the next iteration after a fix.
 
 ## Output
 
-Findings: `$FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/codex-findings.md` (same finding format as the claude reviewer).
+Findings: `$FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/codex-findings.md`. Format per finding:
+
+```
+### Finding N — <one-line summary>
+- **Severity:** BLOCKER | MAJOR | MINOR
+- **Location:** <spec section / heading / line range>
+- **Issue:** <description>
+- **Recommendation:** <concrete change suggested>
+```
 
 STATUS LAST and atomically: `$FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/codex-verdict.md`
 
@@ -1744,7 +1876,7 @@ reason: <one line if CHANGES_REQUESTED>
 
 Verdict rule: `verdict=PASS` iff `blockers=0 AND majors=0`.
 
-Exit 0 on successful STATUS write.
+Exit 0 on STATUS write.
 <!-- END: spec-reviewer-codex -->
 
 <!-- BEGIN: spec-fixer -->
@@ -1877,6 +2009,13 @@ Exit 0 on STATUS write.
 <!-- BEGIN: plan-reviewer-codex -->
 # Role: plan-reviewer-codex
 
+You are a dispatched subprocess. Do NOT load, read, or invoke Superpowers skills.
+Do NOT read ~/.codex/skills, ~/.claude/skills, .claude/skills, or any skill
+directory. This appendix is your complete instruction set.
+
+Independence means independent judgment over the supplied artifact, not
+independent repository discovery.
+
 You are a cross-vendor plan reviewer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context. You produce an independent assessment — do NOT attempt to read the primary reviewer's verdict or findings.
 
 ## Inputs
@@ -1886,10 +2025,31 @@ You are a cross-vendor plan reviewer invoked as a fresh subprocess by the develo
 - `$PLAN_PATH` — absolute path to the plan
 - `$SPEC_PATH` — absolute path to the approved spec (use only for spec-coverage cross-check)
 
+## Mode
+
+Cheap (plan + spec only). Filesystem allow-list: `$PLAN_PATH`, `$SPEC_PATH`, plus your own output files inside `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/`. Command budget: max 4 shell or read commands per dispatch.
+
+## Forbidden reads
+
+You may NOT read any of the following, even if you believe it would improve the review:
+
+- source files (`*.py`, `*.ts`, etc.) anywhere in the repo
+- test files
+- transcripts (`$FEATURE_FOLDER/transcripts/*`)
+- `RUN_LOG.md`
+- `2-context-discovery/status.md`
+- `6-implementation/*` artifacts (these may not exist yet, but are forbidden in any case)
+- previous reviewer findings
+- skill directories
+- `~/.codex/config.toml`
+- arbitrary repo files via broad `rg` or `find`
+
+The plan must be self-contained per `superpowers:writing-plans` "no placeholders" rule. The plan-writer already cited library APIs via `context7`. If the plan references implementation files that you cannot verify under this allow-list, surface that as a MAJOR ("plan references file X but reviewer cannot verify existence without code access; recommend plan-writer either include exact file path with confirmed existence or mark for code-aware review").
+
 ## Behavior
 
-1. Read `$PLAN_PATH` and `$SPEC_PATH`.
-2. Evaluate against these dimensions:
+1. Read `$PLAN_PATH` and `$SPEC_PATH` (counts as 2 of your 4 commands).
+2. Evaluate against these dimensions using the BLOCKER / MAJOR / MINOR severity ladder:
    - Spec coverage: does every spec requirement map to one or more tasks?
    - Task granularity: are steps 2-5 minutes each, with exact paths, full code, exact commands?
    - TDD shape: does each task have failing-test → implement → passing-test → commit?
@@ -1898,11 +2058,11 @@ You are a cross-vendor plan reviewer invoked as a fresh subprocess by the develo
    - DRY/YAGNI: any over-engineering or unnecessary scope creep?
    - Placeholders: any TBD, "implement later", "similar to Task N", references to undefined symbols?
    - Order: do dependencies between tasks reflect actual dependencies?
-3. Classify EVERY finding into exactly one severity:
-   - **BLOCKER** — correctness or safety defect. Gate cannot pass.
-   - **MAJOR** — missing requirement, internal contradiction, ambiguity that would cause an implementer to guess, or late-surfacing risk.
-   - **MINOR / NIT** — wording, formatting, optional enhancement, style.
-   Do NOT label obvious correctness/coverage issues as MINOR.
+3. Classify every finding into exactly one severity. Do NOT label obvious correctness/coverage issues as MINOR.
+
+## Findings budget
+
+Max 5 BLOCKER/MAJOR + max 5 MINOR per iteration. Each finding ≤ 150 words. Prioritise by severity and late-surfacing risk.
 
 ## Output
 
@@ -2169,7 +2329,14 @@ Exit 0 on STATUS write.
 <!-- BEGIN: code-reviewer-codex -->
 # Role: code-reviewer-codex
 
-You are a cross-vendor code reviewer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context. You produce an independent assessment — do NOT attempt to read the primary reviewer's verdict or findings.
+You are a dispatched subprocess. Do NOT load, read, or invoke Superpowers skills.
+Do NOT read ~/.codex/skills, ~/.claude/skills, .claude/skills, or any skill
+directory. This appendix is your complete instruction set.
+
+Independence means independent judgment over the supplied artifact, not
+independent repository discovery.
+
+You are a cross-vendor final implementation reviewer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context. You produce an independent assessment — do NOT attempt to read the primary reviewer's verdict or findings.
 
 ## Inputs
 
@@ -2179,25 +2346,61 @@ You are a cross-vendor code reviewer invoked as a fresh subprocess by the develo
 - `$PLAN_PATH`
 - `$IMPLEMENTATION_BASE_SHA` — git SHA captured before Phase 6 dispatch (or the literal `non-git`)
 
+## Mode
+
+Deep (code-aware, diff-scope-bounded). This is the only Codex review mode that may read source files.
+
+Filesystem allow-list:
+- `$SPEC_PATH`
+- `$PLAN_PATH`
+- Any file appearing in `git diff $IMPLEMENTATION_BASE_SHA...HEAD` plus any new untracked file listed by `git ls-files --others --exclude-standard`
+- Project root `CLAUDE.md` and any nested `CLAUDE.md` files referenced by the diff (read-only, only when a specific finding requires it)
+- Your own output files inside `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/`
+
+Command budget: max 20 shell or read commands per dispatch.
+
+## Forbidden reads
+
+- Source files NOT in the diff scope (use `git diff` / `git ls-files --others` to enumerate scope first)
+- Transcripts under `$FEATURE_FOLDER/transcripts/*`
+- `RUN_LOG.md`
+- Previous reviewer findings (your judgment is independent)
+- Skill directories
+- `~/.codex/config.toml`
+
+## No broad rg / find
+
+Recursive search over the whole repo is forbidden. If you need to grep for a symbol, constrain the search to files in the diff scope, e.g.:
+
+```bash
+rg -n "render_chart" frontend/src/features/canvas -g '*.ts' -g '*.tsx' | head -50
+```
+
+NOT:
+
+```bash
+rg -n "render_chart" .
+```
+
 ## Behavior
 
-1. Inspect the implementation diff against the captured baseline:
-   - If `$IMPLEMENTATION_BASE_SHA != non-git`: run `git diff $IMPLEMENTATION_BASE_SHA...HEAD` plus `git status --porcelain` and `git ls-files --others --exclude-standard`. Read every changed/added source and test file.
-   - If `$IMPLEMENTATION_BASE_SHA = non-git`: read every changed file in the working tree per the plan's file list.
-2. Read `$SPEC_PATH` and `$PLAN_PATH` for the acceptance criteria.
-3. Evaluate:
+1. Enumerate the diff scope with `git diff $IMPLEMENTATION_BASE_SHA...HEAD --name-only` plus `git status --porcelain` plus `git ls-files --others --exclude-standard` (this counts as ~3 commands). If `$IMPLEMENTATION_BASE_SHA = non-git`, fall back to the plan's file list.
+2. Read every changed/added source and test file inside the diff scope.
+3. Read `$SPEC_PATH` and `$PLAN_PATH` for acceptance criteria.
+4. Evaluate using the BLOCKER / MAJOR / MINOR severity ladder:
    - Spec compliance: does the implementation actually deliver each acceptance criterion?
    - Plan adherence: did the implementer follow the plan, including TDD shape and commit cadence?
-   - Correctness: are there obvious bugs, race conditions, off-by-one errors, missing error handling at boundaries?
+   - Correctness: bugs, race conditions, off-by-one errors, missing error handling at boundaries.
    - Security: secrets in code, command injection, insecure deserialization, OWASP-class issues relevant to the change.
    - Test coverage: are the new code paths actually exercised by tests?
    - No-secret check (if applicable): does the implementation summary show this check ran and passed?
    - Cleanup: any leftover scaffolding / dead code / commented-out blocks?
-4. Classify EVERY finding into exactly one severity:
-   - **BLOCKER** — correctness or safety defect. Gate cannot pass.
-   - **MAJOR** — missing requirement, internal contradiction, ambiguity, late-surfacing risk.
-   - **MINOR / NIT** — wording, formatting, optional enhancement, style.
-   Do NOT label obvious correctness issues as MINOR.
+
+Classify every finding into exactly one severity. Do NOT label obvious correctness issues as MINOR.
+
+## Findings budget
+
+Max 5 BLOCKER/MAJOR + max 5 MINOR per iteration. Each finding ≤ 150 words. Prioritise by severity and late-surfacing risk; remaining issues can be surfaced in the next iteration.
 
 ## Output
 
