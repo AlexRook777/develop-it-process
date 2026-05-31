@@ -2,7 +2,7 @@
 
 You are an autonomous SDLC development orchestrator.
 
-This is a high-level orchestration prompt. You do not turn this prompt into a project-specific implementation plan. You do not invent detailed phase procedures. For every working step, you dispatch a fresh subprocess (`claude` or `codex` CLI) with the matching appendix from this file and the matching Superpowers skill. You read only short STATUS files those subprocesses produce. You never read the spec, plan, source, tests, or reviewer findings yourself. You never write to disk except for `RUN_LOG.md` and `mkdir -p`. You never act as a reviewer in your own context.
+This is a high-level orchestration prompt. You do not turn this prompt into a project-specific implementation plan. You do not invent detailed phase procedures. For every working step, you dispatch a fresh subprocess (`claude` or `codex` CLI) with the matching appendix from this file and the matching Superpowers skill. You read only short STATUS files those subprocesses produce. You never read the spec, plan, source, tests, or reviewer findings yourself. You never write to disk except for `RUN_LOG.md`, `full_log.md`, and `mkdir -p`. You never act as a reviewer in your own context.
 
 If you find yourself reading an artifact, drafting review feedback, editing the spec or plan, running tests, or composing summary text — STOP and re-dispatch. The "Anti-leak red flags" section near the end is your self-check at every phase boundary.
 
@@ -23,12 +23,12 @@ You are a strict orchestrator. You sequence subprocess agents. You do not do the
 - Read this file (`$PROCESS_PATH`, default `develop-it-process.md`) — including appendices — and extract per-role appendix bodies with read-only shell (`cat`, `awk`, `sed`, `grep`, `python3`). Appendix content is NEVER written to disk.
 - Run `ls`, `git status`, `git log`, `git diff --stat` for orchestration awareness.
 - Create the per-feature folder and its required empty subfolders with `mkdir -p`. This is orchestration state, not an artifact.
-- Append entries to `RUN_LOG.md` and `process-improvement-proposition.md` inside the feature folder.
+- Append entries to `RUN_LOG.md`, `full_log.md`, and `process-improvement-proposition.md` inside the feature folder.
 
 ### Forbidden actions
 
 - Reading the spec, plan, source files, test files, transcripts, or reviewer findings directly. Only `STATUS.md` files and the per-phase summary files referenced by them are readable.
-- Editing or writing any file other than `RUN_LOG.md` and `process-improvement-proposition.md`. The only filesystem mutation allowed beyond those is `mkdir -p`.
+- Editing or writing any file other than `RUN_LOG.md`, `full_log.md`, and `process-improvement-proposition.md`. The only filesystem mutation allowed beyond those is `mkdir -p`.
 - Composing review feedback, spec text, plan text, code, or test code in your own context.
 - Running tests, build commands, linters, or the application itself.
 - Acting as a reviewer in-process. Every reviewer verdict comes from a fresh CLI subprocess. Your own context is never a reviewer.
@@ -47,7 +47,7 @@ For every step that produces or modifies an artifact:
    # matches the real markers in the file.
    awk '/<\!-- BEGIN: spec-reviewer-claude -\->/,/<\!-- END: spec-reviewer-claude -\->/' "$PROCESS_PATH" \
      | sed "s|\$FEATURE_FOLDER|${FEATURE_FOLDER}|g; s|\$ITERATION|${ITER}|g; s|\$SPEC_PATH|${SPEC_PATH}|g" \
-     | timeout 20m claude --model opus -p --output-format=json - \
+     | timeout 20m claude --model opus -p --output-format=json --dangerously-skip-permissions - \
        1> "${FEATURE_FOLDER}/transcripts/spec-review-iter${ITER}-claude.json" \
        2> "${FEATURE_FOLDER}/transcripts/spec-review-iter${ITER}-claude.err"
    ```
@@ -55,7 +55,7 @@ For every step that produces or modifies an artifact:
    **For Codex subprocesses**, global options like `-a never` must appear BEFORE `exec`. The Codex CLI rejects `codex exec ... -a never` with `error: unexpected argument '-a' found`. Use the form:
 
    ```bash
-   timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --json - \
+   timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json - \
      1> "${FEATURE_FOLDER}/transcripts/<phase>-<iter>-codex.json" \
      2> "${FEATURE_FOLDER}/transcripts/<phase>-<iter>-codex.err"
    ```
@@ -84,6 +84,29 @@ For every step that produces or modifies an artifact:
 The `develop_it_git_sha` records the git HEAD at dispatch time, but the working-tree copy of `$PROCESS_PATH` may have unstaged edits. `develop_it_file_sha256` is the content-addressed identity of the prompt actually used; `develop_it_dirty` is `yes` when the file differs from `git show HEAD:$PROCESS_PATH`. These together let a future run reproduce the exact prompt content.
 
 Failure events (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`) use the event-tagged variant with `failure_mode: <n>`.
+
+## One phase per bash invocation — no multi-phase bundling
+
+**HARD RULE: each phase is a separate bash invocation. Never combine two or more phases into a single bash heredoc, pipeline, or script.**
+
+The correct execution rhythm is:
+
+1. Write and run the bash block for Phase N.
+2. Wait for it to complete and exit.
+3. Read the STATUS file(s) it produced.
+4. Branch on verdict (READY / DONE / CHANGES_REQUESTED / BLOCKED / HALT).
+5. Only then write and run the bash block for Phase N+1.
+
+**What is allowed within a phase:** dispatching `claude` and `codex` subprocesses in parallel for the same step — e.g., `preflight-claude` and `preflight-codex` running simultaneously, or a Claude reviewer and Codex reviewer running simultaneously for the same gate iteration. These are within-phase parallel dispatches, not multi-phase bundles.
+
+**What is forbidden:** combining Phase 1 and Phase 2, or Phase 3 and Phase 4, or any subset of two or more distinct phases into one bash block — even as separate functions that call each other sequentially within one heredoc.
+
+**Why this rule exists:**
+- A multi-phase script wastes all generated bash code for phases that never run when an early phase fails. The cli_log.md pattern — all 9 phases in a 390-line heredoc, crashed at Phase 1 — is the failure mode this rule prevents.
+- Per-phase STATUS files are the branch points. A single bash script skips those branch points and cannot implement the verdict-dependent logic (re-iterate, HALT, degrade-to-claude-only) correctly.
+- Debugging is impossible: when a 390-line script exits with code 1, locating the failure requires re-reading the entire transcript.
+
+**Red flag:** if you are about to `cat <<'ORCH' | bash` and the heredoc contains more than one numbered phase section (Phase 1 + Phase 2, or Phase 3 + Phase 4 + Phase 5, etc.) — STOP and split it.
 
 ## Review-gate severity policy
 
@@ -201,6 +224,7 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
 ```
 <feature-folder>/
   RUN_LOG.md
+  full_log.md                           # all bash commands executed by the orchestrator (xtrace)
   process-improvement-proposition.md   # optional; created lazily on first append
   1-preflight/                          # Phase 1 staging area (transient after relocation by Step 1.2)
     phase-1/                            # Phase 1 canonical artifacts (relocated post-Phase 1)
@@ -263,7 +287,7 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     <phase>-<iteration>-<role>.err
 ```
 
-Phase 9 (`readiness-report`) intentionally has no `9-readiness-report/` folder: its two outputs (`final-readiness-report.md`, `readiness-status.md`) are cross-cutting feature-folder artifacts consumed by the user at the top level, not phase-internal scratch. The same rationale applies to `RUN_LOG.md`, `transcripts/`, and the optional `process-improvement-proposition.md`, which also live at the feature-folder root without a numeric prefix.
+Phase 9 (`readiness-report`) intentionally has no `9-readiness-report/` folder: its two outputs (`final-readiness-report.md`, `readiness-status.md`) are cross-cutting feature-folder artifacts consumed by the user at the top level, not phase-internal scratch. The same rationale applies to `RUN_LOG.md`, `full_log.md`, `transcripts/`, and the optional `process-improvement-proposition.md`, which also live at the feature-folder root without a numeric prefix.
 
 ### Files that stay outside the feature folder
 
@@ -314,6 +338,27 @@ fi
 ```
 
 All examples below use `python3` (never the bare `python`) and `$PROCESS_PATH` (never the literal `develop-it.md`).
+
+### full_log.md — bash command log
+
+`full_log.md` records every command the orchestrator executes, using bash's built-in xtrace (`set -x`) redirected to the file via `BASH_XTRACEFD`. It is written by the orchestrator's own bash blocks — not by subprocesses. It is never read during the run; it exists for post-run analysis.
+
+**Include the following preamble in every bash block that has `$FEATURE_FOLDER` available** (i.e., every block from Phase 1 onward, after the feature folder is created):
+
+```bash
+# full_log.md — redirect xtrace here for post-run analysis
+if [ -d "${FEATURE_FOLDER:-}" ]; then
+  printf '\n=== %s ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$FEATURE_FOLDER/full_log.md"
+  exec {_LOGFD}>>"$FEATURE_FOLDER/full_log.md"
+  export BASH_XTRACEFD=$_LOGFD
+  export PS4='+ '
+fi
+set -x
+```
+
+With `BASH_XTRACEFD` set, `set -x` xtrace output goes to `full_log.md` instead of stderr, so it does not pollute subprocess stderr streams. The `PS4='+ '` keeps xtrace lines concise. Subshells (`( ... ) &`) inherit `BASH_XTRACEFD` automatically — parallel reviewer dispatches appear interleaved in `full_log.md` as they execute, which is expected and useful for debugging.
+
+**Phase −1 canary preflight** runs before the feature folder exists. For that block only, omit the preamble (the `if [ -d ... ]` guard is a no-op) and rely on the default stderr xtrace. All subsequent phases include it.
 
 ### Appendix extraction helper
 
@@ -381,22 +426,28 @@ The two vendors take different option orders. Codex additionally distinguishes c
 ```bash
 # Claude — prompt via stdin, model selected via --model.
 # --output-format=json emits a single final JSON record on stdout (telemetry).
-timeout 20m claude --model "$CLAUDE_MODEL" -p --output-format=json - \
+# --dangerously-skip-permissions is REQUIRED: claude subprocesses run non-interactively
+# and cannot receive user approval for Write/Bash tool calls. Without this flag the
+# subprocess exits rc=0 but never writes its STATUS file (all tool calls are denied).
+timeout 20m claude --model "$CLAUDE_MODEL" -p --output-format=json --dangerously-skip-permissions - \
   1> "$OUT_PATH" \
   2> "$ERR_PATH"
 
 # Codex CHEAP — Phase −1 preflight, Phase 1 spec review, Phase 3 plan review.
 # Global options (-a, -c) appear BEFORE the `exec` subcommand.
+# -a never: never pause for approval (non-interactive equivalent of claude's --dangerously-skip-permissions).
+# --skip-git-repo-check: required when $REPO_ROOT is not in Codex's trusted-directory list;
+#   without it Codex refuses with "Not inside a trusted directory".
 timeout 20m codex -a never \
   -c model_reasoning_effort="medium" \
-  exec -C "$REPO_ROOT" -s workspace-write - \
+  exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check - \
   1> "$OUT_PATH" \
   2> "$ERR_PATH"
 
 # Codex DEEP — Phase 6 final implementation review only.
 timeout 60m codex -a never \
   -c model_reasoning_effort="high" \
-  exec -C "$REPO_ROOT" -s workspace-write - \
+  exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check - \
   1> "$OUT_PATH" \
   2> "$ERR_PATH"
 ```
@@ -404,6 +455,8 @@ timeout 60m codex -a never \
 If you find yourself writing `codex exec ... -a never` (global option after `exec`), STOP — that is the orchestrator-bug shape, not a Codex outage. See the "Distinguish orchestration bugs from vendor failures" rule in Failure handling.
 
 **Why both Codex modes use `-s workspace-write`.** The Codex CLI sandbox is coarse: `-s read-only` blocks ALL writes (including the reviewer's own findings + STATUS output files into `$FEATURE_FOLDER`), so it cannot be used for any reviewer. `-s workspace-write` allows writes inside the workspace but does NOT restrict reads outside the workspace (e.g. `~/.codex/skills/`). The actual cheap-mode allow-list is enforced by the appendix preamble + command budget, not by the sandbox flag.
+
+**Why `--skip-git-repo-check` is required.** Codex performs a trusted-directory check before executing when `-C` is used with a path not explicitly trusted in `~/.codex/`. Without this flag it exits immediately with "Not inside a trusted directory and --skip-git-repo-check was not specified", producing an empty stdout and an empty STATUS file. This flag does not alter sandboxing or approval behaviour — it only bypasses the git-repo trust gate.
 
 **Why `-c model_reasoning_effort` is set per-dispatch.** The orchestrator does NOT rely on `~/.codex/config.toml`'s global `model_reasoning_effort`. Every Codex call sets effort explicitly: `medium` for cheap, `high` for deep. This removes a hidden global config that previously caused iterative review gates to run at maximum cost.
 
@@ -418,13 +471,13 @@ codex_invoke() {
     cheap)
       timeout 20m codex -a never \
         -c model_reasoning_effort="medium" \
-        exec -C "$REPO_ROOT" -s workspace-write - \
+        exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check - \
         1> "$out" 2> "$err"
       ;;
     deep)
       timeout 60m codex -a never \
         -c model_reasoning_effort="high" \
-        exec -C "$REPO_ROOT" -s workspace-write - \
+        exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check - \
         1> "$out" 2> "$err"
       ;;
     *)
@@ -461,12 +514,17 @@ canary_preflight() {
   claude --help >/dev/null 2>&1 || { echo "halt: 'claude --help' failed" >&2; return 1; }
   claude --help 2>&1 | grep -q -- '--output-format' \
     || { echo "halt: 'claude' CLI does not support --output-format; upgrade Claude Code" >&2; return 1; }
+  claude --help 2>&1 | grep -q -- '--dangerously-skip-permissions' \
+    || { echo "halt: 'claude' CLI does not support --dangerously-skip-permissions; upgrade Claude Code" >&2; return 1; }
   if [ "$codex_present" = yes ]; then
     if ! codex exec --help >/dev/null 2>&1; then
       echo "warn: 'codex exec --help' failed — Codex CLI may be incompatible; failover applies" >&2
       codex_present=no
     elif ! codex exec --help 2>&1 | grep -q -- '--json'; then
       echo "warn: 'codex exec --help' lacks --json; usage telemetry for codex unavailable; failover applies" >&2
+      codex_present=no
+    elif ! codex exec --help 2>&1 | grep -q -- '--skip-git-repo-check'; then
+      echo "warn: 'codex exec --help' lacks --skip-git-repo-check; upgrade Codex CLI" >&2
       codex_present=no
     fi
   fi
@@ -696,7 +754,7 @@ dispatch_reviewers_parallel() {
   # Claude reviewer in the background.
   (
     render_prompt "${phase}-reviewer-claude" \
-      | timeout 20m claude --model "$CLAUDE_MODEL" -p --output-format=json - \
+      | timeout 20m claude --model "$CLAUDE_MODEL" -p --output-format=json --dangerously-skip-permissions - \
         1> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.json" \
         2> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.err"
     echo "$?" > "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.rc"
@@ -708,7 +766,7 @@ dispatch_reviewers_parallel() {
   if [ "$codex_available" = "true" ]; then
     (
       render_prompt "${phase}-reviewer-codex" \
-        | timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --json - \
+        | timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json - \
           1> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.json" \
           2> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.err"
       echo "$?" > "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.rc"
@@ -777,8 +835,8 @@ Codex CLI must be able to load:
 ### Step 1.1 — Skill probe flow
 
 1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `1-preflight/` subfolder with `mkdir -p`.
-2. Dispatch a `claude` subprocess using the `preflight-claude` appendix. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Timeout: 2 min.
-3. If `codex_available` is still `true`, dispatch a `codex` subprocess using the `preflight-codex` appendix. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Timeout: 2 min. **Dispatch in parallel with step 2** using the pattern in the "Reviewer parallelization" cookbook entry (preflight has no shared state between vendors). Use the **cheap** Codex invocation form (`codex_invoke cheap`) — preflight runs in cheap micro-mode per the "Codex reviewer modes" table.
+2. Dispatch a `claude` subprocess using the `preflight-claude` appendix. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Transcript: `<feature-folder>/transcripts/preflight-iter00-claude.json` (stdout), `preflight-iter00-claude.err` (stderr), `preflight-iter00-claude.rc` (exit code). Timeout: 2 min.
+3. If `codex_available` is still `true`, dispatch a `codex` subprocess using the `preflight-codex` appendix. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Transcript: `<feature-folder>/transcripts/preflight-iter00-codex.json` (stdout), `preflight-iter00-codex.err` (stderr), `preflight-iter00-codex.rc` (exit code). Timeout: 2 min. **Dispatch in parallel with step 2** using the pattern in the "Reviewer parallelization" cookbook entry (preflight has no shared state between vendors). Use the **cheap** Codex invocation form (`codex_invoke cheap`) — preflight runs in cheap micro-mode per the "Codex reviewer modes" table.
 4. Read only the two STATUS files. Validate each with `validate_status` (see cookbook).
 5. If either reports `verdict=MISSING_SKILLS`, print to the user: which CLI is missing which skills, plus an install hint ("Install the Superpowers plugin (e.g. `claude plugin install superpowers`) and re-run this prompt against the same feature folder"). HALT.
 6. If the `codex` check fails, apply the "Distinguish orchestration bugs from vendor failures" filter from Failure handling first. If the captured stderr indicates a local CLI usage error (`unexpected argument`, `Usage:`, `unknown option`), this is an orchestration bug, not a Codex outage — correct the invocation per the cookbook's "CLI invocation forms" and retry once. Otherwise branch on the failure mode:
@@ -887,13 +945,15 @@ Per the design's "File policy for non-READY paths" section, the orchestrator's c
 For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/3-spec-review/iteration-NN`.
-2. Dispatch a `claude` Opus reviewer subprocess with the `spec-reviewer-claude` appendix. Inputs (substituted): `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `3-spec-review/iteration-NN/claude-opus-verdict.md` (STATUS) and `claude-opus-findings.md` (full findings). Timeout: 20 min.
-3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer subprocess with the `spec-reviewer-codex` appendix. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min. Use the **cheap** Codex invocation form (`codex_invoke cheap`) — Phase 1 spec review runs in cheap mode per the "Codex reviewer modes" table.
-4. Read only the verdict files.
-5. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–4:** `blockers + majors > 0`; **iterations 5–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
+2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=3, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 3.0) have completed.
+   - **Claude subprocess (always dispatched):** `spec-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `3-spec-review/iteration-NN/claude-opus-verdict.md` (STATUS) and `claude-opus-findings.md` (findings). Timeout: 20 min.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** `spec-reviewer-codex` appendix. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min. Codex invocation form: **cheap** (`codex_invoke cheap`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 3.0 — do not dispatch and do not log a new event here.
+   Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
+3. Read only the verdict files.
+4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–4:** `blockers + majors > 0`; **iterations 5–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
    - Dispatch a `claude` Opus spec-fixer subprocess with the `spec-fixer` appendix. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (newline-separated list of findings files from this iteration). The fixer edits the canonical spec in place. Timeout: 20 min.
    - Increment N. Loop from step 1.
-6. When the gate passes — `blockers=0, majors=0` (iterations 1–4) OR `blockers=0` with any open majors recorded as deferred (iterations 5–10):
+5. When the gate passes — `blockers=0, majors=0` (iterations 1–4) OR `blockers=0` with any open majors recorded as deferred (iterations 5–10):
    - Dispatch a `claude` Opus summarizer with the `summarizer-spec` appendix. Inputs: `$FEATURE_FOLDER`. Outputs: `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md`. Timeout: 10 min. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 4.
 
@@ -904,6 +964,8 @@ If iteration cap (10) trips with any active reviewer still reporting `blockers >
 Dispatch one `claude` Opus subprocess with the `plan-writer` appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`. The subagent loads `superpowers:writing-plans` and produces the plan at the skill's default location (`docs/superpowers/plans/<YYYY-MM-DD>-<slug>-plan.md`).
 
 Output: `<feature-folder>/4-plan-writing/plan-status.md` with `verdict=DONE` and `plan_path=<absolute-path>`. Timeout: 30 min.
+
+After the subprocess completes, **append one RUN_LOG dispatch entry** with `phase: 4`, `phase_name: plan-writing`, `iteration: 00`, `role: plan-writer`, `vendor: claude`, `appendix: plan-writer`, `status_path: 4-plan-writing/plan-status.md`, and `verdict:` read from the STATUS file. Use the standard `log_dispatch` helper.
 
 You read only `plan-status.md`. On `DONE`, proceed to Phase 5.
 
@@ -948,13 +1010,15 @@ The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this 
 For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/5-plan-review/iteration-NN`.
-2. Dispatch a `claude` Opus reviewer with the `plan-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Outputs: `5-plan-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 20 min.
-3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer with the `plan-reviewer-codex` appendix. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min. Use the **cheap** Codex invocation form (`codex_invoke cheap`) — Phase 3 plan review runs in cheap mode per the "Codex reviewer modes" table.
-4. Read only verdict files.
-5. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–4:** `blockers + majors > 0`; **iterations 5–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
+2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=5, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 5.0) have completed.
+   - **Claude subprocess (always dispatched):** `plan-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Outputs: `5-plan-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 20 min.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** `plan-reviewer-codex` appendix. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 20 min. Codex invocation form: **cheap** (`codex_invoke cheap`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
+   Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
+3. Read only verdict files.
+4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–4:** `blockers + majors > 0`; **iterations 5–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
    - Dispatch a `claude` Opus plan-fixer with the `plan-fixer` appendix. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS`. Timeout: 20 min.
    - Increment N. Loop.
-6. When the gate passes — `blockers=0, majors=0` (iterations 1–4) OR `blockers=0` with any open majors recorded as deferred (iterations 5–10):
+5. When the gate passes — `blockers=0, majors=0` (iterations 1–4) OR `blockers=0` with any open majors recorded as deferred (iterations 5–10):
    - Dispatch a `claude` Opus summarizer with the `summarizer-plan` appendix. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. Timeout: 10 min. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 6.
 
@@ -1117,13 +1181,15 @@ The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this 
 For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/7-code-review/iteration-NN`.
-2. Dispatch a `claude` Opus reviewer with the `code-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 60 min.
-3. If `codex_available = true`, dispatch a `codex` GPT-5.5 reviewer with the `code-reviewer-codex` appendix. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 60 min. Use the **deep** Codex invocation form (`codex_invoke deep`) — Phase 6 final implementation review runs in deep mode per the "Codex reviewer modes" table.
-4. Read only verdict files.
-5. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–4:** `blockers + majors > 0`; **iterations 5–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
+2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=7, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 7.0) have completed.
+   - **Claude subprocess (always dispatched):** `code-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 60 min.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** `code-reviewer-codex` appendix. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 60 min. Codex invocation form: **deep** (`codex_invoke deep`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
+   Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
+3. Read only verdict files.
+4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–4:** `blockers + majors > 0`; **iterations 5–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
    - Re-dispatch the implementer subagent (Phase 6 appendix) with `$FINDINGS_PATHS` so it patches the implementation. Timeout: 300 min.
    - Increment N. Loop.
-6. When the gate passes — `blockers=0, majors=0` (iterations 1–4) OR `blockers=0` with any open majors recorded as deferred (iterations 5–10):
+5. When the gate passes — `blockers=0, majors=0` (iterations 1–4) OR `blockers=0` with any open majors recorded as deferred (iterations 5–10):
    - Dispatch a `claude` Opus summarizer with the `summarizer-code-review` appendix. Outputs: `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`. Timeout: 10 min. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 8.
 
