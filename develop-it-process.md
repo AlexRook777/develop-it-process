@@ -64,7 +64,7 @@ For every step that produces or modifies an artifact:
 
 3. The subagent writes its artifact and a short `STATUS.md` to a pre-agreed path inside the feature folder. STATUS.md is written LAST and atomically (the subagent writes `STATUS.md.tmp` and renames).
 4. You read ONLY `STATUS.md` (and, for the final readiness writer, the per-phase summary files referenced by STATUS.md). You do not open the artifact, the findings file, or the transcripts. The only exception is surfacing a transcript path to the user when a failure halts the run.
-5. Branch on the verdict. For review gates this follows the **iteration-dependent gate** (see "Review-gate severity policy"): through iteration 4, any `blockers + majors > 0` re-dispatches the relevant fixer subagent with the reviewer findings paths as input; from iteration 5 onward, only `blockers > 0` re-dispatches (a `CHANGES_REQUESTED` carrying majors-only at iteration ≥ 5 passes the gate, with the majors recorded as deferred). If `BLOCKED`, halt and surface to the user.
+5. Branch on the verdict. For review gates this follows the **iteration-dependent gate** (see "Review-gate severity policy"): through iteration 2, any `blockers + majors > 0` re-dispatches the relevant fixer subagent with the reviewer findings paths as input; from iteration 3 onward, only `blockers > 0` re-dispatches (a `CHANGES_REQUESTED` carrying majors-only at iteration ≥ 3 passes the gate, with the majors recorded as deferred). If `BLOCKED`, halt and surface to the user.
 6. Append one multi-line block to `RUN_LOG.md` for every dispatch (see **Resumability** below for the full grammar — blocks are separated by blank lines and start with `--- <ISO-timestamp>  dispatch` or `--- <ISO-timestamp>  event=<NAME>`). Every dispatch block MUST include the nine usage-telemetry fields produced by `parse_usage` (see "Parsing usage from JSON output" in the cookbook). Call `parse_usage` immediately after the subprocess returns and before composing the RUN_LOG block. On parse failure the helper returns `usage_status=unavailable` with zeros; write those into the block unchanged — telemetry parsing failure NEVER blocks dispatch logging.
 
    ```
@@ -113,22 +113,22 @@ The correct execution rhythm is:
 Every reviewer subagent classifies each finding into exactly one severity:
 
 - **BLOCKER** — correctness or safety defect. Always blocks the gate, at every iteration.
-- **MAJOR** — missing requirement, internal contradiction, ambiguity that would cause an implementer to guess, or risk that surfaces late if not fixed now. Blocks the gate through iteration 4; from iteration 5 onward it is downgraded to a *deferred major* (recorded but non-blocking) — see the iteration-dependent gate below.
+- **MAJOR** — missing requirement, internal contradiction, ambiguity that would cause an implementer to guess, or risk that surfaces late if not fixed now. Blocks the gate through iteration 2; from iteration 3 onward it is downgraded to a *deferred major* (recorded but non-blocking) — see the iteration-dependent gate below.
 - **MINOR / NIT** — wording, formatting, micro-improvement, style preference, optional enhancement. Gate is permitted to pass with these recorded but unaddressed, at any iteration.
 
-**Iteration-dependent gate.** Review gates run a fix→re-review loop with a hard cap of 10 iterations and a pass threshold that relaxes after the 4th iteration:
+**Iteration-dependent gate.** Review gates run a fix→re-review loop with a hard cap of 10 iterations and a pass threshold that relaxes after the 2nd iteration:
 
-- **Iterations 1–4 (strict gate):** the gate passes only when zero BLOCKER and zero MAJOR findings remain across all active reviewers. If `blockers + majors > 0` from any active reviewer, re-dispatch the appropriate fixer subagent (spec-fixer / plan-fixer / implementer), then re-dispatch all active reviewers.
-- **Iterations 5–10 (relaxed gate):** the gate passes when zero BLOCKER findings remain across all active reviewers, regardless of MAJOR count. Any MAJOR findings still open are recorded as **deferred majors** in the gate's summary file and carried into the readiness report; they do NOT block progression. Only `blockers > 0` from an active reviewer triggers another fix→re-review round at this stage — majors alone never do.
+- **Iterations 1–2 (strict gate):** the gate passes only when zero BLOCKER and zero MAJOR findings remain across all active reviewers. If `blockers + majors > 0` from any active reviewer, re-dispatch the appropriate fixer subagent (spec-fixer / plan-fixer / implementer), then re-dispatch all active reviewers.
+- **Iterations 3–10 (relaxed gate):** the gate passes when zero BLOCKER findings remain across all active reviewers, regardless of MAJOR count. Any MAJOR findings still open are recorded as **deferred majors** in the gate's summary file and carried into the readiness report; they do NOT block progression. Only `blockers > 0` from an active reviewer triggers another fix→re-review round at this stage — majors alone never do.
 - **Cap (iteration 10):** if any active reviewer still reports `blockers > 0` after iteration 10, HALT and surface residual findings paths plus the artifact path. MAJOR-only residue at the cap is NOT a HALT — it passes as a deferred-majors gate.
 
 MINOR/NIT findings are recorded in the gate's summary file and never block progression, at any iteration.
 
-You read `STATUS.md` for each reviewer subprocess. STATUS.md must declare both an overall verdict (`PASS` or `CHANGES_REQUESTED`) and severity counts (`blockers=N, majors=N, minors=N`). The orchestrator's gate decision is driven by the **severity counts under the iteration-dependent rule above**, NOT by the reviewer's `PASS`/`CHANGES_REQUESTED` string: a reviewer correctly reports `CHANGES_REQUESTED` whenever majors remain, and from iteration 5 the orchestrator may still pass the gate over that verdict when `blockers=0`.
+You read `STATUS.md` for each reviewer subprocess. STATUS.md must declare both an overall verdict (`PASS` or `CHANGES_REQUESTED`) and severity counts (`blockers=N, majors=N, minors=N`). The orchestrator's gate decision is driven by the **severity counts under the iteration-dependent rule above**, NOT by the reviewer's `PASS`/`CHANGES_REQUESTED` string: a reviewer correctly reports `CHANGES_REQUESTED` whenever majors remain, and from iteration 3 the orchestrator may still pass the gate over that verdict when `blockers=0`.
 
 Reviewer appendices in this file instruct reviewers to use this severity ladder explicitly and to refuse to label an obvious correctness issue as MINOR. Reviewers always report majors honestly — their own `PASS` verdict still requires `blockers=0 AND majors=0`; the relaxation lives ONLY in the orchestrator's gate decision and the readiness verdict, never in a reviewer's self-assessment.
 
-A gate that passes at iteration 5–10 with one or more deferred majors forces the final readiness verdict to `READY_WITH_NOTES` (the deferred majors are listed in the readiness report), never a silent `READY`.
+A gate that passes in the relaxed tier (final passing iteration ≥ 3) forces the final readiness verdict to `READY_WITH_NOTES` — whether or not any deferred majors remain — never a silent `READY`. Deferred majors, when present, are listed in the readiness report; a clean relaxed pass (`majors=0`) still earns `READY_WITH_NOTES` on the strength of the extended convergence alone.
 
 ## Models
 
@@ -950,10 +950,10 @@ For each iteration N (start at 1, hard cap at 10):
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** `spec-reviewer-codex` appendix. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 40 min. Codex invocation form: **cheap** (`codex_invoke cheap`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 3.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only the verdict files.
-4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–4:** `blockers + majors > 0`; **iterations 5–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
+4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
    - Dispatch a `claude` Opus spec-fixer subprocess with the `spec-fixer` appendix. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (newline-separated list of findings files from this iteration). The fixer edits the canonical spec in place. Timeout: 40 min.
    - Increment N. Loop from step 1.
-5. When the gate passes — `blockers=0, majors=0` (iterations 1–4) OR `blockers=0` with any open majors recorded as deferred (iterations 5–10):
+5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` with any open majors recorded as deferred (iterations 3–10):
    - Dispatch a `claude` Opus summarizer with the `summarizer-spec` appendix. Inputs: `$FEATURE_FOLDER`. Outputs: `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md`. Timeout: 20 min. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 4.
 
@@ -1015,10 +1015,10 @@ For each iteration N (start at 1, hard cap at 10):
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** `plan-reviewer-codex` appendix. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 40 min. Codex invocation form: **cheap** (`codex_invoke cheap`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
-4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–4:** `blockers + majors > 0`; **iterations 5–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
+4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
    - Dispatch a `claude` Opus plan-fixer with the `plan-fixer` appendix. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS`. Timeout: 40 min.
    - Increment N. Loop.
-5. When the gate passes — `blockers=0, majors=0` (iterations 1–4) OR `blockers=0` with any open majors recorded as deferred (iterations 5–10):
+5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` with any open majors recorded as deferred (iterations 3–10):
    - Dispatch a `claude` Opus summarizer with the `summarizer-plan` appendix. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. Timeout: 20 min. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 6.
 
@@ -1186,10 +1186,10 @@ For each iteration N (start at 1, hard cap at 10):
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** `code-reviewer-codex` appendix. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 60 min. Codex invocation form: **deep** (`codex_invoke deep`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
-4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–4:** `blockers + majors > 0`; **iterations 5–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
+4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
    - Re-dispatch the implementer subagent (Phase 6 appendix) with `$FINDINGS_PATHS` so it patches the implementation. Timeout: 300 min.
    - Increment N. Loop.
-5. When the gate passes — `blockers=0, majors=0` (iterations 1–4) OR `blockers=0` with any open majors recorded as deferred (iterations 5–10):
+5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` with any open majors recorded as deferred (iterations 3–10):
    - Dispatch a `claude` Opus summarizer with the `summarizer-code-review` appendix. Outputs: `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`. Timeout: 20 min. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 8.
 
@@ -1335,7 +1335,7 @@ The "Codex subprocess" column below applies AT A PER-PHASE GATE (Phases 3, 5, 6,
 
 ### Iteration cap
 
-Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 10 fix→re-review iterations with a pass threshold that relaxes after iteration 4 (see "Review-gate severity policy"). Through iteration 4, any active reviewer reporting `blockers > 0` OR `majors > 0` triggers another round. From iteration 5 onward, ONLY `blockers > 0` triggers another round — majors are downgraded to deferred majors (recorded, non-blocking). After 10 iterations with any active reviewer still reporting `blockers > 0`, HALT and surface residual findings paths plus the artifact path. The user decides: override (accept and proceed) or take the work back. A gate that reaches iteration 5 or beyond (including the cap) with `blockers = 0` but deferred majors outstanding passes the gate and sets the readiness verdict to `READY_WITH_NOTES`.
+Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 10 fix→re-review iterations with a pass threshold that relaxes after iteration 2 (see "Review-gate severity policy"). Through iteration 2, any active reviewer reporting `blockers > 0` OR `majors > 0` triggers another round. From iteration 3 onward, ONLY `blockers > 0` triggers another round — majors are downgraded to deferred majors (recorded, non-blocking). After 10 iterations with any active reviewer still reporting `blockers > 0`, HALT and surface residual findings paths plus the artifact path. The user decides: override (accept and proceed) or take the work back. A gate that reaches iteration 3 or beyond (including the cap) with `blockers = 0` but deferred majors outstanding passes the gate and sets the readiness verdict to `READY_WITH_NOTES`.
 
 ### Resumability
 
@@ -1665,13 +1665,13 @@ This Develop-It SDLC step is complete only when ALL of the following hold:
 - Phase 1 preflight passed: `1-preflight/phase-1/claude-check-status.md` is `READY`, AND the readiness writer's classification for the Phase 1 codex slot is one of: (a) `READY` (codex STATUS present with `verdict: READY`), (b) `SKIPPED` consented via `event=CODEX_DISABLED_BY_USER_CONSENT` (codex STATUS absent), or (c) `FAILED` with a present codex STATUS file carrying `verdict: FAILED` / non-`READY` (Mode 4 malformed STATUS may legitimately remain at the relocated path). A Phase 1 codex classification of `INVALID_ORCHESTRATION` blocks completion — this includes both (i) STATUS absent with NO corresponding event, AND (ii) STATUS absent with `event=CODEX_UNAVAILABLE` but no `event=CODEX_DISABLED_BY_USER_CONSENT` (per spec, Phase 1 Mode 0 HALTs unconditionally and Modes 1–5 require user consent — reaching completion without one of those events is an orchestration violation). The Phase 1 path is stricter than per-phase gates: an unavailable codex at Phase 1 is passable ONLY with recorded user consent.
 - Per-phase preflight passed for every phase in {3, 5, 6, 7}: `<phase-dir>/preflight/claude-check-status.md` is `READY`, AND the readiness writer's classification for that phase's codex slot is `READY`, `SKIPPED` (matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for `(phase=<P>, iteration=00)`), or `FAILED` (matching `event=CODEX_UNAVAILABLE` for `(phase=<P>, iteration=00)`, OR a present codex STATUS file with `verdict: FAILED` / non-`READY` — Mode 4 malformed STATUS may legitimately remain). Only an `INVALID_ORCHESTRATION` classification blocks completion. `FAILED` codex per-phase verdicts surface in the readiness report's `partial_review` / `codex_unavailable_reason` notes but do not gate completion. For Phase 6 specifically, this is explicit: Phase 6 codex probe failure is non-blocking by design — see Step 6.−1. Unlike Phase 1, per-phase gates do not require user consent for codex degradation; the per-phase preflight model trades that prompt for fast automatic degradation since the user has already opted into the run.
 - Phase 2 context discovery passed (`2-context-discovery/status.md` = `READY`).
-- Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–4 or deferred majors recorded for a relaxed pass at iterations 5–10); `3-spec-review/spec-review-summary.md` exists.
+- Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (deferred majors recorded only if any remain)); `3-spec-review/spec-review-summary.md` exists.
 - Implementation plan was written by the `plan-writer` subagent (`4-plan-writing/plan-status.md` = `DONE`).
-- Plan review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–4 or deferred majors recorded for a relaxed pass at iterations 5–10); `5-plan-review/plan-review-summary.md` exists.
+- Plan review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (deferred majors recorded only if any remain)); `5-plan-review/plan-review-summary.md` exists.
 - Implementer subagent completed Phase 6 (`6-implementation/implementer-status.md` = `DONE`, `verification=PASS`); `6-implementation/implementation-summary.md` exists.
 - No-secret checks ran (delegated to implementer/debugger; recorded in implementation summary) when the feature touches credentials, config, notebooks, examples, generated artifacts, or deployment files.
 - Credential-dependent checks ran or were safely skipped per the plan.
-- Code review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–4 or deferred majors recorded for a relaxed pass at iterations 5–10); `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
+- Code review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (deferred majors recorded only if any remain)); `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
 - Phase 8 git result is `DONE` or `SKIPPED` with a clear reason; `8-git-finalization/git-status.md` exists.
 - Phase 9 readiness report exists (`<feature-folder>/final-readiness-report.md`) and `<feature-folder>/readiness-status.md` = `DONE`.
 - The final user-facing message lists all artifact paths, the test summary, git summary, skipped optional steps, `partial_review` flag if any, and readiness verdict.
@@ -2572,10 +2572,10 @@ You are a gate summarizer invoked as a fresh subprocess. You have no shared cont
 6. Write the summary file at `$FEATURE_FOLDER/3-spec-review/spec-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
-   - Deferred MAJOR list — MAJOR findings still open at the final (passing) iteration. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 5, `blockers=0`, `majors>0`); empty for a strict pass (final iteration ≤ 4 with `majors=0`). For each deferred major, record its source reviewer, location, and one-line summary so the readiness writer can surface it.
+   - Deferred MAJOR list — MAJOR findings still open at the final (passing) iteration. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass (final iteration ≤ 2 with `majors=0`). For each deferred major, record its source reviewer, location, and one-line summary so the readiness writer can surface it.
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), with one sentence of human-readable context per mode (e.g. "mode=5: Codex hit a rate-limit / quota signal in iteration 02").
-   - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict or relaxed (deferred majors).
+   - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
    - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
      - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).
      - Per-role detail: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
@@ -2632,10 +2632,10 @@ You are a gate summarizer invoked as a fresh subprocess by the develop-it orches
 6. Write the summary file at `$FEATURE_FOLDER/5-plan-review/plan-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
-   - Deferred MAJOR list — MAJOR findings still open at the final (passing) iteration. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 5, `blockers=0`, `majors>0`); empty for a strict pass. For each deferred major, record its source reviewer, location, and one-line summary.
+   - Deferred MAJOR list — MAJOR findings still open at the final (passing) iteration. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass. For each deferred major, record its source reviewer, location, and one-line summary.
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
-   - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict or relaxed (deferred majors).
+   - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
    - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
      - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).
      - Per-role detail: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
@@ -2734,11 +2734,11 @@ You are a gate summarizer for the code review, invoked as a fresh subprocess by 
 6. Write the summary file at `$FEATURE_FOLDER/7-code-review/code-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
-   - Deferred MAJOR list — MAJOR findings still open at the final (passing) iteration. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 5, `blockers=0`, `majors>0`); empty for a strict pass. For each deferred major, record its source reviewer, location, and one-line summary.
+   - Deferred MAJOR list — MAJOR findings still open at the final (passing) iteration. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass. For each deferred major, record its source reviewer, location, and one-line summary.
    - Residual MINOR/NIT list.
    - `implementation_base_sha` from RUN_LOG (so readers can re-derive the reviewed diff).
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
-   - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict or relaxed (deferred majors).
+   - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
    - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
      - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).
      - Per-role detail: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
@@ -2813,10 +2813,10 @@ You are the final readiness reporter. You have no shared context.
    - **Implementation result** — task count, commits, `implementation_base_sha`, verification, no-secret check, browser-QA result if applicable. If a post-debug re-verification occurred, note it.
    - **Git result** — commit SHAs or `SKIPPED` reason.
    - **Skipped optional steps** — list anything bypassed and why.
-   - **Deferred MAJOR items** — total count + per-gate breakdown of MAJOR findings still open when a gate passed under the relaxed rule (iterations 5–10, `blockers=0`). Read from each gate's summary file (the summarizer records deferred majors there). Present this section only when at least one gate passed with deferred majors; its presence forces the readiness verdict to `READY_WITH_NOTES`.
+   - **Deferred MAJOR items** — total count + per-gate breakdown of MAJOR findings still open when a gate passed under the relaxed rule (iterations 3–10, `blockers=0`, `majors>0`). Read from each gate's summary file (the summarizer records deferred majors there). Present this section only when at least one gate carried deferred majors. NOTE: this section's presence is NOT the trigger for `READY_WITH_NOTES` — a relaxed-tier pass forces `READY_WITH_NOTES` on its own (see the readiness-verdict rule), so a clean relaxed pass produces `READY_WITH_NOTES` with this section absent.
    - **Residual MINOR/NIT items** — total count + per-gate breakdown.
    - **Run history** — number of resumes, vendor failover events from RUN_LOG, baseline SHA capture.
-   - **Readiness verdict** — `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 4), verification=PASS, AND every preflight verdict is `READY` or `SKIPPED`; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (iterations 5–10, `blockers=0`) with deferred majors outstanding (listed in the "Deferred MAJOR items" section); `NOT_READY` otherwise — specifically including any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), or any claude preflight that is not `READY`.
+   - **Readiness verdict** — `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, AND every preflight verdict is `READY` or `SKIPPED`; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), or any claude preflight that is not `READY`.
    - **Usage rollup** — emit a final `## Usage rollup` section containing four parts in this order:
      1. **Grand total** (one row) — columns: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration`. Sum across every dispatch entry in `RUN_LOG.md`.
      2. **Per-phase table** — one row per phase that ran (use `phase_name` for the row label). Same columns as grand total, plus a leading `Phase` column. Include a final `TOTAL` row that matches the grand total.
