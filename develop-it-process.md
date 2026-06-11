@@ -10,7 +10,7 @@ If you find yourself reading an artifact, drafting review feedback, editing the 
 
 - An already-written draft spec at `docs/superpowers/specs/<YYYY-MM-DD>-<slug>-design.md` (or the user provides another path).
 - Both `claude` and `codex` CLIs available on PATH.
-- A git repository (most actions are tolerant of non-git; Phase 8 is skipped when not in a repo).
+- A git repository (most actions are tolerant of non-git; Phase 9 is skipped when not in a repo).
 
 ## Orchestration contract
 
@@ -64,8 +64,8 @@ For every step that produces or modifies an artifact:
 
 3. The subagent writes its artifact and a short `STATUS.md` to a pre-agreed path inside the feature folder. STATUS.md is written LAST and atomically (the subagent writes `STATUS.md.tmp` and renames).
 4. You read ONLY `STATUS.md` (and, for the final readiness writer, the per-phase summary files referenced by STATUS.md). You do not open the artifact, the findings file, or the transcripts. The only exception is surfacing a transcript path to the user when a failure halts the run.
-5. Branch on the verdict. For review gates this follows the **iteration-dependent gate** (see "Review-gate severity policy"): through iteration 2, any `blockers + majors > 0` re-dispatches the relevant fixer subagent with the reviewer findings paths as input; from iteration 3 onward, only `blockers > 0` re-dispatches (a `CHANGES_REQUESTED` carrying majors-only at iteration ≥ 3 passes the gate, with the majors recorded as deferred). If `BLOCKED`, halt and surface to the user.
-6. Append one multi-line block to `RUN_LOG.md` for every dispatch (see **Resumability** below for the full grammar — blocks are separated by blank lines and start with `--- <ISO-timestamp>  dispatch` or `--- <ISO-timestamp>  event=<NAME>`). Every dispatch block MUST include the nine usage-telemetry fields produced by `parse_usage` (see "Parsing usage from JSON output" in the cookbook). Call `parse_usage` immediately after the subprocess returns and before composing the RUN_LOG block. On parse failure the helper returns `usage_status=unavailable` with zeros; write those into the block unchanged — telemetry parsing failure NEVER blocks dispatch logging.
+5. Branch on the verdict. For review gates this follows the **iteration-dependent gate** (see "Review-gate severity policy"): through iteration 2, any `blockers + majors > 0` re-dispatches the relevant fixer subagent with the reviewer findings paths as input; from iteration 3 onward, only `blockers > 0` re-dispatches the fix→re-review loop (a `CHANGES_REQUESTED` carrying majors-only at iteration ≥ 3 triggers one **final fix pass** — the fixer runs once with that iteration's findings, reviewers are NOT re-dispatched — then the gate passes, with the majors recorded as deferred (fixed, not re-reviewed)). If `BLOCKED`, halt and surface to the user.
+6. Append one multi-line block to `RUN_LOG.md` for every dispatch **using the `log_dispatch` cookbook helper** (see **Resumability** below for the full grammar — blocks are separated by blank lines and start with `--- <ISO-timestamp>  dispatch` or `--- <ISO-timestamp>  event=<NAME>`; the grammar's block shapes are exhaustive — never hand-compose abbreviated entries). Every dispatch block MUST include the nine usage-telemetry fields produced by `parse_usage` (see "Parsing usage from JSON output" in the cookbook). Call `parse_usage` immediately after the subprocess returns and pass its output line to `log_dispatch`. On parse failure the helper returns `usage_status=unavailable` with zeros; write those into the block unchanged — telemetry parsing failure NEVER blocks dispatch logging.
 
    ```
    --- <ISO-timestamp>  dispatch
@@ -113,18 +113,18 @@ The correct execution rhythm is:
 Every reviewer subagent classifies each finding into exactly one severity:
 
 - **BLOCKER** — correctness or safety defect. Always blocks the gate, at every iteration.
-- **MAJOR** — missing requirement, internal contradiction, ambiguity that would cause an implementer to guess, or risk that surfaces late if not fixed now. Blocks the gate through iteration 2; from iteration 3 onward it is downgraded to a *deferred major* (recorded but non-blocking) — see the iteration-dependent gate below.
+- **MAJOR** — missing requirement, internal contradiction, ambiguity that would cause an implementer to guess, or risk that surfaces late if not fixed now. Blocks the gate through iteration 2; from iteration 3 onward it no longer triggers another review round — it is fixed once in the **final fix pass** (no re-review) and recorded as a *deferred major* (fixed, not re-reviewed) — see the iteration-dependent gate below.
 - **MINOR / NIT** — wording, formatting, micro-improvement, style preference, optional enhancement. Gate is permitted to pass with these recorded but unaddressed, at any iteration.
 
 **Iteration-dependent gate.** Review gates run a fix→re-review loop with a hard cap of 10 iterations and a pass threshold that relaxes after the 2nd iteration:
 
 - **Iterations 1–2 (strict gate):** the gate passes only when zero BLOCKER and zero MAJOR findings remain across all active reviewers. If `blockers + majors > 0` from any active reviewer, re-dispatch the appropriate fixer subagent (spec-fixer / plan-fixer / implementer), then re-dispatch all active reviewers.
-- **Iterations 3–10 (relaxed gate):** the gate passes when zero BLOCKER findings remain across all active reviewers, regardless of MAJOR count. Any MAJOR findings still open are recorded as **deferred majors** in the gate's summary file and carried into the readiness report; they do NOT block progression. Only `blockers > 0` from an active reviewer triggers another fix→re-review round at this stage — majors alone never do.
-- **Cap (iteration 10):** if any active reviewer still reports `blockers > 0` after iteration 10, HALT and surface residual findings paths plus the artifact path. MAJOR-only residue at the cap is NOT a HALT — it passes as a deferred-majors gate.
+- **Iterations 3–10 (relaxed gate):** the gate passes when zero BLOCKER findings remain across all active reviewers, regardless of MAJOR count. If any MAJOR findings are still open at the passing iteration, dispatch the appropriate fixer subagent (spec-fixer / plan-fixer / implementer) ONCE with that iteration's findings paths — the **final fix pass** — and then stop the review loop: reviewers are NOT re-dispatched to verify the fix. The majors are recorded as **deferred majors** (fixed in the final fix pass, not re-reviewed) in the gate's summary file and carried into the readiness report; they do NOT block progression. Only `blockers > 0` from an active reviewer triggers another fix→re-review round at this stage — majors alone never do. A final fix pass that returns `BLOCKED` halts per the standard BLOCKED rule.
+- **Cap (iteration 10):** if any active reviewer still reports `blockers > 0` after iteration 10, HALT and surface residual findings paths plus the artifact path. MAJOR-only residue at the cap is NOT a HALT — it gets the same final fix pass and then passes as a deferred-majors gate.
 
 MINOR/NIT findings are recorded in the gate's summary file and never block progression, at any iteration.
 
-You read `STATUS.md` for each reviewer subprocess. STATUS.md must declare both an overall verdict (`PASS` or `CHANGES_REQUESTED`) and severity counts (`blockers=N, majors=N, minors=N`). The orchestrator's gate decision is driven by the **severity counts under the iteration-dependent rule above**, NOT by the reviewer's `PASS`/`CHANGES_REQUESTED` string: a reviewer correctly reports `CHANGES_REQUESTED` whenever majors remain, and from iteration 3 the orchestrator may still pass the gate over that verdict when `blockers=0`.
+You read `STATUS.md` for each reviewer subprocess. STATUS.md must declare both an overall verdict (`PASS` or `CHANGES_REQUESTED`) and severity counts (`blockers=N, majors=N, minors=N`). The orchestrator's gate decision is driven by the **severity counts under the iteration-dependent rule above**, NOT by the reviewer's `PASS`/`CHANGES_REQUESTED` string: a reviewer correctly reports `CHANGES_REQUESTED` whenever majors remain, and from iteration 3 the orchestrator may still pass the gate over that verdict when `blockers=0` (after running the final fix pass when majors remain).
 
 Reviewer appendices in this file instruct reviewers to use this severity ladder explicitly and to refuse to label an obvious correctness issue as MINOR. Reviewers always report majors honestly — their own `PASS` verdict still requires `blockers=0 AND majors=0`; the relaxation lives ONLY in the orchestrator's gate decision and the readiness verdict, never in a reviewer's self-assessment.
 
@@ -157,8 +157,11 @@ All non-orchestrator roles run as fresh subprocesses with isolated context. You 
 | Debugger                           | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Loads `superpowers:systematic-debugging`. Dispatched on verification failure. |
 | Final reviewer (primary)           | `claude`           | Opus               | `claude-opus-4-8`     | n/a |                                                                        |
 | Final reviewer (cross-vendor)      | `codex`            | GPT-5.5            | `gpt-5.5`             | high | Deep mode. Soft-skipped on failure.                                    |
+| All-tests runner                   | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Runs `$REPO_ROOT/start-all-tests.sh` or discovered test suites; one dispatch per Phase 8 round (max 4). |
+| Test fixer                         | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Loads `superpowers:systematic-debugging`. Dispatched on a failed test round (max 3 fix rounds). |
 | Git finalizer                      | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Loads `superpowers:finishing-a-development-branch`.                    |
 | Summarizers (spec / plan / final)  | `claude`           | Opus               | `claude-opus-4-8`     | n/a | One per gate, reads iteration verdicts and findings.                   |
+| All-tests summarizer               | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Appends `## Usage` to `all-test-summary.md`; reports `final_test_verdict`. |
 | Implementation summarizer          | (folded)           | —                  | —                     | n/a | The Implementer subagent writes its own summary as part of Phase 4.    |
 | Final readiness writer             | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Reads all per-phase summaries; writes `<feature-folder>/final-readiness-report.md`. |
 
@@ -178,7 +181,8 @@ Mandatory mapping (encoded into the appendices — you do not override):
 - Implementation (Phase 6): subagent loads `superpowers:subagent-driven-development` and runs its full per-task loop internally. Implementation sub-subagents additionally load `context7` and use it BEFORE writing or modifying code that touches any external library, framework, SDK, API, or CLI tool (Google ADK, httpx, click, etc.). Always `resolve-library-id` first, then `get-library-docs`.
 - Debugging on verification failure: debugger subagent loads `superpowers:systematic-debugging` and additionally `context7` whenever the failure signature points at an external library or framework — verify against authoritative current docs rather than relying on training-data recollections.
 - Web/browser deliverables: implementer additionally loads `dogfood` (or equivalent) if the plan requires browser QA.
-- Git finalization (Phase 8): subagent loads `superpowers:finishing-a-development-branch`.
+- All tests (Phase 8): the `all-tests-runner` appendix is the entire instruction set (no skill). The `test-fixer` loads `superpowers:systematic-debugging` and additionally `context7` whenever the failure signature points at an external library or framework.
+- Git finalization (Phase 9): subagent loads `superpowers:finishing-a-development-branch`.
 
 You never load any of these skills yourself. You only dispatch subagents whose appendices instruct them to load the relevant skill.
 
@@ -278,7 +282,16 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
       …
     code-review-summary.md
     summarizer-status.md
-  8-git-finalization/
+  8-all-tests/
+    round-01/
+      test-report.md
+      test-runner-status.md
+      test-fixer-status.md               # present only when a fix round ran
+    round-02/
+      …
+    all-test-summary.md
+    summarizer-status.md
+  9-git-finalization/
     git-status.md
   final-readiness-report.md
   readiness-status.md
@@ -287,7 +300,7 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     <phase>-<iteration>-<role>.err
 ```
 
-Phase 9 (`readiness-report`) intentionally has no `9-readiness-report/` folder: its two outputs (`final-readiness-report.md`, `readiness-status.md`) are cross-cutting feature-folder artifacts consumed by the user at the top level, not phase-internal scratch. The same rationale applies to `RUN_LOG.md`, `full_log.md`, `transcripts/`, and the optional `process-improvement-proposition.md`, which also live at the feature-folder root without a numeric prefix.
+Phase 10 (`readiness-report`) intentionally has no `10-readiness-report/` folder: its two outputs (`final-readiness-report.md`, `readiness-status.md`) are cross-cutting feature-folder artifacts consumed by the user at the top level, not phase-internal scratch. The same rationale applies to `RUN_LOG.md`, `full_log.md`, `transcripts/`, and the optional `process-improvement-proposition.md`, which also live at the feature-folder root without a numeric prefix.
 
 ### Files that stay outside the feature folder
 
@@ -556,10 +569,18 @@ parse_usage() {
 
   if [ "$vendor" = "claude" ]; then
     # Single JSON object on stdout.
+    # .modelUsage can contain MORE than one model: Claude Code internally uses a small
+    # Haiku helper alongside the dispatched main model. NEVER take the alphabetically
+    # first key (haiku sorts before opus and misattributes the dispatch) — prefer the
+    # key matching the dispatched model id; fall back to the highest-output model.
     local parsed
-    parsed=$(jq -r '
-      [
-        (.modelUsage | keys | .[0] // "unknown"),
+    parsed=$(jq -r --arg fb "$fallback_model" '
+      (.modelUsage // {}) as $mu
+      | (if ($mu | has($fb)) then $fb
+         elif ($mu | length) > 0 then ($mu | to_entries | max_by(.value.outputTokens // 0) | .key)
+         else "unknown" end) as $model
+      | [
+        $model,
         (.duration_ms // 0),
         (.usage.input_tokens // 0),
         (.usage.cache_read_input_tokens // 0),
@@ -620,9 +641,83 @@ local wall_ms=$((t1 - t0))
 
 Pass `$wall_ms` to `parse_usage` as the third argument. For Claude, the function prefers the CLI-reported `duration_ms` (more accurate; excludes shell overhead); for Codex it returns `$wall_ms`.
 
-**Resolved-model fallback for Codex.** Codex JSON does not carry the model id. Pass the resolved-model id from `2-context-discovery/status.md`'s `resolved_models:` map as the fourth argument to `parse_usage`. For pre-Phase-0 dispatches (canary, preflight) where `resolved_models:` is not yet known, pass `"codex"` literally.
+**Resolved-model argument (4th) — pass it for BOTH vendors.** Always pass the dispatched resolved model id from `2-context-discovery/status.md`'s `resolved_models:` map as the fourth argument to `parse_usage`. For Codex: its JSON does not carry the model id, so the argument is used verbatim (for pre-Phase-0 dispatches — canary, preflight — where `resolved_models:` is not yet known, pass `"codex"` literally). For Claude: a session's `modelUsage` map can contain more than one model — Claude Code internally runs a small Haiku helper for auxiliary work alongside the dispatched main model — and the function reports the key matching the dispatched id, falling back to the highest-output model only when no key matches. (The previous behavior — alphabetically first key — misattributed Opus dispatches to Haiku, since `h` sorts before `o`.) If the printed `model` differs from the dispatched id, the subprocess genuinely ran on a different model than requested: surface a one-line warning to the user (not a HALT) and record it as a deviation per Process self-observation trigger #6.
 
 **Failure handling.** The function ALWAYS exits 0 and ALWAYS prints a complete nine-field record. On any parse error or missing file, it prints `usage_status=unavailable` with zeros. The orchestrator never branches on `parse_usage` exit code — it always uses the output.
+
+### Writing RUN_LOG dispatch entries — `log_dispatch`
+
+This is **the standard helper** every phase step refers to. One call per subprocess invocation, immediately after `parse_usage`. It is the ONLY sanctioned way to record phase progress in `RUN_LOG.md` — do NOT hand-compose abbreviated entries (see the exhaustive-shapes rule in Resumability). It emits the full dispatch block from the Resumability grammar: identity fields, process-file content identity, and the nine telemetry fields.
+
+```bash
+# log_dispatch <phase> <phase_name> <iteration> <role> <vendor> <appendix> <status_path> <verdict> "<usage_line>"
+#   <usage_line> is the single-line nine-pair output of parse_usage, quoted as ONE argument.
+# Requires: $PROCESS_PATH, $FEATURE_FOLDER. Appends exactly one block + trailing blank line.
+log_dispatch() {
+  local phase="$1" phase_name="$2" iteration="$3" role="$4" vendor="$5"
+  local appendix="$6" status_path="$7" verdict="$8" usage_line="$9"
+
+  local git_sha file_sha dirty
+  git_sha="$(git rev-parse HEAD 2>/dev/null || echo non-git)"
+  file_sha="$(sha256sum "$PROCESS_PATH" | cut -d' ' -f1)"
+  if [ "$git_sha" = "non-git" ] || git diff --quiet HEAD -- "$PROCESS_PATH" 2>/dev/null; then
+    dirty=no
+  else
+    dirty=yes
+  fi
+
+  # Defaults guard a missing/short usage line — telemetry failure NEVER blocks logging.
+  local model=unknown dur=0 in_new=0 in_cached=0 cache_w=0 out=0 reasoning=0 cost=n/a status=unavailable kv
+  for kv in $usage_line; do
+    case "$kv" in
+      model=*)               model="${kv#*=}" ;;
+      duration_ms=*)         dur="${kv#*=}" ;;
+      tokens_input_new=*)    in_new="${kv#*=}" ;;
+      tokens_input_cached=*) in_cached="${kv#*=}" ;;
+      tokens_cache_write=*)  cache_w="${kv#*=}" ;;
+      tokens_output=*)       out="${kv#*=}" ;;
+      tokens_reasoning=*)    reasoning="${kv#*=}" ;;
+      cost_usd=*)            cost="${kv#*=}" ;;
+      usage_status=*)        status="${kv#*=}" ;;
+    esac
+  done
+
+  {
+    printf -- '--- %s  dispatch\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%-26s%s\n' \
+      'phase:'                  "$phase" \
+      'phase_name:'             "$phase_name" \
+      'iteration:'              "$iteration" \
+      'role:'                   "$role" \
+      'vendor:'                 "$vendor" \
+      'appendix:'               "$appendix" \
+      'develop_it_git_sha:'     "$git_sha" \
+      'develop_it_file_sha256:' "$file_sha" \
+      'develop_it_dirty:'       "$dirty" \
+      'status_path:'            "$status_path" \
+      'verdict:'                "$verdict" \
+      'model:'                  "$model" \
+      'duration_ms:'            "$dur" \
+      'tokens_input_new:'       "$in_new" \
+      'tokens_input_cached:'    "$in_cached" \
+      'tokens_cache_write:'     "$cache_w" \
+      'tokens_output:'          "$out" \
+      'tokens_reasoning:'       "$reasoning" \
+      'cost_usd:'               "$cost" \
+      'usage_status:'           "$status"
+    printf '\n'
+  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+}
+```
+
+Usage at a dispatch site:
+
+```bash
+usage_line="$(parse_usage claude "$out_json" "$wall_ms" claude-opus-4-8)"
+log_dispatch 3 spec-review 01 spec-reviewer-claude claude spec-reviewer-claude \
+  "3-spec-review/iteration-01/claude-opus-verdict.md" "$(grep -m1 '^verdict:' "$STATUS" | awk '{print $2}')" \
+  "$usage_line"
+```
 
 ### Dirty-tree gate (early — runs at the very top of Phase 1, before any folder creation)
 
@@ -664,7 +759,7 @@ Run this twice:
 
 ### Gitignore guard for the artifacts folder
 
-The feature folder accumulates orchestration state (`RUN_LOG.md`, STATUS files, transcripts). If these files are tracked, they pollute the Phase 6 dirty check and the Phase 8 staging scope. The orchestrator does NOT auto-edit `.gitignore`, but at Phase 1 it MUST verify one of the following is true:
+The feature folder accumulates orchestration state (`RUN_LOG.md`, STATUS files, transcripts). If these files are tracked, they pollute the Phase 6 dirty check and the Phase 9 staging scope. The orchestrator does NOT auto-edit `.gitignore`, but at Phase 1 it MUST verify one of the following is true:
 
 - `docs/superpowers/specs/*-artifacts/` (or the equivalent pattern matching `$FEATURE_FOLDER`) is ignored by `.gitignore`, **or**
 - The orchestrator explicitly excludes `$FEATURE_FOLDER` from the Phase 6 dirty check (already true via `dirty_tree_check`'s allow-list).
@@ -950,14 +1045,15 @@ For each iteration N (start at 1, hard cap at 10):
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** `spec-reviewer-codex` appendix. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 40 min. Codex invocation form: **cheap** (`codex_invoke cheap`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 3.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only the verdict files.
-4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
+4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
    - Dispatch a `claude` Opus spec-fixer subprocess with the `spec-fixer` appendix. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (newline-separated list of findings files from this iteration). The fixer edits the canonical spec in place. Timeout: 40 min.
    - Increment N. Loop from step 1.
-5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` with any open majors recorded as deferred (iterations 3–10):
+5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
+   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** dispatch a `claude` Opus spec-fixer subprocess with the `spec-fixer` appendix. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (findings files from the passing iteration). Timeout: 40 min. Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). If the fixer returns `BLOCKED`, HALT and surface to the user.
    - Dispatch a `claude` Opus summarizer with the `summarizer-spec` appendix. Inputs: `$FEATURE_FOLDER`. Outputs: `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md`. Timeout: 20 min. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 4.
 
-If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT and surface to user with residual findings paths and the spec path. A cap reached with `blockers=0` but deferred majors outstanding is NOT a HALT — it passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
+If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT and surface to user with residual findings paths and the spec path. A cap reached with `blockers=0` but majors outstanding is NOT a HALT — it gets the final fix pass and then passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
 
 ## Phase 4 — Plan writing (delegated)
 
@@ -1015,14 +1111,15 @@ For each iteration N (start at 1, hard cap at 10):
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** `plan-reviewer-codex` appendix. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 40 min. Codex invocation form: **cheap** (`codex_invoke cheap`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
-4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
+4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
    - Dispatch a `claude` Opus plan-fixer with the `plan-fixer` appendix. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS`. Timeout: 40 min.
    - Increment N. Loop.
-5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` with any open majors recorded as deferred (iterations 3–10):
+5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
+   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** dispatch a `claude` Opus plan-fixer with the `plan-fixer` appendix. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS` (findings files from the passing iteration). Timeout: 40 min. Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). If the fixer returns `BLOCKED`, HALT and surface to the user.
    - Dispatch a `claude` Opus summarizer with the `summarizer-plan` appendix. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. Timeout: 20 min. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 6.
 
-If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT and surface to user. A cap reached with `blockers=0` but deferred majors outstanding is NOT a HALT — it passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
+If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT and surface to user. A cap reached with `blockers=0` but majors outstanding is NOT a HALT — it gets the final fix pass and then passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
 
 ## Phase 6 — Implementation (delegated, single supervising subagent)
 
@@ -1103,13 +1200,13 @@ printf '%s  event=IMPLEMENTATION_BASELINE  base_sha=%s  uncommitted_changes=no\n
   >> "$FEATURE_FOLDER/RUN_LOG.md"
 ```
 
-If `UNCOMMITTED=yes` (i.e. offenders exist outside the allowed paths), HALT and surface to user with the offender list. Pre-existing uncommitted changes outside the implementation slice would pollute the Phase 6 diff scope and the Phase 8 staging scope (the finalizer cannot reliably distinguish "implementer-produced uncommitted changes" from "user's pre-existing uncommitted changes" without external knowledge). The user must resolve before proceeding by committing or stashing. The orchestrator does NOT auto-stash and does NOT accept "proceed anyway" — re-run this prompt after the working tree is clean of out-of-scope changes.
+If `UNCOMMITTED=yes` (i.e. offenders exist outside the allowed paths), HALT and surface to user with the offender list. Pre-existing uncommitted changes outside the implementation slice would pollute the Phase 6 diff scope and the Phase 9 staging scope (the finalizer cannot reliably distinguish "implementer-produced uncommitted changes" from "user's pre-existing uncommitted changes" without external knowledge). The user must resolve before proceeding by committing or stashing. The orchestrator does NOT auto-stash and does NOT accept "proceed anyway" — re-run this prompt after the working tree is clean of out-of-scope changes.
 
 Files INSIDE `$FEATURE_FOLDER` (RUN_LOG, STATUS files, transcripts) are expected to be untracked. They are excluded from the dirty check. If `.gitignore` does not yet ignore the `*-artifacts/` pattern, the user was warned in Phase 1; the runtime exclusion above keeps the run unblocked regardless.
 
 The dirty halt writes `event=IMPLEMENTATION_BASELINE_BLOCKED` (advisory, never consumed by downstream subagents) so the audit trail records the attempt. Only `event=IMPLEMENTATION_BASELINE` is the consumable event. Downstream consumers must read the LATEST `event=IMPLEMENTATION_BASELINE` entry in `RUN_LOG.md` (in case a prior failed/aborted run left one or the user resumes).
 
-If `IMPLEMENTATION_BASE_SHA=non-git`, Phase 8 will be SKIPPED and the code reviewers inspect the working tree directly. Pass `non-git` as the input value to downstream subagents that expect this variable. The baseline event is still written with `base_sha=non-git, uncommitted_changes=no` so consumers have a single source.
+If `IMPLEMENTATION_BASE_SHA=non-git`, Phase 9 will be SKIPPED and the code reviewers inspect the working tree directly. Pass `non-git` as the input value to downstream subagents that expect this variable. The baseline event is still written with `base_sha=non-git, uncommitted_changes=no` so consumers have a single source.
 
 ### Step 6.1 — Dispatch implementer
 
@@ -1186,30 +1283,57 @@ For each iteration N (start at 1, hard cap at 10):
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** `code-reviewer-codex` appendix. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 60 min. Codex invocation form: **deep** (`codex_invoke deep`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
-4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone are recorded as deferred majors and do NOT trigger another round):
+4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
    - Re-dispatch the implementer subagent (Phase 6 appendix) with `$FINDINGS_PATHS` so it patches the implementation. Timeout: 300 min.
    - Increment N. Loop.
-5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` with any open majors recorded as deferred (iterations 3–10):
+5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
+   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** re-dispatch the implementer subagent (Phase 6 appendix) with `$FINDINGS_PATHS` (findings files from the passing iteration) so it patches the implementation. Timeout: 300 min. Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). The implementer's own verification must still PASS; if it reports `BLOCKED` or verification fails, HALT and surface to the user.
    - Dispatch a `claude` Opus summarizer with the `summarizer-code-review` appendix. Outputs: `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`. Timeout: 20 min. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 8.
 
-If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT. A cap reached with `blockers=0` but deferred majors outstanding is NOT a HALT — it passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
+If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT. A cap reached with `blockers=0` but majors outstanding is NOT a HALT — it gets the final fix pass and then passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
 
-## Phase 8 — Git finalization (delegated)
+## Phase 8 — All tests (delegated, test→fix loop)
 
-Skip this phase entirely if the working directory is not a git repository (detected via `git status` exit code != 0). In that case, write `<feature-folder>/8-git-finalization/git-status.md` with `verdict=SKIPPED` and `reason=not-a-git-repo` by dispatching a one-shot `claude` Sonnet subprocess with the `finishing-branch` appendix — the appendix detects the no-git case and writes SKIPPED itself.
+Runs after the Phase 7 code-review gate passes. Non-gated phase: no per-phase preflight, claude-only (Codex is never dispatched here). Runs in non-git working directories too — tests do not require a repository.
+
+### Step 8.1 — Test rounds
+
+For each round N (start at 1, hard cap at 4 — the initial run plus at most 3 fix→re-run rounds):
+
+1. `mkdir -p <feature-folder>/8-all-tests/round-NN`.
+2. Dispatch one `claude` Sonnet subprocess with the `all-tests-runner` appendix. Inputs: `$FEATURE_FOLDER`, `$REPO_ROOT`, `$ROUND=NN`. Timeout: 60 min. The runner:
+   - If `$REPO_ROOT/start-all-tests.sh` exists, runs it (the canonical full-suite entry point).
+   - Otherwise discovers every test suite present in the repo (pytest/uv suites, `package.json` test scripts, etc.) and runs each.
+   - If neither the script nor any test suite exists, reports `verdict=SKIPPED, reason=no-tests-found`.
+   - Writes the detailed per-round report `8-all-tests/round-NN/test-report.md`, rewrites the cumulative `8-all-tests/all-test-summary.md`, then writes STATUS `8-all-tests/round-NN/test-runner-status.md` LAST.
+3. Read only `test-runner-status.md`. Append the RUN_LOG dispatch entry (`phase: 8`, `phase_name: all-tests`, `iteration: NN`, `role: all-tests-runner`).
+4. Branch on the verdict:
+   - **`PASS` or `SKIPPED`** → proceed to Step 8.2.
+   - **`FAIL` with fix rounds used < 3:** dispatch one `claude` Sonnet subprocess with the `test-fixer` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$ROUND=NN`, `$TEST_REPORT_PATH` (= `8-all-tests/round-NN/test-report.md`), `$IMPLEMENTATION_BASE_SHA`. Timeout: 60 min. STATUS: `8-all-tests/round-NN/test-fixer-status.md`. On `verdict=DONE`, increment N and loop from step 1. On `verdict=BLOCKED`, stop the fix loop early — do NOT HALT; proceed to Step 8.2 with the round's failures as residual.
+   - **`FAIL` with fix rounds exhausted (3 used):** do NOT HALT. Proceed to Step 8.2 — the final test verdict is `FAILED`, and `all-test-summary.md` MUST carry the detailed residual-failure record (failing test names, error excerpts, suspected causes, and what each fix round attempted).
+
+### Step 8.2 — Summarizer
+
+Dispatch a `claude` Opus summarizer with the `summarizer-all-tests` appendix. Inputs: `$FEATURE_FOLDER`. The summarizer APPENDS the `## Usage` section to `8-all-tests/all-test-summary.md` (the runner already wrote the content) and writes `8-all-tests/summarizer-status.md` carrying `final_test_verdict: PASS | FAILED | SKIPPED`. Timeout: 20 min.
+
+You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 9 — regardless of `final_test_verdict`. A `FAILED` final test verdict never halts the run; it is recorded in detail in `all-test-summary.md` and forces the final readiness verdict to `NOT_READY` (see the readiness-writer appendix).
+
+## Phase 9 — Git finalization (delegated)
+
+Skip this phase entirely if the working directory is not a git repository (detected via `git status` exit code != 0). In that case, write `<feature-folder>/9-git-finalization/git-status.md` with `verdict=SKIPPED` and `reason=not-a-git-repo` by dispatching a one-shot `claude` Sonnet subprocess with the `finishing-branch` appendix — the appendix detects the no-git case and writes SKIPPED itself.
 
 Otherwise:
 
 Dispatch one `claude` Sonnet subprocess with the `finishing-branch` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. The subagent loads `superpowers:finishing-a-development-branch`, reviews the diff against the captured baseline, stages only intended files (no `.env`, secrets, or large binaries; nothing outside the implementation slice), and commits per the plan's git rules and the project's `CLAUDE.md` git policy.
 
-Output: `<feature-folder>/8-git-finalization/git-status.md` with `verdict ∈ {DONE, SKIPPED, FAILED}`, `implementation_base_sha`, plus commit SHAs (if any). Timeout: 30 min.
+Output: `<feature-folder>/9-git-finalization/git-status.md` with `verdict ∈ {DONE, SKIPPED, FAILED}`, `implementation_base_sha`, plus commit SHAs (if any). Timeout: 30 min.
 
 You read only `git-status.md`.
 
-## Phase 9 — Final readiness report (delegated)
+## Phase 10 — Final readiness report (delegated)
 
-Dispatch one `claude` Opus subprocess with the `readiness-writer` appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`, `$PLAN_PATH`. The subagent reads every per-phase summary file inside the feature folder (preflight statuses, phase-0 status, spec-review summary, plan-review summary, implementation summary, code-review summary, git status) and writes:
+Dispatch one `claude` Opus subprocess with the `readiness-writer` appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`, `$PLAN_PATH`. The subagent reads every per-phase summary file inside the feature folder (preflight statuses, phase-0 status, spec-review summary, plan-review summary, implementation summary, code-review summary, all-test summary, git status) and writes:
 
 - `<feature-folder>/final-readiness-report.md` — the human-facing report covering: artifacts, reviewer verdicts (including `partial_review` flag if Codex was unavailable), implementation result, verification result, git result, skipped optional steps, residual MINOR/NIT items, and overall readiness verdict.
 - `<feature-folder>/readiness-status.md` — STATUS with `verdict=DONE` and `report_path=<absolute>`.
@@ -1224,8 +1348,9 @@ Print to the user a concise message containing the following paths:
 - `<feature-folder>/5-plan-review/plan-review-summary.md`
 - `<feature-folder>/6-implementation/implementation-summary.md`
 - `<feature-folder>/7-code-review/code-review-summary.md`
+- `<feature-folder>/8-all-tests/all-test-summary.md`
 - Canonical spec path and plan path
-- Test summary, git summary, skipped optional steps, `partial_review` flag if any, overall readiness verdict.
+- Test summary (final test verdict + residual failures if any), git summary, skipped optional steps, `partial_review` flag if any, overall readiness verdict.
 
 That message is the user-facing end of a successful run.
 
@@ -1335,11 +1460,13 @@ The "Codex subprocess" column below applies AT A PER-PHASE GATE (Phases 3, 5, 6,
 
 ### Iteration cap
 
-Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 10 fix→re-review iterations with a pass threshold that relaxes after iteration 2 (see "Review-gate severity policy"). Through iteration 2, any active reviewer reporting `blockers > 0` OR `majors > 0` triggers another round. From iteration 3 onward, ONLY `blockers > 0` triggers another round — majors are downgraded to deferred majors (recorded, non-blocking). After 10 iterations with any active reviewer still reporting `blockers > 0`, HALT and surface residual findings paths plus the artifact path. The user decides: override (accept and proceed) or take the work back. A gate that reaches iteration 3 or beyond (including the cap) with `blockers = 0` but deferred majors outstanding passes the gate and sets the readiness verdict to `READY_WITH_NOTES`.
+Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 10 fix→re-review iterations with a pass threshold that relaxes after iteration 2 (see "Review-gate severity policy"). Through iteration 2, any active reviewer reporting `blockers > 0` OR `majors > 0` triggers another round. From iteration 3 onward, ONLY `blockers > 0` triggers another round — majors no longer trigger re-review; they are fixed once in the final fix pass and downgraded to deferred majors (fixed, not re-reviewed). After 10 iterations with any active reviewer still reporting `blockers > 0`, HALT and surface residual findings paths plus the artifact path. The user decides: override (accept and proceed) or take the work back. A gate that reaches iteration 3 or beyond (including the cap) with `blockers = 0` but majors outstanding runs the final fix pass, passes the gate, and sets the readiness verdict to `READY_WITH_NOTES`.
 
 ### Resumability
 
 `RUN_LOG.md` is append-only and is the source of truth for where the run stopped. **Each entry is a multi-line YAML-ish block separated from the next by a blank line.** Entries are read top-to-bottom; key order within an entry is fixed (as shown below) so humans can scan it. The first line of every entry is `--- <ISO-timestamp>  <event-or-dispatch-tag>` so blocks are visually distinct. There are four block shapes, distinguishable by their tag:
+
+**The block shapes below are EXHAUSTIVE — do not invent entry kinds.** Phase progress is recorded ONLY as one full `dispatch` entry per subprocess invocation, written via the `log_dispatch` cookbook helper — there are no phase-completion marker events and no free-form progress notes. A RUN_LOG made of blocks like `--- <ts>  event=PHASE3_SPEC_SUMMARY` / `verdict: DONE` (no `role`, no `vendor`, no `appendix`, no process-file identity, no telemetry) is the canonical degenerate failure mode this grammar exists to prevent: it destroys resumability, the per-phase Usage tables, the completion-criteria count checks, and the readiness rollup. The ONLY legal `event=` tags are: `CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `HALT`, `IMPLEMENTATION_BASELINE`, `IMPLEMENTATION_BASELINE_BLOCKED`, `CODEX_DISABLED_BY_USER_CONSENT`, `CODEX_SKIPPED_BY_USER_CONSENT`, `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE` (plus the reserved `CODEX_RE_ENABLED_BY_USER`). An event entry NEVER substitutes for the dispatch entry of a subprocess that actually ran.
 
 **Dispatch entries** (one per subprocess invocation):
 
@@ -1374,7 +1501,7 @@ usage_status:             ok
 - All token counts are integers; `0` when not applicable to the vendor (`tokens_reasoning` is `0` for Claude; `tokens_cache_write` is `0` for Codex).
 - `cost_usd` is numeric for Claude; the literal string `n/a` for Codex (subscription-priced, no per-call cost).
 - `usage_status` is `ok` or `unavailable`. When `unavailable`, all token fields are `0` and `cost_usd` is `n/a` — but the dispatch entry itself is still written normally. Telemetry parsing failure NEVER blocks logging.
-- `model` is the resolved concrete model id (e.g. `claude-opus-4-8`). For Codex, use the value from `2-context-discovery/status.md`'s `resolved_models:` map; for pre-Phase-0 dispatches (canary, preflight), use the literal string `codex`.
+- `model` is the resolved concrete model id (e.g. `claude-opus-4-8`) of the dispatch's MAIN model. Claude sessions may additionally consume tokens on Claude Code's internal small-model helper (haiku); that auxiliary usage is included in `cost_usd` (which is the whole-subprocess `total_cost_usd`) but never changes `model` — `parse_usage` selects the `modelUsage` key matching the dispatched id. For Codex, use the value from `2-context-discovery/status.md`'s `resolved_models:` map; for pre-Phase-0 dispatches (canary, preflight), use the literal string `codex`.
 - `duration_ms` is the CLI-reported wall time for Claude (`duration_ms` field in the JSON), and the orchestrator-measured wall time for Codex (Codex JSON omits a duration field).
 
 Existing entries written by prior versions of this process file MAY lack the nine fields. Readers (summarizers, readiness writer) MUST tolerate missing fields by treating them as `usage_status=unavailable` with zero values.
@@ -1390,8 +1517,9 @@ Existing entries written by prior versions of this process file MAY lack the nin
 | 5 | `plan-review` |
 | 6 | `implementation` |
 | 7 | `code-review` |
-| 8 | `git-finalization` |
-| 9 | `readiness-report` |
+| 8 | `all-tests` |
+| 9 | `git-finalization` |
+| 10 | `readiness-report` |
 
 `phase_name` applies to every dispatch entry and to every event entry that carries `phase:` (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE`). Events that do not carry `phase:` (`IMPLEMENTATION_BASELINE`, `IMPLEMENTATION_BASELINE_BLOCKED`) do not need `phase_name`. Existing entries in already-written RUN_LOGs are not back-filled — readers MUST tolerate entries that lack `phase_name`.
 
@@ -1487,7 +1615,7 @@ On re-run of this prompt against the same feature folder:
 5. Branch by the phase being resumed into:
    - **Resuming before Phase 2** (no phases have started yet — RUN_LOG contains no dispatch entries past Phase 1, or RUN_LOG is empty / has only Phase 1 entries with no `READY` verdict): run Phase 1 in full as if a fresh invocation. Phase 1 itself is not "gated" by per-phase preflight — the Phase 1 logic *is* the preflight. The Step 1.2 relocation runs again on success.
    - **Resuming into Phase N where N ∈ {3, 5, 6, 7}** (a gated phase): the orchestrator runs (or re-runs) Phase N's per-phase preflight before the **next dispatch in the session** (defined as the next dispatch after the process resume, even if Phase N's first work dispatch already executed in a prior session), regardless of whether Phase N's preflight ran in the pre-resume session, and regardless of whether the resume happens before Phase N's first dispatch, between iterations, during a fixer dispatch, or immediately after one. Re-run STATUS files OVERWRITE the prior session's `<phase>/preflight/<vendor>-check-status.md` artifacts — overwrite (not versioned filenames) is the intentional policy: the per-phase preflight verdict is the **current** truth. Pre-resume preflight history is preserved indirectly via the RUN_LOG dispatch entries (each retains `develop_it_git_sha`, timestamp, and verdict). After the resume preflight completes, the per-phase cache applies normally for any further iterations in that session until the next phase transition or halt.
-   - **Resuming into a non-gated phase** (Phase 2, 4, 8, 9, or any future phase not in {3, 5, 6, 7}): no preflight runs on resume. The orchestrator picks up where it left off using the most recent applicable preflight verdict from RUN_LOG (Phase 1 for Phases 2 and 4, or the most recent per-phase preflight for Phase 8 or 9 (and analogously for any future non-gated phase)) and any in-scope flags such as `codex_disabled_by_user`. This is a direct consequence of the "gated set is exactly {3, 5, 6, 7}" rule, not a violation of it.
+   - **Resuming into a non-gated phase** (Phase 2, 4, 8, 9, 10, or any future phase not in {3, 5, 6, 7}): no preflight runs on resume. The orchestrator picks up where it left off using the most recent applicable preflight verdict from RUN_LOG (Phase 1 for Phases 2 and 4, or the most recent per-phase preflight for Phase 8, 9, or 10 (and analogously for any future non-gated phase)) and any in-scope flags such as `codex_disabled_by_user`. This is a direct consequence of the "gated set is exactly {3, 5, 6, 7}" rule, not a violation of it.
 6. Resume from the next un-completed step.
 
 **Terminology gloss** (used in this section and in acceptance criteria):
@@ -1520,13 +1648,13 @@ If you (the orchestrator) catch yourself doing any of the following, STOP immedi
 
 ### Writing red flags
 - Calling Edit or Write on the spec, plan, source code, test code, or reviewer findings.
-- Composing summary text and writing any of: `spec-review-summary.md`, `plan-review-summary.md`, `implementation-summary.md`, `code-review-summary.md`, `final-readiness-report.md`. All are produced by delegated subagents.
+- Composing summary text and writing any of: `spec-review-summary.md`, `plan-review-summary.md`, `implementation-summary.md`, `code-review-summary.md`, `all-test-summary.md`, `final-readiness-report.md`. All are produced by delegated subagents.
 - Writing any file outside the feature folder, with the sole exception of files the standard skills (`brainstorming`, `writing-plans`) place at their canonical paths via delegated subagents.
 - Writing inside the feature folder beyond `RUN_LOG.md` and `mkdir -p`.
 
 ### Running red flags
 - Invoking `pytest`, `ruff`, `npm`, `make`, the application, or any build/test tool directly.
-- Running `git add`, `git commit`, `git checkout`. These belong to the Phase 8 subagent.
+- Running `git add`, `git commit`, `git checkout`. These belong to the Phase 9 subagent (and to the implementer / debugger / test-fixer subagents for their own fix commits).
 - Read-only git is allowed: `git status`, `git log`, `git diff --stat`, `git rev-parse HEAD` (the last is used to record the `$PROCESS_PATH` git SHA in RUN_LOG; the file's content SHA-256 is recorded separately — see the dispatch entry shape in the orchestration contract).
 
 ### Reasoning leaks
@@ -1576,7 +1704,7 @@ The orchestrator **MUST append an entry** on each of these events:
 
 1. Any `event=CODEX_UNAVAILABLE` (regardless of phase or failure_mode).
 2. Any `event=CLAUDE_FAILED`.
-3. Any retry of a dispatch within the same iteration (e.g. Mode 4 retry-once policy after a transient failure). Normal next-iteration progression of an iteration loop (spec-review, plan-review, code-review) is NOT a "retry" for this purpose — iteration number is already recorded in `RUN_LOG.md` and need not be re-logged here unless the orchestrator has a specific observation to record. The iteration-cap trigger (#5) covers the terminal case. Concretely: a "retry within iteration" is identified in `RUN_LOG.md` by a second `dispatch` entry whose `iteration:` field is unchanged from the immediately preceding failed dispatch in the same `phase:` AND whose `role:` matches that preceding failed dispatch; the completion-check uses this pair as the countable event. Phases without an iteration loop (preflight, context-discovery, plan-writing, implementation, git-finalization, readiness-report) only trigger this rule when the same `role:` is dispatched a second time within the same `phase:` after a failed first dispatch — the `iteration:` field, if present at all in those phases, is treated as trivially satisfied and the `role:` equality check is the load-bearing condition. **Example exclusion:** a `debugger` dispatch after a failed `implementer` dispatch in Phase 6 is NOT a retry — different roles, so trigger #3 does not fire (this is structured remediation, not a retry). A second `implementer` dispatch after a failed `implementer` dispatch in Phase 6 IS a retry and DOES fire trigger #3. The same logic applies to Phase 8 (`finishing-branch`): trigger #3 fires only on a second `finishing-branch` dispatch after a failed first one.
+3. Any retry of a dispatch within the same iteration (e.g. Mode 4 retry-once policy after a transient failure). Normal next-iteration progression of an iteration loop (spec-review, plan-review, code-review) or next-round progression of the Phase 8 all-tests loop is NOT a "retry" for this purpose — iteration number is already recorded in `RUN_LOG.md` and need not be re-logged here unless the orchestrator has a specific observation to record. The iteration-cap trigger (#5) covers the terminal case. Concretely: a "retry within iteration" is identified in `RUN_LOG.md` by a second `dispatch` entry whose `iteration:` field is unchanged from the immediately preceding failed dispatch in the same `phase:` AND whose `role:` matches that preceding failed dispatch; the completion-check uses this pair as the countable event. Phases without an iteration loop (preflight, context-discovery, plan-writing, implementation, git-finalization, readiness-report) only trigger this rule when the same `role:` is dispatched a second time within the same `phase:` after a failed first dispatch — the `iteration:` field, if present at all in those phases, is treated as trivially satisfied and the `role:` equality check is the load-bearing condition. **Example exclusion:** a `debugger` dispatch after a failed `implementer` dispatch in Phase 6 is NOT a retry — different roles, so trigger #3 does not fire (this is structured remediation, not a retry). A second `implementer` dispatch after a failed `implementer` dispatch in Phase 6 IS a retry and DOES fire trigger #3. Likewise, a `test-fixer` dispatch after a FAIL test round in Phase 8 is NOT a retry (different roles — structured remediation), but a second `all-tests-runner` dispatch with an unchanged `iteration:` after a failed first one IS. The same logic applies to Phase 9 (`finishing-branch`): trigger #3 fires only on a second `finishing-branch` dispatch after a failed first one.
 4. Any `event=HALT` (graceful or otherwise).
 5. Any `event=ITERATION_CAP_REACHED` AND any `event=ITERATION_CAP_OVERRIDE`. These two are counted **independently** — when a cap is reached and then overridden, that incident yields two distinct `RUN_LOG.md` events and therefore requires two distinct entries in `process-improvement-proposition.md`. A single entry cannot cover both.
 6. Any deviation from this process file's prescribed shape — when the orchestrator interprets an ambiguous instruction, works around an undocumented CLI quirk, or has to compose behavior the process file did not explicitly cover. Illustrative (non-exhaustive) examples: "had to choose between two readings of `Step 6.−1` vs `Step 6.0`"; "process file did not specify behavior when summarizer returns empty output, composed best-effort fallback"; "CLI emitted an undocumented stderr warning that required ad-hoc handling". Deviation is NOT a structured `RUN_LOG.md` event type — it is recognized only by the orchestrator's own judgment at the moment it makes the deviating choice. Because it has no countable RUN_LOG counterpart, deviation entries are explicitly excluded from the strict 1:1 count check in Completion criteria (see that section for the exhaustive list of count-matched event types); deviation remains a mandatory append trigger here regardless.
@@ -1651,7 +1779,7 @@ To enforce "writing here cannot influence current execution":
 
 - The orchestrator MUST NOT read `process-improvement-proposition.md` during the run that wrote it. The reading-red-flags section above lists this as a forbidden action.
 - The file content does NOT contribute to any verdict, summary, gate decision, or readiness classification.
-- The readiness-writer subagent (Phase 9) lists the file in the **Artifacts** section of `final-readiness-report.md` (so the user knows the file exists), but does NOT read its content for verdict purposes. If the file does not exist at Phase 9 (no mandatory triggers fired and no spontaneous entries were emitted), readiness-writer lists it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
+- The readiness-writer subagent (Phase 10) lists the file in the **Artifacts** section of `final-readiness-report.md` (so the user knows the file exists), but does NOT read its content for verdict purposes. If the file does not exist at Phase 10 (no mandatory triggers fired and no spontaneous entries were emitted), readiness-writer lists it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
 - The orchestrator MUST NOT cite the file's content in any other `RUN_LOG.md` entry, STATUS file, or user-facing message.
 
 ### Privacy / anti-leak
@@ -1665,18 +1793,19 @@ This Develop-It SDLC step is complete only when ALL of the following hold:
 - Phase 1 preflight passed: `1-preflight/phase-1/claude-check-status.md` is `READY`, AND the readiness writer's classification for the Phase 1 codex slot is one of: (a) `READY` (codex STATUS present with `verdict: READY`), (b) `SKIPPED` consented via `event=CODEX_DISABLED_BY_USER_CONSENT` (codex STATUS absent), or (c) `FAILED` with a present codex STATUS file carrying `verdict: FAILED` / non-`READY` (Mode 4 malformed STATUS may legitimately remain at the relocated path). A Phase 1 codex classification of `INVALID_ORCHESTRATION` blocks completion — this includes both (i) STATUS absent with NO corresponding event, AND (ii) STATUS absent with `event=CODEX_UNAVAILABLE` but no `event=CODEX_DISABLED_BY_USER_CONSENT` (per spec, Phase 1 Mode 0 HALTs unconditionally and Modes 1–5 require user consent — reaching completion without one of those events is an orchestration violation). The Phase 1 path is stricter than per-phase gates: an unavailable codex at Phase 1 is passable ONLY with recorded user consent.
 - Per-phase preflight passed for every phase in {3, 5, 6, 7}: `<phase-dir>/preflight/claude-check-status.md` is `READY`, AND the readiness writer's classification for that phase's codex slot is `READY`, `SKIPPED` (matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for `(phase=<P>, iteration=00)`), or `FAILED` (matching `event=CODEX_UNAVAILABLE` for `(phase=<P>, iteration=00)`, OR a present codex STATUS file with `verdict: FAILED` / non-`READY` — Mode 4 malformed STATUS may legitimately remain). Only an `INVALID_ORCHESTRATION` classification blocks completion. `FAILED` codex per-phase verdicts surface in the readiness report's `partial_review` / `codex_unavailable_reason` notes but do not gate completion. For Phase 6 specifically, this is explicit: Phase 6 codex probe failure is non-blocking by design — see Step 6.−1. Unlike Phase 1, per-phase gates do not require user consent for codex degradation; the per-phase preflight model trades that prompt for fast automatic degradation since the user has already opted into the run.
 - Phase 2 context discovery passed (`2-context-discovery/status.md` = `READY`).
-- Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (deferred majors recorded only if any remain)); `3-spec-review/spec-review-summary.md` exists.
+- Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining majors fixed via the final fix pass and recorded as deferred)); `3-spec-review/spec-review-summary.md` exists.
 - Implementation plan was written by the `plan-writer` subagent (`4-plan-writing/plan-status.md` = `DONE`).
-- Plan review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (deferred majors recorded only if any remain)); `5-plan-review/plan-review-summary.md` exists.
+- Plan review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining majors fixed via the final fix pass and recorded as deferred)); `5-plan-review/plan-review-summary.md` exists.
 - Implementer subagent completed Phase 6 (`6-implementation/implementer-status.md` = `DONE`, `verification=PASS`); `6-implementation/implementation-summary.md` exists.
 - No-secret checks ran (delegated to implementer/debugger; recorded in implementation summary) when the feature touches credentials, config, notebooks, examples, generated artifacts, or deployment files.
 - Credential-dependent checks ran or were safely skipped per the plan.
-- Code review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (deferred majors recorded only if any remain)); `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
-- Phase 8 git result is `DONE` or `SKIPPED` with a clear reason; `8-git-finalization/git-status.md` exists.
-- Phase 9 readiness report exists (`<feature-folder>/final-readiness-report.md`) and `<feature-folder>/readiness-status.md` = `DONE`.
+- Code review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining majors fixed via the final fix pass and recorded as deferred)); `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
+- Phase 8 all-tests completed: `8-all-tests/summarizer-status.md` = `DONE` and `8-all-tests/all-test-summary.md` exists. A `final_test_verdict` of `FAILED` (residual failures after the 3-fix-round cap) does NOT block completion — the run completes with the detailed residual-failure record in the summary and the readiness verdict forced to `NOT_READY`. `SKIPPED` (`no-tests-found`) does not block.
+- Phase 9 git result is `DONE` or `SKIPPED` with a clear reason; `9-git-finalization/git-status.md` exists.
+- Phase 10 readiness report exists (`<feature-folder>/final-readiness-report.md`) and `<feature-folder>/readiness-status.md` = `DONE`.
 - The final user-facing message lists all artifact paths, the test summary, git summary, skipped optional steps, `partial_review` flag if any, and readiness verdict.
 - Every dispatch entry in `RUN_LOG.md` carries the nine usage-telemetry fields (`model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`, `usage_status`).
-- Every phase summary file (`spec-review-summary.md`, `plan-review-summary.md`, `implementation-summary.md`, `code-review-summary.md`) ends with a `## Usage` section containing phase total, per-vendor, and per-role × iteration tables.
+- Every phase summary file (`spec-review-summary.md`, `plan-review-summary.md`, `implementation-summary.md`, `code-review-summary.md`, `all-test-summary.md`) ends with a `## Usage` section containing phase total, per-vendor, and per-role × iteration tables.
 - `final-readiness-report.md` ends with a `## Usage rollup` section containing grand total, per-phase table, per-vendor grand total, and top-5 most expensive dispatches.
 - For every mandatory-trigger event recorded in `RUN_LOG.md` during the run (the six structured RUN_LOG event types covered by mandatory triggers #1–#5: `CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, retry-within-iteration, `HALT`, `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE` — note `ITERATION_CAP_REACHED` and `ITERATION_CAP_OVERRIDE` count independently per the rule in trigger #5 of the Process self-observation section), a corresponding entry must exist in `process-improvement-proposition.md`, matched by phase + `trigger:` tag value + close-in-time timestamp (the proposition entry's ISO-8601 timestamp falls within ±60 seconds of the RUN_LOG event timestamp, or strictly between the RUN_LOG event timestamp and the next mandatory RUN_LOG event timestamp for the same phase, whichever window is tighter). The `trigger:` tag in the entry header is the load-bearing match key (recovered directly from the header, not inferred from prose); `kind` is always `failure` for mandatory entries per the Trigger → kind mapping table and is therefore not discriminating. The completion check is: count of these six structured event types in `RUN_LOG.md` equals count of corresponding mandatory entries (entries whose header carries a `trigger:` tag) in `process-improvement-proposition.md`, with per-event-type counts matching as well as the overall total. (One entry per event instance — a single entry cannot 'cover' multiple later events.) Deviation entries (trigger #6) are mandatory to write but are NOT counted in this 1:1 match because deviation has no structured RUN_LOG event type and carries no `trigger:` tag; they appear as additional entries beyond the matched count.
 
@@ -2502,6 +2631,96 @@ Verdict rule: `PASS` iff `blockers=0 AND majors=0`.
 Exit 0 on STATUS write.
 <!-- END: code-reviewer-codex -->
 
+<!-- BEGIN: all-tests-runner -->
+# Role: all-tests-runner
+
+You are a test runner invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
+
+## Inputs
+
+- `$FEATURE_FOLDER`
+- `$REPO_ROOT`
+- `$ROUND` — two-digit round number (01–04)
+
+## Behavior
+
+1. Determine the execution mode:
+   - If `$REPO_ROOT/start-all-tests.sh` exists, the mode is `script`: run it from `$REPO_ROOT` (`bash start-all-tests.sh`), capturing stdout+stderr.
+   - Otherwise the mode is `discovery`: enumerate every test suite present in the repo — e.g. Python suites (`pytest` / `uv run pytest`, honoring `pyproject.toml` / `pytest.ini` configuration), JS/TS `package.json` `test` scripts (run per package), and any other runner the repo's config files declare. Run each suite, capturing output.
+   - If the script does not exist AND no test suite is discovered, the round verdict is `SKIPPED` with `reason=no-tests-found`.
+2. Do NOT fix anything. You only run tests and report — fixing belongs to the `test-fixer` role.
+3. Write `$FEATURE_FOLDER/8-all-tests/round-$ROUND/test-report.md` — the detailed per-round report: execution mode, exact commands, per-suite pass/fail counts, every failing test's name, the relevant error excerpt (assertion/traceback tail, not the full log).
+4. Rewrite `$FEATURE_FOLDER/8-all-tests/all-test-summary.md` (full overwrite, cumulative across rounds — re-read earlier rounds' `test-report.md` / `test-runner-status.md` / `test-fixer-status.md` files) with:
+   - Execution mode (`script` / `discovery`) and the commands used.
+   - Per-round results table: round, suites run, total / passed / failed.
+   - Current verdict after this round.
+   - **Residual failures** section — present whenever this round has failures: failing test names, error excerpts, suspected causes, and what each prior fix round attempted. This section is the canonical detailed record when the phase ends `FAILED` after the fix cap.
+   - Do NOT write a `## Usage` section — the summarizer appends it.
+
+## Output
+
+STATUS LAST and atomically: `$FEATURE_FOLDER/8-all-tests/round-$ROUND/test-runner-status.md`
+
+```
+verdict: PASS | FAIL | SKIPPED
+mode: script | discovery
+suites_run: <int>
+tests_total: <int>
+tests_passed: <int>
+tests_failed: <int>
+report_path: <absolute path to round-$ROUND/test-report.md>
+reason: <one line for SKIPPED>
+```
+
+Exit 0 on STATUS write.
+<!-- END: all-tests-runner -->
+
+<!-- BEGIN: test-fixer -->
+# Role: test-fixer
+
+You are a test fixer invoked as a fresh subprocess when a Phase 8 all-tests round reports `FAIL`. You have no shared context.
+
+## Inputs
+
+- `$FEATURE_FOLDER`
+- `$PLAN_PATH`
+- `$ROUND` — the failing round number (your STATUS lands in that round's folder)
+- `$TEST_REPORT_PATH` — absolute path to the failing round's `test-report.md`
+- `$IMPLEMENTATION_BASE_SHA` — git SHA captured before any implementer dispatch (or `non-git`)
+
+## Required skills
+
+- Load `superpowers:systematic-debugging`. Follow it strictly.
+- Load `context7` and use it whenever the failure signature points at an external library, framework, SDK, API, CLI tool, or cloud service (always `resolve-library-id` first, then `get-library-docs`).
+
+## Behavior
+
+1. Read `$TEST_REPORT_PATH` to identify the failing tests and their failure signatures.
+2. Apply systematic debugging per failure cluster: hypothesis → minimal repro → root cause → fix. Fix the code when the code is wrong; fix the test ONLY when the test itself is defective against the spec/plan intent — never weaken, skip, or delete a test just to make it pass.
+3. Re-run the failing tests to spot-check your fixes (the canonical re-verification is the next all-tests round).
+4. If the fix changes source/tests, commit per the project's git policy.
+5. Where a failure requires a decision that cannot be made without user input, do NOT guess — set `verdict=BLOCKED`.
+
+You may use `$IMPLEMENTATION_BASE_SHA` to constrain `git log`/`git diff` scope to commits made during this run.
+
+## Output
+
+STATUS LAST and atomically: `$FEATURE_FOLDER/8-all-tests/round-$ROUND/test-fixer-status.md`
+
+```
+verdict: DONE | BLOCKED
+fixed_tests: <int>
+root_causes: <one line per failure cluster, semicolon-separated>
+fix_summary: <one line>
+new_commits: [sha, ...]
+reason: <one line if BLOCKED>
+```
+
+`verdict=DONE` does not promise the suite passes — it promises fixes were applied. The next all-tests round is the canonical verification authority.
+
+Exit 0 on STATUS write.
+<!-- END: test-fixer -->
+
 <!-- BEGIN: finishing-branch -->
 # Role: finishing-branch
 
@@ -2529,7 +2748,7 @@ Load `superpowers:finishing-a-development-branch` and follow it.
 
 ## Output
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/8-git-finalization/git-status.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/9-git-finalization/git-status.md`
 
 ```
 verdict: DONE | SKIPPED | FAILED
@@ -2572,7 +2791,7 @@ You are a gate summarizer invoked as a fresh subprocess. You have no shared cont
 6. Write the summary file at `$FEATURE_FOLDER/3-spec-review/spec-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
-   - Deferred MAJOR list — MAJOR findings still open at the final (passing) iteration. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass (final iteration ≤ 2 with `majors=0`). For each deferred major, record its source reviewer, location, and one-line summary so the readiness writer can surface it.
+   - Deferred MAJOR list — MAJOR findings open at the final (passing) iteration, each addressed by the final fix pass (fixed, not re-reviewed). Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass (final iteration ≤ 2 with `majors=0`). For each deferred major, record its source reviewer, location, and one-line summary so the readiness writer can surface it. Note in the list that these items were fixed by the final fix pass without reviewer re-verification (extract the fix outcome from the passing iteration's `spec-fixer-status.md` if present).
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), with one sentence of human-readable context per mode (e.g. "mode=5: Codex hit a rate-limit / quota signal in iteration 02").
    - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
@@ -2632,7 +2851,7 @@ You are a gate summarizer invoked as a fresh subprocess by the develop-it orches
 6. Write the summary file at `$FEATURE_FOLDER/5-plan-review/plan-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
-   - Deferred MAJOR list — MAJOR findings still open at the final (passing) iteration. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass. For each deferred major, record its source reviewer, location, and one-line summary.
+   - Deferred MAJOR list — MAJOR findings open at the final (passing) iteration, each addressed by the final fix pass (fixed, not re-reviewed). Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass. For each deferred major, record its source reviewer, location, and one-line summary. Note in the list that these items were fixed by the final fix pass without reviewer re-verification (extract the fix outcome from the passing iteration's `plan-fixer-status.md` if present).
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
    - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
@@ -2734,7 +2953,7 @@ You are a gate summarizer for the code review, invoked as a fresh subprocess by 
 6. Write the summary file at `$FEATURE_FOLDER/7-code-review/code-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
-   - Deferred MAJOR list — MAJOR findings still open at the final (passing) iteration. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass. For each deferred major, record its source reviewer, location, and one-line summary.
+   - Deferred MAJOR list — MAJOR findings open at the final (passing) iteration, each addressed by the final fix pass (fixed, not re-reviewed). Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass. For each deferred major, record its source reviewer, location, and one-line summary. Note in the list that these items were fixed by the final fix pass (an implementer re-dispatch) without reviewer re-verification.
    - Residual MINOR/NIT list.
    - `implementation_base_sha` from RUN_LOG (so readers can re-derive the reviewed diff).
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
@@ -2766,6 +2985,42 @@ implementation_base_sha: <sha or non-git>
 Exit 0 on STATUS write.
 <!-- END: summarizer-code-review -->
 
+<!-- BEGIN: summarizer-all-tests -->
+# Role: summarizer-all-tests
+
+You are a phase summarizer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
+
+## Inputs
+
+- `$FEATURE_FOLDER`
+- `$FEATURE_FOLDER/RUN_LOG.md`
+- `$FEATURE_FOLDER/8-all-tests/all-test-summary.md` (already written by the runner; you APPEND a `## Usage` section to it)
+
+## Behavior
+
+1. Read every `8-all-tests/round-*/test-runner-status.md` (and `test-fixer-status.md` where present). Determine: `final_test_verdict` (`PASS` if the last round passed; `SKIPPED` if the runner reported no tests; `FAILED` if failures remain after the fix loop ended — cap exhausted or fixer `BLOCKED`), rounds used, fix rounds dispatched, residual failure count.
+2. Verify `all-test-summary.md` carries the **Residual failures** detail section whenever `final_test_verdict=FAILED`; if the runner's last write is missing detail that exists in the round reports, fold it in (edit the summary in place) — the summary must be self-sufficient for the readiness writer and the user.
+3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter dispatch entries (NOT event entries) where `phase=8`. Compute the same Usage aggregation as `summarizer-implementation` (phase total, per-vendor subtotal, per-role × round detail; rows with `usage_status=unavailable` are skipped from the detail table but counted in a footnote).
+4. APPEND the `## Usage` section to `$FEATURE_FOLDER/8-all-tests/all-test-summary.md` with the three standard tables (same columns and formatting rules as `summarizer-implementation`).
+
+## Output
+
+STATUS LAST and atomically: `$FEATURE_FOLDER/8-all-tests/summarizer-status.md`
+
+```
+verdict: DONE
+summary_path: <absolute path to 8-all-tests/all-test-summary.md>
+final_test_verdict: PASS | FAILED | SKIPPED
+rounds: <int>
+fix_rounds: <int>
+residual_failures: <int>
+dispatches: <int>
+skipped_unavailable: <int>
+```
+
+Exit 0 on STATUS write.
+<!-- END: summarizer-all-tests -->
+
 <!-- BEGIN: readiness-writer -->
 # Role: readiness-writer
 
@@ -2792,7 +3047,8 @@ You are the final readiness reporter. You have no shared context.
    - `6-implementation/implementation-summary.md`
    - `6-implementation/implementer-status.md`
    - `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`
-   - `8-git-finalization/git-status.md` (for `implementation_base_sha` and commit SHAs)
+   - `8-all-tests/all-test-summary.md` and `8-all-tests/summarizer-status.md` (for `final_test_verdict`, rounds used, and residual failures)
+   - `9-git-finalization/git-status.md` (for `implementation_base_sha` and commit SHAs)
    - `RUN_LOG.md` (for failure events, resume history, the LATEST `event=IMPLEMENTATION_BASELINE` — ignore any `IMPLEMENTATION_BASELINE_BLOCKED` advisory entries — every `event=CODEX_DISABLED_BY_USER_CONSENT`, `event=CODEX_SKIPPED_BY_USER_CONSENT`, and `event=CODEX_UNAVAILABLE` entry, indexed by `(phase, iteration)`, AND every dispatch entry's nine usage-telemetry fields for the `## Usage rollup` section).
 
 2. **Classify each preflight verdict** before composing the report. For each `(phase ∈ {1, 3, 5, 6, 7}, vendor ∈ {claude, codex})` pair:
@@ -2807,16 +3063,17 @@ You are the final readiness reporter. You have no shared context.
 
    The classification per `(phase, vendor)` is reported in the new "Preflight verdicts" section (see step 3 below).
 3. Compose `$FEATURE_FOLDER/final-readiness-report.md` with these sections:
-   - **Artifacts** — paths to canonical spec, canonical plan, all summary files, AND `<feature-folder>/process-improvement-proposition.md`. The proposition file is listed by path only — its content is NOT read for verdict purposes. If the file does not exist at Phase 9 (no mandatory triggers fired and no spontaneous entries were emitted), list it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
+   - **Artifacts** — paths to canonical spec, canonical plan, all summary files, AND `<feature-folder>/process-improvement-proposition.md`. The proposition file is listed by path only — its content is NOT read for verdict purposes. If the file does not exist at Phase 10 (no mandatory triggers fired and no spontaneous entries were emitted), list it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
    - **Preflight verdicts** — per `(phase, vendor)` table for phases in {1, 3, 5, 6, 7}: each row reports `phase`, `vendor`, classification (`READY` / `SKIPPED` / `FAILED` / `INVALID_ORCHESTRATION`), and `failure_mode` (if `FAILED`) or skip-reason (if `SKIPPED`). Phase 1 rows are read from `1-preflight/phase-1/`; per-phase rows from `<phase-dir>/preflight/`. Any `INVALID_ORCHESTRATION` row forces the overall readiness verdict to `NOT_READY`.
    - **Reviewer verdicts** — per-gate iteration counts, final verdicts, `partial_review` flag with per-gate `codex_unavailable_reason` if any.
    - **Implementation result** — task count, commits, `implementation_base_sha`, verification, no-secret check, browser-QA result if applicable. If a post-debug re-verification occurred, note it.
+   - **Test results** — `final_test_verdict` (`PASS` / `FAILED` / `SKIPPED`), execution mode (`start-all-tests.sh` vs discovered suites), rounds used, fix rounds dispatched, and — when `FAILED` — the residual-failure detail carried over from `all-test-summary.md` (failing test names, error excerpts, what each fix round attempted).
    - **Git result** — commit SHAs or `SKIPPED` reason.
    - **Skipped optional steps** — list anything bypassed and why.
-   - **Deferred MAJOR items** — total count + per-gate breakdown of MAJOR findings still open when a gate passed under the relaxed rule (iterations 3–10, `blockers=0`, `majors>0`). Read from each gate's summary file (the summarizer records deferred majors there). Present this section only when at least one gate carried deferred majors. NOTE: this section's presence is NOT the trigger for `READY_WITH_NOTES` — a relaxed-tier pass forces `READY_WITH_NOTES` on its own (see the readiness-verdict rule), so a clean relaxed pass produces `READY_WITH_NOTES` with this section absent.
+   - **Deferred MAJOR items** — total count + per-gate breakdown of MAJOR findings open when a gate passed under the relaxed rule (iterations 3–10, `blockers=0`, `majors>0`); each was addressed by that gate's final fix pass (fixed, not re-reviewed). Read from each gate's summary file (the summarizer records deferred majors there). Present this section only when at least one gate carried deferred majors. NOTE: this section's presence is NOT the trigger for `READY_WITH_NOTES` — a relaxed-tier pass forces `READY_WITH_NOTES` on its own (see the readiness-verdict rule), so a clean relaxed pass produces `READY_WITH_NOTES` with this section absent.
    - **Residual MINOR/NIT items** — total count + per-gate breakdown.
    - **Run history** — number of resumes, vendor failover events from RUN_LOG, baseline SHA capture.
-   - **Readiness verdict** — `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, AND every preflight verdict is `READY` or `SKIPPED`; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), or any claude preflight that is not `READY`.
+   - **Readiness verdict** — `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, the all-tests `final_test_verdict` is `PASS` or `SKIPPED`, AND every preflight verdict is `READY` or `SKIPPED`; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including an all-tests `final_test_verdict` of `FAILED` (residual test failures after the fix cap — `NOT_READY` even when everything else passed; the "Test results" section carries the detail), any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), or any claude preflight that is not `READY`.
    - **Usage rollup** — emit a final `## Usage rollup` section containing four parts in this order:
      1. **Grand total** (one row) — columns: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration`. Sum across every dispatch entry in `RUN_LOG.md`.
      2. **Per-phase table** — one row per phase that ran (use `phase_name` for the row label). Same columns as grand total, plus a leading `Phase` column. Include a final `TOTAL` row that matches the grand total.
