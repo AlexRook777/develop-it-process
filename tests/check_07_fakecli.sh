@@ -119,4 +119,68 @@ case "$rc" in
   *) _fail "expected 124 or 137 from timeout escalation, got $rc" ;;
 esac
 
+# --- long dispatch: recording and resume classification ---
+for fn in dispatch_id role_mutates appendix_exists log_dispatch_started dispatch_state; do
+  declare -F "$fn" >/dev/null || _fail "$fn is not defined"
+done
+[ "$_FAILURES" -eq 0 ] || finish
+
+assert_eq "6-iter00-implementer" "$(dispatch_id 6 00 implementer)" \
+  "dispatch_id is deterministic"
+
+# dispatch_state sets a GLOBAL and must be called directly: "$(dispatch_state ...)"
+# would run it in a subshell and discard it.
+state_of() { dispatch_state "$1" "$2" "$3" "$4"; printf '%s' "$DISPATCH_STATE"; }
+
+SD="$FEATURE_FOLDER/6-implementation"; mkdir -p "$SD"
+ST="$SD/implementer-status.md"
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+
+# 1. Nothing recorded, no STATUS -> never launched.
+assert_eq NEVER_LAUNCHED "$(state_of 6 00 implementer "$ST")" \
+  "no DISPATCH_STARTED record means NEVER_LAUNCHED"
+
+# 2. Recorded, but no STATUS -> unfinished. This is the session-crash case.
+log_dispatch_started 6 implementation 00 implementer
+assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "the dispatch is recorded BEFORE it runs"
+assert_eq UNFINISHED "$(state_of 6 00 implementer "$ST")" \
+  "a recorded dispatch with no STATUS is UNFINISHED"
+
+# 3. Recorded and a valid STATUS -> completed.
+printf 'verdict: DONE\nverification: PASS\n' > "$ST"
+assert_eq COMPLETED "$(state_of 6 00 implementer "$ST")" \
+  "a recorded dispatch with a valid STATUS is COMPLETED"
+
+# 4. A STATUS that fails validation is NOT completion. A half-written artifact
+#    must never be mistaken for a finished dispatch.
+printf 'verdict: DONE\nverification: MAYBE\n' > "$ST"
+assert_eq UNFINISHED "$(state_of 6 00 implementer "$ST")" \
+  "an invalid STATUS is UNFINISHED, not COMPLETED"
+
+# 5. role_mutates decides what UNFINISHED means. This is the rule that keeps a
+#    half-run implementer from being silently re-run over its own commits.
+assert_eq yes "$(role_mutates implementer)"           "the implementer mutates"
+assert_eq yes "$(role_mutates finishing-branch)"      "the git finalizer mutates"
+assert_eq no  "$(role_mutates summarizer-spec)"       "summarizers are read-only"
+assert_eq no  "$(role_mutates code-reviewer-claude)"  "reviewers are read-only"
+
+# 6. Pre-launch validation: a missing appendix must fail before any CLI runs.
+appendix_exists implementer     && _ok "appendix_exists finds a real appendix" \
+                                || _fail "appendix_exists missed a real appendix"
+appendix_exists no-such-role    && _fail "appendix_exists accepted a missing appendix" \
+                                || _ok "appendix_exists rejects a missing appendix"
+
+# 7. A render failure must produce ZERO CLI invocations. Asserting only that the
+#    delivered prompt has no $VARS is insufficient: an empty prompt also passes
+#    that test.
+: > "$FAKE_ARGV_LOG"
+unset SPEC_PATH
+dispatch_role 7 01 code-reviewer-claude "$SD/x-status.md" \
+  && _fail "dispatch must fail when a render key is unset" \
+  || _ok "dispatch fails when a render key is unset"
+assert_eq 0 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
+  "a render failure invokes the CLI zero times"
+SPEC_PATH="$WORK/spec.md"
+
 finish

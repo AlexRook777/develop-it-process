@@ -94,6 +94,11 @@ The correct execution rhythm is:
 
 **Red flag:** if you are about to `cat <<'ORCH' | bash` and the heredoc contains more than one numbered phase section (Phase 1 + Phase 2, or Phase 3 + Phase 4 + Phase 5, etc.) — STOP and split it.
 
+**A background dispatch is not phase bundling.** Roles whose timeout exceeds a single
+Bash tool call are issued as one Bash call with `run_in_background: true`; the
+orchestrator's next turn begins when that call finishes. That is still one dispatch
+for one phase. What remains forbidden is combining two numbered phases into one block.
+
 ## Review-gate severity policy
 
 Every reviewer subagent classifies each finding into exactly one severity:
@@ -703,6 +708,195 @@ If you find yourself writing `codex exec ... -a never` (global option after `exe
 **Why `-c model_reasoning_effort` is set per-dispatch.** The orchestrator does NOT rely on `~/.codex/config.toml`'s global `model_reasoning_effort`. Every Codex call sets effort explicitly, resolved per role via `role_effort`. This removes a hidden global config that previously caused iterative review gates to run at maximum cost.
 
 Pass the role; effort and timeout follow from the Models table.
+
+### Long dispatch
+
+Three roles have timeouts that exceed a single Bash tool call: `plan-writer` (120
+min), `implementer` (300 min) and `code-reviewer-codex` (120 min). For these, the
+orchestrator issues the dispatch as **one Bash tool call with
+`run_in_background: true`**. The harness keeps it running across turns and re-invokes
+the orchestrator when it exits, delivering the exit status.
+
+Do **not** hand-roll process supervision: no session-detaching wrapper, no `.pid`
+files, no polling loop, no PID-liveness checks. An earlier revision of this document
+specified exactly that and it accumulated a launch-intent file, a nonce lease,
+attempt-scoped control files and thirteen states — all reimplementing what the
+harness already does correctly. If a future harness lacks background execution,
+reduce the affected roles' timeouts instead; do not reintroduce the protocol.
+
+**One dispatch per phase still holds.** A background dispatch is one Bash call, and
+the orchestrator's next turn begins when it finishes. Nothing about it bundles phases.
+
+Three small helpers back the recording and resume logic below:
+
+<!-- lint: cookbook -->
+```bash
+# Deterministic dispatch identifier. Depends only on (phase, iter, role), never
+# on time or PID, so it is stable across a session and across resume.
+dispatch_id() {
+  # Usage: dispatch_id <phase> <iter> <role>
+  printf '%s-iter%s-%s\n' "$1" "$2" "$3"
+}
+
+# Whether a role's dispatch can leave irreversible side effects (commits, file
+# edits) if silently re-run. This decides UNFINISHED recovery: a "no" role is
+# safe to redispatch once; a "yes" role must halt for the user to reconcile.
+#
+# Default arm: "yes". An unrecognized role is treated as mutating, so an
+# UNFINISHED dispatch for it HALTS rather than auto-retries. The unsafe default
+# would be "no" — it would silently redispatch a role that turns out to write
+# commits, which is exactly the failure this whole rule exists to prevent. A
+# halt the user can override costs nothing; a silent duplicate commit is not
+# reversible.
+role_mutates() {
+  case "$1" in
+    implementer|impl-worker|debugger|test-fixer|\
+    spec-fixer|plan-fixer|plan-writer|all-tests-runner|finishing-branch)
+      echo yes ;;
+    spec-reviewer-claude|spec-reviewer-codex|\
+    plan-reviewer-claude|plan-reviewer-codex|\
+    code-reviewer-claude|code-reviewer-codex|\
+    summarizer-spec|summarizer-plan|summarizer-implementation|\
+    summarizer-code-review|summarizer-all-tests|\
+    context-discovery|preflight-claude|preflight-codex|readiness-writer)
+      echo no ;;
+    *) echo yes ;;   # fail safe — see comment above
+  esac
+}
+
+# Pre-launch validation: a role's appendix must exist as a BEGIN/END marker
+# pair in $PROCESS_PATH before any CLI runs. `impl-worker` is a sub-subagent
+# type spawned only from inside the implementer's own session, not a
+# top-level dispatched role with a prompt appendix here — appendix_exists
+# correctly returns 1 for it, and no appendix is ever added for it.
+appendix_exists() {
+  # Usage: appendix_exists <role>
+  local role="$1"
+  "$GREP_BIN" -qF -- "<!-- BEGIN: ${role} -->" "$PROCESS_PATH" 2>/dev/null || return 1
+  "$GREP_BIN" -qF -- "<!-- END: ${role} -->" "$PROCESS_PATH" 2>/dev/null || return 1
+  return 0
+}
+```
+
+Every dispatch, foreground or background, goes through the same helper:
+
+<!-- lint: cookbook -->
+```bash
+# Record a dispatch BEFORE it runs. This is the only durable evidence that a
+# dispatch was attempted, and it is what a resume reads to tell "never started"
+# apart from "started and did not finish".
+log_dispatch_started() {
+  # Usage: log_dispatch_started <phase> <phase_name> <iter> <role>
+  {
+    printf -- '--- %s  event=DISPATCH_STARTED\n' "$(iso_now)"
+    printf 'phase:                    %s\n' "$1"
+    printf 'phase_name:               %s\n' "$2"
+    printf 'iteration:                %s\n' "$3"
+    printf 'role:                     %s\n' "$4"
+    printf 'dispatch_id:              %s\n' "$(dispatch_id "$1" "$3" "$4")"
+    printf 'model:                    %s\n' "$(role_model "$4")"
+    printf '\n'
+  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+}
+
+# Render, validate, record, dispatch. Used for every role; the ONLY difference for a
+# long-running role is that the orchestrator makes the Bash tool call with
+# run_in_background: true.
+dispatch_role() {
+  # Usage: dispatch_role <phase> <iter> <role> <status_path> [extra CLI args...]
+  local phase="$1" iter="$2" role="$3" status_path="$4"; shift 4
+  local id tdir base vendor prompt
+  id="$(dispatch_id "$phase" "$iter" "$role")"
+  tdir="$FEATURE_FOLDER/transcripts"; mkdir -p "$tdir"
+  base="$tdir/$id"
+  vendor="$(role_vendor "$role")"
+
+  appendix_exists "$role" \
+    || { echo "halt: no appendix markers for role $role" >&2; return 1; }
+
+  # Render FIRST, into memory, and check it. Process substitution must not be used:
+  # `cmd < <(render_prompt ...)` discards the renderer's exit status entirely --
+  # verified, a renderer returning 42 still ran the consumer with zero bytes and
+  # yielded rc 0. That would send an EMPTY prompt to a real model and bill for it.
+  prompt="$(render_prompt "$role")" \
+    || { echo "halt: render failed for role $role" >&2; return 1; }
+  [ -n "$prompt" ] \
+    || { echo "halt: empty prompt for role $role" >&2; return 1; }
+
+  log_dispatch_started "$phase" "${PHASE_NAME:-unknown}" "$iter" "$role"
+
+  # A herestring, not a pipe: a pipe would run the invoker in a subshell and
+  # discard the globals run_timed sets.
+  if [ "$vendor" = codex ]; then
+    run_timed codex_invoke "$role" "$base.json" "$base.err" "$@" <<< "$prompt"
+  else
+    run_timed claude_invoke "$role" "$base.json" "$base.err" "$@" <<< "$prompt"
+  fi
+
+  local usage_line verdict
+  usage_line="$(parse_usage "$vendor" "$base.json" "$DISPATCH_WALL_MS" "$(role_model "$role")")"
+  verdict=""
+  [ -f "$status_path" ] && verdict="$(status_field "$status_path" verdict)"
+  log_dispatch "$role" "$phase" "${PHASE_NAME:-unknown}" "$iter" \
+               "$status_path" "$verdict" "$usage_line"
+  return "$DISPATCH_RC"
+}
+
+# Classify a dispatch for resume. Sets the global DISPATCH_STATE; echoes nothing,
+# because "$(dispatch_state ...)" would run it in a subshell.
+#
+# Three states, not thirteen. The harness owns process lifecycle, so the only
+# question a resume must answer is whether the dispatch finished — and the STATUS
+# file, written last and atomically, is the authoritative answer.
+dispatch_state() {
+  # Usage: dispatch_state <phase> <iter> <role> <status_path>
+  local phase="$1" iter="$2" role="$3" status_path="$4" id
+  id="$(dispatch_id "$phase" "$iter" "$role")"
+  # shellcheck disable=SC2034  # consumed by the caller after dispatch_state returns
+  DISPATCH_STATE=""
+
+  if ! "$GREP_BIN" -q "^dispatch_id: *${id}\$" "$FEATURE_FOLDER/RUN_LOG.md" 2>/dev/null; then
+    # shellcheck disable=SC2034  # consumed by the caller after dispatch_state returns
+    DISPATCH_STATE=NEVER_LAUNCHED
+    return 0
+  fi
+  # A STATUS file only counts when it VALIDATES. A truncated or malformed one means
+  # the subagent died mid-write, which is not completion.
+  if [ -f "$status_path" ] && validate_status "$status_path" "$role" >/dev/null 2>&1; then
+    # shellcheck disable=SC2034  # consumed by the caller after dispatch_state returns
+    DISPATCH_STATE=COMPLETED
+  else
+    # shellcheck disable=SC2034  # consumed by the caller after dispatch_state returns
+    DISPATCH_STATE=UNFINISHED
+  fi
+  return 0
+}
+```
+
+**Resume.** Call `dispatch_state` directly (never in `$(…)`) and branch on
+`$DISPATCH_STATE`:
+
+| State | Meaning | Action |
+|---|---|---|
+| `NEVER_LAUNCHED` | no `DISPATCH_STARTED` record for this id | dispatch fresh |
+| `COMPLETED` | recorded, and STATUS present **and valid** | read STATUS, proceed |
+| `UNFINISHED` | recorded, STATUS absent or invalid | **depends on `role_mutates`** — below |
+
+`UNFINISHED` recovery is role-dependent, and this is the one place the process
+deliberately stops rather than recovering:
+
+| `role_mutates` | Action on `UNFINISHED` |
+|---|---|
+| `no` — reviewers, summarizers, `context-discovery`, preflight, `readiness-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: no`, `action: redispatched`, and re-dispatch once. These roles only read and write their own STATUS and findings, so a repeat is idempotent. |
+| `yes` — `implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `finishing-branch` | log `event=DISPATCH_ORPHANED` with `role_mutates: yes`, `action: halted`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, the `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch or keep the partial work. **Never auto-retry.** After the fact nothing can distinguish "the task ran once" from "the task ran twice", and a re-run implementer duplicates commits and re-applies edits. |
+
+**Write contract.** Long dispatch adds no control files. The orchestrator writes only
+`RUN_LOG.md`, `full_log.md`, `process-improvement-proposition.md` and
+`transcripts/<dispatch-id>.{json,err}`. Nothing else. Appendix content is never written
+to disk: prompts are rendered into a shell variable and delivered by herestring.
+
+Removing the hand-rolled protocol also removed every atomic-publication site the
+orchestrator had, so no `.tmp` companion is written any more either.
 
 ### CLI canary preflight
 
@@ -2170,6 +2364,12 @@ On re-run of this prompt against the same feature folder:
    - **Resuming into Phase N where N ∈ {3, 5, 6, 7}** (a gated phase): the orchestrator runs (or re-runs) Phase N's per-phase preflight before the **next dispatch in the session** (defined as the next dispatch after the process resume, even if Phase N's first work dispatch already executed in a prior session), regardless of whether Phase N's preflight ran in the pre-resume session, and regardless of whether the resume happens before Phase N's first dispatch, between iterations, during a fixer dispatch, or immediately after one. Re-run STATUS files OVERWRITE the prior session's `<phase>/preflight/<vendor>-check-status.md` artifacts — overwrite (not versioned filenames) is the intentional policy: the per-phase preflight verdict is the **current** truth. Pre-resume preflight history is preserved indirectly via the RUN_LOG dispatch entries (each retains `develop_it_git_sha`, timestamp, and verdict). After the resume preflight completes, the per-phase cache applies normally for any further iterations in that session until the next phase transition or halt.
    - **Resuming into a non-gated phase** (Phase 2, 4, 8, 9, 10, or any future phase not in {3, 5, 6, 7}): no preflight runs on resume. The orchestrator picks up where it left off using the most recent applicable preflight verdict from RUN_LOG (Phase 1 for Phases 2 and 4, or the most recent per-phase preflight for Phase 8, 9, or 10 (and analogously for any future non-gated phase)) and any in-scope flags such as `codex_disabled_by_user`. This is a direct consequence of the "gated set is exactly {3, 5, 6, 7}" rule, not a violation of it.
 6. Resume from the next un-completed step.
+
+Resume reads `RUN_LOG.md` for the last completed step **and** calls `dispatch_state`
+for the current phase's dispatch. `RUN_LOG.md` alone is insufficient: a session that
+died mid-dispatch leaves an `event=DISPATCH_STARTED` block with no matching `dispatch`
+block, and only the STATUS file distinguishes a finished subagent from one killed
+mid-write. A STATUS file that does not pass `validate_status` counts as unfinished.
 
 **Terminology gloss** (used in this section and in acceptance criteria):
 - *first work dispatch* = the very first dispatch of a gate's iteration loop across the entire run as a whole (e.g., for Phase 3, the iter 01 spec-reviewer-claude dispatch). The per-phase preflight (Step 3.0 / 5.0 / 6.−1 / 7.0) is the dispatch immediately preceding the first work dispatch.
