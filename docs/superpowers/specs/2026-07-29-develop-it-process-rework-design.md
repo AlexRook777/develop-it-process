@@ -656,11 +656,13 @@ correctly identified, since resume logic at lines 1610–1619 reads only `RUN_LO
 |---|---|---|---|---|---|
 | absent | — | absent | — | `NEVER_LAUNCHED` | dispatch fresh |
 | present | absent | absent | within grace period | `LAUNCHING` | poll again; do **not** re-dispatch |
-| present | absent | absent | past grace period | `LAUNCH_FAILED` | the fork never took, no CLI ran — safe to re-dispatch for **any** role |
+| present | absent | absent | past grace period | `LAUNCH_FAILED` | re-dispatch — but see the lease rule below; the grace period alone does **not** prove no CLI will run |
 | present | present | absent | pid alive, starttime matches | `RUNNING` | resume polling; do **not** re-dispatch |
 | present | present | absent | pid dead or starttime differs | `ORPHANED` | **role-dependent** — see below |
 | present | — | valid, `0` | — | `COMPLETED` | read STATUS, proceed |
 | present | — | valid, `124` | — | `TIMED_OUT` | apply the existing Mode-2 policy |
+| present | — | valid, `75` | — | `LEASE_REVOKED` | a straggler found its nonce revoked and exited before spending; informational — the replacement dispatch is authoritative |
+| present | — | valid, `71` | — | `LAUNCH_FAILED` | the child could not publish `.started` and aborted before the CLI; nothing was spent |
 | present | — | valid, other | — | `FAILED` | apply the existing failure-mode classifier |
 | present | — | malformed | — | `CORRUPT` | treat as `FAILED`; surface the transcript path |
 | absent | — | present | — | `INCONSISTENT` | HALT; indicates concurrent runs on one feature folder |
@@ -682,10 +684,39 @@ artifacts the dead process already made, so blind re-dispatch would double-apply
 A `role_mutates <role>` helper encodes the split so the rule is executable rather than
 prose.
 
+**A launch nonce, not a timeout, is what makes retry safe.** `LAUNCH_FAILED` means only
+"no `.started` appeared within the grace period" — it does **not** prove the child will
+never run. A child slow to schedule, or SIGSTOPped, can miss the window and then wake up
+and invoke the CLI after a replacement dispatch has begun: two CLIs writing one STATUS
+path. Verified reproducible.
+
+So `.intent` carries a `nonce` unique to each launch attempt, and every child re-reads
+`.intent` immediately before invoking the CLI, exiting `75` (`LEASE_REVOKED`) if the nonce
+no longer matches. A retry writes a fresh nonce, which revokes any straggler. Verified:
+with a deliberately delayed child plus a retry, exactly one CLI invocation occurred.
+
+**Publication failure must abort, not fall through.** `> x.tmp && mv x.tmp x` has no
+failure branch, so a failed `.intent` or `.started` write would let the launch proceed with
+no durable record — verified reaching "launch" after a failed intent write. Both sites now
+abort: the parent returns non-zero without forking; the child publishes rc `71`
+(`LAUNCH_FAILED`) and exits before spending anything.
+
+Because `71` and `75` are both published *before* the CLI runs, they are the only two
+terminal states that certify nothing was spent.
+
 **State is a global, never a captured value.** `dispatch_state` sets `DISPATCH_STATE` and
 `DISPATCH_RC` and is called directly. Capturing it as `$(dispatch_state …)` would run it
 in a subshell and silently discard `DISPATCH_RC`, leaving the caller with an unset
 variable — verified.
+
+**Substitution values must be passed explicitly.** `render_prompt` resolves variables
+through python3's `os.environ`, but orchestration variables are ordinary shell
+assignments, which `os.environ` never sees — verified `None`. The helper therefore hands
+each set key to python via `env`, using `${!k+x}` to distinguish "set but empty" from
+"unset", and **fails loudly listing any `$VAR` left unresolved**. A prompt containing a
+literal `$SPEC_PATH` would otherwise instruct a subagent to read a file by that name.
+Tests must use unexported assignments; an `export` in the fixture hides the whole defect
+class.
 
 Required tests (§9 check 2): every row above including both `ORPHANED` branches, timeout
 escalation to `--kill-after`, PID-reuse rejection via a forged `pid_starttime`, and a

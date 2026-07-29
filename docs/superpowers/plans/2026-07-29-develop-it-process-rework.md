@@ -1085,8 +1085,10 @@ Simplify that loop — a per-binary grep is noisy. Replace with a single asserti
 
 ```bash
 # --- Task 8: canary and model probe ---
-assert_present 'for bin in claude codex timeout awk sed jq git date sha256sum cut mkdir mv tail tr grep setsid realpath flock' \
+assert_present 'for bin in claude timeout awk sed jq git date sha256sum cut mkdir mv tail tr' \
   "$D" "T8: canary checks every used binary"
+assert_present 'setsid realpath flock env python3' "$D" "T8: canary checks the new runtime tools"
+assert_absent 'for bin in claude codex ' "$D" "T8: codex is not in the hard-required list"
 assert_present 'probe_models\(\)' "$D" "T8: model probe helper exists"
 ```
 
@@ -1100,11 +1102,19 @@ Expected: the two `T8:` assertions FAIL.
 Replace the binary loop and the `python3` warning inside `canary_preflight` (lines 512–519) with:
 
 ```bash
+  # HARD-REQUIRED binaries. `codex` is deliberately NOT here: its absence is
+  # handled by the asymmetric failover policy below, and listing it in both places
+  # made the canary contradict itself — it would halt on a missing binary the very
+  # next lines describe as optional.
+  # `env` is required because dispatch_detached uses it to hand variables to the
+  # detached child; `setsid`, `realpath` and `flock` are likewise new dependencies.
   local missing=()
-  for bin in claude codex timeout awk sed jq git date sha256sum cut mkdir mv tail tr grep setsid realpath flock python3; do
+  for bin in claude timeout awk sed jq git date sha256sum cut mkdir mv tail tr \
+             grep setsid realpath flock env python3; do
     command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
   done
-  # codex absence is handled by the failover policy, not by this list.
+  # codex is optional here; a missing binary drives the failover policy (Mode 0),
+  # which Phase 1 escalates to a HALT on its own terms.
   local codex_present=yes
   command -v codex >/dev/null 2>&1 || codex_present=no
   # python3 is REQUIRED: render_prompt cannot function without it.
@@ -1322,6 +1332,9 @@ init_orchestration_vars() {
   fi
   codex_available="${codex_available:-false}"
   codex_disabled_by_user="${codex_disabled_by_user:-false}"
+  # How long .intent may exist without the child's .started before the launch is
+  # called failed. The child publishes it as its first action, so this is generous.
+  DISPATCH_START_GRACE_S="${DISPATCH_START_GRACE_S:-30}"
   validate_roots
 }
 
@@ -1630,11 +1643,14 @@ from role_model, and adds 'unknown' for the non-git case."
           "cache_creation_input_tokens":300,"output_tokens":800}}
 ```
 
-`tests/fixtures/codex-usage.jsonl`:
+`tests/fixtures/codex-usage.jsonl` — `input_tokens` is the TOTAL with cached
+included, so `cached_input_tokens` must be less than it. The values are chosen so
+that a parser returning raw `input_tokens` (2100) instead of the difference (300)
+fails visibly:
 
 ```json
 {"type":"turn.started"}
-{"type":"turn.completed","usage":{"input_tokens":2100,"cached_input_tokens":15000,"output_tokens":640,"reasoning_output_tokens":2048}}
+{"type":"turn.completed","usage":{"input_tokens":2100,"cached_input_tokens":1800,"output_tokens":640,"reasoning_output_tokens":2048}}
 ```
 
 `tests/fixtures/codex-no-turn.jsonl`:
@@ -1670,11 +1686,14 @@ if declare -F parse_usage >/dev/null; then
     *) _fail "parse_usage claude status: $out" ;;
   esac
 
+  # Assert EVERY emitted field, not just one. The fixture is
+  # input_tokens=2100, cached_input_tokens=15000 -> wait: cached exceeds total,
+  # so use the corrected fixture below. Values are chosen so a raw-vs-subtracted
+  # mistake in tokens_input_new is visible: 2100 total - 1800 cached = 300 new.
   out="$(parse_usage codex fixtures/codex-usage.jsonl 900 gpt-5.6-sol)"
-  case "$out" in
-    *"tokens_reasoning=2048"*) _ok "parse_usage reads codex reasoning tokens" ;;
-    *) _fail "parse_usage codex reasoning: $out" ;;
-  esac
+  assert_eq \
+    "model=gpt-5.6-sol duration_ms=900 tokens_input_new=300 tokens_input_cached=1800 tokens_cache_write=0 tokens_output=640 tokens_reasoning=2048 cost_usd=n/a usage_status=ok" \
+    "$out" "parse_usage emits every codex field exactly (input_new is total minus cached)"
 
   # The regression: a transcript with no turn.completed must be 'unavailable',
   # not 'ok' with zeros.
@@ -1747,7 +1766,13 @@ In `parse_usage`, replace the codex jq invocation so an absent `turn.completed` 
         "$fallback_model" "$wall_ms"
       return 0
     fi
-    IFS=$'\t' read -r in_new in_cached out reasoning <<< "$parsed"
+    IFS=$'\t' read -r in_total in_cached out reasoning <<< "$parsed"
+    # tokens_input_new is NEW input only: Codex reports input_tokens as the TOTAL,
+    # cached included. The existing implementation subtracts cached and this must
+    # preserve that, or the field silently changes meaning and every per-phase
+    # Usage table double-counts cached input.
+    in_new=$(( in_total - in_cached ))
+    [ "$in_new" -lt 0 ] && in_new=0
     printf 'model=%s duration_ms=%s tokens_input_new=%s tokens_input_cached=%s tokens_cache_write=0 tokens_output=%s tokens_reasoning=%s cost_usd=n/a usage_status=ok\n' \
       "$fallback_model" "$wall_ms" "$in_new" "$in_cached" "$out" "$reasoning"
     ;;
@@ -2166,12 +2191,28 @@ Append to `tests/check_06_cookbook.sh` before `finish`:
 ```bash
 # --- render_prompt ---
 if declare -F render_prompt >/dev/null; then
+  # PLAIN ASSIGNMENTS, deliberately NOT exported. The orchestrator sets these the
+  # same way, so an `export` here would mask the real defect: render_prompt reads
+  # them through python3's os.environ, which never sees an unexported shell
+  # variable. Verified: python3 reports None for a plain assignment.
   PROCESS_PATH="$PROCESS_DOC"
-  ITERATION=07 FEATURE_FOLDER=/tmp/ff ROUND=03 TEST_REPORT_PATH=/tmp/tr.md
-  export PROCESS_PATH ITERATION FEATURE_FOLDER ROUND TEST_REPORT_PATH
+  ITERATION=07
+  FEATURE_FOLDER=/tmp/ff
+  SPEC_PATH=/tmp/spec.md
+  PLAN_PATH=/tmp/plan.md
+  FINDINGS_PATHS="/tmp/a.md
+/tmp/b.md"
+  IMPLEMENTATION_BASE_SHA=deadbeef
+  IMPLEMENTATION_SUMMARY_PATH=/tmp/impl.md
+  DEBUGGER_STATUS_PATH=/tmp/dbg.md
+  REPO_ROOT=/tmp/repo
+  ROUND=03
+  TEST_REPORT_PATH=/tmp/tr.md
+  RESOLVED_MODELS="  implementer: claude-opus-5"
+  CONTEXT7_POLICY=required
 
   body="$(render_prompt spec-reviewer-claude)" \
-    && _ok "render_prompt extracts a known appendix" \
+    && _ok "render_prompt extracts a known appendix from unexported variables" \
     || _fail "render_prompt failed on spec-reviewer-claude"
   case "$body" in
     *'$ITERATION'*) _fail "render_prompt left \$ITERATION unsubstituted" ;;
@@ -2179,12 +2220,35 @@ if declare -F render_prompt >/dev/null; then
     *)              _fail "render_prompt output lacks the substituted value" ;;
   esac
 
-  # Phase 8 variables: the omission that made all-tests prompts render literals.
-  body="$(render_prompt all-tests-runner)"
+  # THE regression: no appendix may render with an unresolved variable. This one
+  # assertion covers every appendix and every key at once.
+  unresolved=""
+  for a in $(/usr/bin/grep -oP '^<!-- BEGIN: \K[a-z0-9-]+' "$PROCESS_DOC"); do
+    out="$(render_prompt "$a" 2>&1)" || { unresolved="$unresolved $a(rc)"; continue; }
+    case "$out" in
+      *'$'[A-Z][A-Z]*) unresolved="$unresolved $a" ;;
+    esac
+  done
+  assert_eq "" "$unresolved" "every appendix renders with no unresolved \$VARS"
+
+  # Multi-line values must survive verbatim -- this is why python3, not sed.
+  body="$(render_prompt spec-fixer)"
   case "$body" in
-    *'$ROUND'*) _fail "render_prompt left \$ROUND unsubstituted" ;;
-    *)          _ok "render_prompt substitutes \$ROUND" ;;
+    *"/tmp/a.md"*"/tmp/b.md"*) _ok "multi-line \$FINDINGS_PATHS survives intact" ;;
+    *) _fail "multi-line substitution mangled \$FINDINGS_PATHS" ;;
   esac
+
+  # An UNSET variable that the appendix uses must be a named failure, not a
+  # half-rendered prompt.
+  unset SPEC_PATH
+  err="$(render_prompt spec-reviewer-claude 2>&1 >/dev/null)"; rc=$?
+  [ "$rc" -ne 0 ] && _ok "render_prompt fails when an appendix variable is unset" \
+                  || _fail "render_prompt must fail on an unset appendix variable"
+  case "$err" in
+    *SPEC_PATH*) _ok "render_prompt names the unset variable" ;;
+    *) _fail "render_prompt did not name the unset variable: $err" ;;
+  esac
+  SPEC_PATH=/tmp/spec.md
 
   # A missing marker must be a legible error, not a Python traceback that
   # becomes the prompt.
@@ -2216,10 +2280,40 @@ Replace lines 393–433 with:
 # Extract one appendix and substitute orchestration variables into it.
 # `sed` is NOT an alternative: multi-line values such as $FINDINGS_PATHS break
 # it, and path values collide with any delimiter chosen.
+# Every variable any appendix may reference. Declared by render_keys() rather
+# than a top-level assignment, because the cookbook must be definitions-only:
+# check_01_lint.sh sources it in a pristine shell and fails on any variable it
+# sets. tests/check_03_varcoverage.sh asserts this list covers every $VAR used in
+# every appendix body, and dispatch_detached forwards exactly this list.
+render_keys() {
+  printf '%s\n' FEATURE_FOLDER ITERATION SPEC_PATH PLAN_PATH FINDINGS_PATHS \
+    IMPLEMENTATION_BASE_SHA IMPLEMENTATION_SUMMARY_PATH DEBUGGER_STATUS_PATH \
+    REPO_ROOT ROUND TEST_REPORT_PATH RESOLVED_MODELS CONTEXT7_POLICY
+}
+
 render_prompt() {
   # Usage: render_prompt <appendix-name>
-  local appendix="$1"
-  APPENDIX="$appendix" PROCESS_PATH="$PROCESS_PATH" "$PYTHON_BIN" - <<'PY'
+  local appendix="$1" k
+  local set_keys=() envargs=()
+
+  # Pass values EXPLICITLY. Orchestration variables are ordinary shell
+  # assignments, not exports, so python3 would see none of them via os.environ —
+  # the prompt would render with every $VAR intact and the subagent would be told
+  # to read a file called literally "$SPEC_PATH".
+  #
+  # `${!k+x}` distinguishes "set but empty" from "unset", which the prefix form
+  # alone cannot: an unset variable would arrive as an empty string and silently
+  # substitute nothing.
+  for k in $(render_keys); do
+    if [ -n "${!k+x}" ]; then
+      set_keys+=("$k")
+      envargs+=("$k=${!k}")
+    fi
+  done
+
+  env APPENDIX="$appendix" PROCESS_PATH="$PROCESS_PATH" \
+      SET_KEYS="${set_keys[*]}" ${envargs[@]+"${envargs[@]}"} \
+      "$PYTHON_BIN" - <<'PY'
 import os
 import re
 import sys
@@ -2241,34 +2335,28 @@ if end == -1:
     sys.exit(f"render_prompt: BEGIN without END for appendix '{name}' in {process}")
 body = text[start:end + len(end_marker)]
 
-# Every variable any appendix may reference. tests/check_03_varcoverage.sh
-# asserts this list covers every $VAR used in every appendix body, so an
-# appendix cannot start using a variable that is never substituted.
-KEYS = [
-    "FEATURE_FOLDER",
-    "ITERATION",
-    "SPEC_PATH",
-    "PLAN_PATH",
-    "FINDINGS_PATHS",
-    "IMPLEMENTATION_BASE_SHA",
-    "IMPLEMENTATION_SUMMARY_PATH",
-    "DEBUGGER_STATUS_PATH",
-    "REPO_ROOT",
-    "ROUND",
-    "TEST_REPORT_PATH",
-    # Multi-line: the role->model map injected into context-discovery. A
-    # dispatched session cannot call role_model, so the orchestrator formats it
-    # and substitutes it here. This is the case sed cannot handle.
-    "RESOLVED_MODELS",
-]
+# Only the keys the CALLER actually had set. The shell computed this list with
+# ${!k+x}, so "set but empty" is honoured and "unset" is detectable here.
+set_keys = os.environ.get("SET_KEYS", "").split()
 
 # Longest name first, and a trailing boundary assertion, so a short name can
 # never partially replace a longer one (e.g. $ITERATION vs $ITERATION_CAP).
-for key in sorted(KEYS, key=len, reverse=True):
-    value = os.environ.get(key)
-    if value is None:
-        continue
+for key in sorted(set_keys, key=len, reverse=True):
+    value = os.environ.get(key, "")
     body = re.sub(rf"\${key}(?![A-Za-z0-9_])", value.replace("\\", "\\\\"), body)
+
+# FAIL LOUDLY on anything left unresolved. A prompt containing a literal
+# "$SPEC_PATH" tells the subagent to read a file by that name; it will either
+# error confusingly or, worse, proceed against the wrong input. This is the
+# check that turns "the orchestrator forgot to set $PLAN_PATH" from a silent
+# wrong-input bug into an immediate, named failure.
+leftover = sorted(set(re.findall(r"\$([A-Z][A-Z0-9_]{2,})", body)))
+if leftover:
+    sys.exit(
+        f"render_prompt: appendix '{name}' references unset variable(s): "
+        + ", ".join("$" + v for v in leftover)
+        + f"\n  set keys were: {' '.join(sorted(set_keys)) or '(none)'}"
+    )
 
 print(body)
 PY
@@ -2387,6 +2475,58 @@ EOF
   ( cd "$BUILD" && validate_status impl-missing.md implementer ) \
     && _fail "validate_status must require verification: for the implementer" \
     || _ok "validate_status requires verification: for the implementer"
+
+  # A LEGAL verdict must be accepted. Rejecting implementer FAILED would turn a
+  # correct failure report into a bogus malformed-STATUS Mode 4.
+  printf 'verdict: FAILED\nverification: FAIL\nreason: task 3 needs human input\n' \
+    > "$BUILD/impl-failed.md"
+  ( cd "$BUILD" && validate_status impl-failed.md implementer ) \
+    && _ok "validate_status accepts implementer verdict FAILED (legal)" \
+    || _fail "validate_status must accept implementer FAILED"
+  # DONE_WITH_CONCERNS is NOT in the implementer contract and must be rejected.
+  printf 'verdict: DONE_WITH_CONCERNS\nverification: PASS\n' > "$BUILD/impl-inv.md"
+  ( cd "$BUILD" && validate_status impl-inv.md implementer ) \
+    && _fail "DONE_WITH_CONCERNS is not a legal implementer verdict" \
+    || _ok "validate_status rejects DONE_WITH_CONCERNS for the implementer"
+
+  # Role-specific enums that no generic category can express.
+  printf 'verdict: SKIPPED\nreason: no test suite discovered\n' > "$BUILD/tr.md"
+  ( cd "$BUILD" && validate_status tr.md all-tests-runner ) \
+    && _ok "all-tests-runner accepts SKIPPED" \
+    || _fail "all-tests-runner must accept SKIPPED"
+  ( cd "$BUILD" && validate_status tr.md spec-fixer ) \
+    && _fail "SKIPPED is not legal for spec-fixer" \
+    || _ok "spec-fixer rejects SKIPPED"
+
+  # EXHAUSTIVE: every dispatched role must have a schema, and every verdict the
+  # role's appendix declares must validate. This is what stops the table from
+  # drifting away from the appendices.
+  missing_schema=""
+  for r in $(_role_keys); do
+    [ "$r" = impl-worker ] && continue    # sub-subagent: writes no STATUS
+    _status_verdicts "$r" >/dev/null 2>&1 || missing_schema="$missing_schema $r"
+  done
+  assert_eq "" "$missing_schema" "every dispatched role has a STATUS schema"
+
+  for r in $(_role_keys); do
+    [ "$r" = impl-worker ] && continue
+    for vd in $(_status_verdicts "$r"); do
+      f="$BUILD/x-$r-$vd.md"
+      { printf 'verdict: %s\n' "$vd"
+        printf 'reason: because\n'
+        for k in $(_status_required_fields "$r"); do
+          case "$k" in
+            findings)      printf 'findings: %s\n' "f-$r.md"; : > "$BUILD/f-$r.md" ;;
+            verification)  printf 'verification: PASS\n' ;;
+            *)             printf '%s: 0\n' "$k" ;;
+          esac
+        done
+      } > "$f"
+      ( cd "$BUILD" && validate_status "${f##*/}" "$r" ) \
+        || _fail "role $r must accept its own declared verdict '$vd'"
+    done
+  done
+  _ok "every role accepts every verdict its appendix declares"
 else
   _fail "status_field / validate_status not defined"
 fi
@@ -2446,17 +2586,40 @@ status_field() {
   printf '%s\n' "$line"
 }
 
-# Legal verdicts per kind. An arbitrary verdict string must NOT validate: the
-# orchestrator branches on this value, and an unrecognised one would fall through
-# every case arm silently.
-_verdict_enum() {
+# Legal verdicts and required extra fields, keyed by CONCRETE ROLE.
+#
+# Transcribed verbatim from each appendix's own `verdict:` line — the appendix is
+# the contract for what its subagent writes. Generic categories cannot express
+# this: `all-tests-runner` is PASS|FAIL|SKIPPED, `finishing-branch` is
+# DONE|SKIPPED|FAILED, and `implementer` is DONE|FAILED|NEEDS_DEBUG|BLOCKED. An
+# enum that merely looks plausible is worse than none: accepting an invalid
+# verdict lets it fall through every gate `case` arm silently, and rejecting a
+# LEGAL one turns a correct failure report into a bogus malformed-STATUS Mode 4.
+_status_verdicts() {
   case "$1" in
-    reviewer)   echo "PASS CHANGES_REQUESTED BLOCKED" ;;
-    implementer) echo "DONE DONE_WITH_CONCERNS NEEDS_DEBUG BLOCKED" ;;
-    worker)     echo "DONE READY BLOCKED" ;;
-    summarizer) echo "DONE BLOCKED" ;;
-    preflight)  echo "READY MISSING_SKILLS BLOCKED" ;;
+    preflight-claude|preflight-codex)   echo "READY MISSING_SKILLS" ;;
+    context-discovery)                  echo "READY BLOCKED" ;;
+    spec-reviewer-claude|spec-reviewer-codex|\
+    plan-reviewer-claude|plan-reviewer-codex|\
+    code-reviewer-claude|code-reviewer-codex) echo "PASS CHANGES_REQUESTED" ;;
+    spec-fixer|plan-writer|plan-fixer|debugger|test-fixer) echo "DONE BLOCKED" ;;
+    implementer)                        echo "DONE FAILED NEEDS_DEBUG BLOCKED" ;;
+    all-tests-runner)                   echo "PASS FAIL SKIPPED" ;;
+    finishing-branch)                   echo "DONE SKIPPED FAILED" ;;
+    summarizer-spec|summarizer-plan|summarizer-implementation|\
+    summarizer-code-review|summarizer-all-tests|readiness-writer) echo "DONE" ;;
     *) return 1 ;;
+  esac
+}
+
+# Extra required fields beyond verdict/reason, keyed by concrete role.
+_status_required_fields() {
+  case "$1" in
+    spec-reviewer-claude|spec-reviewer-codex|\
+    plan-reviewer-claude|plan-reviewer-codex|\
+    code-reviewer-claude|code-reviewer-codex) echo "blockers majors minors findings" ;;
+    implementer)                              echo "verification" ;;
+    *)                                        echo "" ;;
   esac
 }
 
@@ -2464,8 +2627,9 @@ _verdict_enum() {
 # Note: `\S` is a PCRE/GNU extension and is NOT valid POSIX ERE — use
 # [^[:space:]] instead.
 validate_status() {
-  # Usage: validate_status <status-path> <reviewer|implementer|worker|summarizer|preflight>
-  local path="$1" kind="$2" v verdict legal ok
+  # Usage: validate_status <status-path> <role>
+  # <role> is a CONCRETE role key, not a category.
+  local path="$1" role="$2" v verdict legal ok k
   if [ ! -f "$path" ]; then
     echo "invalid status: missing file: $path" >&2; return 1
   fi
@@ -2473,18 +2637,18 @@ validate_status() {
     echo "invalid status: no non-empty verdict: field in $path" >&2; return 1
   fi
 
-  legal="$(_verdict_enum "$kind")" \
-    || { echo "validate_status: unknown kind '$kind'" >&2; return 1; }
+  legal="$(_status_verdicts "$role")" \
+    || { echo "validate_status: unknown role '$role'" >&2; return 1; }
   verdict="$(status_field "$path" verdict)"
   ok=no
   for v in $legal; do [ "$verdict" = "$v" ] && ok=yes; done
   if [ "$ok" = no ]; then
-    echo "invalid status: verdict '$verdict' is not one of [$legal] in $path" >&2
+    echo "invalid status: verdict '$verdict' is not legal for role $role [$legal] in $path" >&2
     return 1
   fi
 
   # Contract rule 4 (line 797): any verdict other than PASS/READY/DONE requires a
-  # non-empty one-line reason.
+  # non-empty one-line reason. SKIPPED counts as needing one — it explains why.
   case "$verdict" in
     PASS|READY|DONE) : ;;
     *)
@@ -2494,36 +2658,30 @@ validate_status() {
       fi ;;
   esac
 
-  case "$kind" in
-    reviewer)
-      local k
-      for k in blockers majors minors findings; do
-        v="$(status_field "$path" "$k")"
-        if [ -z "$v" ]; then
-          echo "invalid status: reviewer status missing '$k:' in $path" >&2; return 1
-        fi
-        case "$k" in
-          blockers|majors|minors)
-            case "$v" in ''|*[!0-9]*)
-              echo "invalid status: $k must be an integer, got '$v' in $path" >&2
-              return 1 ;;
-            esac ;;
-          findings)
-            if [ ! -f "$(dirname "$path")/$v" ] && [ ! -f "$v" ]; then
-              echo "invalid status: findings: '$v' does not exist" >&2; return 1
-            fi ;;
-        esac
-      done ;;
-    implementer)
-      # Contract rule 5 (line 798): verification: in {PASS, FAIL, PARTIAL}.
-      v="$(status_field "$path" verification)"
-      case "$v" in
-        PASS|FAIL|PARTIAL) : ;;
-        *) echo "invalid status: verification must be PASS|FAIL|PARTIAL, got '$v' in $path" >&2
-           return 1 ;;
-      esac ;;
-    worker|summarizer|preflight) : ;;
-  esac
+  for k in $(_status_required_fields "$role"); do
+    v="$(status_field "$path" "$k")"
+    if [ -z "$v" ]; then
+      echo "invalid status: role $role requires '$k:' in $path" >&2; return 1
+    fi
+    case "$k" in
+      blockers|majors|minors)
+        case "$v" in ''|*[!0-9]*)
+          echo "invalid status: $k must be an integer, got '$v' in $path" >&2
+          return 1 ;;
+        esac ;;
+      findings)
+        if [ ! -f "$(dirname "$path")/$v" ] && [ ! -f "$v" ]; then
+          echo "invalid status: findings: '$v' does not exist" >&2; return 1
+        fi ;;
+      verification)
+        # Contract rule 5 (line 798).
+        case "$v" in
+          PASS|FAIL|PARTIAL) : ;;
+          *) echo "invalid status: verification must be PASS|FAIL|PARTIAL, got '$v' in $path" >&2
+             return 1 ;;
+        esac ;;
+    esac
+  done
   return 0
 }
 ```
@@ -2731,17 +2889,18 @@ Expected: FAIL — `claude: command not found`, because the stubs do not exist.
 set -u
 [ -n "${FAKE_ARGV_LOG:-}" ] && printf 'claude %s\n' "$*" >> "$FAKE_ARGV_LOG"
 [ -n "${FAKE_IGNORE_TERM:-}" ] && trap '' TERM
-cat >/dev/null 2>&1 || true          # drain the prompt on stdin
-[ "${FAKE_DELAY:-0}" != 0 ] && sleep "${FAKE_DELAY}"
 case " $* " in
   *" --help "*) printf -- '--output-format --dangerously-skip-permissions --model --agents\n'; exit 0 ;;
 esac
-cat <<'JSON'
-{"type":"result","duration_ms":1234,"total_cost_usd":0.01,
- "modelUsage":{"claude-opus-5":{"inputTokens":10,"outputTokens":5}},
- "usage":{"input_tokens":10,"cache_read_input_tokens":0,
-          "cache_creation_input_tokens":0,"output_tokens":5}}
-JSON
+# Capture the prompt rather than discarding it: tests assert that what actually
+# reached the CLI is fully substituted (no literal $VARS survived render_prompt).
+prompt="$(cat || true)"
+[ "${FAKE_DELAY:-0}" != 0 ] && sleep "${FAKE_DELAY}"
+printf '{"type":"result","duration_ms":1234,"total_cost_usd":0.01,'
+printf '"modelUsage":{"claude-opus-5":{"inputTokens":10,"outputTokens":5}},'
+printf '"usage":{"input_tokens":10,"cache_read_input_tokens":0,'
+printf '"cache_creation_input_tokens":0,"output_tokens":5},'
+printf '"prompt_received":%s}\n' "$(printf '%s' "$prompt" | jq -Rs .)"
 exit "${FAKE_RC:-0}"
 ```
 
@@ -2766,10 +2925,10 @@ done
 case " $* " in
   *" --help "*) printf -- '--json --skip-git-repo-check --add-dir --model\n'; exit 0 ;;
 esac
-cat >/dev/null 2>&1 || true
+prompt="$(cat || true)"
 [ "${FAKE_DELAY:-0}" != 0 ] && sleep "${FAKE_DELAY}"
-printf '%s\n' '{"type":"turn.started"}'
-printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":7}}'
+printf '%s\n' "{\"type\":\"turn.started\",\"prompt_received\":$(printf '%s' "$prompt" | jq -Rs .)}"
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":2100,"cached_input_tokens":1800,"output_tokens":640,"reasoning_output_tokens":2048}}'
 exit "${FAKE_RC:-0}"
 ```
 
@@ -2913,6 +3072,38 @@ assert_eq yes "$(role_mutates finishing-branch)" "the git finalizer mutates"
 assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" \
   "launch is recorded in RUN_LOG before the process starts"
 
+# 13a. NONCE LEASE: a straggler child must not run after a retry. Launch a slow
+#      child, re-dispatch over it, and assert exactly ONE CLI invocation.
+: > "$FAKE_ARGV_LOG"
+FAKE_DELAY=4 dispatch_detached 3 11 summarizer-spec    # slow to reach the CLI
+sleep 1
+dispatch_detached 3 11 summarizer-spec                 # retry revokes the nonce
+await_dispatch 3 11 summarizer-spec 60
+sleep 5                                                # let the straggler wake
+assert_eq 1 "$("$GREP_BIN" -c 'claude ' "$FAKE_ARGV_LOG")" \
+  "the nonce lease admits exactly one CLI invocation after a retry"
+
+# 13b. A failed .intent publication must abort BEFORE forking.
+ro="$WORK/readonly"; mkdir -p "$ro/transcripts"; chmod 500 "$ro/transcripts"
+( FEATURE_FOLDER="$ro"; dispatch_detached 3 12 summarizer-spec ) \
+  && _fail "dispatch_detached must abort when .intent cannot be published" \
+  || _ok "dispatch_detached aborts when .intent cannot be published"
+chmod 700 "$ro/transcripts"
+
+# 13c. The child receives every render key. A prompt that reached the stub with an
+#      unresolved $VAR would mean render_prompt silently half-rendered.
+: > "$FAKE_ARGV_LOG"
+SPEC_PATH="$WORK/spec.md"; : > "$SPEC_PATH"          # plain assignment, no export
+PLAN_PATH="$WORK/plan.md"; : > "$PLAN_PATH"
+ITERATION=01
+dispatch_detached 7 01 code-reviewer-claude
+await_dispatch 7 01 code-reviewer-claude 60
+id="$(dispatch_id 7 01 code-reviewer-claude)"
+assert_eq COMPLETED "$DISPATCH_STATE" "detached dispatch completes with unexported render keys"
+# The stub echoes its stdin into the transcript, so the rendered prompt is visible.
+assert_absent '\$[A-Z][A-Z_]{2,}' "$T/$id.json" \
+  "the prompt delivered to the child has no unresolved \$VARS"
+
 # 14. A detached CODEX dispatch works when the vars are NOT exported by the
 #     parent -- this is the regression that `export`-based tests would mask.
 unset REPO_ROOT FEATURE_FOLDER FEATURE_FOLDER_OUTSIDE_REPO
@@ -3016,15 +3207,33 @@ dispatch_detached() {
   appendix_exists "$role" \
     || { echo "halt: no appendix markers for role $role" >&2; return 1; }
 
-  # 1. Durable pre-launch intent. No pid yet — that is the point.
-  {
-    printf 'dispatch_id: %s\n' "$id"
-    printf 'role: %s\n' "$role"
-    printf 'vendor: %s\n' "$vendor"
-    printf 'model: %s\n' "$model"
-    printf 'timeout_s: %s\n' "$timeout_s"
-    printf 'intent_at: %s\n' "$(iso_now)"
-  } > "$base.intent.tmp" && mv "$base.intent.tmp" "$base.intent"
+  # 1. Durable pre-launch intent, stamped with a NONCE that identifies this
+  #    launch attempt. No pid yet — that is the point.
+  #
+  #    The nonce is what makes a retry safe. A grace-period timeout alone cannot
+  #    prove no child will run: a child that was slow to schedule, or SIGSTOPped,
+  #    can miss the window, be classified LAUNCH_FAILED, and then wake up and
+  #    invoke the CLI *after* a replacement dispatch has started — two CLIs, one
+  #    dispatch id. Verified reproducible. So every child re-reads the intent
+  #    immediately before invoking the CLI and exits if its nonce no longer owns
+  #    it; a retry writes a fresh nonce, revoking the old one.
+  local nonce
+  nonce="$(_new_nonce)"
+  if ! { printf 'dispatch_id: %s\n' "$id"
+         printf 'role: %s\n' "$role"
+         printf 'vendor: %s\n' "$vendor"
+         printf 'model: %s\n' "$model"
+         printf 'timeout_s: %s\n' "$timeout_s"
+         printf 'nonce: %s\n' "$nonce"
+         printf 'intent_at: %s\n' "$(iso_now)"
+       } > "$base.intent.tmp" && mv "$base.intent.tmp" "$base.intent"; then
+    # A failed intent write MUST abort. Without this branch the `&& mv` chain
+    # simply falls through and the launch proceeds with no durable record —
+    # verified: execution reached "launch" after a failed intent write.
+    echo "halt: could not publish dispatch intent at $base.intent" >&2
+    rm -f "$base.intent.tmp"
+    return 1
+  fi
 
   {
     printf -- '--- %s  event=DISPATCH_STARTED\n' "$(iso_now)"
@@ -3048,24 +3257,49 @@ dispatch_detached() {
             role_model role_effort role_timeout role_vendor \
             _role_row _role_field
 
-  setsid env \
-      REPO_ROOT="$REPO_ROOT" \
-      FEATURE_FOLDER="$FEATURE_FOLDER" \
-      FEATURE_FOLDER_OUTSIDE_REPO="${FEATURE_FOLDER_OUTSIDE_REPO:-}" \
-      PROCESS_PATH="$PROCESS_PATH" \
-      PYTHON_BIN="$PYTHON_BIN" \
-      GREP_BIN="$GREP_BIN" \
-      bash -c '
+  # Forward every variable the child needs. Ordinary assignments are NOT
+  # inherited across `bash -c`, and render_prompt / codex_invoke read all of
+  # these. render_keys() supplies the substitution set so it stays in one place.
+  local child_env=(
+    REPO_ROOT="$REPO_ROOT"
+    FEATURE_FOLDER="$FEATURE_FOLDER"
+    FEATURE_FOLDER_OUTSIDE_REPO="${FEATURE_FOLDER_OUTSIDE_REPO:-}"
+    PROCESS_PATH="$PROCESS_PATH"
+    PYTHON_BIN="$PYTHON_BIN"
+    GREP_BIN="$GREP_BIN"
+  )
+  for k in $(render_keys); do
+    [ -n "${!k+x}" ] && child_env+=("$k=${!k}")
+  done
+
+  setsid env "${child_env[@]}" bash -c '
     set -uo pipefail
-    base="$1"; vendor="$2"; role="$3"; shift 3
+    base="$1"; vendor="$2"; role="$3"; nonce="$4"; shift 4
+
     # 3. First action: publish .started with our OWN pid. No parent-side window.
-    {
-      printf "dispatch_id: %s\n" "${base##*/}"
-      printf "pid: %s\n" "$$"
-      printf "pid_starttime: %s\n" "$(awk "{print \$22}" "/proc/$$/stat")"
-      printf "started_at: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    } > "$base.started.tmp" && mv "$base.started.tmp" "$base.started"
+    #    A failed publication must abort BEFORE the CLI runs, or an unrecorded
+    #    child would burn tokens while the orchestrator believes nothing launched.
+    if ! { printf "dispatch_id: %s\n" "${base##*/}"
+           printf "pid: %s\n" "$$"
+           printf "pid_starttime: %s\n" "$(awk "{print \$22}" "/proc/$$/stat")"
+           printf "nonce: %s\n" "$nonce"
+           printf "started_at: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+         } > "$base.started.tmp" && mv "$base.started.tmp" "$base.started"; then
+      rm -f "$base.started.tmp"
+      printf "%s\n" 71 > "$base.rc.tmp" && mv "$base.rc.tmp" "$base.rc"
+      exit 71
+    fi
     printf "%s\n" "$$" > "$base.pid.tmp" && mv "$base.pid.tmp" "$base.pid"
+
+    # 4. LEASE CHECK, immediately before spending anything. If the orchestrator
+    #    gave up on us and re-dispatched, the intent now carries a different
+    #    nonce and we must not run: otherwise two CLIs share one dispatch id and
+    #    both write the same STATUS path.
+    current_nonce="$(sed -n "s/^nonce: //p" "$base.intent" 2>/dev/null)"
+    if [ "$current_nonce" != "$nonce" ]; then
+      printf "%s\n" 75 > "$base.rc.tmp" && mv "$base.rc.tmp" "$base.rc"
+      exit 75    # lease revoked; a replacement dispatch owns this id
+    fi
 
     if [ "$vendor" = codex ]; then
       codex_invoke "$role" "$base.json" "$base.err" "$@" < <(render_prompt "$role")
@@ -3075,14 +3309,13 @@ dispatch_detached() {
     rc=$?
     # Atomic publication: a poller must never read a partial .rc.
     printf "%s\n" "$rc" > "$base.rc.tmp" && mv "$base.rc.tmp" "$base.rc"
-  ' _ "$base" "$vendor" "$role" "$@" >/dev/null 2>&1 &
+  ' _ "$base" "$vendor" "$role" "$nonce" "$@" >/dev/null 2>&1 &
   disown $! 2>/dev/null || true
   return 0
 }
 
-# How long to wait for a child to publish .started before calling the launch
-# failed. The child writes it as its first action, so this is generous.
-DISPATCH_START_GRACE_S="${DISPATCH_START_GRACE_S:-30}"
+# A launch nonce: unique per attempt, no Date/Random dependency beyond the shell.
+_new_nonce() { printf '%s-%s\n' "$$" "${EPOCHREALTIME/[.,]/}"; }
 
 # Classify a dispatch. Sets the globals DISPATCH_STATE and DISPATCH_RC.
 #
@@ -3109,6 +3342,12 @@ dispatch_state() {
     case "$rc" in
       0)   DISPATCH_STATE=COMPLETED ;;
       124) DISPATCH_STATE=TIMED_OUT ;;
+      # 75: the child found its lease revoked and exited without running the CLI.
+      # 71: the child could not publish .started and aborted before the CLI.
+      # Both mean NOTHING was spent, so the replacement dispatch is authoritative
+      # and this record is informational only.
+      75)  DISPATCH_STATE=LEASE_REVOKED ;;
+      71)  DISPATCH_STATE=LAUNCH_FAILED ;;
       *)   DISPATCH_STATE=FAILED ;;
     esac
     return 0
@@ -3119,8 +3358,13 @@ dispatch_state() {
   fi
 
   # Intent exists but the child has not published .started yet. Either it is
-  # about to, or the fork failed. Bound the ambiguity with a grace period
-  # instead of guessing.
+  # about to, or the fork failed. Bound the ambiguity with a grace period.
+  #
+  # IMPORTANT: LAUNCH_FAILED does NOT prove no child will ever run — a child that
+  # was slow to schedule or SIGSTOPped can publish .started after this point.
+  # Safety comes from the NONCE LEASE, not from this timeout: re-dispatching
+  # writes a new nonce, and any late child checks the intent before spending and
+  # exits 75. Never treat this state as proof of non-execution on its own.
   if [ ! -f "$base.started" ]; then
     age=$(( $(date -u +%s) - $(date -u -r "$base.intent" +%s 2>/dev/null || date -u +%s) ))
     if [ "$age" -lt "$DISPATCH_START_GRACE_S" ]; then
@@ -3277,8 +3521,11 @@ agents_json="$(jq -nc --arg m "$(role_model impl-worker)" \
   '{"impl-worker":{description:"Implementation sub-subagent",
                    prompt:"Follow the task instructions you are given.",
                    model:$m}}')"
-render_prompt implementer \
-  | dispatch_detached 6 00 implementer --agents "$agents_json"
+
+# No pipe: dispatch_detached reads no stdin -- the CHILD renders the appendix.
+# Piping into it would render twice, and the pipeline's exit status would report
+# a SIGPIPE from the discarded render *after* the child had already launched.
+dispatch_detached 6 00 implementer --agents "$agents_json"
 ```
 ````
 
@@ -3410,7 +3657,11 @@ Replace each of the four divergent statements with a reference to one canonical 
   `mkdir -p` and may write ONLY: `RUN_LOG.md`, `full_log.md`,
   `process-improvement-proposition.md`, and
   `transcripts/<dispatch-id>.{json,err,rc,pid,started,intent}` — all inside
-  `$FEATURE_FOLDER`. Nothing else, ever. Reading remains restricted to STATUS
+  `$FEATURE_FOLDER`. Also permitted: a `<allowed-control-file>.tmp` companion in
+  the SAME directory, and only as the write target of an atomic
+  `> x.tmp && mv x.tmp x` publication. Those temporaries are transient by
+  construction and never outlive the `mv`; a failed publication removes its own
+  `.tmp` and aborts. Nothing else, ever. Reading remains restricted to STATUS
   files and the per-phase summaries they reference.
 - **Appendix content is still never written to disk.** There is no `.prompt` file:
   a detached child renders its own appendix from `$PROCESS_PATH`, and an inline
@@ -3495,13 +3746,57 @@ MCP servers that must be reachable:
   `test-fixer`. It is an **MCP server, not a Superpowers skill**, so it is not
   covered by the skill probes above.
 
-If `context7` is unreachable, do NOT halt. Log `event=CONTEXT7_UNAVAILABLE`,
-record it in the readiness report, and downgrade every appendix's `context7`
-requirement from MUST to best-effort for this run. Silently proceeding — the
+If `context7` is unreachable, do NOT halt. Log `event=CONTEXT7_UNAVAILABLE` and
+downgrade the requirement to best-effort for this run. Silently proceeding — the
 previous behaviour — hid the degradation from the final report.
 ```
 
-Add the probe to `preflight-claude` (line 1837) and report it in that appendix's STATUS as `context7: reachable|unreachable`.
+Add the probe to `preflight-claude` (line 1837) and report it in that appendix's
+STATUS as `context7: reachable|unreachable`.
+
+**The downgrade must be executable, not prose.** A dispatched subprocess receives
+only its rendered appendix — it cannot see a policy statement written elsewhere in
+this document, so "affected appendices downgrade to best-effort" is unenforceable on
+its own. Three concrete changes:
+
+1. The orchestrator sets a substitution variable after Phase 1:
+
+   ```bash
+   # Read from 1-preflight/phase-1/claude-check-status.md's context7: field.
+   if [ "$(status_field "$FEATURE_FOLDER/1-preflight/phase-1/claude-check-status.md" context7)" = reachable ]; then
+     CONTEXT7_POLICY=required
+   else
+     CONTEXT7_POLICY=best-effort
+   fi
+   ```
+
+   `CONTEXT7_POLICY` is already in `render_keys()`, so every appendix receives it
+   and `render_prompt` fails loudly if it is ever left unset.
+
+2. Each of the four appendices that require `context7` (`plan-writer` line 2136,
+   `implementer` line 2354, `debugger` line 2446, `test-fixer` line 2694) replaces
+   its unconditional MUST with:
+
+   ```markdown
+   `context7` policy for this run: **$CONTEXT7_POLICY**.
+   - `required` — you MUST call `resolve-library-id` then `get-library-docs` before
+     writing or modifying code that touches any external library, framework, SDK,
+     API, CLI tool, or cloud service.
+   - `best-effort` — `context7` was unreachable at preflight. Attempt it; if it
+     fails, proceed using the plan's cited APIs and record in your summary which
+     APIs you could not verify against current documentation.
+   ```
+
+3. The `readiness-writer` appendix (line 3052) adds `RUN_LOG.md` event filtering to
+   its declared inputs, because degradations live only in the log:
+
+   ```markdown
+   Also scan `RUN_LOG.md` for `event=CONTEXT7_UNAVAILABLE`,
+   `event=DISPATCH_ORPHANED`, and `event=MODEL_REJECTED`. Each present event gets a
+   line in a "## Degradations" section of the readiness report, naming the affected
+   roles. A run with any degradation cannot be reported `READY` — use
+   `READY_WITH_NOTES` at minimum.
+   ```
 
 - [ ] **Step 8: Fix the remaining small items**
 
@@ -3571,24 +3866,41 @@ python3 lib/extract.py snippets
 # 2a. INVARIANT: the cookbook is definitions only. A top-level statement would
 #     execute on `source`, and a top-level ${VAR:?} would abort the sourcing
 #     shell -- which is exactly how the test suite loads these helpers.
-offending="$(awk '
-  /^[[:space:]]*(#|$)/            { next }   # comments and blanks
-  /^[a-zA-Z_][a-zA-Z0-9_]*\(\)/   { depth++; next }   # function opener
-  /^}/                            { depth--; next }   # function closer
-  depth > 0                       { next }            # inside a function
-  { printf "%d: %s\n", NR, $0 }
-' "$BUILD/cookbook.sh")"
-if [ -z "$offending" ]; then
-  _ok "cookbook contains no top-level statements"
-else
-  _fail "cookbook has top-level statements; they run on source and can abort the shell"
-  printf '    %s\n' "$offending"
-fi
+#     Detect this by OBSERVATION, not by parsing braces. A brace-counting awk
+#     heuristic is unreliable: a one-liner such as `f() { :; }` increments the
+#     depth and never matches a lone `^}`, so every following top-level statement
+#     is silently treated as inside a function. Verified -- such a detector
+#     reported no offender for a file containing a bare `LEAK=1`.
+#
+#     Instead source the cookbook in a pristine shell and diff the variable set.
+#     A definitions-only file adds functions and nothing else.
+#     Note: any non-zero rc here means "did not source cleanly". A top-level
+#     ${VAR:?} kills the shell outright, so a trailing `|| exit N` never runs and
+#     the observed code is bash's own (127) -- do not test for a sentinel value.
+#     PIPESTATUS is filtered out: the `compgen -v | sort` pipeline sets it itself.
+IGNORE_VARS='_|PIPESTATUS|BASH_EXECUTION_STRING'
+before="$BUILD/vars-before.txt"; after="$BUILD/vars-after.txt"
+env -i bash --noprofile --norc -c 'compgen -v | sort' > "$before" 2>/dev/null
+env -i bash --noprofile --norc -c '
+  source "$1" || exit 9
+  compgen -v | sort' _ "$BUILD/cookbook.sh" > "$after" 2>/dev/null
+src_rc=$?
 
-# 2b. Sourcing must be side-effect free with NO variables preset.
-( set -uo pipefail; source "$BUILD/cookbook.sh" ) >/dev/null 2>&1 \
-  && _ok "cookbook sources cleanly with no variables preset" \
-  || _fail "sourcing the cookbook fails on a bare shell"
+if [ "$src_rc" -ne 0 ]; then
+  _fail "cookbook does not source cleanly in a pristine shell (rc=$src_rc)"
+  note "a top-level \${VAR:?} aborts the sourcing shell; move it into init_orchestration_vars"
+  env -i bash --noprofile --norc -c 'source "$1"' _ "$BUILD/cookbook.sh" 2>&1 | head -3 \
+    | while IFS= read -r l; do note "$l"; done
+else
+  _ok "cookbook sources cleanly in a pristine shell with no variables preset"
+  leaked="$(comm -13 "$before" "$after" | "$GREP_BIN" -vxE "$IGNORE_VARS" || true)"
+  if [ -z "$leaked" ]; then
+    _ok "cookbook assigns no variables at source time (definitions only)"
+  else
+    _fail "cookbook assigns variables at top level; move them into init_orchestration_vars"
+    printf '    %s\n' "$leaked"
+  fi
+fi
 
 bash -n "$BUILD/cookbook.sh" && _ok "cookbook.sh is syntactically valid" \
                              || _fail "cookbook.sh has a syntax error"
@@ -3774,7 +4086,30 @@ Eleven findings, all reproduced before being accepted. Five were blockers:
 | 4 | A `.prompt` file put appendix content on disk, contradicting line 23, and a failed render could still launch | No prompt file: the child renders its own appendix; the parent pre-validates with `appendix_exists` before forking |
 | 5 | `assert_present --  …` shifted every argument, making the model string the filename | Leading `--` removed from all call sites |
 
-Six majors: the launch window now uses a parent `.intent` plus a child-published
+### Second revision after external review
+
+Nine findings, all reproduced first. Four blockers:
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | `render_prompt` read substitutions from `os.environ`, but orchestration variables are unexported assignments — verified `None`. Its own test `export`ed them, hiding it, and the detached child received only 6 of 13 keys | Values passed explicitly via `env`, `${!k+x}` distinguishing unset from empty; **fails loudly naming any unresolved `$VAR`**; `render_keys()` is the single list, forwarded whole to the child; tests use plain assignments and assert no `$VAR` survives in any appendix or in the prompt the stub actually received |
+| 2 | Task 18 still piped into `dispatch_detached`, which reads no stdin | Direct call; comment explains the double-render and post-launch SIGPIPE |
+| 3 | `LAUNCH_FAILED` does not prove no CLI will run — a delayed child can wake after a retry; and `> x.tmp && mv` had no failure branch, so a failed intent write still "launched" | **Nonce lease**: `.intent` carries a per-attempt nonce, every child re-checks it immediately before spending and exits 75 if revoked. Both publication sites now abort. Verified: delayed child + retry ⇒ exactly one CLI invocation |
+| 4 | The implementer enum invented `DONE_WITH_CONCERNS` and rejected the legal `FAILED`, turning a correct failure report into a bogus Mode 4; generic categories could not express `all-tests-runner` or `finishing-branch` either | Role-keyed `_status_verdicts` / `_status_required_fields`, transcribed from all 23 appendices, with an exhaustive test that every role accepts every verdict its own appendix declares |
+
+Five majors: the top-level-statement detector was blind to one-line functions
+(verified: it reported nothing for a file containing `LEAK=1`) and is replaced by
+sourcing in a pristine `env -i` shell and diffing `compgen -v` — which then caught two
+top-level assignments of my own, now moved into `init_orchestration_vars` and
+`render_keys()`; `CONTEXT7_UNAVAILABLE` gains a real propagation path via a
+`$CONTEXT7_POLICY` substitution plus explicit `readiness-writer` event filtering,
+since a subprocess sees only its own appendix; the canonical write list now permits
+`<control-file>.tmp` for same-directory atomic publication; the Codex parser restores
+`input_tokens - cached_input_tokens` with a fixture chosen so the raw value differs
+visibly and an assertion on every emitted field; and the canary drops `codex` from the
+hard-required loop it simultaneously called optional, while adding `env`.
+
+First-revision majors: the launch window now uses a parent `.intent` plus a child-published
 `.started` (the design's "`.started` before `setsid`, containing the pid" was
 impossible as written); `ORPHANED` re-dispatch is gated by `role_mutates`, halting
 for mutating roles rather than risking double-applied commits; `post_dispatch` is
