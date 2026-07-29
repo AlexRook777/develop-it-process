@@ -508,26 +508,50 @@ resolved_models_block() {
 }
 ```
 
+### Shell policy
+
+Every orchestrator bash block starts with:
+
+<!-- lint: snippet -->
+```bash
+set -uo pipefail
+```
+
+**Never `set -e`.** Helpers signal outcomes through return codes that the
+orchestrator is required to inspect and branch on; `set -e` would abort the
+block instead of letting the gate decide. `-u` catches the unset-variable class
+of bug that made `codex_available` and `$STATUS` silently empty.
+
+**Bash functions do not survive across invocations.** Because each phase is a
+separate bash invocation, every cookbook helper this document defines must be
+re-defined in each phase block. Paste the whole cookbook at the top of each
+block; do not attempt to carry definitions between phases.
+
 ### full_log.md — bash command log
 
-`full_log.md` records every command the orchestrator executes, using bash's built-in xtrace (`set -x`) redirected to the file via `BASH_XTRACEFD`. It is written by the orchestrator's own bash blocks — not by subprocesses. It is never read during the run; it exists for post-run analysis.
-
-**Include the following preamble in every bash block that has `$FEATURE_FOLDER` available** (i.e., every block from Phase 1 onward, after the feature folder is created):
-
+<!-- lint: snippet -->
 ```bash
-# full_log.md — redirect xtrace here for post-run analysis
+# Redirect xtrace into full_log.md for post-run analysis.
+# BASH_XTRACEFD is deliberately NOT exported: exporting it leaks the fd into
+# every child, so each child bash writes its own xtrace into full_log.md, and a
+# child that does not inherit the fd fails with "invalid value for trace file
+# descriptor".
 if [ -d "${FEATURE_FOLDER:-}" ]; then
   printf '\n=== %s ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$FEATURE_FOLDER/full_log.md"
   exec {_LOGFD}>>"$FEATURE_FOLDER/full_log.md"
-  export BASH_XTRACEFD=$_LOGFD
-  export PS4='+ '
+  BASH_XTRACEFD=$_LOGFD
+  PS4='+ '
+  set -x
 fi
-set -x
+# ... phase body ...
+# At the end of the block, release the descriptor:
+#   set +x; exec {_LOGFD}>&-
 ```
 
-With `BASH_XTRACEFD` set, `set -x` xtrace output goes to `full_log.md` instead of stderr, so it does not pollute subprocess stderr streams. The `PS4='+ '` keeps xtrace lines concise. Subshells (`( ... ) &`) inherit `BASH_XTRACEFD` automatically — parallel reviewer dispatches appear interleaved in `full_log.md` as they execute, which is expected and useful for debugging.
-
-**Phase −1 canary preflight** runs before the feature folder exists. For that block only, omit the preamble (the `if [ -d ... ]` guard is a no-op) and rely on the default stderr xtrace. All subsequent phases include it.
+**Phase −1** runs before the feature folder exists. Send its xtrace to a temp
+file rather than stderr: the Mode-1 classifier greps subprocess stderr for
+`Usage:` and `unexpected argument`, and orchestrator xtrace on that stream is
+misread as a CLI usage error.
 
 ### Appendix substitution helper (handles multi-line values)
 
@@ -1070,10 +1094,19 @@ The strict orchestrator rules say "STATUS files only." During failure handling y
 - **On subprocess SUCCESS** (`rc == 0` AND `STATUS.md` exists AND parses): read ONLY `STATUS.md`. Do NOT tail transcripts "out of curiosity" — the verdict is whatever STATUS.md says.
 - **On subprocess FAILURE** (`rc != 0` OR `STATUS.md` missing OR malformed): read up to 40 lines of stderr to classify the failure mode. Surface that tail to the user when halting.
 
+<!-- lint: cookbook -->
 ```bash
 post_dispatch() {
   local rc="$1" status_path="$2" err_path="$3"
-  if [ "$rc" -ne 0 ] || [ ! -f "$status_path" ]; then
+  # An empty or non-numeric rc must be treated as a failure, not a syntax
+  # error: nothing ever wrote a readable `.rc` before Task 17.
+  local rc_bad
+  case "${rc:-}" in
+    ''|*[!0-9]*) rc_bad=yes ;;
+    0)           rc_bad=no ;;
+    *)           rc_bad=yes ;;
+  esac
+  if [ "$rc_bad" = yes ] || [ ! -f "$status_path" ]; then
     echo "subprocess failed (rc=$rc, status_present=$( [ -f "$status_path" ] && echo yes || echo no ))" >&2
     tail -n 40 "$err_path" >&2
     return 1
@@ -1096,39 +1129,118 @@ The STATUS.md contract is enforced by the orchestrator, not assumed. A malformed
 
 A minimal validator:
 
+<!-- lint: cookbook -->
 ```bash
-validate_status() {
-  # Usage: validate_status <status_path> <role>
-  local path="$1" role="$2"
-  [ -f "$path" ] || { echo "missing: $path" >&2; return 1; }
-  grep -qE '^verdict:[[:space:]]*\S' "$path" || { echo "no verdict: $path" >&2; return 1; }
-  local verdict
-  verdict="$(awk -F: '/^verdict:/{print $2; exit}' "$path" | xargs)"
+# Read one field from a STATUS file. Everything after the FIRST colon is the
+# value, so colons and quotes inside it survive. `awk -F:` truncated at the
+# first colon and `| xargs` interpreted quotes and died on an unmatched one.
+status_field() {
+  # Usage: status_field <status-path> <key>
+  local path="$1" key="$2" line
+  line="$("$GREP_BIN" -m1 "^${key}:" "$path" 2>/dev/null)" || return 1
+  line="${line#*:}"
+  # Trim surrounding whitespace with parameter expansion only.
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  printf '%s\n' "$line"
+}
 
-  case "$role" in
-    reviewer-*)
-      for k in blockers majors minors findings; do
-        grep -qE "^${k}:[[:space:]]*\S" "$path" || { echo "no ${k}: $path" >&2; return 1; }
-      done
-      for k in blockers majors minors; do
-        local v
-        v="$(awk -F: "/^${k}:/{print \$2; exit}" "$path" | xargs)"
-        case "$v" in ''|*[!0-9]*) echo "bad ${k}=${v}: $path" >&2; return 1 ;; esac
-      done
-      ;;
-    implementer)
-      grep -qE '^verification:[[:space:]]*(PASS|FAIL|PARTIAL)' "$path" \
-        || { echo "bad verification: $path" >&2; return 1; }
-      ;;
+# Legal verdicts and required extra fields, keyed by CONCRETE ROLE.
+#
+# Transcribed verbatim from each appendix's own `verdict:` line — the appendix is
+# the contract for what its subagent writes. Generic categories cannot express
+# this: `all-tests-runner` is PASS|FAIL|SKIPPED, `finishing-branch` is
+# DONE|SKIPPED|FAILED, and `implementer` is DONE|FAILED|NEEDS_DEBUG|BLOCKED. An
+# enum that merely looks plausible is worse than none: accepting an invalid
+# verdict lets it fall through every gate `case` arm silently, and rejecting a
+# LEGAL one turns a correct failure report into a bogus malformed-STATUS Mode 4.
+_status_verdicts() {
+  case "$1" in
+    preflight-claude|preflight-codex)   echo "READY MISSING_SKILLS" ;;
+    context-discovery)                  echo "READY BLOCKED" ;;
+    spec-reviewer-claude|spec-reviewer-codex|\
+    plan-reviewer-claude|plan-reviewer-codex|\
+    code-reviewer-claude|code-reviewer-codex) echo "PASS CHANGES_REQUESTED" ;;
+    spec-fixer|plan-writer|plan-fixer|debugger|test-fixer) echo "DONE BLOCKED" ;;
+    implementer)                        echo "DONE FAILED NEEDS_DEBUG BLOCKED" ;;
+    all-tests-runner)                   echo "PASS FAIL SKIPPED" ;;
+    finishing-branch)                   echo "DONE SKIPPED FAILED" ;;
+    summarizer-spec|summarizer-plan|summarizer-implementation|\
+    summarizer-code-review|summarizer-all-tests|readiness-writer) echo "DONE" ;;
+    *) return 1 ;;
   esac
+}
 
+# Extra required fields beyond verdict/reason, keyed by concrete role.
+_status_required_fields() {
+  case "$1" in
+    spec-reviewer-claude|spec-reviewer-codex|\
+    plan-reviewer-claude|plan-reviewer-codex|\
+    code-reviewer-claude|code-reviewer-codex) echo "blockers majors minors findings" ;;
+    implementer)                              echo "verification" ;;
+    *)                                        echo "" ;;
+  esac
+}
+
+# Validate a STATUS file's shape before branching on it.
+# Note: the PCRE/GNU non-whitespace shorthand is not valid POSIX ERE — use
+# [^[:space:]] instead.
+validate_status() {
+  # Usage: validate_status <status-path> <role>
+  # <role> is a CONCRETE role key, not a category.
+  local path="$1" role="$2" v verdict legal ok k
+  if [ ! -f "$path" ]; then
+    echo "invalid status: missing file: $path" >&2; return 1
+  fi
+  if ! "$GREP_BIN" -qE '^verdict:[[:space:]]*[^[:space:]]' "$path"; then
+    echo "invalid status: no non-empty verdict: field in $path" >&2; return 1
+  fi
+
+  legal="$(_status_verdicts "$role")" \
+    || { echo "validate_status: unknown role '$role'" >&2; return 1; }
+  verdict="$(status_field "$path" verdict)"
+  ok=no
+  for v in $legal; do [ "$verdict" = "$v" ] && ok=yes; done
+  if [ "$ok" = no ]; then
+    echo "invalid status: verdict '$verdict' is not legal for role $role [$legal] in $path" >&2
+    return 1
+  fi
+
+  # Contract rule 4 (line 797): any verdict other than PASS/READY/DONE requires a
+  # non-empty one-line reason. SKIPPED counts as needing one — it explains why.
   case "$verdict" in
     PASS|READY|DONE) : ;;
     *)
-      grep -qE '^reason:[[:space:]]*\S' "$path" \
-        || { echo "missing reason for verdict=$verdict: $path" >&2; return 1; }
-      ;;
+      if [ -z "$(status_field "$path" reason)" ]; then
+        echo "invalid status: verdict '$verdict' requires a non-empty reason: in $path" >&2
+        return 1
+      fi ;;
   esac
+
+  for k in $(_status_required_fields "$role"); do
+    v="$(status_field "$path" "$k")"
+    if [ -z "$v" ]; then
+      echo "invalid status: role $role requires '$k:' in $path" >&2; return 1
+    fi
+    case "$k" in
+      blockers|majors|minors)
+        case "$v" in ''|*[!0-9]*)
+          echo "invalid status: $k must be an integer, got '$v' in $path" >&2
+          return 1 ;;
+        esac ;;
+      findings)
+        if [ ! -f "$(dirname "$path")/$v" ] && [ ! -f "$v" ]; then
+          echo "invalid status: findings: '$v' does not exist" >&2; return 1
+        fi ;;
+      verification)
+        # Contract rule 5 (line 798).
+        case "$v" in
+          PASS|FAIL|PARTIAL) : ;;
+          *) echo "invalid status: verification must be PASS|FAIL|PARTIAL, got '$v' in $path" >&2
+             return 1 ;;
+        esac ;;
+    esac
+  done
   return 0
 }
 ```
@@ -1313,12 +1425,15 @@ Immediately after step 8 completes (or immediately after the consented-degradati
 
 ```bash
 mkdir -p "$FEATURE_FOLDER/1-preflight/phase-1"
-[ -f "$FEATURE_FOLDER/1-preflight/claude-check-status.md" ] && \
-  mv "$FEATURE_FOLDER/1-preflight/claude-check-status.md" \
-     "$FEATURE_FOLDER/1-preflight/phase-1/claude-check-status.md"
-[ -f "$FEATURE_FOLDER/1-preflight/codex-check-status.md" ] && \
-  mv "$FEATURE_FOLDER/1-preflight/codex-check-status.md" \
-     "$FEATURE_FOLDER/1-preflight/phase-1/codex-check-status.md"
+for v in claude codex; do
+  src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
+  if [ -f "$src" ]; then
+    mv "$src" "$FEATURE_FOLDER/1-preflight/phase-1/${v}-check-status.md"
+  fi
+done
+# An `if` is required, not `[ -f … ] && mv`: as the LAST statement of a block
+# the latter returns 1 whenever the file is absent, which is the normal
+# codex-skipped path, making a successful phase look like a failure.
 ```
 
 The conditional `[ -f … ]` guards handle the consented-degradation case (codex STATUS file may not exist when `codex_disabled_by_user=true` was set above, or when codex Mode 0/1/2/3/5 killed the subprocess before any STATUS write — see "File policy for non-READY paths" below). No synthetic STATUS file is fabricated for absent codex outputs; the absence plus the corresponding `CODEX_DISABLED_BY_USER_CONSENT` or `CODEX_UNAVAILABLE` event in RUN_LOG is the canonical Phase 1 codex verdict.
@@ -1381,12 +1496,15 @@ Before iter 01's first reviewer dispatch (the gate's **first work dispatch**, de
 5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
 
    ```bash
-   [ -f "$FEATURE_FOLDER/1-preflight/claude-check-status.md" ] && \
-     mv "$FEATURE_FOLDER/1-preflight/claude-check-status.md" \
-        "$FEATURE_FOLDER/3-spec-review/preflight/claude-check-status.md"
-   [ -f "$FEATURE_FOLDER/1-preflight/codex-check-status.md" ] && \
-     mv "$FEATURE_FOLDER/1-preflight/codex-check-status.md" \
-        "$FEATURE_FOLDER/3-spec-review/preflight/codex-check-status.md"
+   for v in claude codex; do
+     src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
+     if [ -f "$src" ]; then
+       mv "$src" "$FEATURE_FOLDER/3-spec-review/preflight/${v}-check-status.md"
+     fi
+   done
+   # An `if` is required, not `[ -f … ] && mv`: as the LAST statement of a block
+   # the latter returns 1 whenever the file is absent, which is the normal
+   # codex-skipped path, making a successful phase look like a failure.
    ```
 
    Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" below). Order of the two moves is irrelevant. Do not read any STATUS verdict until both moves (or their no-op equivalents) complete.
@@ -1455,12 +1573,15 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
 
    ```bash
-   [ -f "$FEATURE_FOLDER/1-preflight/claude-check-status.md" ] && \
-     mv "$FEATURE_FOLDER/1-preflight/claude-check-status.md" \
-        "$FEATURE_FOLDER/5-plan-review/preflight/claude-check-status.md"
-   [ -f "$FEATURE_FOLDER/1-preflight/codex-check-status.md" ] && \
-     mv "$FEATURE_FOLDER/1-preflight/codex-check-status.md" \
-        "$FEATURE_FOLDER/5-plan-review/preflight/codex-check-status.md"
+   for v in claude codex; do
+     src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
+     if [ -f "$src" ]; then
+       mv "$src" "$FEATURE_FOLDER/5-plan-review/preflight/${v}-check-status.md"
+     fi
+   done
+   # An `if` is required, not `[ -f … ] && mv`: as the LAST statement of a block
+   # the latter returns 1 whenever the file is absent, which is the normal
+   # codex-skipped path, making a successful phase look like a failure.
    ```
 
    Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" in Step 1.0). Order of the two moves is irrelevant. Do not read any STATUS verdict until both moves (or their no-op equivalents) complete.
@@ -1509,12 +1630,15 @@ Before Step 6.0 (the gate's first work dispatch is the implementer dispatch in S
 5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
 
    ```bash
-   [ -f "$FEATURE_FOLDER/1-preflight/claude-check-status.md" ] && \
-     mv "$FEATURE_FOLDER/1-preflight/claude-check-status.md" \
-        "$FEATURE_FOLDER/6-implementation/preflight/claude-check-status.md"
-   [ -f "$FEATURE_FOLDER/1-preflight/codex-check-status.md" ] && \
-     mv "$FEATURE_FOLDER/1-preflight/codex-check-status.md" \
-        "$FEATURE_FOLDER/6-implementation/preflight/codex-check-status.md"
+   for v in claude codex; do
+     src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
+     if [ -f "$src" ]; then
+       mv "$src" "$FEATURE_FOLDER/6-implementation/preflight/${v}-check-status.md"
+     fi
+   done
+   # An `if` is required, not `[ -f … ] && mv`: as the LAST statement of a block
+   # the latter returns 1 whenever the file is absent, which is the normal
+   # codex-skipped path, making a successful phase look like a failure.
    ```
 
    Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" in Step 1.0).
@@ -1622,12 +1746,15 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
 
    ```bash
-   [ -f "$FEATURE_FOLDER/1-preflight/claude-check-status.md" ] && \
-     mv "$FEATURE_FOLDER/1-preflight/claude-check-status.md" \
-        "$FEATURE_FOLDER/7-code-review/preflight/claude-check-status.md"
-   [ -f "$FEATURE_FOLDER/1-preflight/codex-check-status.md" ] && \
-     mv "$FEATURE_FOLDER/1-preflight/codex-check-status.md" \
-        "$FEATURE_FOLDER/7-code-review/preflight/codex-check-status.md"
+   for v in claude codex; do
+     src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
+     if [ -f "$src" ]; then
+       mv "$src" "$FEATURE_FOLDER/7-code-review/preflight/${v}-check-status.md"
+     fi
+   done
+   # An `if` is required, not `[ -f … ] && mv`: as the LAST statement of a block
+   # the latter returns 1 whenever the file is absent, which is the normal
+   # codex-skipped path, making a successful phase look like a failure.
    ```
 
    Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" in Step 1.0).
@@ -2197,7 +2324,7 @@ Subsequent appends just add new `## ` entry sections (no extra horizontal rules 
 
 ### Resume semantics
 
-Before each append, the orchestrator performs a filesystem-existence check on `<feature-folder>/process-improvement-proposition.md` (presence/absence only — the file's content is NOT read, in keeping with the non-influence guarantee). Any tool that reports existence without reading content satisfies this — e.g. a `Glob` for the path, or a shell `[ -f <path> ]` test; this section does not prescribe a specific tool. If the file does not exist, the orchestrator emits header and first entry as **one `Write` tool call whose content is `<header>\n\n<first-entry>`** — this is the prescribed concrete pattern, so the "single append" invariant is enforced by the choice of tool rather than left implicit. Do not use `Edit` or two separate appends for the first write. If the file already exists, the header is skipped and the new entry is appended directly using a single `Bash` invocation of the form `printf '%s' "$ENTRY" >> <feature-folder>/process-improvement-proposition.md` (one tool call, one atomic shell-level append; do not use `Edit` or multiple appends). This makes header emission idempotent across resumes without violating the no-read rule, and a mid-write harness crash cannot leave a half-written file with a header but no first entry (or vice versa).
+Before each append, the orchestrator performs a filesystem-existence check on `<feature-folder>/process-improvement-proposition.md` (presence/absence only — the file's content is NOT read, in keeping with the non-influence guarantee). Any tool that reports existence without reading content satisfies this — e.g. a `Glob` for the path, or a shell `[ -f <path> ]` test; this section does not prescribe a specific tool. If the file does not exist, the orchestrator emits header and first entry as **one `Write` tool call whose content is `<header>\n\n<first-entry>`** — this is the prescribed concrete pattern, so the "single append" invariant is enforced by the choice of tool rather than left implicit. Do not use `Edit` or two separate appends for the first write. If the file already exists, the header is skipped and the new entry is appended directly using a single `Bash` invocation of the form `printf '%s\n' "$ENTRY" >> <feature-folder>/process-improvement-proposition.md` (one tool call, one atomic shell-level append; do not use `Edit` or multiple appends). This makes header emission idempotent across resumes without violating the no-read rule, and a mid-write harness crash cannot leave a half-written file with a header but no first entry (or vice versa).
 
 ### Non-influence guarantee
 

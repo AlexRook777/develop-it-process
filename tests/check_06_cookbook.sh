@@ -226,4 +226,135 @@ else
   _fail "render_prompt is not defined"
 fi
 
+# --- status_field / validate_status ---
+if declare -F status_field >/dev/null && declare -F validate_status >/dev/null; then
+  S="$BUILD/status.md"
+  cat > "$S" <<'EOF'
+verdict: CHANGES_REQUESTED
+blockers: 0
+majors: 2
+minors: 5
+findings: claude-findings.md
+reason: cannot read /etc/a:b -- unmatched " quote
+EOF
+  assert_eq "CHANGES_REQUESTED" "$(status_field "$S" verdict)" "status_field reads verdict"
+  # A colon inside a value must survive: -F: truncated it before.
+  assert_eq 'cannot read /etc/a:b -- unmatched " quote' "$(status_field "$S" reason)" \
+    "status_field preserves colons and quotes in a value"
+
+  ( cd "$BUILD" && : > claude-findings.md )
+  ( cd "$BUILD" && validate_status status.md spec-reviewer-claude ) \
+    && _ok "validate_status accepts a complete reviewer status" \
+    || _fail "validate_status rejected a valid reviewer status"
+
+  printf 'verdict: PASS\n' > "$BUILD/thin.md"
+  ( cd "$BUILD" && validate_status thin.md spec-reviewer-claude ) \
+    && _fail "validate_status must require severity counts for reviewers" \
+    || _ok "validate_status rejects a reviewer status missing severity counts"
+
+  # Contract rule: an unrecognised verdict must NOT validate. The orchestrator
+  # branches on this string; an unknown value falls through every case arm.
+  printf 'verdict: LOOKS_FINE\nblockers: 0\nmajors: 0\nminors: 0\nfindings: claude-findings.md\n' \
+    > "$BUILD/bogus.md"
+  ( cd "$BUILD" && validate_status bogus.md spec-reviewer-claude ) \
+    && _fail "validate_status must reject a verdict outside the enum" \
+    || _ok "validate_status rejects a verdict outside the enum"
+
+  # Contract rule 4 (doc line 797): non-PASS/READY/DONE requires a reason.
+  printf 'verdict: CHANGES_REQUESTED\nblockers: 1\nmajors: 0\nminors: 0\nfindings: claude-findings.md\n' \
+    > "$BUILD/noreason.md"
+  ( cd "$BUILD" && validate_status noreason.md spec-reviewer-claude ) \
+    && _fail "validate_status must require reason: for a non-PASS verdict" \
+    || _ok "validate_status requires reason: for a non-PASS verdict"
+
+  # Contract rule 5 (doc line 798): implementer verification: enum.
+  printf 'verdict: DONE\nverification: PASS\n' > "$BUILD/impl-ok.md"
+  ( cd "$BUILD" && validate_status impl-ok.md implementer ) \
+    && _ok "validate_status accepts implementer verification=PASS" \
+    || _fail "validate_status rejected a valid implementer status"
+  printf 'verdict: DONE\nverification: MAYBE\n' > "$BUILD/impl-bad.md"
+  ( cd "$BUILD" && validate_status impl-bad.md implementer ) \
+    && _fail "validate_status must reject verification outside PASS|FAIL|PARTIAL" \
+    || _ok "validate_status rejects verification outside PASS|FAIL|PARTIAL"
+  printf 'verdict: DONE\n' > "$BUILD/impl-missing.md"
+  ( cd "$BUILD" && validate_status impl-missing.md implementer ) \
+    && _fail "validate_status must require verification: for the implementer" \
+    || _ok "validate_status requires verification: for the implementer"
+
+  # A LEGAL verdict must be accepted. Rejecting implementer FAILED would turn a
+  # correct failure report into a bogus malformed-STATUS Mode 4.
+  printf 'verdict: FAILED\nverification: FAIL\nreason: task 3 needs human input\n' \
+    > "$BUILD/impl-failed.md"
+  ( cd "$BUILD" && validate_status impl-failed.md implementer ) \
+    && _ok "validate_status accepts implementer verdict FAILED (legal)" \
+    || _fail "validate_status must accept implementer FAILED"
+  # DONE_WITH_CONCERNS is NOT in the implementer contract and must be rejected.
+  printf 'verdict: DONE_WITH_CONCERNS\nverification: PASS\n' > "$BUILD/impl-inv.md"
+  ( cd "$BUILD" && validate_status impl-inv.md implementer ) \
+    && _fail "DONE_WITH_CONCERNS is not a legal implementer verdict" \
+    || _ok "validate_status rejects DONE_WITH_CONCERNS for the implementer"
+
+  # Role-specific enums that no generic category can express.
+  printf 'verdict: SKIPPED\nreason: no test suite discovered\n' > "$BUILD/tr.md"
+  ( cd "$BUILD" && validate_status tr.md all-tests-runner ) \
+    && _ok "all-tests-runner accepts SKIPPED" \
+    || _fail "all-tests-runner must accept SKIPPED"
+  ( cd "$BUILD" && validate_status tr.md spec-fixer ) \
+    && _fail "SKIPPED is not legal for spec-fixer" \
+    || _ok "spec-fixer rejects SKIPPED"
+
+  # EXHAUSTIVE + NON-CIRCULAR. Inputs are extracted from the APPENDIX BODIES, not
+  # from _status_verdicts -- feeding the validator its own table would make schema
+  # drift invisible, which is the whole failure this check exists to prevent.
+  #
+  # Each appendix declares its verdicts on a line like:
+  #     verdict: DONE | FAILED | NEEDS_DEBUG | BLOCKED
+  drift=""
+  while IFS=$'\t' read -r a declared; do
+    [ -n "$a" ] || continue
+    coded="$(_status_verdicts "$a" 2>/dev/null | tr ' ' '\n' | sort | tr '\n' ' ')"
+    want="$(printf '%s' "$declared" | tr '|' '\n' | tr -d ' ' \
+            | "$GREP_BIN" -v '^$' | sort | tr '\n' ' ')"
+    [ "$coded" = "$want" ] || drift="$drift
+  $a: appendix declares [$want] but _status_verdicts returns [$coded]"
+  done < <(python3 "$_TESTS_DIR/lib/verdicts.py" "$PROCESS_DOC")
+  assert_eq "" "$drift" "_status_verdicts matches every appendix declared verdict line"
+
+  missing_schema=""
+  for r in $(_role_keys); do
+    [ "$r" = impl-worker ] && continue    # sub-subagent: writes no STATUS
+    _status_verdicts "$r" >/dev/null 2>&1 || missing_schema="$missing_schema $r"
+  done
+  assert_eq "" "$missing_schema" "every dispatched role has a STATUS schema"
+
+  for r in $(_role_keys); do
+    [ "$r" = impl-worker ] && continue
+    for vd in $(_status_verdicts "$r"); do
+      f="$BUILD/x-$r-$vd.md"
+      { printf 'verdict: %s\n' "$vd"
+        printf 'reason: because\n'
+        for k in $(_status_required_fields "$r"); do
+          case "$k" in
+            findings)      printf 'findings: %s\n' "f-$r.md"; : > "$BUILD/f-$r.md" ;;
+            verification)  printf 'verification: PASS\n' ;;
+            *)             printf '%s: 0\n' "$k" ;;
+          esac
+        done
+      } > "$f"
+      ( cd "$BUILD" && validate_status "${f##*/}" "$r" ) \
+        || _fail "role $r must accept its own declared verdict '$vd'"
+    done
+  done
+  _ok "every role accepts every verdict its appendix declares"
+else
+  _fail "status_field / validate_status not defined"
+fi
+
+# --- post_dispatch survives Task 15 and tolerates an empty rc ---
+if declare -F post_dispatch >/dev/null; then
+  _ok "post_dispatch was preserved (it implements the transcript-read policy)"
+else
+  _fail "post_dispatch was deleted; doc line 1390 references it"
+fi
+
 finish
