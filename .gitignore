@@ -1,0 +1,7 @@
+# Knowledge-graph analysis output (graphify)
+graphify-out/
+
+# Per-feature orchestration artifacts produced by develop-it runs.
+# The canonical spec and plan are tracked; only the artifacts folder is not.
+# See the gitignore guard in develop-it-process.md.
+docs/superpowers/specs/*-artifacts/

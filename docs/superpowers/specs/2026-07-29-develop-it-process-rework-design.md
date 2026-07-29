@@ -44,9 +44,10 @@ defects.
 
 - No change to the pipeline's phase structure, gate semantics, or the
   iteration-dependent severity policy. These are sound.
-- No change to the delegation contract (orchestrator never reads artifacts, never
-  reviews, never writes except `RUN_LOG.md` / `full_log.md` /
-  `process-improvement-proposition.md` / `mkdir -p`).
+- No change to the delegation contract: the orchestrator never reads artifacts and never
+  reviews. Its *write* list is corrected and unified in §8.1 — the narrow three-file list
+  quoted in the current document is one of the three contradictory versions §8.4 resolves,
+  and it already excludes the transcript writes line 21 permits.
 - No support for a non-Linux host. The document targets this machine.
 - No backward compatibility with feature folders from prior runs. None exist in this
   repository, so the renames in §8.3 are free.
@@ -92,11 +93,35 @@ nothing enforces. This is why the assignments drifted silently.
 
 ### 5.2 Single source of truth
 
-Add a `role_model()` lookup to the cookbook mapping role name to concrete model id, and a
-parallel `role_effort()` for codex roles. Every dispatch site sets
-`CLAUDE_MODEL="$(role_model <role>)"` immediately before invoking. The role table in the
-document becomes documentation *of* this function, not a second independent statement of
-the same facts.
+Add three cookbook lookups keyed by role name, and nothing else that states the same facts:
+
+| Function | Returns | Applies to |
+|---|---|---|
+| `role_model <role>` | concrete model id | all dispatched roles, **both vendors** |
+| `role_effort <role>` | `medium` \| `high` | codex roles only; empty for claude |
+| `role_timeout <role>` | `<minutes>` (see §8.2) | all dispatched roles |
+
+Every dispatch site resolves before invoking, and **both vendors are bound explicitly**:
+
+```bash
+CLAUDE_MODEL="$(role_model "$role")"   # → claude --model "$CLAUDE_MODEL"
+CODEX_MODEL="$(role_model "$role")"    # → codex -m "$CODEX_MODEL" -a never …
+```
+
+Binding Codex is not optional. Effort and `--json` alone leave the model determined by
+`~/.codex/config.toml`, i.e. by ambient state outside this document — the same class of
+defect as the unassigned `$CLAUDE_MODEL`. `codex` accepts `-m/--model` both globally and on
+`exec` (verified in 0.146.0); it is passed as a **global** option before `exec`, alongside
+`-a never`, per the ordering constraint at line 55.
+
+This also requires rewriting line 143's advice that "the safest invocation is to omit `-m`
+entirely and let `~/.codex/config.toml` supply the model." That guidance exists to avoid the
+ChatGPT-auth HTTP 400, but it trades one failure mode for unpinned models. The forbidden-id
+prohibition (`*-codex-max`, `o*`) is what actually prevents the 400 and stays; the
+omit-`-m` advice goes.
+
+The role table in the document becomes documentation *of* these functions. §9 check 6
+asserts table and function agree, so they cannot drift.
 
 ### 5.3 Role assignments
 
@@ -192,12 +217,17 @@ Lines 137–143 and their duplicate at line 1917 are rewritten around pinned ids
 - Line 140 currently reads "The implementer must remain on a Sonnet-class Claude model."
   This directly contradicts the new assignment and must be **rewritten, not
   re-versioned** — the supervisor moves to Opus and only sub-subagents stay Sonnet.
-- Codex fallback chain becomes `gpt-5.6-sol` → `gpt-5.5` → `gpt-5.4`, matching this
-  account's actual `models_cache.json`. The current chain's `gpt-5.3-codex` and `gpt-5.2`
-  do not exist here.
+- **All model fallback chains are removed.** This is a strict-pinning design: a rejected id
+  HALTs (§5.8). Retaining a chain would contradict both the HALT rule and §8.4's
+  no-model-failover rule, and a silent fallback is exactly how the current ids went stale
+  without anyone noticing. The old chain (`gpt-5.5` → `gpt-5.4` → `gpt-5.3-codex` →
+  `gpt-5.2`) is deleted rather than updated; its last two entries do not exist for this
+  account anyway.
 - The forbidden-models prohibition (`*-codex-max`, `o*`) stays; it is auth-related, not
-  version-related. Add that `gpt-5.6-luna` and `gpt-5.6-terra` are available but
-  deliberately unused.
+  version-related, and it is what prevents the ChatGPT-account HTTP 400. Add that
+  `gpt-5.6-luna` and `gpt-5.6-terra` are available but deliberately unused.
+- Changing a pinned model is therefore an **edit to this document**, not a runtime decision.
+  That is the intended cost: it makes model changes reviewable.
 - A fourth resolution entry for Fable is added; the policy currently has three.
 
 ### 5.8 Preflight model probe
@@ -205,6 +235,11 @@ Lines 137–143 and their duplicate at line 1917 are rewritten around pinned ids
 Phase −1 gains a model-resolution check: one minimal-cost call per distinct pinned id
 (`claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`, `gpt-5.6-sol`). A rejected id HALTs
 with a remediation message naming the role and the id.
+
+This is a **runtime gate inside the orchestration**, distinct from §9's tier-2 test that
+probes the same ids. The gate protects a real run from starting on an unavailable model; the
+test protects the document from claiming an id that no longer exists. Both make live calls,
+which is why the test is opt-in while the gate is not.
 
 This converts rot from silent drift into a loud, actionable failure, and settles
 empirically whether the accepted literal is `claude-opus-5` or a context-window variant
@@ -224,10 +259,24 @@ The `implementer` appendix (lines 2331–2400) delegates all sub-subagent spawni
 `superpowers:subagent-driven-development`, which inherits the session model. With the
 supervisor on Opus 5, inheritance would silently promote every sub-subagent to Opus 5.
 
-Fix: the implementer dispatch passes
-`--agents '{"impl-worker":{"description":…,"prompt":…,"model":"claude-sonnet-5"}}'`, and
-the appendix requires every sub-subagent to be spawned with that agent type. The pin is
-enforced by the CLI, so it holds even if the supervisor disregards its instructions.
+Fix: the implementer dispatch passes an `--agents` definition declaring an `impl-worker`
+agent type with a pinned model, and the appendix requires every sub-subagent to be spawned
+with that type. The pin is enforced by the CLI, so it holds even if the supervisor
+disregards its instructions.
+
+**`impl-worker` is a role key in `role_model`, and the JSON is generated from it** — never
+written as a literal:
+
+```bash
+agents_json="$(jq -nc --arg m "$(role_model impl-worker)" \
+  '{"impl-worker":{description:"…",prompt:"…",model:$m}}')"
+```
+
+A hardcoded `"model":"claude-sonnet-5"` would be a fourth independent statement of the
+assignment, able to drift from the table, from `role_model`, and from `resolved_models:`
+alike. Generating it means §9 check 6 covers the sub-subagent pin as a side effect of
+covering the role table.
+
 Injection points: lines 2345–2354 (the sentence governing sub-subagent spawning), 2365
 (Mode A), 2383 (Mode C), plus the orchestrator-side mirrors at lines 156, 181, 1213.
 
@@ -264,6 +313,43 @@ baseline.
 `PROCESS_REPO_ROOT` and `REPO_ROOT` must not be equal; the canary asserts this and HALTs
 if they are, since that means the orchestrator would review its own process file as if it
 were the feature under development.
+
+#### Validation, not just non-emptiness
+
+`${VAR:?}` checks only that a value is set. Each root and path gets real validation, in
+this order, each failure a HALT with the offending value named:
+
+| Check | Applies to | Mechanism |
+|---|---|---|
+| exists, is a regular file, is readable | `PROCESS_PATH` | `[ -f ] && [ -r ]` |
+| canonicalized (symlinks, `..`, trailing `/` resolved) | all paths and both roots | `realpath -e` (*verified present*) |
+| is a git work-tree root | both roots | `git -C <root> rev-parse --show-toplevel` equals the canonicalized root |
+| `PROCESS_PATH` lies inside `PROCESS_REPO_ROOT` | — | subtree test below |
+| `FEATURE_FOLDER` under `REPO_ROOT`? | — | subtree test; result selects whether `--add-dir` is needed (§6.4) |
+| roots differ | — | canonicalized string inequality |
+
+Canonicalization must happen **before** any comparison. Comparing a symlinked or
+non-normalized path against a canonical one produces false negatives, which in an
+allow-list means a file is silently reported as an offender.
+
+#### Allow-list matching semantics
+
+The NUL parser (§7.2) compares repo-relative porcelain paths against the allow-list. Three
+rules the previous draft left implicit:
+
+1. **Entries outside the target repo are skipped, not converted.** `$PROCESS_PATH` lives in
+   the other repository by design, so it can never appear in `$REPO_ROOT`'s porcelain
+   output. It is dropped from the allow-list with a one-line note rather than being
+   relativized into a meaningless path. This is the dead-weight entry the current document
+   carries at line 735.
+2. **Files match exactly; directories match boundary-aware.** A directory entry `d` matches
+   a path `p` only when `p = d` or `p` begins with `d/`. A bare prefix test would let
+   `docs/superpowers/specs/foo-artifacts` also allow
+   `docs/superpowers/specs/foo-artifacts-backup`, silently widening the gate.
+3. **Renames are checked on both paths.** For an `R`/`C` entry, *both* the new and the old
+   path must be in the allow-list. Checking only the new path hides an out-of-scope
+   deletion: renaming an unrelated tracked file *into* the allow-listed feature folder
+   would pass the gate while having removed something outside it.
 
 ### 6.3 Provenance correctness
 
@@ -449,8 +535,10 @@ path.
 - Lines 603–611: if no `turn.completed` record exists, `last` is `null` and every
   `$u.x // 0` yields 0, so the helper reports `usage_status=ok` with all zeros instead of
   `unavailable`. Silent misreporting.
-- Line 716 passes a hardcoded `claude-opus-4-8` as the fallback-model argument; becomes a
-  variable from `role_model()`.
+- Line 716 passes a hardcoded `claude-opus-4-8` as `parse_usage`'s 4th argument — the id
+  reported when the transcript JSON carries no model field. It becomes
+  `"$(role_model "$role")"`. Note this is telemetry attribution, unrelated to model
+  selection; strict pinning (§5.7) does not apply to it.
 - Line 718 references `$STATUS`, which is **undefined anywhere in the document**. Under
   `set -u` the canonical usage example aborts. Define it.
 - Line 602 `jq -s` slurps an entire JSONL transcript into memory; a 90-minute deep review
@@ -506,16 +594,74 @@ The implementer (300–600 min), plan-writer (120 min) and deep Codex review (90
 complete inside one Claude Code Bash call (hard cap 600 000 ms), yet line 90 forbids
 splitting a phase.
 
-Add `dispatch_detached` and `await_dispatch` helpers: `setsid` the CLI, write `.pid`, write
-`.rc` on completion; the orchestrator polls for `.rc` in short, bounded Bash calls. This
-finally gives the `.rc` files a reader (§7.1).
+Add `dispatch_detached` and `await_dispatch` helpers. `setsid` the CLI so it survives the
+launching shell; the orchestrator polls in short, bounded Bash calls. This finally gives the
+`.rc` files a reader (§7.1).
 
 Restate the rule as **one *dispatch* per phase** — polling calls are not phase bundling.
 Chosen over the harness-native background-Bash option because it works regardless of which
 harness runs the orchestrator, and the document claims support for a Codex orchestrator at
 line 147.
 
-Add `timeout --kill-after` so a CLI ignoring SIGTERM cannot hang a phase indefinitely.
+`timeout --kill-after=60s` so a CLI ignoring SIGTERM cannot hang a phase indefinitely.
+
+#### Dispatch identity and control files
+
+`dispatch_id` = `<phase>-iter<NN>-<role>`. It is **deterministic**, so a resuming
+orchestrator can recompute it rather than having to discover it. All control files live
+beside the transcript under `$FEATURE_FOLDER/transcripts/`:
+
+| File | Written by | Content |
+|---|---|---|
+| `<id>.started` | launcher, **before** `setsid` | `dispatch_id`, ISO timestamp, `pid`, `pid_starttime`, `timeout_s`, resolved model |
+| `<id>.pid` | launcher, after `setsid` | pid only, for cheap liveness checks |
+| `<id>.rc` | wrapper, on exit | exit code, one integer |
+| `<id>.json` / `.err` | the CLI | stdout / stderr |
+
+**Atomic publication.** `.rc` and `.started` are written to `<name>.tmp` in the same
+directory and `mv`'d into place — rename within a filesystem is atomic, so a poller never
+observes a partial file. *Verified.* A poller that finds `.rc` must still validate it
+matches `^[0-9]+$`; anything else is corruption, treated as failure.
+
+**PID reuse.** A bare pid is not a safe liveness token across a crash — the pid may have
+been recycled. `.started` records `pid_starttime`, field 22 of `/proc/<pid>/stat`
+(*verified readable*). A pid is the same process only if it exists **and** its current
+`starttime` equals the recorded value.
+
+#### Resume decision table
+
+An orchestrator resuming mid-phase reconstructs state from the control files plus
+`RUN_LOG.md`. A `event=DISPATCH_STARTED` entry carrying `dispatch_id` is appended **before**
+launch, so a crash between launch and completion still leaves a trace — the gap the reviewer
+correctly identified, since resume logic at lines 1610–1619 reads only `RUN_LOG.md`.
+
+| `.started` | `.rc` | Process check | State | Action |
+|---|---|---|---|---|
+| absent | absent | — | `NEVER_LAUNCHED` | dispatch fresh |
+| present | absent | pid alive, starttime matches | `RUNNING` | resume polling; do **not** re-dispatch |
+| present | absent | pid dead or starttime differs | `ORPHANED` | log `event=DISPATCH_ORPHANED`, re-dispatch |
+| present | present, valid, `0` | — | `COMPLETED` | read STATUS, proceed |
+| present | present, valid, `124` | — | `TIMED_OUT` | apply the existing Mode-2 policy |
+| present | present, valid, other | — | `FAILED` | apply the existing failure-mode classifier |
+| present | present, malformed | — | `CORRUPT` | treat as `FAILED`; surface the transcript path |
+| absent | present | — | `INCONSISTENT` | HALT; indicates concurrent runs on one feature folder |
+
+Re-dispatch after `ORPHANED` is safe only because every subagent writes its STATUS last and
+atomically — the existing contract at line 65 — so a partially-written artifact from the
+dead process cannot be mistaken for a completed one.
+
+Required tests (§9 check 2): crash-and-resume for each of the eight rows, timeout escalation
+to `--kill-after`, and PID-reuse rejection via a forged `pid_starttime`.
+
+#### Write contract
+
+`.started` / `.pid` / `.rc` and the transcript files must be added to the canonical
+orchestrator write list. §3's non-goal above restates the narrow three-file list, which is
+itself one of the three contradictory lists §8.4 resolves — line 21 already permits
+capturing stdout/stderr under `transcripts/`. The single canonical list becomes:
+`RUN_LOG.md`, `full_log.md`, `process-improvement-proposition.md`,
+`transcripts/<id>.{json,err,rc,pid,started}`, and `mkdir -p`. Reading artifacts stays
+forbidden; this widens only what the orchestrator may *write*.
 
 ### 8.2 Timeouts: one source of truth
 
@@ -528,8 +674,38 @@ Three-way disagreement today:
 | Implementer | 20 min | **300 min** (1213) | **600 min** (1412) |
 
 The cookbook value is what would actually run, silently capping every reviewer and the
-implementer at 20 minutes. Collapse to **one table**; the literals in the invocation forms
-become `timeout "$DISPATCH_TIMEOUT"`, set from that table.
+implementer at 20 minutes.
+
+A `$DISPATCH_TIMEOUT` variable alone would just relocate the ambiguity to its assignment
+site. The resolution is an **executable `role_timeout()` lookup** (§5.2), with these
+authoritative values. Where sources disagreed, the phase-text value wins: it is the most
+specific statement of intent, whereas the 20-minute cookbook literals are an unvaried
+copy-paste default and the table's 600 for the implementer is unexplained.
+
+| Role | Minutes | Basis |
+|---|---|---|
+| `preflight-claude`, `preflight-codex` | 5 | unchanged (lines 933–934) |
+| `context-discovery` | 15 | unchanged (line 992) |
+| `spec-reviewer-claude`, `plan-reviewer-claude` | 40 | phase text |
+| `spec-fixer`, `plan-fixer` | 40 | phase text |
+| `spec-reviewer-codex`, `plan-reviewer-codex` | 60 | phase text 40, **raised** for `high` effort (§5.4) |
+| `plan-writer` | 120 | phase text (line 1062), not the table's 40 |
+| `implementer` | 300 | phase text (line 1213), not the table's 600 |
+| `debugger` | 60 | unchanged (line 1225) |
+| `code-reviewer-claude` | 60 | phase text |
+| `code-reviewer-codex` | 120 | phase text 60, **raised** for `diff-aware` + `high` effort |
+| `all-tests-runner`, `test-fixer` | 60 | unchanged |
+| `finishing-branch` | 30 | unchanged (line 1330) |
+| all 5 summarizers, `readiness-writer` | 20 | unchanged |
+
+Grace period is uniform: `--kill-after=60s`. Every invocation form uses
+`timeout --kill-after=60s "$(role_timeout "$role")m"`; no literal minute value survives
+anywhere else in the document. §9 check 6 asserts the table matches `role_timeout` for all
+24 roles, so this table cannot drift either.
+
+The two raised values are the only intentional increases, and both follow from §5.4's
+effort decision — high-effort reviewers are slower, so keeping the old ceilings would
+convert the effort change into spurious Mode-2 timeouts.
 
 ### 8.3 Renames
 
@@ -596,24 +772,69 @@ folders exist in this repository.
 The deliverable is a prompt, not code, so it ships with runnable checks. Inspection alone
 has a demonstrated failure record on this exact document.
 
-New `tests/` directory plus a runner:
+Two tiers, because they have different determinism and cost profiles. Only tier 1 is the
+default runner.
 
-1. **Extract-and-lint** — extract every fenced bash block into files; run `bash -n` and
-   `shellcheck`.
-2. **Cookbook unit tests** — `dirty_tree_check` against fixtures with spaces, renames, and
-   unset allow-list vars; `parse_usage` against fixture JSON including the missing
-   `turn.completed` case; `EPOCHREALTIME` millisecond math; `role_model` / `role_effort`
-   lookups for every role in §5.3.
-3. **Marker integrity** — every `<!-- BEGIN: X -->` has a matching `END`, and every
-   appendix name referenced in orchestrator text exists as a marker pair. Directly prevents
-   the §7.1 Phase-7 bug class.
+#### Tier 1 — offline, deterministic, no network or credentials
+
+1. **Extract-and-lint.** Not every fenced block is lintable: many are contextual snippets
+   that reference `$FEATURE_FOLDER` and friends by design, so `shellcheck` would emit SC2154
+   throughout and the signal would drown. Blocks are therefore **classified by a marker
+   comment immediately above the fence**:
+   - `<!-- lint: cookbook -->` — a complete, self-contained helper. Extracted into one
+     canonical sourceable file and linted fully.
+   - `<!-- lint: snippet -->` — illustrative. Gets `bash -n` (syntax) only, with a generated
+     preamble declaring the orchestration variables so SC2154 is not raised.
+   - Unmarked blocks fail the check. That forces a deliberate choice for every block and
+     prevents a new block from silently escaping the linter.
+
+   `shellcheck` is **absent on this machine** (verified; apt candidate `0.11.0-2`). It is a
+   documented prerequisite (`apt-get install shellcheck`, minimum 0.10). When missing the
+   runner reports the lint check as `SKIP` with the install command, never `PASS` — a skip
+   must be visible in the summary and must not be counted as success.
+
+2. **Cookbook unit tests** — `dirty_tree_check` against fixtures covering paths with spaces,
+   renames, copies, unset allow-list vars, and out-of-target entries; the boundary-aware
+   directory match from §6.2; `parse_usage` against fixture JSON including the missing
+   `turn.completed` case; `EPOCHREALTIME` millisecond math; the §8.1 resume decision table,
+   all eight rows, including forged `pid_starttime`.
+
+3. **Marker integrity** — every `<!-- BEGIN: X -->` has a matching `END`, and every appendix
+   name referenced in orchestrator text exists as a marker pair. Directly prevents the §7.1
+   Phase-7 bug class.
+
 4. **Variable coverage** — every `$VAR` appearing in any appendix body is present in
    `render_prompt`'s substitution list. Directly prevents the §7.6 missing-`$ROUND` bug
    class.
-5. **Model probe** — each pinned id in §5.3 is accepted by its CLI.
 
-Checks 3 and 4 are the highest-value: they mechanically prevent the two failure modes that
-were hardest to detect by reading.
+5. **Fake-CLI integration** — stub `claude` and `codex` executables placed first on `PATH`,
+   emitting canned JSON/JSONL with configurable exit code and delay. This exercises the
+   riskiest new behavior without spending a token: detached dispatch, `--add-dir` selection,
+   `timeout` escalation to `--kill-after`, parallel `.rc` collection under
+   `dispatch_reviewers_parallel`, and crash-and-resume. Without this tier-1 check, none of
+   §8.1 is covered by anything but inspection.
+
+6. **Table/function agreement** — parse the §5.3 role table out of the document and assert
+   it matches `role_model`, `role_effort`, and `role_timeout` for all 24 dispatched roles.
+   Asserting against the *document* rather than a hand-maintained fixture is what makes the
+   table and the functions a single source of truth instead of two that drift.
+
+#### Tier 2 — live model probe, run on demand
+
+Each pinned id in §5.3 is accepted by its CLI (§5.8). This is **excluded from the default
+runner**: it needs valid credentials and network, and it is billable, so including it would
+make ordinary runs nondeterministic and non-free. It is invoked explicitly
+(`tests/run.sh --live`) and is the check that resolves the `claude-opus-5` literal question
+in §11.
+
+#### Canary additions
+
+Tools introduced by this rework join `canary_preflight` alongside §6.6's list: `setsid`,
+`realpath`, and `flock` (all verified present). `shellcheck` is a test-time prerequisite
+only, not a runtime one, so it stays out of the canary.
+
+Checks 3, 4 and 6 are the highest-value: each mechanically prevents a class of drift that
+inspection demonstrably failed to catch on this document.
 
 ## 10. Success criteria
 
@@ -621,8 +842,10 @@ were hardest to detect by reading.
 2. `role_model` returns the §5.3 value for all 24 dispatched roles (the orchestrator row
    has no model); no dispatch site invokes a CLI without setting `$CLAUDE_MODEL` (or the
    codex equivalent) from it.
-3. No occurrence of `claude-opus-4-8`, `claude-sonnet-4-6`, `gpt-5.5` as an assignment
-   anywhere; `gpt-5.5` survives only as a fallback-chain entry.
+3. No occurrence of `claude-opus-4-8`, `claude-sonnet-4-6`, `gpt-5.5`, `gpt-5.4`,
+   `gpt-5.3-codex`, or `gpt-5.2` anywhere except §4's environment inventory. Strict pinning
+   (§5.7) leaves no fallback chain for them to live in. No occurrence of the word
+   "fallback" applied to model selection.
 4. No occurrence of `/home/worker`, `repos/GCP`, `claude-opus-verdict.md`, or
    `claude-opus-findings.md`.
 5. Grep for each fixed defect confirms the pattern is gone: `date +%s%3N`,
@@ -631,9 +854,22 @@ were hardest to detect by reading.
 6. `$CLAUDE_MODEL`, `$STATUS`, `$codex_available`, `$ROUND`, `$TEST_REPORT_PATH` each have
    a definition or substitution entry.
 7. Each timeout value appears in exactly one authoritative table.
-8. An end-to-end dry run on a scratch target repo reaches Phase 2 `READY` with correct
-   `develop_it_git_sha` (matching this repo's HEAD, not the target's) and a plausible
-   13-digit `duration_ms`.
+8. **Fake-CLI end-to-end** (§9 check 5) runs a scratch target repo through Phase 2 `READY`
+   *and* through the new machinery that a Phase-2 stop would never reach:
+   - `develop_it_git_sha` matches **this** repo's HEAD, not the target's; `develop_it_dirty`
+     varies correctly with a deliberate edit to the process file.
+   - `duration_ms` is a plausible 13-digit value.
+   - A detached dispatch is launched, polled, and collected; `.rc` is read.
+   - A stub that ignores SIGTERM is killed by `--kill-after`, yielding rc 124 → `TIMED_OUT`.
+   - The orchestrator is killed mid-dispatch and resumed: `RUNNING` resumes polling without
+     re-dispatching, and `ORPHANED` re-dispatches exactly once.
+   - Parallel reviewer dispatch reports a **failing** stub as failed — the §7.1 regression.
+   - `--add-dir` is present when `$FEATURE_FOLDER` is outside `$REPO_ROOT` and absent when
+     inside.
+   - `role_timeout` and `role_model` values reach the actual argv (asserted by a stub that
+     records its own arguments).
+9. A live smoke run (tier 2) on one real dispatch confirms the pinned ids are accepted and
+   that Codex received `-m` — verified from the recorded argv, not assumed.
 
 ## 11. Risks
 
@@ -647,21 +883,33 @@ were hardest to detect by reading.
   `gpt-5.6-sol` honours the `medium`/`high` effort tokens are settled by §5.8's probe, not
   by this document.
 - **The detach-and-poll rewrite touches the resumability contract** (lines 1610–1619),
-  which reads `RUN_LOG.md` to locate the last completed step. The new `.pid`/`.rc` files
-  must not create a state a resume cannot interpret.
+  which reads `RUN_LOG.md` to locate the last completed step. §8.1's `DISPATCH_STARTED`
+  event and eight-row decision table are the mitigation; the residual risk is a state the
+  table does not enumerate, which is why all eight rows are tested rather than sampled.
+- **Two live runs on one feature folder would corrupt state.** §8.1's `INCONSISTENT` row
+  detects it after the fact but nothing prevents it. `flock` on the feature folder is
+  available (verified present) and should be considered during planning; it is not specified
+  here because single-operator use makes it low-probability.
 
 ## 12. Ordering constraints
 
 Not a plan, but three sequencing facts the plan must respect:
 
-1. **The §9 harness lands first.** Checks 3 and 4 (marker integrity, variable coverage)
-   must exist before the cookbook and appendix edits, so they catch regressions introduced
-   by those edits rather than being written to match whatever the edits produced.
+1. **The §9 tier-1 harness lands first.** Checks 3, 4 and 6 must exist before the cookbook
+   and appendix edits, so they catch regressions introduced by those edits rather than being
+   written to match whatever the edits produced. Check 5's fake-CLI stubs must exist before
+   §8.1, since detached dispatch has no other means of verification.
 2. **The §8.3 renames are one atomic change.** All 22 occurrences, or the three summarizers
    silently read nothing.
-3. **§5's `role_model` precedes every dispatch-site edit.** Dispatch sites are rewritten to
-   call it, so the function must exist first; otherwise the edits have nothing to call and
-   `$CLAUDE_MODEL` stays undefined, which is the original defect.
+3. **§5.2's three lookups precede every dispatch-site edit.** Dispatch sites are rewritten
+   to call `role_model`, `role_effort` and `role_timeout`, so the functions must exist first;
+   otherwise the edits have nothing to call and `$CLAUDE_MODEL` stays undefined, which is the
+   original defect.
+4. **§7.2's NUL parser precedes §7.3.** Both the dirty-tree gate and the Phase 6 baseline
+   share one helper; writing them separately would reintroduce the divergence that let the
+   same bug appear twice.
+5. **`shellcheck` install precedes check 1 being meaningful.** Not a blocker for other work —
+   the runner reports `SKIP` — but the lint check gives no signal until it is present.
 
 Everything else is independent. §6 (environment), §7 (cookbook), §8.1–8.2 (dispatch), and
 §8.4 (contradictions) touch largely disjoint line ranges and can proceed in any order.
