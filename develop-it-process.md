@@ -529,19 +529,6 @@ With `BASH_XTRACEFD` set, `set -x` xtrace output goes to `full_log.md` instead o
 
 **Phase −1 canary preflight** runs before the feature folder exists. For that block only, omit the preamble (the `if [ -d ... ]` guard is a no-op) and rely on the default stderr xtrace. All subsequent phases include it.
 
-### Appendix extraction helper
-
-```bash
-extract_appendix() {
-  # Print the full appendix body (including BEGIN/END markers) for a given role name.
-  # Usage: extract_appendix spec-reviewer-claude
-  local name="$1"
-  awk "/<!-- BEGIN: ${name} -->/,/<!-- END: ${name} -->/" "$PROCESS_PATH"
-}
-```
-
-The `awk` range is sufficient for extraction. The BEGIN and END markers are HTML comments, so an extra layer of escaping is not required when the marker string is built dynamically.
-
 ### Appendix substitution helper (handles multi-line values)
 
 `sed` is fine for single-line scalars (`$ITERATION`, `$SPEC_PATH`, `$PLAN_PATH`). It breaks or silently mangles output for multi-line values like `$FINDINGS_PATHS` (a newline-separated list). For any role that consumes a list-shaped variable, use this `render_prompt` helper instead:
@@ -634,7 +621,7 @@ PY
 }
 ```
 
-Export each `$VARNAME` the appendix expects, then pipe `render_prompt <name>` into the subprocess. Treat the `sed` shortcut shown in the Delegation pattern example as legal only when every substituted value is a single line.
+Set each orchestration variable the appendix expects as an ordinary shell assignment — no `export` required, since `render_prompt` reads them through `${!k}` — then call `render_prompt <name>` and check its exit status: it fails loudly and names any variable it could not resolve, so a non-zero exit must halt dispatch rather than pipe a half-rendered prompt forward. `sed` is not an alternative for this substitution: multi-line values like `$FINDINGS_PATHS` break it.
 
 ### CLI invocation forms
 
@@ -2252,7 +2239,7 @@ Partial completion: if Codex was unavailable for part of the run, the run still 
 
 # Appendices — subagent prompts
 
-Each appendix below is delimited by HTML comment markers of the form `BEGIN: <role>` / `END: <role>` (full HTML-comment syntax). The orchestrator extracts each on demand using the `extract_appendix` / `render_prompt` helpers from the "Runtime cookbook & guardrails" section — `extract_appendix` for raw extraction, `render_prompt` for extraction + multi-line-safe variable substitution. Use `sed`-only substitution only when every value being substituted is a single line. Appendix content is never written to disk.
+Each appendix below is delimited by HTML comment markers of the form `BEGIN: <role>` / `END: <role>` (full HTML-comment syntax). The orchestrator extracts and renders each on demand using the `render_prompt` helper from the "Runtime cookbook & guardrails" section, which handles multi-line-safe variable substitution and fails loudly on anything it cannot resolve. Appendix content is never written to disk.
 
 <!-- BEGIN: preflight-claude -->
 # Role: preflight-claude
