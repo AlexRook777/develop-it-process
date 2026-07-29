@@ -400,6 +400,45 @@ git commit -m "test: add harness foundation (runner, assertions, block extractor
 - Consumes: `tests/lib/assert.sh` (`PROCESS_DOC`, `assert_eq`, `finish`, `note`)
 - Produces: nothing consumed by later tasks. This check must PASS on the current document for balance, and FAIL on the constructed-name rule until Task 13 fixes it.
 
+**Sourcing convention for every check that loads the cookbook.** Add this helper to
+`tests/lib/assert.sh` now, because Tasks 4, 6, 9–17 and the live check all need it.
+The cookbook is definitions-only (Task 9), so sourcing is safe; but any check that
+calls a helper touching `$REPO_ROOT` / `$FEATURE_FOLDER` must initialise them first:
+
+```bash
+# Append to tests/lib/assert.sh
+# Source the extracted cookbook and initialise orchestration variables with
+# throwaway fixture values. Never rely on the cookbook initialising itself: it
+# is definitions-only by design, so a top-level ${VAR:?} cannot abort this shell.
+load_cookbook() {
+  python3 "$_TESTS_DIR/lib/extract.py" cookbook >/dev/null 2>&1 || {
+    _fail "cookbook not extractable"; return 1; }
+  # shellcheck source=/dev/null
+  source "$BUILD/cookbook.sh" || { _fail "cookbook.sh failed to source"; return 1; }
+  return 0
+}
+
+# Build a throwaway target repo and feature folder, then initialise.
+# Usage: init_fixture_env [outside]   ("outside" puts the feature folder outside the repo)
+init_fixture_env() {
+  local where="${1:-inside}"
+  FIXTURE_ROOT="$(mktemp -d)"
+  REPO_ROOT="$FIXTURE_ROOT/target"
+  mkdir -p "$REPO_ROOT"
+  git -C "$REPO_ROOT" init -q
+  ( cd "$REPO_ROOT" && : > seed && git add seed \
+    && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+  if [ "$where" = outside ]; then
+    FEATURE_FOLDER="$FIXTURE_ROOT/outside-ff"
+  else
+    FEATURE_FOLDER="$REPO_ROOT/docs/superpowers/specs/fixture-artifacts"
+  fi
+  mkdir -p "$FEATURE_FOLDER/transcripts"
+  PROCESS_PATH="$PROCESS_DOC"
+  init_orchestration_vars
+}
+```
+
 **Context:** Real appendix markers sit at column 0 and match `^<!-- (BEGIN|END): [a-z0-9-]+ -->$`. Two lines inside helper code ([:383](../../../develop-it-process.md), [:406](../../../develop-it-process.md)) contain marker *template strings* and must not be counted — anchoring at column 0 excludes them. Verified: 23 balanced pairs.
 
 - [ ] **Step 1: Write the failing test**
@@ -571,9 +610,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 source lib/assert.sh
 
 python3 lib/extract.py roles 2>/dev/null || { _fail "role table not parseable"; finish; }
-python3 lib/extract.py cookbook 2>/dev/null || { _fail "cookbook not extractable"; finish; }
-# shellcheck source=/dev/null
-source "$BUILD/cookbook.sh" || { _fail "cookbook.sh failed to source"; finish; }
+load_cookbook || finish
+# role_* are pure lookups: no orchestration variables needed.
 
 for fn in role_model role_effort role_timeout; do
   if declare -F "$fn" >/dev/null; then _ok "$fn is defined"
@@ -954,22 +992,52 @@ Then replace the old `codex_invoke` helper at lines 478–501 entirely — it is
 
 - [ ] **Step 3: Update the duplicated policy and the resolved_models schema**
 
-At line 1917 (`context-discovery` appendix), replace the resolution instructions with:
+At line 1917 (`context-discovery` appendix), replace the resolution instructions
+with the form below. The appendix **must not be told to call `role_model`**: it runs
+inside a dispatched `claude` session, which has no access to the orchestrator's
+shell functions. The orchestrator resolves the map and injects it as a substituted
+variable:
 
 ```markdown
-4. Record the role→model map by calling `role_model` for every role in the
-   Models table. Do not invent, alias, or substitute ids; do not consult
-   `~/.codex/config.toml`. If any id is rejected, report `verdict=BLOCKED` with
-   the rejected role and id — there is no fallback.
+4. Copy the resolved role→model map below verbatim into your STATUS file under
+   `resolved_models:`. It was produced by the orchestrator from the Models table.
+   Do NOT re-derive, alias, or substitute ids, and do NOT consult
+   `~/.codex/config.toml`:
+
+$RESOLVED_MODELS
 ```
 
 Replace the `resolved_models:` schema at lines 1928–1931 with a role-keyed map:
 
 ```markdown
 resolved_models:
-  # one line per dispatched role, exactly as role_model returns it
+  # one line per dispatched role, exactly as supplied in $RESOLVED_MODELS
   <role-key>: <model-id>
 ```
+
+Add `RESOLVED_MODELS` to `render_prompt`'s `KEYS` list (Task 14), and add the
+generator to the role cookbook block (Task 5):
+
+```bash
+# Render the role->model map for injection into the context-discovery prompt.
+# The dispatched session cannot call role_model, so the orchestrator formats it.
+resolved_models_block() {
+  local role
+  for role in $(_role_keys); do
+    printf '  %s: %s\n' "$role" "$(role_model "$role")"
+  done
+}
+```
+
+The orchestrator exports it before rendering:
+
+```bash
+RESOLVED_MODELS="$(resolved_models_block)"
+export RESOLVED_MODELS
+```
+
+Because `$RESOLVED_MODELS` is multi-line, this is exactly the case `sed`
+substitution cannot handle — it is why `render_prompt` uses python3.
 
 - [ ] **Step 4: Run the contract check**
 
@@ -1125,10 +1193,8 @@ source lib/assert.sh
 command -v claude >/dev/null 2>&1 || skip "claude CLI not on PATH"
 command -v codex  >/dev/null 2>&1 || skip "codex CLI not on PATH"
 
-python3 lib/extract.py cookbook 2>/dev/null || { _fail "cookbook not extractable"; finish; }
-# shellcheck source=/dev/null
-source "$BUILD/cookbook.sh"
-REPO_ROOT="$REPO_TOP"
+load_cookbook || finish
+init_fixture_env || { _fail "fixture env setup failed"; finish; }
 
 if probe_models; then _ok "every pinned model id is accepted"
 else _fail "at least one pinned model id was rejected (see stderr above)"; fi
@@ -1179,9 +1245,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 source lib/assert.sh
 
-python3 lib/extract.py cookbook 2>/dev/null || { _fail "cookbook not extractable"; finish; }
-# shellcheck source=/dev/null
-source "$BUILD/cookbook.sh" || { _fail "cookbook.sh failed to source"; finish; }
+load_cookbook || finish
+init_fixture_env || { _fail "fixture env setup failed"; finish; }
 
 # --- path_in_tree: boundary-aware directory matching ---
 if declare -F path_in_tree >/dev/null; then
@@ -1220,17 +1285,11 @@ Replace lines 326–351 with this `<!-- lint: cookbook -->` block:
 ````markdown
 <!-- lint: cookbook -->
 ```bash
-# ---- Tooling pins -----------------------------------------------------------
+# ---- Path helpers -----------------------------------------------------------
 # `grep` may be a shell-function shim in some harnesses; that shim does not
 # exist in subprocess shells and errors differently on the same pattern.
-GREP_BIN="${GREP_BIN:-/usr/bin/grep}"
-PYTHON_BIN="$(command -v python3 || true)"
-if [ -z "$PYTHON_BIN" ]; then
-  echo "halt: python3 not on PATH; render_prompt requires it" >&2
-  exit 1
-fi
-
-# ---- Path helpers -----------------------------------------------------------
+# GREP_BIN and PYTHON_BIN are set by init_orchestration_vars below, not here —
+# the cookbook must contain no top-level statements.
 canon() { realpath -e -- "$1"; }          # fails if the path does not exist
 is_git_root() { [ "$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" = "$1" ]; }
 
@@ -1245,9 +1304,26 @@ path_in_tree() {
 # This document lives in its own repository and orchestrates OTHER projects.
 # PROCESS_REPO_ROOT is where this file lives; REPO_ROOT is the project under
 # development. They are never the same repository.
-PROCESS_PATH="${PROCESS_PATH:?must be set to this document's absolute path}"
-REPO_ROOT="${REPO_ROOT:?must be set to the target project repo root}"
-FEATURE_FOLDER="${FEATURE_FOLDER:?must be set before dispatching any phase}"
+#
+# CRITICAL: these checks live in a FUNCTION, never at top level. A top-level
+# `${VAR:?}` aborts any shell that sources the cookbook — including the test
+# suite, which sources it to unit-test the helpers. The cookbook must be pure
+# definitions with no executable top-level statements; check_01_lint.sh enforces
+# that invariant.
+init_orchestration_vars() {
+  PROCESS_PATH="${PROCESS_PATH:?must be set to this document's absolute path}"
+  REPO_ROOT="${REPO_ROOT:?must be set to the target project repo root}"
+  FEATURE_FOLDER="${FEATURE_FOLDER:?must be set before dispatching any phase}"
+  GREP_BIN="${GREP_BIN:-/usr/bin/grep}"
+  PYTHON_BIN="$(command -v python3 || true)"
+  if [ -z "$PYTHON_BIN" ]; then
+    echo "halt: python3 not on PATH; render_prompt requires it" >&2
+    return 1
+  fi
+  codex_available="${codex_available:-false}"
+  codex_disabled_by_user="${codex_disabled_by_user:-false}"
+  validate_roots
+}
 
 validate_roots() {
   local halt=0
@@ -1387,8 +1463,11 @@ log_dispatch() {
     printf 'develop_it_dirty:         %s\n' "$PROCESS_DIRTY"
     printf 'status_path:              %s\n' "$status_path"
     printf 'verdict:                  %s\n' "$verdict"
+    # parse_usage's line ALSO begins with model=, so skip that pair here or the
+    # block would carry two `model:` keys and break the fixed-key-order grammar.
     local kv
     for kv in $usage_line; do
+      case "$kv" in model=*) continue ;; esac
       printf '%-25s %s\n' "${kv%%=*}:" "${kv#*=}"
     done
     printf '\n'
@@ -1400,6 +1479,73 @@ Add the timestamp helper to the same block:
 
 ```bash
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+```
+
+- [ ] **Step 4b: Amend the exhaustive event list**
+
+Line 1467 declares the block shapes EXHAUSTIVE and enumerates the only legal
+`event=` tags. The rework introduces four new ones, so that list must be amended in
+the same pass — otherwise every new event violates the document's own grammar and a
+reader following the rule would treat them as the degenerate failure mode the
+grammar exists to prevent.
+
+Extend the sentence to read:
+
+```markdown
+The ONLY legal `event=` tags are: `CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `HALT`,
+`IMPLEMENTATION_BASELINE`, `IMPLEMENTATION_BASELINE_BLOCKED`,
+`CODEX_DISABLED_BY_USER_CONSENT`, `CODEX_SKIPPED_BY_USER_CONSENT`,
+`ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE`, `MODEL_REJECTED`,
+`DISPATCH_STARTED`, `DISPATCH_ORPHANED`, `CONTEXT7_UNAVAILABLE` (plus the reserved
+`CODEX_RE_ENABLED_BY_USER`).
+```
+
+Then add the four block schemas beside the existing ones, each with its consumer
+behaviour:
+
+```markdown
+--- <ISO-timestamp>  event=MODEL_REJECTED
+phase:                    -1
+phase_name:               preflight
+role:                     <role>
+model:                    <rejected id>
+vendor:                   claude | codex
+reason:                   <one line from the CLI>
+
+Consumer: the readiness writer reports this as a HALT cause. The run does not
+continue; there is no fallback model.
+
+--- <ISO-timestamp>  event=DISPATCH_STARTED
+phase:                    <n>
+phase_name:               <name>
+iteration:                <NN>
+role:                     <role>
+dispatch_id:              <phase>-iter<NN>-<role>
+model:                    <resolved id>
+
+Consumer: resume. Its presence without a matching `dispatch` block means the
+dispatch was launched but never completed; `dispatch_state` then classifies it.
+This event NEVER substitutes for the `dispatch` block of a subprocess that ran to
+completion — both appear for a normal dispatch.
+
+--- <ISO-timestamp>  event=DISPATCH_ORPHANED
+phase:                    <n>
+iteration:                <NN>
+role:                     <role>
+dispatch_id:              <phase>-iter<NN>-<role>
+role_mutates:             yes | no
+action:                   redispatched | halted
+
+Consumer: resume and the readiness writer. `role_mutates: yes` always pairs with
+`action: halted` — see the ORPHANED recovery table.
+
+--- <ISO-timestamp>  event=CONTEXT7_UNAVAILABLE
+phase:                    1
+phase_name:               preflight
+degraded_roles:           plan-writer impl-worker debugger test-fixer
+
+Consumer: the readiness writer lists this as a degradation note, and the affected
+appendices treat `context7` as best-effort rather than MUST for this run.
 ```
 
 - [ ] **Step 5: Correct the grammar prose**
@@ -1470,7 +1616,7 @@ from role_model, and adds 'unknown' for the non-git case."
 
 **Interfaces:**
 - Consumes: `role_model` (Task 5)
-- Produces: `now_ms` (echoes epoch milliseconds), `timed_dispatch` wrapper, `parse_usage <vendor> <stdout-path> <wall-ms> <fallback-model>` emitting nine `key=value` pairs on one line.
+- Produces: `now_ms` (echoes epoch milliseconds); `run_timed <command...>` which sets the globals `DISPATCH_WALL_MS` and `DISPATCH_RC` (it must be called directly — never as `$(run_timed …)` and never as the last element of a pipe, both of which run it in a subshell and discard the globals); `parse_usage <vendor> <stdout-path> <wall-ms> <fallback-model>` emitting nine `key=value` pairs on one line.
 
 - [ ] **Step 1: Create the fixtures**
 
@@ -1562,17 +1708,25 @@ Delete the `local t0=$(date +%s%3N)` snippet at lines 635–650 and add to the c
 # bash builtin, so it does not depend on which coreutils is installed.
 now_ms() { local t="${EPOCHREALTIME}"; local us="${t/[.,]/}"; printf '%s\n' "$((us / 1000))"; }
 
-# Runs a dispatch and prints its wall-clock milliseconds on stdout. `local` is
-# only legal inside a function — the previous snippet used it at top level and
-# silently produced an empty duration.
-timed_dispatch() {
-  # Usage: wall_ms="$(timed_dispatch <command...>)"; rc is in $DISPATCH_RC
+# Runs a command and records BOTH its duration and its exit code in globals.
+#
+# It must NOT print the duration for capture via `wall_ms="$(run_timed ...)"`:
+# command substitution runs in a subshell, so any global the function sets is
+# discarded and the caller sees nothing. Call it directly and read the globals.
+#   run_timed claude_invoke "$role" "$out" "$err" < prompt
+#   echo "$DISPATCH_WALL_MS $DISPATCH_RC"
+#
+# `local` is also only legal inside a function — the previous snippet used it at
+# top level, so the assignment never happened and the duration was always empty.
+run_timed() {
+  # Usage: run_timed <command...>   -> sets DISPATCH_WALL_MS, DISPATCH_RC
   local t0 t1
   t0="$(now_ms)"
   "$@"
   DISPATCH_RC=$?
   t1="$(now_ms)"
-  printf '%s\n' "$((t1 - t0))"
+  DISPATCH_WALL_MS=$((t1 - t0))
+  return 0
 }
 ```
 
@@ -1613,9 +1767,22 @@ out_json="$FEATURE_FOLDER/transcripts/3-spec-review-iter01-claude.json"
 err_txt="${out_json%.json}.err"
 status="$FEATURE_FOLDER/3-spec-review/iteration-01/claude-verdict.md"
 
-wall_ms="$(timed_dispatch claude_invoke "$role" "$out_json" "$err_txt" < prompt.txt)"
-usage_line="$(parse_usage claude "$out_json" "$wall_ms" "$(role_model "$role")")"
-verdict="$("$GREP_BIN" -m1 '^verdict:' "$status" | cut -d: -f2- | tr -d '[:space:]')"
+# Validate the appendix BEFORE dispatching: a failed render must not reach the
+# CLI as an empty prompt.
+appendix_exists "$role" || { echo "halt: no appendix for role $role" >&2; return 1; }
+
+# Process substitution, NOT a pipe and NOT "$(...)":
+#   render_prompt … | run_timed …   -> run_timed is the last pipeline element,
+#                                      which bash runs in a SUBSHELL, so both
+#                                      globals are discarded.
+#   wall="$(run_timed …)"           -> same problem, plus it captures nothing.
+#   run_timed … < <(render_prompt …) -> run_timed stays in THIS shell. Correct.
+# It also keeps the prompt off disk, satisfying "appendix content is NEVER
+# written to disk".
+run_timed claude_invoke "$role" "$out_json" "$err_txt" < <(render_prompt "$role")
+
+usage_line="$(parse_usage claude "$out_json" "$DISPATCH_WALL_MS" "$(role_model "$role")")"
+verdict="$(status_field "$status" verdict)"
 
 log_dispatch "$role" 3 spec-review 01 "$status" "$verdict" "$usage_line"
 ```
@@ -1822,10 +1989,11 @@ capture_implementation_baseline() {
   # a full-line exact match of ABSOLUTE paths against RELATIVE porcelain output,
   # so nothing was ever excluded and Phase 6 HALTed unconditionally.
   local offenders
-  offenders="$(dirty_tree_check)"
-  if [ -n "$offenders" ] || ! dirty_tree_check >/dev/null 2>&1; then
+  # dirty_tree_check reports offenders on STDERR and signals via its exit code,
+  # so branch on the code and let its diagnostic reach the user directly. Do not
+  # capture its stdout -- it prints nothing there.
+  if ! dirty_tree_check; then
     echo "halt: uncommitted changes outside the implementation slice; commit or stash first" >&2
-    dirty_tree_check >/dev/null
     return 1
   fi
 
@@ -1941,16 +2109,19 @@ dispatch_reviewers_parallel() {
 ```
 ````
 
-- [ ] **Step 3: Initialise `codex_available`**
+- [ ] **Step 3: Confirm `codex_available` is initialised**
 
-`codex_available` is referenced but never assigned. Add it to the Task 9 orchestration-variables block:
+`codex_available` is referenced at the old line 861 but assigned nowhere, so under
+`set -u` this helper aborts. Task 9's `init_orchestration_vars` already defaults it
+and `codex_disabled_by_user` to `false`. Verify both appear there, and that this
+helper reads it as `"${codex_available:-false}"` so it is safe even if a caller
+skipped initialisation:
 
 ```bash
-# Set by canary_preflight and by each per-phase preflight gate. Explicitly
-# initialised because it is read under `set -u`.
-codex_available="${codex_available:-false}"
-codex_disabled_by_user="${codex_disabled_by_user:-false}"
+/usr/bin/grep -n 'codex_available="\${codex_available:-false}"' develop-it-process.md
 ```
+
+Expected: one hit, inside `init_orchestration_vars`.
 
 - [ ] **Step 4: Run the checks**
 
@@ -2085,6 +2256,10 @@ KEYS = [
     "REPO_ROOT",
     "ROUND",
     "TEST_REPORT_PATH",
+    # Multi-line: the role->model map injected into context-discovery. A
+    # dispatched session cannot call role_model, so the orchestrator formats it
+    # and substitutes it here. This is the case sed cannot handle.
+    "RESOLVED_MODELS",
 ]
 
 # Longest name first, and a trailing boundary assertion, so a short name can
@@ -2141,7 +2316,12 @@ legible message instead of piping a Python traceback in as the prompt."
 ## Task 15: `validate_status`, shell policy, and xtrace hygiene
 
 **Files:**
-- Modify: `develop-it-process.md` — `validate_status` (lines 776–840), `full_log.md` preamble (lines 355–374), the five `[ -f … ] && mv` sites (lines 955–962, 1015–1017, 1089–1091, 1143–1145, 1261–1263), the proposition append at line 1774
+- Modify: `develop-it-process.md` — `post_dispatch` (line 777, **fix in place, do not delete**), `validate_status` (lines 803–840), `full_log.md` preamble (lines 355–374), the five `[ -f … ] && mv` sites (lines 955–962, 1015–1017, 1089–1091, 1143–1145, 1261–1263), the proposition append at line 1774
+
+**Do not replace lines 776–840 wholesale.** `post_dispatch()` starts at line 777 and
+is a separate helper referenced at line 1390 (it implements the transcript-read
+policy: read a transcript tail ONLY when classifying a failure). Deleting it would
+silently drop that rule. Replace only `validate_status`, which starts at line 803.
 - Test: `tests/check_05_contract.sh`, `tests/check_06_cookbook.sh`
 
 **Interfaces:**
@@ -2178,8 +2358,44 @@ EOF
   ( cd "$BUILD" && validate_status thin.md reviewer ) \
     && _fail "validate_status must require severity counts for reviewers" \
     || _ok "validate_status rejects a reviewer status missing severity counts"
+
+  # Contract rule: an unrecognised verdict must NOT validate. The orchestrator
+  # branches on this string; an unknown value falls through every case arm.
+  printf 'verdict: LOOKS_FINE\nblockers: 0\nmajors: 0\nminors: 0\nfindings: claude-findings.md\n' \
+    > "$BUILD/bogus.md"
+  ( cd "$BUILD" && validate_status bogus.md reviewer ) \
+    && _fail "validate_status must reject a verdict outside the enum" \
+    || _ok "validate_status rejects a verdict outside the enum"
+
+  # Contract rule 4 (doc line 797): non-PASS/READY/DONE requires a reason.
+  printf 'verdict: CHANGES_REQUESTED\nblockers: 1\nmajors: 0\nminors: 0\nfindings: claude-findings.md\n' \
+    > "$BUILD/noreason.md"
+  ( cd "$BUILD" && validate_status noreason.md reviewer ) \
+    && _fail "validate_status must require reason: for a non-PASS verdict" \
+    || _ok "validate_status requires reason: for a non-PASS verdict"
+
+  # Contract rule 5 (doc line 798): implementer verification: enum.
+  printf 'verdict: DONE\nverification: PASS\n' > "$BUILD/impl-ok.md"
+  ( cd "$BUILD" && validate_status impl-ok.md implementer ) \
+    && _ok "validate_status accepts implementer verification=PASS" \
+    || _fail "validate_status rejected a valid implementer status"
+  printf 'verdict: DONE\nverification: MAYBE\n' > "$BUILD/impl-bad.md"
+  ( cd "$BUILD" && validate_status impl-bad.md implementer ) \
+    && _fail "validate_status must reject verification outside PASS|FAIL|PARTIAL" \
+    || _ok "validate_status rejects verification outside PASS|FAIL|PARTIAL"
+  printf 'verdict: DONE\n' > "$BUILD/impl-missing.md"
+  ( cd "$BUILD" && validate_status impl-missing.md implementer ) \
+    && _fail "validate_status must require verification: for the implementer" \
+    || _ok "validate_status requires verification: for the implementer"
 else
   _fail "status_field / validate_status not defined"
+fi
+
+# --- post_dispatch survives Task 15 and tolerates an empty rc ---
+if declare -F post_dispatch >/dev/null; then
+  _ok "post_dispatch was preserved (it implements the transcript-read policy)"
+else
+  _fail "post_dispatch was deleted; doc line 1390 references it"
 fi
 ```
 
@@ -2188,9 +2404,30 @@ fi
 Run: `bash tests/check_06_cookbook.sh`
 Expected: FAIL — `status_field / validate_status not defined` (the current helper has neither name nor colon-safe parsing).
 
-- [ ] **Step 3: Replace `validate_status`**
+- [ ] **Step 3a: Fix `post_dispatch` in place**
 
-Replace lines 776–840 with:
+`post_dispatch` (line 777) stays. It has one bug: line 779's `[ "$rc" -ne 0 ]`
+raises `[: -ne: unary operator expected` when `$rc` is empty, which is the norm
+because nothing ever wrote a readable `.rc` before Task 17. Harden the guard only:
+
+```bash
+# was: if [ "$rc" -ne 0 ] || [ ! -f "$status_path" ]; then
+# An empty or non-numeric rc must be treated as a failure, not a syntax error.
+case "${rc:-}" in
+  ''|*[!0-9]*) rc_bad=yes ;;
+  0)           rc_bad=no ;;
+  *)           rc_bad=yes ;;
+esac
+if [ "$rc_bad" = yes ] || [ ! -f "$status_path" ]; then
+```
+
+Leave the rest of `post_dispatch` — including the transcript-tail policy it
+implements for line 1390 — untouched.
+
+- [ ] **Step 3b: Replace `validate_status`**
+
+Replace lines 803–840 (the `validate_status` body only — **not** 776–802, which is
+`post_dispatch`) with:
 
 ````markdown
 <!-- lint: cookbook -->
@@ -2209,18 +2446,54 @@ status_field() {
   printf '%s\n' "$line"
 }
 
+# Legal verdicts per kind. An arbitrary verdict string must NOT validate: the
+# orchestrator branches on this value, and an unrecognised one would fall through
+# every case arm silently.
+_verdict_enum() {
+  case "$1" in
+    reviewer)   echo "PASS CHANGES_REQUESTED BLOCKED" ;;
+    implementer) echo "DONE DONE_WITH_CONCERNS NEEDS_DEBUG BLOCKED" ;;
+    worker)     echo "DONE READY BLOCKED" ;;
+    summarizer) echo "DONE BLOCKED" ;;
+    preflight)  echo "READY MISSING_SKILLS BLOCKED" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Validate a STATUS file's shape before branching on it.
 # Note: `\S` is a PCRE/GNU extension and is NOT valid POSIX ERE — use
 # [^[:space:]] instead.
 validate_status() {
-  # Usage: validate_status <status-path> <reviewer|worker|summarizer>
-  local path="$1" kind="$2" v
+  # Usage: validate_status <status-path> <reviewer|implementer|worker|summarizer|preflight>
+  local path="$1" kind="$2" v verdict legal ok
   if [ ! -f "$path" ]; then
     echo "invalid status: missing file: $path" >&2; return 1
   fi
   if ! "$GREP_BIN" -qE '^verdict:[[:space:]]*[^[:space:]]' "$path"; then
     echo "invalid status: no non-empty verdict: field in $path" >&2; return 1
   fi
+
+  legal="$(_verdict_enum "$kind")" \
+    || { echo "validate_status: unknown kind '$kind'" >&2; return 1; }
+  verdict="$(status_field "$path" verdict)"
+  ok=no
+  for v in $legal; do [ "$verdict" = "$v" ] && ok=yes; done
+  if [ "$ok" = no ]; then
+    echo "invalid status: verdict '$verdict' is not one of [$legal] in $path" >&2
+    return 1
+  fi
+
+  # Contract rule 4 (line 797): any verdict other than PASS/READY/DONE requires a
+  # non-empty one-line reason.
+  case "$verdict" in
+    PASS|READY|DONE) : ;;
+    *)
+      if [ -z "$(status_field "$path" reason)" ]; then
+        echo "invalid status: verdict '$verdict' requires a non-empty reason: in $path" >&2
+        return 1
+      fi ;;
+  esac
+
   case "$kind" in
     reviewer)
       local k
@@ -2241,8 +2514,15 @@ validate_status() {
             fi ;;
         esac
       done ;;
-    worker|summarizer) : ;;
-    *) echo "validate_status: unknown kind '$kind'" >&2; return 1 ;;
+    implementer)
+      # Contract rule 5 (line 798): verification: in {PASS, FAIL, PARTIAL}.
+      v="$(status_field "$path" verification)"
+      case "$v" in
+        PASS|FAIL|PARTIAL) : ;;
+        *) echo "invalid status: verification must be PASS|FAIL|PARTIAL, got '$v' in $path" >&2
+           return 1 ;;
+      esac ;;
+    worker|summarizer|preflight) : ;;
   esac
   return 0
 }
@@ -2366,38 +2646,43 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 source lib/assert.sh
 
-python3 lib/extract.py cookbook 2>/dev/null || { _fail "cookbook not extractable"; finish; }
+load_cookbook || finish
 
 WORK="$BUILD/fakecli"; rm -rf "$WORK"; mkdir -p "$WORK"
-export PATH="$PWD/fakebin:$PATH"
-export FAKE_ARGV_LOG="$WORK/argv.log"
+export PATH="$PWD/fakebin:$PATH"          # the stubs must be found by name
+export FAKE_ARGV_LOG="$WORK/argv.log"     # the stubs read this themselves
 
 # A throwaway target repo, distinct from the process repo.
-export REPO_ROOT="$WORK/target"; mkdir -p "$REPO_ROOT"
+#
+# CRITICAL: REPO_ROOT / FEATURE_FOLDER / PROCESS_PATH are assigned WITHOUT
+# `export`. Exporting them here would mask the real bug this check exists to
+# catch: a detached child running under `bash -c` does not inherit ordinary
+# assignments, so dispatch_detached must pass them explicitly via `env`. If the
+# test exported them, a broken dispatch_detached would still pass.
+REPO_ROOT="$WORK/target"; mkdir -p "$REPO_ROOT"
 git -C "$REPO_ROOT" init -q
 ( cd "$REPO_ROOT" && : > seed && git add seed \
-  && git -c user.email=t@t -c user.name=t commit -qm seed )
-export FEATURE_FOLDER="$REPO_ROOT/docs/superpowers/specs/x-artifacts"
+  && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+FEATURE_FOLDER="$REPO_ROOT/docs/superpowers/specs/x-artifacts"
 mkdir -p "$FEATURE_FOLDER/transcripts"
-export PROCESS_PATH="$PROCESS_DOC"
+PROCESS_PATH="$PROCESS_DOC"
 
-# shellcheck source=/dev/null
-source "$BUILD/cookbook.sh"
-validate_roots || { _fail "validate_roots failed in the fake environment"; finish; }
+init_orchestration_vars \
+  || { _fail "init_orchestration_vars failed in the fake environment"; finish; }
 
 # --- 1. claude_invoke passes the resolved model and timeout ---
 : > "$FAKE_ARGV_LOG"
 printf 'prompt\n' | claude_invoke spec-reviewer-claude "$WORK/o.json" "$WORK/o.err"
 assert_rc 0 $? "claude_invoke succeeds with a healthy stub"
-assert_present -- "--model claude-opus-5" "$FAKE_ARGV_LOG" \
+assert_present "--model claude-opus-5" "$FAKE_ARGV_LOG" \
   "claude_invoke passes the role's resolved model"
 
 # --- 2. codex_invoke pins the model, effort, and --json ---
 : > "$FAKE_ARGV_LOG"
 printf 'prompt\n' | codex_invoke spec-reviewer-codex "$WORK/c.json" "$WORK/c.err"
-assert_present -- "-m gpt-5.6-sol" "$FAKE_ARGV_LOG" "codex_invoke pins the model"
-assert_present -- "model_reasoning_effort=high" "$FAKE_ARGV_LOG" "codex_invoke sets high effort"
-assert_present -- "--json" "$FAKE_ARGV_LOG" "codex_invoke always passes --json"
+assert_present "-m gpt-5.6-sol" "$FAKE_ARGV_LOG" "codex_invoke pins the model"
+assert_present "model_reasoning_effort=high" "$FAKE_ARGV_LOG" "codex_invoke sets high effort"
+assert_present "--json" "$FAKE_ARGV_LOG" "codex_invoke always passes --json"
 
 # --- 3. --add-dir appears only when the feature folder is outside REPO_ROOT ---
 case "$(cat "$FAKE_ARGV_LOG")" in
@@ -2408,7 +2693,7 @@ esac
 ( export FEATURE_FOLDER="$WORK/outside"; mkdir -p "$FEATURE_FOLDER"
   validate_roots >/dev/null 2>&1
   printf 'p\n' | codex_invoke plan-reviewer-codex "$WORK/c2.json" "$WORK/c2.err" )
-assert_present -- "--add-dir" "$FAKE_ARGV_LOG" \
+assert_present "--add-dir" "$FAKE_ARGV_LOG" \
   "--add-dir present for an out-of-repo feature folder"
 
 # --- 4. A failing stub is reported as failed ---
@@ -2519,10 +2804,13 @@ global options after exec, so it cannot mask that ordering bug."
 **Interfaces:**
 - Consumes: `claude_invoke`, `codex_invoke` (Task 7), `iso_now` (Task 10)
 - Produces:
-  - `dispatch_id <phase> <iter> <role>` → `<phase>-iter<NN>-<role>`
-  - `dispatch_detached <phase> <iter> <role>` — launches, writes `.started` then `.pid`; prompt on stdin
-  - `dispatch_state <phase> <iter> <role>` → one of `NEVER_LAUNCHED RUNNING ORPHANED COMPLETED TIMED_OUT FAILED CORRUPT INCONSISTENT`; sets `DISPATCH_RC` when a valid `.rc` exists
-  - `await_dispatch <phase> <iter> <role> <max_wait_s>` — polls; returns 0 on a terminal state, 1 on timeout of the poll itself
+  - `dispatch_id <phase> <iter> <role>` → `<phase>-iter<NN>-<role>` (echoed; pure function, safe to capture)
+  - `role_mutates <role>` → `yes|no` — drives `ORPHANED` recovery
+  - `appendix_exists <role>` → rc 0/1 — pre-launch validation
+  - `dispatch_detached <phase> <iter> <role> [extra CLI args...]` — writes `.intent`, forks; the **child** publishes `.started`/`.pid`/`.rc` and renders its own prompt. Reads no stdin.
+  - `dispatch_state <phase> <iter> <role>` — **sets the globals `DISPATCH_STATE` and `DISPATCH_RC`**; echoes nothing. One of `NEVER_LAUNCHED LAUNCHING LAUNCH_FAILED RUNNING ORPHANED COMPLETED TIMED_OUT FAILED CORRUPT INCONSISTENT`. Must be called directly: `$(dispatch_state …)` runs it in a subshell and discards `DISPATCH_RC`.
+  - `await_dispatch <phase> <iter> <role> <max_wait_s>` — polls, setting the same globals; returns 0 on a terminal state, 1 if still `RUNNING`/`LAUNCHING`
+  - `DISPATCH_START_GRACE_S` — how long `.intent` may exist without `.started` before the launch is called failed
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2537,66 +2825,109 @@ done
 
 T="$FEATURE_FOLDER/transcripts"
 
+# dispatch_state sets GLOBALS and must be called directly. Capturing it as
+# "$(dispatch_state ...)" runs it in a subshell, so DISPATCH_RC never comes back.
+# This helper makes every call below use the correct form.
+state_of() { dispatch_state "$1" "$2" "$3"; printf '%s' "$DISPATCH_STATE"; }
+
 assert_eq "3-iter01-spec-reviewer-claude" \
   "$(dispatch_id 3 01 spec-reviewer-claude)" "dispatch_id is deterministic"
 
 # 1. Nothing launched yet.
-assert_eq NEVER_LAUNCHED "$(dispatch_state 9 01 summarizer-spec)" \
+assert_eq NEVER_LAUNCHED "$(state_of 9 01 summarizer-spec)" \
   "no control files means NEVER_LAUNCHED"
 
-# 2. Completed successfully.
-printf 'p\n' | dispatch_detached 3 02 summarizer-spec
-await_dispatch 3 02 summarizer-spec 30 || _fail "await_dispatch timed out on a fast stub"
-assert_eq COMPLETED "$(dispatch_state 3 02 summarizer-spec)" "rc=0 means COMPLETED"
-assert_eq 0 "$DISPATCH_RC" "DISPATCH_RC is 0 for a clean run"
+# 2. Completed successfully. DISPATCH_RC must survive into THIS shell.
+dispatch_detached 3 02 summarizer-spec
+await_dispatch 3 02 summarizer-spec 60 || _fail "await_dispatch timed out on a fast stub"
+assert_eq COMPLETED "$DISPATCH_STATE" "rc=0 means COMPLETED"
+assert_eq 0 "$DISPATCH_RC" "DISPATCH_RC reaches the caller (not swallowed by a subshell)"
+
+# 2b. The child renders its own prompt: no .prompt file may exist.
+id="$(dispatch_id 3 02 summarizer-spec)"
+[ ! -e "$T/$id.prompt" ] && _ok "no .prompt file is persisted" \
+                         || _fail "appendix content was written to disk: $T/$id.prompt"
 
 # 3. Non-zero rc.
-( export FAKE_RC=4; printf 'p\n' | dispatch_detached 3 03 summarizer-spec
-  await_dispatch 3 03 summarizer-spec 30 )
-assert_eq FAILED "$(dispatch_state 3 03 summarizer-spec)" "non-zero rc means FAILED"
+FAKE_RC=4 dispatch_detached 3 03 summarizer-spec
+await_dispatch 3 03 summarizer-spec 60
+assert_eq FAILED "$DISPATCH_STATE" "non-zero rc means FAILED"
+assert_eq 4 "$DISPATCH_RC" "DISPATCH_RC carries the child's exit code"
+
+# Helper: fabricate control files for the states that cannot be produced quickly.
+mk_intent()  { printf 'dispatch_id: %s\nrole: summarizer-spec\n' "$1" > "$T/$1.intent"; }
+mk_started() { printf 'dispatch_id: %s\npid: %s\npid_starttime: %s\n' "$1" "$2" "$3" > "$T/$1.started"; }
 
 # 4. timeout rc 124.
-id="$(dispatch_id 3 04 summarizer-spec)"
-printf '%s\n' 124 > "$T/$id.rc"
-printf 'dispatch_id: %s\npid: 999999\npid_starttime: 1\n' "$id" > "$T/$id.started"
-assert_eq TIMED_OUT "$(dispatch_state 3 04 summarizer-spec)" "rc=124 means TIMED_OUT"
+id="$(dispatch_id 3 04 summarizer-spec)"; mk_intent "$id"; mk_started "$id" 999999 1
+printf '124\n' > "$T/$id.rc"
+assert_eq TIMED_OUT "$(state_of 3 04 summarizer-spec)" "rc=124 means TIMED_OUT"
 
 # 5. Malformed .rc.
-id="$(dispatch_id 3 05 summarizer-spec)"
+id="$(dispatch_id 3 05 summarizer-spec)"; mk_intent "$id"; mk_started "$id" 999999 1
 printf 'garbage\n' > "$T/$id.rc"
-printf 'dispatch_id: %s\npid: 999999\npid_starttime: 1\n' "$id" > "$T/$id.started"
-assert_eq CORRUPT "$(dispatch_state 3 05 summarizer-spec)" "a non-numeric .rc is CORRUPT"
+assert_eq CORRUPT "$(state_of 3 05 summarizer-spec)" "a non-numeric .rc is CORRUPT"
 
 # 6. Started, no .rc, dead pid -> ORPHANED (the harness-crash case).
-id="$(dispatch_id 3 06 summarizer-spec)"
-printf 'dispatch_id: %s\npid: 999999\npid_starttime: 12345\n' "$id" > "$T/$id.started"
-assert_eq ORPHANED "$(dispatch_state 3 06 summarizer-spec)" \
+id="$(dispatch_id 3 06 summarizer-spec)"; mk_intent "$id"; mk_started "$id" 999999 12345
+assert_eq ORPHANED "$(state_of 3 06 summarizer-spec)" \
   "a dead pid with no .rc is ORPHANED, not RUNNING"
 
 # 7. PID reuse: live pid, wrong starttime -> ORPHANED, not RUNNING.
-sleep 60 & live=$!
-id="$(dispatch_id 3 07 summarizer-spec)"
-printf 'dispatch_id: %s\npid: %s\npid_starttime: 1\n' "$id" "$live" > "$T/$id.started"
-assert_eq ORPHANED "$(dispatch_state 3 07 summarizer-spec)" \
+sleep 120 & live=$!
+id="$(dispatch_id 3 07 summarizer-spec)"; mk_intent "$id"; mk_started "$id" "$live" 1
+assert_eq ORPHANED "$(state_of 3 07 summarizer-spec)" \
   "a recycled pid is ORPHANED (starttime mismatch)"
 
 # 8. Genuinely running.
-real_start="$(awk '{print $22}' /proc/$live/stat)"
-printf 'dispatch_id: %s\npid: %s\npid_starttime: %s\n' "$id" "$live" "$real_start" \
-  > "$T/$id.started"
-assert_eq RUNNING "$(dispatch_state 3 07 summarizer-spec)" \
+mk_started "$id" "$live" "$(awk '{print $22}' "/proc/$live/stat")"
+assert_eq RUNNING "$(state_of 3 07 summarizer-spec)" \
   "a live pid with a matching starttime is RUNNING"
 kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
 
-# 9. .rc without .started -> INCONSISTENT (two runs on one folder).
-id="$(dispatch_id 3 08 summarizer-spec)"
-printf '0\n' > "$T/$id.rc"; rm -f "$T/$id.started"
-assert_eq INCONSISTENT "$(dispatch_state 3 08 summarizer-spec)" \
-  ".rc without .started is INCONSISTENT"
+# 9. LAUNCHING: intent written, child has not published .started yet.
+id="$(dispatch_id 3 09 summarizer-spec)"; mk_intent "$id"
+assert_eq LAUNCHING "$(state_of 3 09 summarizer-spec)" \
+  "fresh intent without .started is LAUNCHING, not NEVER_LAUNCHED"
 
-# 10. A DISPATCH_STARTED event is logged before launch.
+# 10. LAUNCH_FAILED: the fork never took. Age the intent past the grace period.
+DISPATCH_START_GRACE_S=1
+touch -d '1 hour ago' "$T/$id.intent"
+assert_eq LAUNCH_FAILED "$(state_of 3 09 summarizer-spec)" \
+  "a stale intent with no .started is LAUNCH_FAILED"
+DISPATCH_START_GRACE_S=30
+
+# 11. .rc without .intent -> INCONSISTENT (two runs on one folder).
+id="$(dispatch_id 3 10 summarizer-spec)"
+printf '0\n' > "$T/$id.rc"; rm -f "$T/$id.intent" "$T/$id.started"
+assert_eq INCONSISTENT "$(state_of 3 10 summarizer-spec)" \
+  ".rc without .intent is INCONSISTENT"
+
+# 12. role_mutates drives ORPHANED recovery.
+assert_eq no  "$(role_mutates summarizer-spec)" "summarizers are read-only"
+assert_eq no  "$(role_mutates code-reviewer-claude)" "reviewers are read-only"
+assert_eq yes "$(role_mutates implementer)" "the implementer mutates"
+assert_eq yes "$(role_mutates finishing-branch)" "the git finalizer mutates"
+
+# 13. A DISPATCH_STARTED event is logged before launch.
 assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" \
   "launch is recorded in RUN_LOG before the process starts"
+
+# 14. A detached CODEX dispatch works when the vars are NOT exported by the
+#     parent -- this is the regression that `export`-based tests would mask.
+unset REPO_ROOT FEATURE_FOLDER FEATURE_FOLDER_OUTSIDE_REPO
+REPO_ROOT="$WORK/target"                     # plain assignment, no export
+FEATURE_FOLDER="$WORK/outside-ff"            # deliberately OUTSIDE the repo
+mkdir -p "$FEATURE_FOLDER/transcripts"
+PROCESS_PATH="$PROCESS_DOC"
+init_orchestration_vars || _fail "init_orchestration_vars failed"
+assert_eq yes "${FEATURE_FOLDER_OUTSIDE_REPO:-no}" "outside-repo feature folder is detected"
+: > "$FAKE_ARGV_LOG"
+dispatch_detached 5 01 plan-reviewer-codex
+await_dispatch 5 01 plan-reviewer-codex 60 || _fail "detached codex dispatch did not finish"
+assert_eq COMPLETED "$DISPATCH_STATE" "detached codex dispatch completes without exported vars"
+assert_present "--add-dir" "$FAKE_ARGV_LOG" \
+  "detached codex received --add-dir for an out-of-repo feature folder"
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -2618,12 +2949,25 @@ detached and polled across short calls.
 **One *dispatch* per phase** is the rule — polling calls are not phase bundling.
 Control files live beside the transcript:
 
-| File | Written | Content |
-|---|---|---|
-| `<id>.started` | before launch | `dispatch_id`, ISO timestamp, `pid`, `pid_starttime`, `timeout_s`, model |
-| `<id>.pid` | after launch | pid only |
-| `<id>.rc` | on exit | exit code, one integer |
-| `<id>.json` / `.err` | by the CLI | stdout / stderr |
+| File | Written by | When | Content |
+|---|---|---|---|
+| `<id>.intent` | parent | **before** the fork | `dispatch_id`, `role`, `vendor`, `model`, `timeout_s`, `intent_at` — no pid, which is the point |
+| `<id>.started` | **child** | its first action | `dispatch_id`, `pid` (`$$`), `pid_starttime`, `started_at` |
+| `<id>.pid` | child | after `.started` | pid only, for cheap liveness checks |
+| `<id>.rc` | child | on exit | exit code, one integer |
+| `<id>.json` / `.err` | the CLI | during the run | stdout / stderr |
+
+There is deliberately **no `.prompt` file**. The child renders the appendix itself
+from `$PROCESS_PATH`, so appendix content is never written to disk — the rule at
+line 23 of the process document. `.tmp` files exist only momentarily during atomic
+`mv` publication.
+
+`.started` is written by the **child**, not the parent. It must contain the pid,
+which does not exist until after the fork, so a parent that wrote it would leave a
+window where a live child has no control file — `dispatch_state` would report
+`NEVER_LAUNCHED` and a resume would start a duplicate. Having the child publish its
+own `$$` closes that window entirely; the parent's `.intent` covers the remaining
+gap between "decided to launch" and "child running".
 
 <!-- lint: cookbook -->
 ```bash
@@ -2631,13 +2975,35 @@ dispatch_id() { printf '%s-iter%s-%s\n' "$1" "$2" "$3"; }
 
 _pid_starttime() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 
-# Launch a dispatch that outlives this shell. Prompt is read from stdin.
+# Does this role mutate the working tree? An abandoned mutating dispatch cannot
+# simply be re-run: it may have left edits, commits, or artifacts behind.
+role_mutates() {
+  case "$1" in
+    spec-fixer|plan-writer|plan-fixer|implementer|impl-worker|debugger|\
+    test-fixer|all-tests-runner|finishing-branch) echo yes ;;
+    *) echo no ;;   # reviewers, summarizers, discovery, preflight, readiness
+  esac
+}
+
+appendix_exists() {
+  "$GREP_BIN" -qF "<!-- BEGIN: $1 -->" "$PROCESS_PATH" \
+    && "$GREP_BIN" -qF "<!-- END: $1 -->" "$PROCESS_PATH"
+}
+
+# Launch a dispatch that outlives this shell.
+#
+# Three-phase publication closes the launch window. The parent writes .intent
+# BEFORE forking; the CHILD writes .started with its own $$ as its first action.
+# Writing .started in the parent is impossible to do safely: it must contain the
+# pid, which does not exist until after the fork, so a parent crash in between
+# would leave a live child with no control file and dispatch_state would report
+# NEVER_LAUNCHED and start a duplicate.
 dispatch_detached() {
-  # Usage: dispatch_detached <phase> <iter> <role> [extra CLI args...] < prompt
-  # Trailing arguments are forwarded to claude_invoke / codex_invoke — this is
-  # how the implementer passes --agents to pin its sub-subagent model.
+  # Usage: dispatch_detached <phase> <iter> <role> [extra CLI args...]
+  # The prompt is rendered BY THE CHILD from $PROCESS_PATH — it is never written
+  # to disk, per "appendix content is NEVER written to disk".
   local phase="$1" iter="$2" role="$3"; shift 3
-  local id tdir base vendor model timeout_s prompt
+  local id tdir base vendor model timeout_s
   id="$(dispatch_id "$phase" "$iter" "$role")"
   tdir="$FEATURE_FOLDER/transcripts"; mkdir -p "$tdir"
   base="$tdir/$id"
@@ -2645,15 +3011,27 @@ dispatch_detached() {
   model="$(role_model "$role")"   || return 1
   timeout_s=$(( $(role_timeout "$role") * 60 ))
 
-  # Buffer the prompt: the detached child cannot inherit this shell's stdin.
-  prompt="$base.prompt"
-  cat > "$prompt"
+  # Fail before forking if the appendix is missing, rather than launching a
+  # child that would dispatch an empty prompt.
+  appendix_exists "$role" \
+    || { echo "halt: no appendix markers for role $role" >&2; return 1; }
 
-  # Record the intent BEFORE launching, so a crash between launch and
-  # completion still leaves an auditable trace.
+  # 1. Durable pre-launch intent. No pid yet — that is the point.
+  {
+    printf 'dispatch_id: %s\n' "$id"
+    printf 'role: %s\n' "$role"
+    printf 'vendor: %s\n' "$vendor"
+    printf 'model: %s\n' "$model"
+    printf 'timeout_s: %s\n' "$timeout_s"
+    printf 'intent_at: %s\n' "$(iso_now)"
+  } > "$base.intent.tmp" && mv "$base.intent.tmp" "$base.intent"
+
   {
     printf -- '--- %s  event=DISPATCH_STARTED\n' "$(iso_now)"
     printf 'phase:                    %s\n' "$phase"
+    # PHASE_NAME is set by the orchestrator at the top of each phase block; the
+    # default keeps this safe under `set -u` if a caller forgets.
+    printf 'phase_name:               %s\n' "${PHASE_NAME:-unknown}"
     printf 'iteration:                %s\n' "$iter"
     printf 'role:                     %s\n' "$role"
     printf 'dispatch_id:              %s\n' "$id"
@@ -2661,110 +3039,158 @@ dispatch_detached() {
     printf '\n'
   } >> "$FEATURE_FOLDER/RUN_LOG.md"
 
-  # The child needs the cookbook: functions do not cross a bash -c boundary.
-  # Export the definitions it calls rather than re-sourcing the document.
-  export -f claude_invoke codex_invoke role_model role_effort role_timeout \
-            role_vendor _role_row _role_field
+  # 2. Fork. The child needs both the FUNCTIONS and the VARIABLES they read:
+  #    ordinary assignments are NOT inherited across `bash -c`, and
+  #    codex_invoke reads REPO_ROOT / FEATURE_FOLDER / FEATURE_FOLDER_OUTSIDE_REPO
+  #    under `set -u`. Passing them via `env` is explicit and does not depend on
+  #    whatever the caller happened to export.
+  export -f claude_invoke codex_invoke render_prompt appendix_exists \
+            role_model role_effort role_timeout role_vendor \
+            _role_row _role_field
 
-  setsid bash -c '
+  setsid env \
+      REPO_ROOT="$REPO_ROOT" \
+      FEATURE_FOLDER="$FEATURE_FOLDER" \
+      FEATURE_FOLDER_OUTSIDE_REPO="${FEATURE_FOLDER_OUTSIDE_REPO:-}" \
+      PROCESS_PATH="$PROCESS_PATH" \
+      PYTHON_BIN="$PYTHON_BIN" \
+      GREP_BIN="$GREP_BIN" \
+      bash -c '
     set -uo pipefail
     base="$1"; vendor="$2"; role="$3"; shift 3
+    # 3. First action: publish .started with our OWN pid. No parent-side window.
+    {
+      printf "dispatch_id: %s\n" "${base##*/}"
+      printf "pid: %s\n" "$$"
+      printf "pid_starttime: %s\n" "$(awk "{print \$22}" "/proc/$$/stat")"
+      printf "started_at: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$base.started.tmp" && mv "$base.started.tmp" "$base.started"
+    printf "%s\n" "$$" > "$base.pid.tmp" && mv "$base.pid.tmp" "$base.pid"
+
     if [ "$vendor" = codex ]; then
-      codex_invoke "$role" "$base.json" "$base.err" "$@" < "$base.prompt"
+      codex_invoke "$role" "$base.json" "$base.err" "$@" < <(render_prompt "$role")
     else
-      claude_invoke "$role" "$base.json" "$base.err" "$@" < "$base.prompt"
+      claude_invoke "$role" "$base.json" "$base.err" "$@" < <(render_prompt "$role")
     fi
     rc=$?
     # Atomic publication: a poller must never read a partial .rc.
     printf "%s\n" "$rc" > "$base.rc.tmp" && mv "$base.rc.tmp" "$base.rc"
   ' _ "$base" "$vendor" "$role" "$@" >/dev/null 2>&1 &
-  local pid=$!
-  disown "$pid" 2>/dev/null || true
-
-  {
-    printf 'dispatch_id: %s\n' "$id"
-    printf 'started_at: %s\n' "$(iso_now)"
-    printf 'pid: %s\n' "$pid"
-    printf 'pid_starttime: %s\n' "$(_pid_starttime "$pid")"
-    printf 'timeout_s: %s\n' "$timeout_s"
-    printf 'model: %s\n' "$model"
-  } > "$base.started.tmp" && mv "$base.started.tmp" "$base.started"
-  printf '%s\n' "$pid" > "$base.pid.tmp" && mv "$base.pid.tmp" "$base.pid"
+  disown $! 2>/dev/null || true
   return 0
 }
 
-# Classify a dispatch. Sets DISPATCH_RC when a valid .rc exists.
+# How long to wait for a child to publish .started before calling the launch
+# failed. The child writes it as its first action, so this is generous.
+DISPATCH_START_GRACE_S="${DISPATCH_START_GRACE_S:-30}"
+
+# Classify a dispatch. Sets the globals DISPATCH_STATE and DISPATCH_RC.
+#
+# It does NOT print the state for capture via "$(dispatch_state ...)": command
+# substitution runs in a subshell, so DISPATCH_RC would be discarded and the
+# caller would see it unset. Call directly, then read $DISPATCH_STATE.
 dispatch_state() {
-  # Usage: dispatch_state <phase> <iter> <role>
-  local base rc pid recorded current
+  # Usage: dispatch_state <phase> <iter> <role>  -> DISPATCH_STATE, DISPATCH_RC
+  local base rc pid recorded current age
   base="$FEATURE_FOLDER/transcripts/$(dispatch_id "$1" "$2" "$3")"
   DISPATCH_RC=""
+  DISPATCH_STATE=""
 
-  if [ ! -f "$base.started" ]; then
-    if [ -f "$base.rc" ]; then echo INCONSISTENT; else echo NEVER_LAUNCHED; fi
-    return 0
-  fi
-
+  # A .rc is terminal regardless of anything else.
   if [ -f "$base.rc" ]; then
+    if [ ! -f "$base.intent" ]; then
+      DISPATCH_STATE=INCONSISTENT; return 0   # two runs sharing one folder
+    fi
     rc="$(tr -d '[:space:]' < "$base.rc")"
     case "$rc" in
-      ''|*[!0-9]*) echo CORRUPT; return 0 ;;
+      ''|*[!0-9]*) DISPATCH_STATE=CORRUPT; return 0 ;;
     esac
     DISPATCH_RC="$rc"
     case "$rc" in
-      0)   echo COMPLETED ;;
-      124) echo TIMED_OUT ;;
-      *)   echo FAILED ;;
+      0)   DISPATCH_STATE=COMPLETED ;;
+      124) DISPATCH_STATE=TIMED_OUT ;;
+      *)   DISPATCH_STATE=FAILED ;;
     esac
     return 0
   fi
 
-  # No .rc yet: is the process actually alive? A bare pid is not enough — it
-  # may have been recycled, so compare /proc starttime too.
+  if [ ! -f "$base.intent" ]; then
+    DISPATCH_STATE=NEVER_LAUNCHED; return 0
+  fi
+
+  # Intent exists but the child has not published .started yet. Either it is
+  # about to, or the fork failed. Bound the ambiguity with a grace period
+  # instead of guessing.
+  if [ ! -f "$base.started" ]; then
+    age=$(( $(date -u +%s) - $(date -u -r "$base.intent" +%s 2>/dev/null || date -u +%s) ))
+    if [ "$age" -lt "$DISPATCH_START_GRACE_S" ]; then
+      DISPATCH_STATE=LAUNCHING
+    else
+      DISPATCH_STATE=LAUNCH_FAILED
+    fi
+    return 0
+  fi
+
+  # A bare pid is not a liveness token across a crash: it may have been
+  # recycled. Compare /proc starttime too.
   pid="$(status_field "$base.started" pid)"
   recorded="$(status_field "$base.started" pid_starttime)"
   current="$(_pid_starttime "$pid")"
   if [ -n "$current" ] && [ "$current" = "$recorded" ]; then
-    echo RUNNING
+    DISPATCH_STATE=RUNNING
   else
-    echo ORPHANED
+    DISPATCH_STATE=ORPHANED
   fi
+  return 0
 }
 
-# Poll until a terminal state or until max_wait_s elapses.
+# Poll until a terminal state or until max_wait_s elapses. Sets DISPATCH_STATE
+# and DISPATCH_RC; returns 0 on a terminal state, 1 if still non-terminal.
 await_dispatch() {
   # Usage: await_dispatch <phase> <iter> <role> <max_wait_s>
-  local phase="$1" iter="$2" role="$3" max="$4" waited=0 state
+  local phase="$1" iter="$2" role="$3" max="$4" waited=0
   while [ "$waited" -lt "$max" ]; do
-    state="$(dispatch_state "$phase" "$iter" "$role")"
-    case "$state" in
-      RUNNING) ;;
-      *) printf '%s\n' "$state"; return 0 ;;
+    dispatch_state "$phase" "$iter" "$role"
+    case "$DISPATCH_STATE" in
+      RUNNING|LAUNCHING) ;;
+      *) return 0 ;;
     esac
     sleep 2; waited=$((waited + 2))
   done
-  printf 'RUNNING\n'
   return 1
 }
 ```
 
-**Resume.** On resume, call `dispatch_state` for the phase's dispatch before
-doing anything else, and act on the result:
+**Resume.** On resume, call `dispatch_state` directly (never in `$(…)`) and act on
+`$DISPATCH_STATE`:
 
-| State | Action |
+| State | Meaning | Action |
+|---|---|---|
+| `NEVER_LAUNCHED` | no `.intent` | dispatch fresh |
+| `LAUNCHING` | `.intent` present, `.started` not yet, within grace | poll again; do **not** re-dispatch |
+| `LAUNCH_FAILED` | `.intent` older than the grace period, still no `.started` | the fork never took; safe to re-dispatch for **any** role — no CLI ran |
+| `RUNNING` | live pid, `pid_starttime` matches | resume polling; do **not** re-dispatch |
+| `ORPHANED` | `.started` present, process gone, no `.rc` | see the table below — **depends on the role** |
+| `COMPLETED` | `.rc` = 0 | read STATUS, proceed |
+| `TIMED_OUT` | `.rc` = 124 | apply the Mode-2 policy |
+| `FAILED` | `.rc` non-zero, not 124 | apply the failure-mode classifier |
+| `CORRUPT` | `.rc` present but not an integer | treat as `FAILED`; surface the transcript path |
+| `INCONSISTENT` | `.rc` without `.intent` | HALT — two runs are sharing one feature folder |
+
+**`ORPHANED` recovery depends on whether the role mutates the repository.** Atomic
+STATUS publication guarantees a half-written *STATUS* is never mistaken for a
+finished one, but it says nothing about code edits, commits, or artifacts the dead
+process already made. Blind re-dispatch would double-apply them.
+
+| `role_mutates` | Action on `ORPHANED` |
 |---|---|
-| `NEVER_LAUNCHED` | dispatch fresh |
-| `RUNNING` | resume polling — do **not** re-dispatch |
-| `ORPHANED` | log `event=DISPATCH_ORPHANED`, re-dispatch once |
-| `COMPLETED` | read STATUS, proceed |
-| `TIMED_OUT` | apply the Mode-2 policy |
-| `FAILED` | apply the failure-mode classifier |
-| `CORRUPT` | treat as `FAILED`; surface the transcript path |
-| `INCONSISTENT` | HALT — two runs are sharing one feature folder |
+| `no` (reviewers, summarizers, `context-discovery`, preflight, `readiness-writer`) | log `event=DISPATCH_ORPHANED`, re-dispatch once. These roles only read and write their own STATUS/findings, so a repeat is idempotent. |
+| `yes` (`implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `finishing-branch`) | log `event=DISPATCH_ORPHANED`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch, or to keep the partial work and continue. Never auto-retry. |
 
-Re-dispatching after `ORPHANED` is safe only because every subagent writes its
-STATUS last and atomically, so a half-written artifact from the dead process
-cannot be mistaken for a finished one.
+This is the one place the process deliberately stops rather than recovering:
+re-running a half-finished implementer is how you get duplicated commits and
+double-applied edits, and no automated check can distinguish "the task was done
+twice" from "the task was done once" after the fact.
 ````
 
 - [ ] **Step 4: Update the one-phase rule and resumability prose**
@@ -2983,21 +3409,41 @@ Replace each of the four divergent statements with a reference to one canonical 
 - **Canonical write list.** The orchestrator may create directories with
   `mkdir -p` and may write ONLY: `RUN_LOG.md`, `full_log.md`,
   `process-improvement-proposition.md`, and
-  `transcripts/<dispatch-id>.{json,err,rc,pid,started,prompt}` — all inside
+  `transcripts/<dispatch-id>.{json,err,rc,pid,started,intent}` — all inside
   `$FEATURE_FOLDER`. Nothing else, ever. Reading remains restricted to STATUS
   files and the per-phase summaries they reference.
+- **Appendix content is still never written to disk.** There is no `.prompt` file:
+  a detached child renders its own appendix from `$PROCESS_PATH`, and an inline
+  dispatch pipes it via process substitution. The control files above carry only
+  metadata — pids, timestamps, exit codes — never prompt text.
 ```
 
 At lines 5, 23, 31 and 1653, replace the enumerations with "see the canonical write list in Allowed actions".
 
 - [ ] **Step 4: Unify transcript naming**
 
-Adopt `<phase>-iter<NN>-<vendor>.<ext>` everywhere, matching `dispatch_id`. Update lines 299–300 and 933, and note:
+Adopt **`<phase>-iter<NN>-<role>.<ext>`** everywhere — the role, not the vendor,
+because that is what `dispatch_id` produces and because a vendor suffix collides.
+Phase 3 iteration 1 dispatches `spec-reviewer-claude` and, on a re-review round,
+`spec-fixer` and `summarizer-spec` — all vendor `claude`, all in the same phase and
+iteration, so `3-iter01-claude.json` would be overwritten three times.
+
+Update lines 299–300 and 933, and note:
 
 ```markdown
-Transcript and control files are named `<phase>-iter<NN>-<vendor>.<ext>`,
-matching `dispatch_id`. Earlier revisions used three different schemes, which
-left the readiness writer unable to locate transcripts reliably.
+Transcript and control files are named `<phase>-iter<NN>-<role>.<ext>`, exactly
+what `dispatch_id` returns. The role is required, not the vendor: several roles of
+the same vendor run within one phase and iteration, so a vendor-suffixed name
+would collide and silently overwrite. Earlier revisions used three different
+schemes, which left the readiness writer unable to locate transcripts reliably.
+```
+
+Also update `dispatch_reviewers_parallel` (Task 13), whose `base_c` / `base_x` use
+`${phase}-iter${iter}-claude` / `-codex`, to use the role instead:
+
+```bash
+  local base_c="$tdir/$(dispatch_id "$phase" "$iter" "$claude_role")"
+  local base_x="$tdir/$(dispatch_id "$phase" "$iter" "$codex_role")"
 ```
 
 - [ ] **Step 5: Rename the Codex modes and fix the phase numbers**
@@ -3121,6 +3567,28 @@ fi
 # 2. Syntax-check everything.
 python3 lib/extract.py cookbook >/dev/null 2>&1 || { _fail "cookbook not extractable"; finish; }
 python3 lib/extract.py snippets
+
+# 2a. INVARIANT: the cookbook is definitions only. A top-level statement would
+#     execute on `source`, and a top-level ${VAR:?} would abort the sourcing
+#     shell -- which is exactly how the test suite loads these helpers.
+offending="$(awk '
+  /^[[:space:]]*(#|$)/            { next }   # comments and blanks
+  /^[a-zA-Z_][a-zA-Z0-9_]*\(\)/   { depth++; next }   # function opener
+  /^}/                            { depth--; next }   # function closer
+  depth > 0                       { next }            # inside a function
+  { printf "%d: %s\n", NR, $0 }
+' "$BUILD/cookbook.sh")"
+if [ -z "$offending" ]; then
+  _ok "cookbook contains no top-level statements"
+else
+  _fail "cookbook has top-level statements; they run on source and can abort the shell"
+  printf '    %s\n' "$offending"
+fi
+
+# 2b. Sourcing must be side-effect free with NO variables preset.
+( set -uo pipefail; source "$BUILD/cookbook.sh" ) >/dev/null 2>&1 \
+  && _ok "cookbook sources cleanly with no variables preset" \
+  || _fail "sourcing the cookbook fails on a bare shell"
 
 bash -n "$BUILD/cookbook.sh" && _ok "cookbook.sh is syntactically valid" \
                              || _fail "cookbook.sh has a syntax error"
@@ -3288,11 +3756,36 @@ and giving `codex_invoke` a matching signature so both branches of the detached
 launcher are correct (Task 7).
 
 **Second gap closed:** the detached child runs under `bash -c`, and shell
-functions do not cross that boundary. Task 17 now exports the eight functions the
-child calls; without this every detached dispatch would have failed with
+functions do not cross that boundary. Task 17 now exports the functions the child
+calls; without this every detached dispatch would have failed with
 `claude_invoke: command not found` — and because the child's output is redirected
 to `/dev/null`, it would have failed *silently*, leaving only an `ORPHANED` state
 with no diagnostic.
+
+### Revision after external review
+
+Eleven findings, all reproduced before being accepted. Five were blockers:
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | `DISPATCH_RC` set inside `$(…)` never reaches the caller — verified `unset` | `run_timed` and `dispatch_state` set globals and are called directly; input arrives by process substitution, never a pipe (bash runs a pipeline's last element in a subshell too) |
+| 2 | The detached child never received `REPO_ROOT` / `FEATURE_FOLDER` / `FEATURE_FOLDER_OUTSIDE_REPO`; the fixture's `export` calls masked it | Values passed explicitly via `setsid env`; the fake-CLI fixture now uses plain assignments, and a detached out-of-repo Codex dispatch is asserted |
+| 3 | Top-level `${VAR:?}` in a cookbook block aborts any shell that sources it — verified rc=127 | Moved into `init_orchestration_vars`; `check_01_lint.sh` now fails on **any** top-level statement and asserts the cookbook sources cleanly on a bare shell |
+| 4 | A `.prompt` file put appendix content on disk, contradicting line 23, and a failed render could still launch | No prompt file: the child renders its own appendix; the parent pre-validates with `appendix_exists` before forking |
+| 5 | `assert_present --  …` shifted every argument, making the model string the filename | Leading `--` removed from all call sites |
+
+Six majors: the launch window now uses a parent `.intent` plus a child-published
+`.started` (the design's "`.started` before `setsid`, containing the pid" was
+impossible as written); `ORPHANED` re-dispatch is gated by `role_mutates`, halting
+for mutating roles rather than risking double-applied commits; `post_dispatch` is
+preserved and fixed in place instead of deleted with the block around it, and
+`validate_status` regains the verdict enum, the `reason:` rule, and the implementer
+`verification:` check; the four new RUN_LOG events are registered in the
+declared-exhaustive tag list with block schemas and consumers, and the duplicate
+`model:` key is suppressed; transcript naming is `<role>`-suffixed throughout, since
+several same-vendor roles share a phase and iteration; and `context-discovery` is
+handed a pre-rendered `$RESOLVED_MODELS` block rather than being told to call a shell
+function it cannot reach from a dispatched session.
 
 **2. Placeholder scan.** No `TBD`/`TODO`. Every code step contains runnable code.
 Task 18 Steps 2–3 and Task 21 Step 3 are enumerated edits across many lines
@@ -3306,7 +3799,7 @@ mechanical sweep.
 - `porcelain_offenders <repo> <allow...>` — defined 12, used by `dirty_tree_check` and the Phase 6 baseline.
 - `status_field <path> <key>` — defined 15, used by `dispatch_state` in 17. **Ordering note:** Task 17 depends on Task 15; the plan already sequences 15 before 17.
 - `iso_now` — defined 10, used 12, 17.
-- `now_ms` / `timed_dispatch` — defined 11, used in the Task 11 example.
+- `now_ms` / `run_timed` — defined 11, used in the Task 11 example. `run_timed` sets globals, so every call site uses `run_timed cmd < <(render_prompt …)`, never a pipe or command substitution.
 - `canon` / `path_in_tree` / `is_git_root` / `validate_roots` — defined 9, used 12, 16.
 - `dispatch_id` / `dispatch_state` / `await_dispatch` / `dispatch_detached` — defined 17, used 18.
 - `PROCESS_PATH_REL` — set by `validate_roots` (9), consumed by `process_identity` (10).

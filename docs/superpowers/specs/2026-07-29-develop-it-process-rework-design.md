@@ -611,12 +611,29 @@ line 147.
 orchestrator can recompute it rather than having to discover it. All control files live
 beside the transcript under `$FEATURE_FOLDER/transcripts/`:
 
-| File | Written by | Content |
-|---|---|---|
-| `<id>.started` | launcher, **before** `setsid` | `dispatch_id`, ISO timestamp, `pid`, `pid_starttime`, `timeout_s`, resolved model |
-| `<id>.pid` | launcher, after `setsid` | pid only, for cheap liveness checks |
-| `<id>.rc` | wrapper, on exit | exit code, one integer |
-| `<id>.json` / `.err` | the CLI | stdout / stderr |
+| File | Written by | When | Content |
+|---|---|---|---|
+| `<id>.intent` | launcher | **before** the fork | `dispatch_id`, `role`, `vendor`, `model`, `timeout_s`, `intent_at` — deliberately no pid |
+| `<id>.started` | **the child** | its first action | `dispatch_id`, `pid` (`$$`), `pid_starttime`, `started_at` |
+| `<id>.pid` | the child | after `.started` | pid only, for cheap liveness checks |
+| `<id>.rc` | the child | on exit | exit code, one integer |
+| `<id>.json` / `.err` | the CLI | during the run | stdout / stderr |
+
+**Two files, because one pre-launch file is impossible.** An earlier revision of this
+section required `.started` to be written before `setsid` *and* to contain the pid —
+which cannot both hold, since the pid does not exist until after the fork. Writing it
+after the fork instead leaves a window in which a live child has no control file, so a
+resume would read `NEVER_LAUNCHED` and start a duplicate. The split resolves it: the
+parent commits `.intent` before forking, and the child publishes its own `$$` as its
+first action. The residual `.intent`-without-`.started` window is bounded by a grace
+period and classified `LAUNCHING` or `LAUNCH_FAILED`.
+
+**No prompt file.** The child renders its own appendix from `$PROCESS_PATH`; inline
+dispatches pipe it via process substitution. Nothing here carries prompt text, so the
+existing "appendix content is NEVER written to disk" rule holds unchanged. Note that
+process substitution — not a pipe — is required whenever a helper sets globals the
+caller needs: bash runs the last element of a pipeline in a subshell, which discards
+them.
 
 **Atomic publication.** `.rc` and `.started` are written to `<name>.tmp` in the same
 directory and `mv`'d into place — rename within a filesystem is atomic, so a poller never
@@ -635,33 +652,68 @@ An orchestrator resuming mid-phase reconstructs state from the control files plu
 launch, so a crash between launch and completion still leaves a trace — the gap the reviewer
 correctly identified, since resume logic at lines 1610–1619 reads only `RUN_LOG.md`.
 
-| `.started` | `.rc` | Process check | State | Action |
-|---|---|---|---|---|
-| absent | absent | — | `NEVER_LAUNCHED` | dispatch fresh |
-| present | absent | pid alive, starttime matches | `RUNNING` | resume polling; do **not** re-dispatch |
-| present | absent | pid dead or starttime differs | `ORPHANED` | log `event=DISPATCH_ORPHANED`, re-dispatch |
-| present | present, valid, `0` | — | `COMPLETED` | read STATUS, proceed |
-| present | present, valid, `124` | — | `TIMED_OUT` | apply the existing Mode-2 policy |
-| present | present, valid, other | — | `FAILED` | apply the existing failure-mode classifier |
-| present | present, malformed | — | `CORRUPT` | treat as `FAILED`; surface the transcript path |
-| absent | present | — | `INCONSISTENT` | HALT; indicates concurrent runs on one feature folder |
+| `.intent` | `.started` | `.rc` | Process check | State | Action |
+|---|---|---|---|---|---|
+| absent | — | absent | — | `NEVER_LAUNCHED` | dispatch fresh |
+| present | absent | absent | within grace period | `LAUNCHING` | poll again; do **not** re-dispatch |
+| present | absent | absent | past grace period | `LAUNCH_FAILED` | the fork never took, no CLI ran — safe to re-dispatch for **any** role |
+| present | present | absent | pid alive, starttime matches | `RUNNING` | resume polling; do **not** re-dispatch |
+| present | present | absent | pid dead or starttime differs | `ORPHANED` | **role-dependent** — see below |
+| present | — | valid, `0` | — | `COMPLETED` | read STATUS, proceed |
+| present | — | valid, `124` | — | `TIMED_OUT` | apply the existing Mode-2 policy |
+| present | — | valid, other | — | `FAILED` | apply the existing failure-mode classifier |
+| present | — | malformed | — | `CORRUPT` | treat as `FAILED`; surface the transcript path |
+| absent | — | present | — | `INCONSISTENT` | HALT; indicates concurrent runs on one feature folder |
 
-Re-dispatch after `ORPHANED` is safe only because every subagent writes its STATUS last and
-atomically — the existing contract at line 65 — so a partially-written artifact from the
-dead process cannot be mistaken for a completed one.
+**`ORPHANED` recovery depends on whether the role mutates the repository.** Atomic
+STATUS publication (the existing contract at line 65) guarantees a half-written STATUS
+is never mistaken for a finished one — but it says nothing about code edits, commits, or
+artifacts the dead process already made, so blind re-dispatch would double-apply them.
 
-Required tests (§9 check 2): crash-and-resume for each of the eight rows, timeout escalation
-to `--kill-after`, and PID-reuse rejection via a forged `pid_starttime`.
+- **Read-only roles** (reviewers, summarizers, `context-discovery`, preflight,
+  `readiness-writer`): log `event=DISPATCH_ORPHANED`, re-dispatch once. Idempotent.
+- **Mutating roles** (`implementer`, `impl-worker`, `debugger`, `test-fixer`, all three
+  fixers, `plan-writer`, `all-tests-runner`, `finishing-branch`): log the event, then
+  **HALT** with a reconciliation report — commits since the baseline, `dirty_tree_check`
+  output, transcript path. The user decides whether to reset and retry or keep the
+  partial work. Never auto-retry: after the fact, no check can distinguish "done once"
+  from "done twice".
+
+A `role_mutates <role>` helper encodes the split so the rule is executable rather than
+prose.
+
+**State is a global, never a captured value.** `dispatch_state` sets `DISPATCH_STATE` and
+`DISPATCH_RC` and is called directly. Capturing it as `$(dispatch_state …)` would run it
+in a subshell and silently discard `DISPATCH_RC`, leaving the caller with an unset
+variable — verified.
+
+Required tests (§9 check 2): every row above including both `ORPHANED` branches, timeout
+escalation to `--kill-after`, PID-reuse rejection via a forged `pid_starttime`, and a
+detached dispatch whose environment variables were **not** exported by the parent (an
+`export`-based fixture would mask the fact that `bash -c` does not inherit ordinary
+assignments).
 
 #### Write contract
 
-`.started` / `.pid` / `.rc` and the transcript files must be added to the canonical
-orchestrator write list. §3's non-goal above restates the narrow three-file list, which is
-itself one of the three contradictory lists §8.4 resolves — line 21 already permits
-capturing stdout/stderr under `transcripts/`. The single canonical list becomes:
-`RUN_LOG.md`, `full_log.md`, `process-improvement-proposition.md`,
-`transcripts/<id>.{json,err,rc,pid,started}`, and `mkdir -p`. Reading artifacts stays
-forbidden; this widens only what the orchestrator may *write*.
+The control and transcript files must be added to the canonical orchestrator write list.
+§3's non-goal above restates the narrow three-file list, which is itself one of the three
+contradictory lists §8.4 resolves — line 21 already permits capturing stdout/stderr under
+`transcripts/`. The single canonical list becomes: `RUN_LOG.md`, `full_log.md`,
+`process-improvement-proposition.md`,
+`transcripts/<id>.{json,err,rc,pid,started,intent}`, and `mkdir -p`.
+
+Reading artifacts stays forbidden; this widens only what the orchestrator may *write*, and
+only to metadata. **No prompt file is added**: persisting rendered appendices would
+contradict "appendix content is NEVER written to disk", and would also introduce a
+retention and permissions question this design does not want to answer. The child renders
+its own prompt instead.
+
+**New RUN_LOG events must be added to the grammar in the same change.** Line 1467 declares
+the block shapes exhaustive and enumerates the only legal `event=` tags; this rework adds
+`MODEL_REJECTED`, `DISPATCH_STARTED`, `DISPATCH_ORPHANED` and `CONTEXT7_UNAVAILABLE`, each
+of which needs its tag registered, a block schema, and a stated consumer. An event that is
+not in that list is, by the document's own rule, the degenerate failure mode the grammar
+exists to prevent.
 
 ### 8.2 Timeouts: one source of truth
 
