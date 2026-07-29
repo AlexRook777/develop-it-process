@@ -134,40 +134,42 @@ A gate that passes in the relaxed tier (final passing iteration ≥ 3) forces th
 
 All non-orchestrator roles run as fresh subprocesses with isolated context. You never produce content a worker or reviewer would produce.
 
-**Default model resolution.** The role table below names model *classes* (Opus / Sonnet / GPT-5.5). At preflight time you resolve each class to the **latest available concrete model id** for that family, in this priority order:
+**Forbidden codex models.** Do NOT pass `-m`, `--model`, or `-c model=...` with any of: `gpt-5.1-codex-max`, `gpt-5-codex-max`, `o3`, `o3-mini`, or any other `*-codex-max` / `o*` id. These require an OpenAI API key; the user's auth is a ChatGPT subscription and the request will fail with HTTP 400 `"model is not supported when using Codex with a ChatGPT account"`.
 
-1. **Claude Opus** → latest available; today: `claude-opus-4-8`. If unavailable, fall back to the most recent Opus-class id reported by `claude --help` / model listing.
-2. **Claude Sonnet** → latest available; today: `claude-sonnet-4-6`. The implementer must remain on a Sonnet-class Claude model.
-3. **Codex (GPT-5.5)** → use the exact literal id `gpt-5.5` (configured as the default in `~/.codex/config.toml`). If `gpt-5.5` is not listed in `~/.codex/models_cache.json` for the active account, fall back in this order: `gpt-5.4` → `gpt-5.3-codex` → `gpt-5.2`.
+| Role | Vendor | Model | Effort | Timeout (min) |
+|---|---|---|---|---|
+| `orchestrator` | — | — | — | — |
+| `preflight-claude` | `claude` | `claude-sonnet-5` | — | 5 |
+| `preflight-codex` | `codex` | `gpt-5.6-sol` | `medium` | 5 |
+| `context-discovery` | `claude` | `claude-sonnet-5` | — | 15 |
+| `spec-reviewer-claude` | `claude` | `claude-opus-5` | — | 40 |
+| `spec-reviewer-codex` | `codex` | `gpt-5.6-sol` | `high` | 60 |
+| `spec-fixer` | `claude` | `claude-fable-5` | — | 40 |
+| `plan-writer` | `claude` | `claude-fable-5` | — | 120 |
+| `plan-reviewer-claude` | `claude` | `claude-opus-5` | — | 40 |
+| `plan-reviewer-codex` | `codex` | `gpt-5.6-sol` | `high` | 60 |
+| `plan-fixer` | `claude` | `claude-fable-5` | — | 40 |
+| `implementer` | `claude` | `claude-opus-5` | — | 300 |
+| `impl-worker` | `claude` | `claude-sonnet-5` | — | 300 |
+| `debugger` | `claude` | `claude-opus-5` | — | 60 |
+| `code-reviewer-claude` | `claude` | `claude-opus-5` | — | 60 |
+| `code-reviewer-codex` | `codex` | `gpt-5.6-sol` | `high` | 120 |
+| `all-tests-runner` | `claude` | `claude-sonnet-5` | — | 60 |
+| `test-fixer` | `claude` | `claude-sonnet-5` | — | 60 |
+| `finishing-branch` | `claude` | `claude-sonnet-5` | — | 30 |
+| `summarizer-spec` | `claude` | `claude-sonnet-5` | — | 20 |
+| `summarizer-plan` | `claude` | `claude-sonnet-5` | — | 20 |
+| `summarizer-implementation` | `claude` | `claude-sonnet-5` | — | 20 |
+| `summarizer-code-review` | `claude` | `claude-sonnet-5` | — | 20 |
+| `summarizer-all-tests` | `claude` | `claude-sonnet-5` | — | 20 |
+| `readiness-writer` | `claude` | `claude-sonnet-5` | — | 20 |
 
-**Forbidden codex models.** Do NOT pass `-m`, `--model`, or `-c model=...` with any of: `gpt-5.1-codex-max`, `gpt-5-codex-max`, `o3`, `o3-mini`, or any other `*-codex-max` / `o*` id. These require an OpenAI API key; the user's auth is a ChatGPT subscription and the request will fail with HTTP 400 `"model is not supported when using Codex with a ChatGPT account"`. The safest invocation is to omit `-m` entirely and let `~/.codex/config.toml` supply the model.
-
-| Role                              | Vendor / CLI       | Model class        | Concrete id (today)   | Effort | Notes                                                                 |
-|-----------------------------------|--------------------|--------------------|-----------------------|--------|-----------------------------------------------------------------------|
-| Orchestrator                       | (the running LLM)  | (whatever runs this prompt; expected: Codex / GPT-5.5 or Claude Opus) | — | n/a | Sequences subprocesses. Never reviews. Never writes artifacts. |
-| Phase-0 context discovery          | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Single dispatch.                                                       |
-| Spec reviewer (primary)            | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Per gate iteration.                                                    |
-| Spec reviewer (cross-vendor)       | `codex`            | GPT-5.5            | `gpt-5.5`             | medium | Cheap mode. Soft-skipped on failure (see Failure handling).            |
-| Spec fixer                         | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Patches spec from reviewer findings.                                   |
-| Plan writer                        | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Loads `superpowers:writing-plans`.                                     |
-| Plan reviewer (primary)            | `claude`           | Opus               | `claude-opus-4-8`     | n/a |                                                                        |
-| Plan reviewer (cross-vendor)       | `codex`            | GPT-5.5            | `gpt-5.5`             | medium | Cheap mode. Soft-skipped on failure.                                   |
-| Plan fixer                         | `claude`           | Opus               | `claude-opus-4-8`     | n/a |                                                                        |
-| Implementer                        | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Loads `superpowers:subagent-driven-development`. One supervising subagent per Phase 4 run; dispatches its own sub-subagents per task. |
-| Debugger                           | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Loads `superpowers:systematic-debugging`. Dispatched on verification failure. |
-| Final reviewer (primary)           | `claude`           | Opus               | `claude-opus-4-8`     | n/a |                                                                        |
-| Final reviewer (cross-vendor)      | `codex`            | GPT-5.5            | `gpt-5.5`             | high | Deep mode. Soft-skipped on failure.                                    |
-| All-tests runner                   | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Runs `$REPO_ROOT/start-all-tests.sh` or discovered test suites; one dispatch per Phase 8 round (max 4). |
-| Test fixer                         | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Loads `superpowers:systematic-debugging`. Dispatched on a failed test round (max 3 fix rounds). |
-| Git finalizer                      | `claude`           | Sonnet             | `claude-sonnet-4-6`   | n/a | Loads `superpowers:finishing-a-development-branch`.                    |
-| Summarizers (spec / plan / final)  | `claude`           | Opus               | `claude-opus-4-8`     | n/a | One per gate, reads iteration verdicts and findings.                   |
-| All-tests summarizer               | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Appends `## Usage` to `all-test-summary.md`; reports `final_test_verdict`. |
-| Implementation summarizer          | (folded)           | —                  | —                     | n/a | The Implementer subagent writes its own summary as part of Phase 4.    |
-| Final readiness writer             | `claude`           | Opus               | `claude-opus-4-8`     | n/a | Reads all per-phase summaries; writes `<feature-folder>/final-readiness-report.md`. |
-
-**Effort column.** This is set per-dispatch via Codex's `-c model_reasoning_effort=<value>` flag, NOT read from `~/.codex/config.toml`. Cheap-mode Codex reviewers (spec, plan, preflight) run at `medium`; deep-mode (final implementation review) runs at `high`. Claude has no equivalent knob in this orchestration, hence `n/a`. See "Codex reviewer modes" in the cookbook for the full mode contract.
-
-When you write the role-to-concrete-id map to `2-context-discovery/status.md` under `resolved_models:`, use the concrete ids above (unchanged unless preflight discovers a newer Opus / Sonnet / Codex release in the runtime environment).
+This table is the only place a model, effort, or timeout is stated. The
+`role_model` / `role_effort` / `role_timeout` helpers in the Runtime cookbook
+implement it, and `tests/check_04_table.sh` asserts the two agree for every row —
+they cannot drift. `impl-worker` is the pinned agent type used by the
+implementer's sub-subagents; its timeout matches the implementer's because it
+runs inside that dispatch.
 
 ## Skill selection rule
 
@@ -351,6 +353,73 @@ fi
 ```
 
 All examples below use `python3` (never the bare `python`) and `$PROCESS_PATH` (never the literal `develop-it.md`).
+
+### Role → model / effort / timeout
+
+<!-- lint: cookbook -->
+```bash
+# Single source of truth for per-role dispatch parameters. Mirrors the Models
+# table exactly; tests/check_04_table.sh enforces the mirror.
+# Fields: <model> <effort> <timeout_minutes>.  '-' means empty.
+_role_row() {
+  case "$1" in
+    preflight-claude)          echo "claude-sonnet-5 - 5" ;;
+    preflight-codex)           echo "gpt-5.6-sol medium 5" ;;
+    context-discovery)         echo "claude-sonnet-5 - 15" ;;
+    spec-reviewer-claude)      echo "claude-opus-5 - 40" ;;
+    spec-reviewer-codex)       echo "gpt-5.6-sol high 60" ;;
+    spec-fixer)                echo "claude-fable-5 - 40" ;;
+    plan-writer)               echo "claude-fable-5 - 120" ;;
+    plan-reviewer-claude)      echo "claude-opus-5 - 40" ;;
+    plan-reviewer-codex)       echo "gpt-5.6-sol high 60" ;;
+    plan-fixer)                echo "claude-fable-5 - 40" ;;
+    implementer)               echo "claude-opus-5 - 300" ;;
+    impl-worker)               echo "claude-sonnet-5 - 300" ;;
+    debugger)                  echo "claude-opus-5 - 60" ;;
+    code-reviewer-claude)      echo "claude-opus-5 - 60" ;;
+    code-reviewer-codex)       echo "gpt-5.6-sol high 120" ;;
+    all-tests-runner)          echo "claude-sonnet-5 - 60" ;;
+    test-fixer)                echo "claude-sonnet-5 - 60" ;;
+    finishing-branch)          echo "claude-sonnet-5 - 30" ;;
+    summarizer-spec)           echo "claude-sonnet-5 - 20" ;;
+    summarizer-plan)           echo "claude-sonnet-5 - 20" ;;
+    summarizer-implementation) echo "claude-sonnet-5 - 20" ;;
+    summarizer-code-review)    echo "claude-sonnet-5 - 20" ;;
+    summarizer-all-tests)      echo "claude-sonnet-5 - 20" ;;
+    readiness-writer)          echo "claude-sonnet-5 - 20" ;;
+    *) echo "unknown role: $1" >&2; return 1 ;;
+  esac
+}
+
+_role_field() {
+  local row field
+  row="$(_role_row "$1")" || return 1
+  field="$(printf '%s\n' "$row" | cut -d' ' -f"$2")"
+  [ "$field" = "-" ] && field=""
+  printf '%s\n' "$field"
+}
+
+role_model()   { _role_field "$1" 1; }
+role_effort()  { _role_field "$1" 2; }
+role_timeout() { _role_field "$1" 3; }
+
+role_vendor() {
+  case "$1" in
+    *-codex|preflight-codex) echo codex ;;
+    orchestrator) echo "" ;;
+    *) echo claude ;;
+  esac
+}
+_role_keys() {
+  printf '%s\n' preflight-claude preflight-codex context-discovery \
+    spec-reviewer-claude spec-reviewer-codex spec-fixer plan-writer \
+    plan-reviewer-claude plan-reviewer-codex plan-fixer implementer \
+    impl-worker debugger code-reviewer-claude code-reviewer-codex \
+    all-tests-runner test-fixer finishing-branch summarizer-spec \
+    summarizer-plan summarizer-implementation summarizer-code-review \
+    summarizer-all-tests readiness-writer
+}
+```
 
 ### full_log.md — bash command log
 
@@ -1403,21 +1472,10 @@ Every subagent must:
 
 ### Per-subprocess timeouts
 
-```
-Preflight check:             5 min
-Phase-0 context discovery:   15 min
-Spec reviewer (per call):    40 min
-Plan writer:                 40 min
-Plan reviewer:               40 min
-Implementer (per Phase 6):   600 min   (10 hours)
-Debugger:                    60 min
-Final reviewer:              60 min
-Git finalizer:               30 min
-Summarizers:                 20 min
-Final-readiness writer:      20 min
-```
-
-Every subprocess wrapped: `timeout <N>m <cli> -p -`. Exit code 124 = Mode 2.
+Timeouts are per-role and defined once, in the Models table. Resolve with
+`role_timeout <role>`; every invocation wraps the CLI in
+`timeout --kill-after=60s "$(role_timeout "$role")m"`. No literal minute value
+appears anywhere else in this document.
 
 ### Vendor failover policy (asymmetric)
 
