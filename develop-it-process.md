@@ -1016,6 +1016,7 @@ porcelain_offenders() {
 # $PROCESS_PATH is deliberately NOT passed: it lives in the other repository, so
 # it can never appear in this repo's porcelain output. Passing it would be dead
 # weight, not protection.
+# shellcheck disable=SC2120  # optional allow-list args are passed from phase blocks
 dirty_tree_check() {
   # Usage: dirty_tree_check [extra-repo-relative-allow-entries...]
   local allow=("$@") offenders
@@ -1485,6 +1486,12 @@ capture_implementation_baseline() {
   # so branch on the code and let its diagnostic reach the user directly. Do not
   # capture its stdout -- it prints nothing there.
   if ! dirty_tree_check; then
+    {
+      printf -- '--- %s  event=IMPLEMENTATION_BASELINE_BLOCKED\n' "$(iso_now)"
+      printf 'candidate_sha:  %s\n' "$IMPLEMENTATION_BASE_SHA"
+      printf 'reason:         dirty-tree\n'
+      printf '\n'
+    } >> "$FEATURE_FOLDER/RUN_LOG.md"
     echo "halt: uncommitted changes outside the implementation slice; commit or stash first" >&2
     return 1
   fi
@@ -1504,7 +1511,7 @@ Call `capture_implementation_baseline` here. On a non-zero return, HALT and surf
 
 Files INSIDE `$FEATURE_FOLDER` (RUN_LOG, STATUS files, transcripts) are expected to be untracked. They are excluded from the dirty check via `dirty_tree_check`'s allow-list. If `.gitignore` does not yet ignore the `*-artifacts/` pattern, the user was warned in Phase 1; the runtime exclusion above keeps the run unblocked regardless.
 
-The `event=IMPLEMENTATION_BASELINE` entry is a **multi-line block** matching the RUN_LOG grammar (a `--- <timestamp>  event=...` header line followed by `key: value` fields and a trailing blank line) — not the previous single-line form, which the summarizers and the readiness writer could not parse. On a dirty-tree halt, no baseline event is written at all (the function returns before reaching the `RUN_LOG.md` append), so a stale or blocked baseline can never be mistaken for a consumable one. Downstream consumers must read the LATEST `event=IMPLEMENTATION_BASELINE` entry in `RUN_LOG.md` (in case a prior failed/aborted run left one or the user resumes).
+The `event=IMPLEMENTATION_BASELINE` entry is a **multi-line block** matching the RUN_LOG grammar (a `--- <timestamp>  event=...` header line followed by `key: value` fields and a trailing blank line) — not the previous single-line form, which the summarizers and the readiness writer could not parse. On a dirty-tree halt, only the advisory `event=IMPLEMENTATION_BASELINE_BLOCKED` block is written (see schema above) — the consumable `event=IMPLEMENTATION_BASELINE` event is never written on that path, so a blocked attempt can never be mistaken for a consumable baseline. Downstream consumers must read the LATEST `event=IMPLEMENTATION_BASELINE` entry in `RUN_LOG.md` (in case a prior failed/aborted run left one or the user resumes), ignoring any `IMPLEMENTATION_BASELINE_BLOCKED` entries.
 
 If `IMPLEMENTATION_BASE_SHA=non-git`, Phase 9 will be SKIPPED and the code reviewers inspect the working tree directly. Pass `non-git` as the input value to downstream subagents that expect this variable. The baseline event is still written with `base_sha=non-git, uncommitted_changes=no` so consumers have a single source.
 
