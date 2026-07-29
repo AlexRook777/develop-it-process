@@ -1293,7 +1293,9 @@ The strict orchestrator rules say "STATUS files only." During failure handling y
 post_dispatch() {
   local rc="$1" status_path="$2" err_path="$3"
   # An empty or non-numeric rc must be treated as a failure, not a syntax
-  # error: nothing ever wrote a readable `.rc` before Task 17.
+  # error. Nothing writes a `.rc` file: this rc is passed in by the caller
+  # (from `wait`'s exit status), so a bad value here means the caller itself
+  # got confused, not that a control file was ever consulted.
   local rc_bad
   case "${rc:-}" in
     ''|*[!0-9]*) rc_bad=yes ;;
@@ -1490,7 +1492,6 @@ dispatch_reviewers_parallel() {
   (
     claude_invoke "$claude_role" "${base_c}.json" "${base_c}.err" <<< "$claude_prompt"
     rc=$?
-    printf '%s\n' "$rc" > "${base_c}.rc.tmp" && mv "${base_c}.rc.tmp" "${base_c}.rc"
     exit "$rc"
   ) &
   claude_pid=$!
@@ -1499,7 +1500,6 @@ dispatch_reviewers_parallel() {
     (
       codex_invoke "$codex_role" "${base_x}.json" "${base_x}.err" <<< "$codex_prompt"
       rc=$?
-      printf '%s\n' "$rc" > "${base_x}.rc.tmp" && mv "${base_x}.rc.tmp" "${base_x}.rc"
       exit "$rc"
     ) &
     codex_pid=$!
