@@ -590,168 +590,123 @@ State this once, explicitly.
 
 ### 8.1 Long-dispatch mechanism
 
-The implementer (300–600 min), plan-writer (120 min) and deep Codex review (90 min) cannot
-complete inside one Claude Code Bash call (hard cap 600 000 ms), yet line 90 forbids
-splitting a phase.
+Three roles have timeouts that exceed a single Bash tool call: `plan-writer` (120 min),
+`implementer` (300 min) and `code-reviewer-codex` (120 min). The Bash tool caps a
+foreground call at 600 000 ms, while line 90 forbids splitting a phase across
+invocations.
 
-Add `dispatch_detached` and `await_dispatch` helpers. `setsid` the CLI so it survives the
-launching shell; the orchestrator polls in short, bounded Bash calls. This finally gives the
-`.rc` files a reader (§7.1).
+**The orchestrator issues those dispatches as one Bash tool call with
+`run_in_background: true`.** The harness keeps the command running across turns and
+re-invokes the orchestrator when it exits. A background call is still one dispatch for
+one phase; it does not bundle phases.
 
-Restate the rule as **one *dispatch* per phase** — polling calls are not phase bundling.
-Chosen over the harness-native background-Bash option because it works regardless of which
-harness runs the orchestrator, and the document claims support for a Codex orchestrator at
-line 147.
+#### Why not hand-rolled process supervision
 
-`timeout --kill-after=60s` so a CLI ignoring SIGTERM cannot hang a phase indefinitely.
+This design originally specified a detach-and-poll protocol built on `setsid` plus
+control files. Over three review passes it accumulated: a pre-launch `.intent` file, a
+child-published `.started` carrying its own `$$`, PID-reuse detection via `/proc/<pid>/stat`
+field 22, a per-attempt nonce lease so a straggler could not double-spend after a retry,
+attempt-scoped `<id>.<nonce>.*` paths so a revoked straggler could not overwrite the
+lease holder's records, structured `kind:` outcomes so a real CLI exiting 71 was not
+mistaken for a certified non-execution, and thirteen states.
 
-#### Dispatch identity and control files
+Eleven of the twenty-seven findings across those passes were in that one subsystem, and
+each rewrite introduced the next round. Every one of those mechanisms was reimplementing
+supervision the harness already performs: it tracks the process, reports its exit status,
+and re-invokes the orchestrator exactly once. Delegating removes the entire surface.
 
-`dispatch_id` = `<phase>-iter<NN>-<role>`. It is **deterministic**, so a resuming
-orchestrator can recompute it rather than having to discover it. All control files live
-beside the transcript under `$FEATURE_FOLDER/transcripts/`:
+The original rationale for hand-rolling — portability to a non-Claude-Code orchestrator —
+did not hold up. The document already depends on Claude-Code-shaped tooling at lines
+1642, 1650 and 1774; §8.4 addresses that by describing the required capabilities
+functionally, not by eliminating the dependency. Trading a recurring correctness cost for
+a portability guarantee the document does not otherwise honour was the wrong trade.
 
-| File | Written by | When | Content |
-|---|---|---|---|
-| `<id>.intent` | launcher | **before** the fork | `dispatch_id`, `role`, `vendor`, `model`, `timeout_s`, `intent_at` — deliberately no pid |
-| `<id>.started` | **the child** | its first action | `dispatch_id`, `pid` (`$$`), `pid_starttime`, `started_at` |
-| `<id>.pid` | the child | after `.started` | pid only, for cheap liveness checks |
-| `<id>.rc` | the child | on exit | exit code, one integer |
-| `<id>.json` / `.err` | the CLI | during the run | stdout / stderr |
+If a future harness lacks background execution, reduce the affected roles' timeouts.
+Do not reintroduce the protocol.
 
-**Two files, because one pre-launch file is impossible.** An earlier revision of this
-section required `.started` to be written before `setsid` *and* to contain the pid —
-which cannot both hold, since the pid does not exist until after the fork. Writing it
-after the fork instead leaves a window in which a live child has no control file, so a
-resume would read `NEVER_LAUNCHED` and start a duplicate. The split resolves it: the
-parent commits `.intent` before forking, and the child publishes its own `$$` as its
-first action. The residual `.intent`-without-`.started` window is bounded by a grace
-period and classified `LAUNCHING` or `LAUNCH_UNCERTAIN` — the latter deliberately named
-so it cannot be mistaken for proof that no CLI ran.
+#### What survives
 
-**No prompt file.** The child renders its own appendix from `$PROCESS_PATH`; inline
-dispatches pipe it via process substitution. Nothing here carries prompt text, so the
-existing "appendix content is NEVER written to disk" rule holds unchanged. Note that
-process substitution — not a pipe — is required whenever a helper sets globals the
-caller needs: bash runs the last element of a pipeline in a subshell, which discards
-them.
+Two rules were load-bearing rather than incidental, and both are kept:
 
-**Atomic publication.** `.rc` and `.started` are written to `<name>.tmp` in the same
-directory and `mv`'d into place — rename within a filesystem is atomic, so a poller never
-observes a partial file. *Verified.* A poller that finds `.rc` must still validate it
-matches `^[0-9]+$`; anything else is corruption, treated as failure.
+1. **A dispatch is recorded before it runs.** `log_dispatch_started` appends an
+   `event=DISPATCH_STARTED` block containing the `dispatch_id` *before* the CLI is
+   invoked. Without it, a resume cannot distinguish "never started" from "started and
+   died", and would either skip work or duplicate it.
+2. **An unfinished mutating dispatch halts.** See the recovery table below.
 
-**PID reuse.** A bare pid is not a safe liveness token across a crash — the pid may have
-been recycled. `.started` records `pid_starttime`, field 22 of `/proc/<pid>/stat`
-(*verified readable*). A pid is the same process only if it exists **and** its current
-`starttime` equals the recorded value.
+Everything else the protocol carried is gone: no `.intent`, `.started`, `.pid`, `.rc` or
+`.outcome`; no nonce, lease or attempt scoping; no PID tracking. `setsid` and `flock`
+are no longer dependencies.
+
+#### Dispatch identity and files
+
+`dispatch_id` = `<phase>-iter<NN>-<role>`, deterministic so a resuming orchestrator
+recomputes rather than discovers it. The role, never the vendor: several same-vendor
+roles run within one phase and iteration (Phase 3 iteration 1 dispatches
+`spec-reviewer-claude`, `spec-fixer` and `summarizer-spec`), so a vendor-suffixed name
+would collide and silently overwrite.
+
+The only files a dispatch produces are `transcripts/<dispatch-id>.json` and `.err`.
+Prompts are rendered into a shell variable and delivered by herestring, so appendix
+content is never written to disk — the rule at line 23 holds unchanged. Because no
+atomic-publication site remains, the orchestrator writes no `.tmp` companions either.
 
 #### Resume decision table
 
-An orchestrator resuming mid-phase reconstructs state from the control files plus
-`RUN_LOG.md`. A `event=DISPATCH_STARTED` entry carrying `dispatch_id` is appended **before**
-launch, so a crash between launch and completion still leaves a trace — the gap the reviewer
-correctly identified, since resume logic at lines 1610–1619 reads only `RUN_LOG.md`.
+`dispatch_state` sets the global `DISPATCH_STATE` and echoes nothing. It must be called
+directly: `$(dispatch_state …)` runs it in a subshell, which discards the global —
+verified.
 
-| `.intent` | `.started` | `.rc` | Process check | State | Action |
-|---|---|---|---|---|---|
-| absent | — | absent | — | `NEVER_LAUNCHED` | dispatch fresh |
-| present | absent | absent | within grace period | `LAUNCHING` | poll again; do **not** re-dispatch |
-| present | absent | absent | past grace period | `LAUNCH_UNCERTAIN` | re-dispatch (revoking the old nonce), then treat the old attempt as `role_mutates`-dependent. The grace period alone does **not** prove no CLI ran |
-| present | present | absent | pid alive, starttime matches | `RUNNING` | resume polling; do **not** re-dispatch |
-| present | present | absent | pid dead or starttime differs | `ORPHANED` | **role-dependent** — see below |
-| present | — | valid, `0` | — | `COMPLETED` | read STATUS, proceed |
-| present | — | valid, `124` | — | `TIMED_OUT` | apply the existing Mode-2 policy |
-| present | — | any | `kind: lease_revoked` | `LEASE_REVOKED` | certified: this attempt spent nothing. The lease holder is authoritative |
-| present | — | any | `kind: launch_aborted` | `LAUNCH_ABORTED` | certified: the child could not publish `.started` and never invoked the CLI |
-| present | — | any | `kind: render_failed` | `RENDER_FAILED` | certified: the prompt would not render, so no CLI was invoked |
+| `DISPATCH_STARTED` recorded | STATUS file | State | Action |
+|---|---|---|---|
+| no | — | `NEVER_LAUNCHED` | dispatch fresh |
+| yes | present **and** passes `validate_status` | `COMPLETED` | read STATUS, proceed |
+| yes | absent, or present but invalid | `UNFINISHED` | **depends on `role_mutates`** |
 
-Terminal outcomes are recorded as a structured `kind:` in an `.outcome` file, **not** as
-reserved exit codes. Overloading rc 71/75 would misclassify a real CLI that happens to
-exit with one of those values as "nothing was spent" — a false certification with real
-cost behind it. Only the three `kind:` values above certify non-execution, and only the
-child can write them.
-| present | — | valid, other | — | `FAILED` | apply the existing failure-mode classifier |
-| present | — | malformed | — | `CORRUPT` | treat as `FAILED`; surface the transcript path |
-| absent | — | present | — | `INCONSISTENT` | HALT; indicates concurrent runs on one feature folder |
+A STATUS file counts only when it validates. A truncated or malformed one means the
+subagent died mid-write, which is not completion — and since STATUS is written last and
+atomically (the contract at line 65), a valid STATUS is positive evidence the subagent
+finished.
 
-**`ORPHANED` recovery depends on whether the role mutates the repository.** Atomic
-STATUS publication (the existing contract at line 65) guarantees a half-written STATUS
-is never mistaken for a finished one — but it says nothing about code edits, commits, or
-artifacts the dead process already made, so blind re-dispatch would double-apply them.
+**`UNFINISHED` recovery depends on whether the role mutates the repository.** Atomic
+STATUS publication guarantees a half-written STATUS is never mistaken for a finished one,
+but says nothing about code edits, commits, or artifacts the dead process already made.
 
 - **Read-only roles** (reviewers, summarizers, `context-discovery`, preflight,
-  `readiness-writer`): log `event=DISPATCH_ORPHANED`, re-dispatch once. Idempotent.
+  `readiness-writer`): log `event=DISPATCH_ORPHANED` with `action: redispatched` and
+  re-dispatch once. Idempotent.
 - **Mutating roles** (`implementer`, `impl-worker`, `debugger`, `test-fixer`, all three
-  fixers, `plan-writer`, `all-tests-runner`, `finishing-branch`): log the event, then
-  **HALT** with a reconciliation report — commits since the baseline, `dirty_tree_check`
-  output, transcript path. The user decides whether to reset and retry or keep the
-  partial work. Never auto-retry: after the fact, no check can distinguish "done once"
-  from "done twice".
+  fixers, `plan-writer`, `all-tests-runner`, `finishing-branch`): log the event with
+  `action: halted`, then **HALT** with a reconciliation report — commits since the
+  baseline, `dirty_tree_check` output, transcript path. The user decides whether to reset
+  and retry or keep the partial work. Never auto-retry: after the fact no check can
+  distinguish "ran once" from "ran twice", and a re-run implementer duplicates commits
+  and re-applies edits.
 
 A `role_mutates <role>` helper encodes the split so the rule is executable rather than
 prose.
 
-**A launch nonce, not a timeout, is what makes retry safe.** `LAUNCH_UNCERTAIN` means only
-"no `.started` appeared within the grace period" — it does **not** prove the child will
-never run. A child slow to schedule, or SIGSTOPped, can miss the window and then wake up
-and invoke the CLI after a replacement dispatch has begun: two CLIs writing one STATUS
-path. Verified reproducible.
+#### Pre-dispatch validation
 
-So `.intent` carries a `nonce` unique to each launch attempt, and every child re-reads
-`.intent` immediately before invoking the CLI, exiting `75` (`LEASE_REVOKED`) if the nonce
-no longer matches. A retry writes a fresh nonce, which revokes any straggler. Verified:
-with a deliberately delayed child plus a retry, exactly one CLI invocation occurred.
+`dispatch_role` fails before invoking any CLI when either check fails:
 
-**Publication failure must abort, not fall through.** `> x.tmp && mv x.tmp x` has no
-failure branch, so a failed `.intent` or `.started` write would let the launch proceed with
-no durable record — verified reaching "launch" after a failed intent write. Both sites now
-abort: the parent returns non-zero without forking; the child publishes rc `71`
-(`kind: launch_aborted`) and exits before spending anything.
+- `appendix_exists <role>` — both marker lines are present.
+- The prompt renders and is non-empty. `render_prompt` resolves substitutions through
+  python3 and **fails loudly naming any unresolved `$VAR`**; `dispatch_role` additionally
+  rejects an empty result.
 
-Because `71` and `75` are both published *before* the CLI runs, they are the only two
-terminal states that certify nothing was spent.
+Neither may be delegated to process substitution. `cmd < <(render_prompt …)` discards the
+renderer's exit status: verified, a renderer returning 42 still invoked the consumer with
+zero bytes and yielded rc 0, which would send an empty prompt to a real model and bill
+for it. Render into a variable, check it, then feed it by herestring — not a pipe either,
+since bash runs a pipeline's last element in a subshell and would discard the globals
+`run_timed` sets.
 
-**State is a global, never a captured value.** `dispatch_state` sets `DISPATCH_STATE` and
-`DISPATCH_RC` and is called directly. Capturing it as `$(dispatch_state …)` would run it
-in a subshell and silently discard `DISPATCH_RC`, leaving the caller with an unset
-variable — verified.
+#### New RUN_LOG events
 
-**Substitution values must be passed explicitly.** `render_prompt` resolves variables
-through python3's `os.environ`, but orchestration variables are ordinary shell
-assignments, which `os.environ` never sees — verified `None`. The helper therefore hands
-each set key to python via `env`, using `${!k+x}` to distinguish "set but empty" from
-"unset", and **fails loudly listing any `$VAR` left unresolved**. A prompt containing a
-literal `$SPEC_PATH` would otherwise instruct a subagent to read a file by that name.
-Tests must use unexported assignments; an `export` in the fixture hides the whole defect
-class.
-
-Required tests (§9 check 2): every row above including both `ORPHANED` branches, timeout
-escalation to `--kill-after`, PID-reuse rejection via a forged `pid_starttime`, and a
-detached dispatch whose environment variables were **not** exported by the parent (an
-`export`-based fixture would mask the fact that `bash -c` does not inherit ordinary
-assignments).
-
-#### Write contract
-
-The control and transcript files must be added to the canonical orchestrator write list.
-§3's non-goal above restates the narrow three-file list, which is itself one of the three
-contradictory lists §8.4 resolves — line 21 already permits capturing stdout/stderr under
-`transcripts/`. The single canonical list becomes: `RUN_LOG.md`, `full_log.md`,
-`process-improvement-proposition.md`,
-`transcripts/<id>.{json,err,rc,pid,started,intent}`, and `mkdir -p`.
-
-Reading artifacts stays forbidden; this widens only what the orchestrator may *write*, and
-only to metadata. **No prompt file is added**: persisting rendered appendices would
-contradict "appendix content is NEVER written to disk", and would also introduce a
-retention and permissions question this design does not want to answer. The child renders
-its own prompt instead.
-
-**New RUN_LOG events must be added to the grammar in the same change.** Line 1467 declares
-the block shapes exhaustive and enumerates the only legal `event=` tags; this rework adds
-`MODEL_REJECTED`, `DISPATCH_STARTED`, `DISPATCH_ORPHANED` and `CONTEXT7_UNAVAILABLE`, each
-of which needs its tag registered, a block schema, and a stated consumer. An event that is
-not in that list is, by the document's own rule, the degenerate failure mode the grammar
+`DISPATCH_STARTED` and `DISPATCH_ORPHANED` are added to the declared-exhaustive event
+list at line 1467, each with a block schema and a stated consumer (§8.4). An event absent
+from that list is, by the document's own rule, the degenerate failure mode the grammar
 exists to prevent.
 
 ### 8.2 Timeouts: one source of truth
@@ -900,10 +855,12 @@ default runner.
 
 5. **Fake-CLI integration** — stub `claude` and `codex` executables placed first on `PATH`,
    emitting canned JSON/JSONL with configurable exit code and delay. This exercises the
-   riskiest new behavior without spending a token: detached dispatch, `--add-dir` selection,
-   `timeout` escalation to `--kill-after`, parallel `.rc` collection under
-   `dispatch_reviewers_parallel`, and crash-and-resume. Without this tier-1 check, none of
-   §8.1 is covered by anything but inspection.
+   riskiest new behavior without spending a token: that the resolved model, effort and
+   timeout reach the actual argv; `--add-dir` selection; `timeout` escalation to
+   `--kill-after`; failure detection in `dispatch_reviewers_parallel`; the three resume
+   states including an invalid STATUS; and that a render failure produces **zero** CLI
+   invocations. Without this tier-1 check, none of §8.1 is covered by anything but
+   inspection.
 
 6. **Table/function agreement** — parse the §5.3 role table out of the document and assert
    it matches `role_model`, `role_effort`, and `role_timeout` for all 24 dispatched roles.
@@ -920,9 +877,11 @@ in §11.
 
 #### Canary additions
 
-Tools introduced by this rework join `canary_preflight` alongside §6.6's list: `setsid`,
-`realpath`, and `flock` (all verified present). `shellcheck` is a test-time prerequisite
-only, not a runtime one, so it stays out of the canary.
+Tools introduced by this rework join `canary_preflight` alongside §6.6's list: `realpath`
+(used by `canon`) and `env` (used by `render_prompt` to pass substitution values
+explicitly). Both verified present. `setsid` and `flock` are **not** required — they
+belonged to the hand-rolled dispatch protocol §8.1 removes. `shellcheck` is a test-time
+prerequisite only, not a runtime one, so it stays out of the canary.
 
 Checks 3, 4 and 6 are the highest-value: each mechanically prevents a class of drift that
 inspection demonstrably failed to catch on this document.
@@ -950,10 +909,14 @@ inspection demonstrably failed to catch on this document.
    - `develop_it_git_sha` matches **this** repo's HEAD, not the target's; `develop_it_dirty`
      varies correctly with a deliberate edit to the process file.
    - `duration_ms` is a plausible 13-digit value.
-   - A detached dispatch is launched, polled, and collected; `.rc` is read.
-   - A stub that ignores SIGTERM is killed by `--kill-after`, yielding rc 124 → `TIMED_OUT`.
-   - The orchestrator is killed mid-dispatch and resumed: `RUNNING` resumes polling without
-     re-dispatching, and `ORPHANED` re-dispatches exactly once.
+   - `dispatch_role` records `event=DISPATCH_STARTED` **before** invoking the CLI.
+   - A stub that ignores SIGTERM is killed by `--kill-after`, yielding rc 124.
+   - Resume classification: no record → `NEVER_LAUNCHED`; record + valid STATUS →
+     `COMPLETED`; record + absent-or-invalid STATUS → `UNFINISHED`. An invalid STATUS
+     must NOT read as completion.
+   - `UNFINISHED` on a read-only role re-dispatches once; on a mutating role it halts.
+   - A render failure yields zero CLI invocations (asserted on the stub's argv log, not
+     on the delivered prompt — an empty prompt would pass a no-`$VAR` check).
    - Parallel reviewer dispatch reports a **failing** stub as failed — the §7.1 regression.
    - `--add-dir` is present when `$FEATURE_FOLDER` is outside `$REPO_ROOT` and absent when
      inside.
@@ -973,10 +936,14 @@ inspection demonstrably failed to catch on this document.
 - **Unverifiable-until-run items.** The exact accepted form of `claude-opus-5` and whether
   `gpt-5.6-sol` honours the `medium`/`high` effort tokens are settled by §5.8's probe, not
   by this document.
-- **The detach-and-poll rewrite touches the resumability contract** (lines 1610–1619),
-  which reads `RUN_LOG.md` to locate the last completed step. §8.1's `DISPATCH_STARTED`
-  event and eight-row decision table are the mitigation; the residual risk is a state the
-  table does not enumerate, which is why all eight rows are tested rather than sampled.
+- **Long dispatch depends on the harness providing background execution.** If that is
+  unavailable, the affected roles' timeouts must be reduced rather than the removed
+  protocol reinstated — reintroducing it would reinstate the subsystem that absorbed
+  eleven of twenty-seven review findings.
+- **Resumability now rests on two signals**: the `DISPATCH_STARTED` record and a STATUS
+  file that passes `validate_status`. The residual risk is a subagent that writes a
+  *valid* STATUS and then dies before its side effects are complete; the mutating-role
+  halt does not cover that case, because the STATUS says it finished.
 - **Two live runs on one feature folder would corrupt state.** §8.1's `INCONSISTENT` row
   detects it after the fact but nothing prevents it. `flock` on the feature folder is
   available (verified present) and should be considered during planning; it is not specified
@@ -989,7 +956,7 @@ Not a plan, but three sequencing facts the plan must respect:
 1. **The §9 tier-1 harness lands first.** Checks 3, 4 and 6 must exist before the cookbook
    and appendix edits, so they catch regressions introduced by those edits rather than being
    written to match whatever the edits produced. Check 5's fake-CLI stubs must exist before
-   §8.1, since detached dispatch has no other means of verification.
+   §8.1, since dispatch behaviour has no other means of verification.
 2. **The §8.3 renames are one atomic change.** All 22 occurrences, or the three summarizers
    silently read nothing.
 3. **§5.2's three lookups precede every dispatch-site edit.** Dispatch sites are rewritten

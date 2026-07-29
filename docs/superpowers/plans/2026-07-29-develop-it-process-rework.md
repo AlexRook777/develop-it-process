@@ -19,7 +19,7 @@ Copied verbatim from the spec. Every task's requirements implicitly include thes
 - **No POSIX-ERE extensions**: `\S`, `\d`, `\w` are forbidden in `grep -E` patterns.
 - **`python3` is a hard requirement**, not warn-only.
 - **Shell policy: `set -uo pipefail`. Never `set -e`** — helpers signal via return codes the orchestrator branches on.
-- **No new runtime dependencies.** `setsid`, `realpath`, `flock`, `jq`, `git`, `python3` are all already present and verified.
+- **No new runtime dependencies.** `realpath`, `env`, `jq`, `git`, `python3` are all already present and verified. (`setsid` and `flock` were required by an earlier hand-rolled dispatch protocol that Task 17 removes.)
 - **Pinned model ids, no fallback chains:** `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`, `gpt-5.6-sol`. A rejected id HALTs. The word "fallback" must never be applied to model selection.
 - **Codex global-option ordering:** `-a`, `-c`, `-m` appear **before** `exec`. `codex exec -a never` does not parse.
 - **Forbidden codex models:** never pass `*-codex-max`, `o3`, `o3-mini`, or any `o*` id.
@@ -1132,7 +1132,7 @@ Add to `tests/check_05_contract.sh` before `finish`:
 
 ```bash
 # --- Task 8: canary and model probe ---
-for b in git date sha256sum cut mkdir mv tail tr grep setsid realpath flock; do
+for b in git date sha256sum cut mkdir mv tail tr grep realpath env; do
   assert_present "\"?$b\"? " "$D" "T8: canary checks $b" || true
 done
 assert_present 'probe_models' "$D" "T8: model probe exists"
@@ -1145,7 +1145,8 @@ Simplify that loop — a per-binary grep is noisy. Replace with a single asserti
 # --- Task 8: canary and model probe ---
 assert_present 'for bin in claude timeout awk sed jq git date sha256sum cut mkdir mv tail tr' \
   "$D" "T8: canary checks every used binary"
-assert_present 'setsid realpath flock env python3' "$D" "T8: canary checks the new runtime tools"
+assert_present 'realpath env python3' "$D" "T8: canary checks the new runtime tools"
+assert_absent 'setsid' "$D" "T8: setsid is not a dependency (no hand-rolled dispatch protocol)"
 assert_absent 'for bin in claude codex ' "$D" "T8: codex is not in the hard-required list"
 assert_present 'probe_models\(\)' "$D" "T8: model probe helper exists"
 ```
@@ -1164,11 +1165,12 @@ Replace the binary loop and the `python3` warning inside `canary_preflight` (lin
   # handled by the asymmetric failover policy below, and listing it in both places
   # made the canary contradict itself — it would halt on a missing binary the very
   # next lines describe as optional.
-  # `env` is required because dispatch_detached uses it to hand variables to the
-  # detached child; `setsid`, `realpath` and `flock` are likewise new dependencies.
+  # `env` is required by render_prompt to pass substitution values explicitly;
+  # `realpath` by canon(). Long dispatch uses the harness's background execution,
+  # so no process-supervision tools are needed.
   local missing=()
   for bin in claude timeout awk sed jq git date sha256sum cut mkdir mv tail tr \
-             grep setsid realpath flock env python3; do
+             grep realpath env python3; do
     command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
   done
   # codex is optional here; a missing binary drives the failover policy (Mode 0),
@@ -1406,9 +1408,6 @@ init_orchestration_vars() {
   fi
   codex_available="${codex_available:-false}"
   codex_disabled_by_user="${codex_disabled_by_user:-false}"
-  # How long .intent may exist without the child's .started before the launch is
-  # called failed. The child publishes it as its first action, so this is generous.
-  DISPATCH_START_GRACE_S="${DISPATCH_START_GRACE_S:-30}"
   validate_roots
 }
 
@@ -2365,7 +2364,7 @@ Replace lines 393–433 with:
 # than a top-level assignment, because the cookbook must be definitions-only:
 # check_01_lint.sh sources it in a pristine shell and fails on any variable it
 # sets. tests/check_03_varcoverage.sh asserts this list covers every $VAR used in
-# every appendix body, and dispatch_detached forwards exactly this list.
+# every appendix body, and render_prompt passes exactly this list to python3.
 render_keys() {
   printf '%s\n' FEATURE_FOLDER ITERATION SPEC_PATH PLAN_PATH FINDINGS_PATHS \
     IMPLEMENTATION_BASE_SHA IMPLEMENTATION_SUMMARY_PATH DEBUGGER_STATUS_PATH \
@@ -2884,9 +2883,9 @@ trailing '[ -f ] && mv' blocks that returned 1 on the codex-skipped path."
 
 **Interfaces:**
 - Consumes: `tests/lib/assert.sh`
-- Produces: stubs controlled by environment variables — `FAKE_RC` (exit code, default 0), `FAKE_DELAY` (seconds to sleep, default 0), `FAKE_IGNORE_TERM` (when set, trap and ignore SIGTERM), `FAKE_ARGV_LOG` (file to append the full argv to). Each stub emits vendor-appropriate telemetry on stdout. `check_07_fakecli.sh` asserts against `$FAKE_ARGV_LOG`.
+- Produces: stubs controlled by environment variables — `FAKE_RC` (exit code, default 0), `FAKE_DELAY` (seconds to sleep before responding, default 0), `FAKE_IGNORE_TERM` (when set, trap and ignore SIGTERM so `--kill-after` can be exercised), `FAKE_ARGV_LOG` (file the stub appends its full argv to). Each stub captures its stdin and echoes it back as a `prompt_received` field, so tests can assert on the prompt that actually reached the CLI rather than on what was intended. `check_07_fakecli.sh` asserts against `$FAKE_ARGV_LOG` and those transcripts.
 
-**Context:** §9 check 5. Without this, nothing verifies detached dispatch, `--add-dir` selection, timeout escalation, or resume except inspection.
+**Context:** §9 check 5. Without this, nothing verifies that the resolved model/effort/timeout reach the real argv, that `--add-dir` is selected correctly, that `--kill-after` escalation works, that reviewer failures are detected, or that a render failure invokes the CLI zero times — all of it would rest on inspection, which has a demonstrated failure record on this document.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2908,10 +2907,9 @@ export FAKE_ARGV_LOG="$WORK/argv.log"     # the stubs read this themselves
 # A throwaway target repo, distinct from the process repo.
 #
 # CRITICAL: REPO_ROOT / FEATURE_FOLDER / PROCESS_PATH are assigned WITHOUT
-# `export`. Exporting them here would mask the real bug this check exists to
-# catch: a detached child running under `bash -c` does not inherit ordinary
-# assignments, so dispatch_detached must pass them explicitly via `env`. If the
-# test exported them, a broken dispatch_detached would still pass.
+# `export`, because that is how the orchestrator sets them. render_prompt resolves
+# substitutions through python3's os.environ, which never sees an unexported shell
+# variable -- exporting them here would mask that whole defect class.
 REPO_ROOT="$WORK/target"; mkdir -p "$REPO_ROOT"
 git -C "$REPO_ROOT" init -q
 ( cd "$REPO_ROOT" && : > seed && git add seed \
@@ -3049,622 +3047,254 @@ global options after exec, so it cannot mask that ordering bug."
 
 ---
 
-## Task 17: Detached dispatch and the resume state machine
+## Task 17: Long dispatch via harness background execution
 
 **Files:**
-- Modify: `develop-it-process.md` — add a "Long dispatch" cookbook section; update the one-phase-per-invocation rule (lines 88–109); update resumability (lines 1610–1619)
+- Modify: `develop-it-process.md` — add a "Long dispatch" section; update the one-phase-per-invocation rule (lines 88–109); update resumability (lines 1610–1619)
 - Test: `tests/check_05_contract.sh`, `tests/check_07_fakecli.sh`
 
 **Interfaces:**
-- Consumes: `claude_invoke`, `codex_invoke` (Task 7), `iso_now` (Task 10)
+- Consumes: `claude_invoke`, `codex_invoke` (Task 7), `role_model`/`role_timeout` (Task 5), `iso_now` (Task 10), `role_mutates`, `appendix_exists`
 - Produces:
-  - `dispatch_id <phase> <iter> <role>` → `<phase>-iter<NN>-<role>` (echoed; pure function, safe to capture)
-  - `role_mutates <role>` → `yes|no` — drives `ORPHANED` recovery
+  - `dispatch_id <phase> <iter> <role>` → `<phase>-iter<NN>-<role>` (echoed; pure, safe to capture)
+  - `role_mutates <role>` → `yes|no` — decides recovery for an unfinished dispatch
   - `appendix_exists <role>` → rc 0/1 — pre-launch validation
-  - `dispatch_detached <phase> <iter> <role> [extra CLI args...]` — writes `.intent`, forks; the **child** publishes `.started`/`.pid`/`.rc` and renders its own prompt. Reads no stdin.
-  - `dispatch_state <phase> <iter> <role>` — **sets the globals `DISPATCH_STATE` and `DISPATCH_RC`**; echoes nothing. Must be called directly: `$(dispatch_state …)` runs it in a subshell and discards `DISPATCH_RC`. The complete state set, in two groups:
-    - *Nothing was spent* (safe to re-dispatch for any role): `NEVER_LAUNCHED`, `LAUNCH_ABORTED` (the child could not publish `.started`), `LEASE_REVOKED` (a straggler found its nonce superseded), `RENDER_FAILED` (the prompt would not render).
-    - *A CLI may have run* — recovery depends on `role_mutates`: `LAUNCHING`, `LAUNCH_UNCERTAIN` (grace expired with no `.started`; this does **not** certify non-execution), `RUNNING`, `ORPHANED`, `COMPLETED`, `TIMED_OUT`, `FAILED`, `CORRUPT`, `INCONSISTENT`.
-  - `await_dispatch <phase> <iter> <role> <max_wait_s>` — polls, setting the same globals; returns 0 on a terminal state, 1 if still `RUNNING`/`LAUNCHING`
-  - `DISPATCH_START_GRACE_S` — how long `.intent` may exist without `.started` before the launch is called failed
+  - `log_dispatch_started <phase> <phase_name> <iter> <role>` — appends the `event=DISPATCH_STARTED` block **before** the dispatch runs
+  - `dispatch_state <phase> <iter> <role> <status_path>` — sets `DISPATCH_STATE` ∈ {`NEVER_LAUNCHED`, `COMPLETED`, `UNFINISHED`}; echoes nothing
+
+**Why this shape.** The implementer (300 min), plan writer (120 min) and deep Codex
+review (120 min) outlive any single Bash tool call. Rather than hand-rolling process
+management in shell, the orchestrator issues those dispatches as a **single Bash tool
+call with `run_in_background: true`**. The harness keeps the command running across
+turns and re-invokes the orchestrator when it exits.
+
+That is a deliberate reversal of an earlier design. A hand-rolled detach-and-poll
+protocol was specified first, and it grew a launch-intent file, a child-published
+`.started`, PID-reuse detection via `/proc` starttime, a nonce lease to stop a
+straggler double-spending, attempt-scoped control files, structured outcome kinds, and
+thirteen states. Three consecutive reviews found blockers in it — eleven findings in
+that one subsystem, each rewrite introducing the next round. All of that machinery
+existed to reimplement process supervision the harness already provides. Delegating it
+removes the whole surface: no nonce, no lease, no PID tracking, no attempt scoping, no
+`.intent`/`.started`/`.pid`/`.outcome`/`.rc`, and three states instead of thirteen.
+
+What survives is the part that was genuinely load-bearing: a dispatch must be
+**recorded before it runs**, and an unfinished mutating dispatch must **halt rather
+than auto-retry**.
 
 - [ ] **Step 1: Write the failing test**
 
 Append to `tests/check_07_fakecli.sh` before `finish`:
 
 ```bash
-# --- detached dispatch state machine ---
-for fn in dispatch_id dispatch_detached dispatch_state await_dispatch; do
+# --- long dispatch: recording and resume classification ---
+for fn in dispatch_id role_mutates appendix_exists log_dispatch_started dispatch_state; do
   declare -F "$fn" >/dev/null || _fail "$fn is not defined"
 done
 [ "$_FAILURES" -eq 0 ] || finish
 
-T="$FEATURE_FOLDER/transcripts"
+assert_eq "6-iter00-implementer" "$(dispatch_id 6 00 implementer)" \
+  "dispatch_id is deterministic"
 
-# dispatch_state sets GLOBALS and must be called directly. Capturing it as
-# "$(dispatch_state ...)" runs it in a subshell, so DISPATCH_RC never comes back.
-# This helper makes every call below use the correct form.
-state_of() { dispatch_state "$1" "$2" "$3"; printf '%s' "$DISPATCH_STATE"; }
+# dispatch_state sets a GLOBAL and must be called directly: "$(dispatch_state ...)"
+# would run it in a subshell and discard it.
+state_of() { dispatch_state "$1" "$2" "$3" "$4"; printf '%s' "$DISPATCH_STATE"; }
 
-assert_eq "3-iter01-spec-reviewer-claude" \
-  "$(dispatch_id 3 01 spec-reviewer-claude)" "dispatch_id is deterministic"
+SD="$FEATURE_FOLDER/6-implementation"; mkdir -p "$SD"
+ST="$SD/implementer-status.md"
+: > "$FEATURE_FOLDER/RUN_LOG.md"
 
-# 1. Nothing launched yet.
-assert_eq NEVER_LAUNCHED "$(state_of 9 01 summarizer-spec)" \
-  "no control files means NEVER_LAUNCHED"
+# 1. Nothing recorded, no STATUS -> never launched.
+assert_eq NEVER_LAUNCHED "$(state_of 6 00 implementer "$ST")" \
+  "no DISPATCH_STARTED record means NEVER_LAUNCHED"
 
-# 2. Completed successfully. DISPATCH_RC must survive into THIS shell.
-dispatch_detached 3 02 summarizer-spec
-await_dispatch 3 02 summarizer-spec 60 || _fail "await_dispatch timed out on a fast stub"
-assert_eq COMPLETED "$DISPATCH_STATE" "rc=0 means COMPLETED"
-assert_eq 0 "$DISPATCH_RC" "DISPATCH_RC reaches the caller (not swallowed by a subshell)"
-
-# 2b. The child renders its own prompt: no .prompt file may exist.
-id="$(dispatch_id 3 02 summarizer-spec)"
-[ ! -e "$T/$id.prompt" ] && _ok "no .prompt file is persisted" \
-                         || _fail "appendix content was written to disk: $T/$id.prompt"
-
-# 3. Non-zero rc.
-FAKE_RC=4 dispatch_detached 3 03 summarizer-spec
-await_dispatch 3 03 summarizer-spec 60
-assert_eq FAILED "$DISPATCH_STATE" "non-zero rc means FAILED"
-assert_eq 4 "$DISPATCH_RC" "DISPATCH_RC carries the child's exit code"
-
-# Helper: fabricate control files for the states that cannot be produced quickly.
-mk_intent()  { printf 'dispatch_id: %s\nrole: summarizer-spec\n' "$1" > "$T/$1.intent"; }
-mk_started() { printf 'dispatch_id: %s\npid: %s\npid_starttime: %s\n' "$1" "$2" "$3" > "$T/$1.started"; }
-
-# 4. timeout rc 124.
-id="$(dispatch_id 3 04 summarizer-spec)"; mk_intent "$id"; mk_started "$id" 999999 1
-printf '124\n' > "$T/$id.rc"
-assert_eq TIMED_OUT "$(state_of 3 04 summarizer-spec)" "rc=124 means TIMED_OUT"
-
-# 5. Malformed .rc.
-id="$(dispatch_id 3 05 summarizer-spec)"; mk_intent "$id"; mk_started "$id" 999999 1
-printf 'garbage\n' > "$T/$id.rc"
-assert_eq CORRUPT "$(state_of 3 05 summarizer-spec)" "a non-numeric .rc is CORRUPT"
-
-# 6. Started, no .rc, dead pid -> ORPHANED (the harness-crash case).
-id="$(dispatch_id 3 06 summarizer-spec)"; mk_intent "$id"; mk_started "$id" 999999 12345
-assert_eq ORPHANED "$(state_of 3 06 summarizer-spec)" \
-  "a dead pid with no .rc is ORPHANED, not RUNNING"
-
-# 7. PID reuse: live pid, wrong starttime -> ORPHANED, not RUNNING.
-sleep 120 & live=$!
-id="$(dispatch_id 3 07 summarizer-spec)"; mk_intent "$id"; mk_started "$id" "$live" 1
-assert_eq ORPHANED "$(state_of 3 07 summarizer-spec)" \
-  "a recycled pid is ORPHANED (starttime mismatch)"
-
-# 8. Genuinely running.
-mk_started "$id" "$live" "$(awk '{print $22}' "/proc/$live/stat")"
-assert_eq RUNNING "$(state_of 3 07 summarizer-spec)" \
-  "a live pid with a matching starttime is RUNNING"
-kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
-
-# 9. LAUNCHING: intent written, child has not published .started yet.
-id="$(dispatch_id 3 09 summarizer-spec)"; mk_intent "$id"
-assert_eq LAUNCHING "$(state_of 3 09 summarizer-spec)" \
-  "fresh intent without .started is LAUNCHING, not NEVER_LAUNCHED"
-
-# 10. LAUNCH_UNCERTAIN: grace expired with no .started. This state does NOT
-#     certify that no CLI ran -- only the child can certify that, via
-#     kind: launch_aborted. Age the intent past the grace period.
-DISPATCH_START_GRACE_S=1
-touch -d '1 hour ago' "$T/$id.intent"
-assert_eq LAUNCH_UNCERTAIN "$(state_of 3 09 summarizer-spec)" \
-  "a stale intent with no .started is LAUNCH_UNCERTAIN (not a certification)"
-
-# 10b. Certified non-execution is a KIND, not an exit code. A CLI that genuinely
-#      exits 71 must read as FAILED, not as "nothing was spent".
-id="$(dispatch_id 3 13 summarizer-spec)"; mk_intent "$id"; mk_started "$id" 999999 1
-printf 'kind: cli_exit\nrc: 71\n' > "$T/$id.outcome"
-printf '71\n' > "$T/$id.rc"
-assert_eq FAILED "$(state_of 3 13 summarizer-spec)" \
-  "a real CLI exiting 71 is FAILED, not LAUNCH_ABORTED"
-printf 'kind: launch_aborted\nrc: 0\n' > "$T/$id.outcome"
-printf '0\n' > "$T/$id.rc"
-assert_eq LAUNCH_ABORTED "$(state_of 3 13 summarizer-spec)" \
-  "kind: launch_aborted certifies that nothing was spent"
-printf 'kind: render_failed\nrc: 0\n' > "$T/$id.outcome"
-assert_eq RENDER_FAILED "$(state_of 3 13 summarizer-spec)" \
-  "kind: render_failed certifies that nothing was spent"
-DISPATCH_START_GRACE_S=30
-
-# 11. .rc without .intent -> INCONSISTENT (two runs on one folder).
-id="$(dispatch_id 3 10 summarizer-spec)"
-printf '0\n' > "$T/$id.rc"; rm -f "$T/$id.intent" "$T/$id.started"
-assert_eq INCONSISTENT "$(state_of 3 10 summarizer-spec)" \
-  ".rc without .intent is INCONSISTENT"
-
-# 12. role_mutates drives ORPHANED recovery.
-assert_eq no  "$(role_mutates summarizer-spec)" "summarizers are read-only"
-assert_eq no  "$(role_mutates code-reviewer-claude)" "reviewers are read-only"
-assert_eq yes "$(role_mutates implementer)" "the implementer mutates"
-assert_eq yes "$(role_mutates finishing-branch)" "the git finalizer mutates"
-
-# 13. A DISPATCH_STARTED event is logged before launch.
+# 2. Recorded, but no STATUS -> unfinished. This is the session-crash case.
+log_dispatch_started 6 implementation 00 implementer
 assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" \
-  "launch is recorded in RUN_LOG before the process starts"
+  "the dispatch is recorded BEFORE it runs"
+assert_eq UNFINISHED "$(state_of 6 00 implementer "$ST")" \
+  "a recorded dispatch with no STATUS is UNFINISHED"
 
-# 13a. NONCE LEASE: a straggler child must not run after a retry.
-#
-#      The delay MUST occur before the child reaches its lease check. FAKE_DELAY
-#      lives inside the stub, which only runs AFTER the lease check has already
-#      passed -- using it here would simply start two CLIs and prove nothing.
-#      DISPATCH_TEST_PRELAUNCH_DELAY_S is honoured by the child wrapper as its
-#      first action, before .started and before the lease check, which is the
-#      window a slow-to-schedule or SIGSTOPped child actually occupies.
+# 3. Recorded and a valid STATUS -> completed.
+printf 'verdict: DONE\nverification: PASS\n' > "$ST"
+assert_eq COMPLETED "$(state_of 6 00 implementer "$ST")" \
+  "a recorded dispatch with a valid STATUS is COMPLETED"
+
+# 4. A STATUS that fails validation is NOT completion. A half-written artifact
+#    must never be mistaken for a finished dispatch.
+printf 'verdict: DONE\nverification: MAYBE\n' > "$ST"
+assert_eq UNFINISHED "$(state_of 6 00 implementer "$ST")" \
+  "an invalid STATUS is UNFINISHED, not COMPLETED"
+
+# 5. role_mutates decides what UNFINISHED means. This is the rule that keeps a
+#    half-run implementer from being silently re-run over its own commits.
+assert_eq yes "$(role_mutates implementer)"           "the implementer mutates"
+assert_eq yes "$(role_mutates finishing-branch)"      "the git finalizer mutates"
+assert_eq no  "$(role_mutates summarizer-spec)"       "summarizers are read-only"
+assert_eq no  "$(role_mutates code-reviewer-claude)"  "reviewers are read-only"
+
+# 6. Pre-launch validation: a missing appendix must fail before any CLI runs.
+appendix_exists implementer     && _ok "appendix_exists finds a real appendix" \
+                                || _fail "appendix_exists missed a real appendix"
+appendix_exists no-such-role    && _fail "appendix_exists accepted a missing appendix" \
+                                || _ok "appendix_exists rejects a missing appendix"
+
+# 7. A render failure must produce ZERO CLI invocations. Asserting only that the
+#    delivered prompt has no $VARS is insufficient: an empty prompt also passes
+#    that test.
 : > "$FAKE_ARGV_LOG"
-DISPATCH_TEST_PRELAUNCH_DELAY_S=6 dispatch_detached 3 11 summarizer-spec
-sleep 1
-dispatch_detached 3 11 summarizer-spec                 # retry revokes the nonce
-await_dispatch 3 11 summarizer-spec 60
-sleep 8                                                # let the straggler wake up
-assert_eq 1 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG")" \
-  "the nonce lease admits exactly one CLI invocation after a retry"
-# And the straggler must have recorded WHY it declined.
-assert_present 'kind: lease_revoked' "$T/"*.outcome \
-  "the revoked straggler recorded a lease_revoked outcome"
-
-# 13b. A failed .intent publication must abort BEFORE forking.
-ro="$WORK/readonly"; mkdir -p "$ro/transcripts"; chmod 500 "$ro/transcripts"
-( FEATURE_FOLDER="$ro"; dispatch_detached 3 12 summarizer-spec ) \
-  && _fail "dispatch_detached must abort when .intent cannot be published" \
-  || _ok "dispatch_detached aborts when .intent cannot be published"
-chmod 700 "$ro/transcripts"
-
-# 13c. The child receives every render key. A prompt that reached the stub with an
-#      unresolved $VAR would mean render_prompt silently half-rendered.
-: > "$FAKE_ARGV_LOG"
-SPEC_PATH="$WORK/spec.md"; : > "$SPEC_PATH"          # plain assignment, no export
-PLAN_PATH="$WORK/plan.md"; : > "$PLAN_PATH"
-ITERATION=01
-dispatch_detached 7 01 code-reviewer-claude
-await_dispatch 7 01 code-reviewer-claude 60
-id="$(dispatch_id 7 01 code-reviewer-claude)"
-assert_eq COMPLETED "$DISPATCH_STATE" "detached dispatch completes with unexported render keys"
-# The stub echoes its stdin into the transcript, so the rendered prompt is visible.
-assert_absent '\$[A-Z][A-Z_]{2,}' "$T/$id.json" \
-  "the prompt delivered to the child has no unresolved \$VARS"
-
-# 14. A detached CODEX dispatch works when the vars are NOT exported by the
-#     parent -- this is the regression that `export`-based tests would mask.
-unset REPO_ROOT FEATURE_FOLDER FEATURE_FOLDER_OUTSIDE_REPO
-REPO_ROOT="$WORK/target"                     # plain assignment, no export
-FEATURE_FOLDER="$WORK/outside-ff"            # deliberately OUTSIDE the repo
-mkdir -p "$FEATURE_FOLDER/transcripts"
-PROCESS_PATH="$PROCESS_DOC"
-init_orchestration_vars || _fail "init_orchestration_vars failed"
-assert_eq yes "${FEATURE_FOLDER_OUTSIDE_REPO:-no}" "outside-repo feature folder is detected"
-: > "$FAKE_ARGV_LOG"
-dispatch_detached 5 01 plan-reviewer-codex
-await_dispatch 5 01 plan-reviewer-codex 60 || _fail "detached codex dispatch did not finish"
-assert_eq COMPLETED "$DISPATCH_STATE" "detached codex dispatch completes without exported vars"
-assert_present "--add-dir" "$FAKE_ARGV_LOG" \
-  "detached codex received --add-dir for an out-of-repo feature folder"
+unset SPEC_PATH
+dispatch_role 7 01 code-reviewer-claude "$SD/x-status.md" \
+  && _fail "dispatch must fail when a render key is unset" \
+  || _ok "dispatch fails when a render key is unset"
+assert_eq 0 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
+  "a render failure invokes the CLI zero times"
+SPEC_PATH="$WORK/spec.md"
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 2: Run it to verify it fails**
 
 Run: `bash tests/check_07_fakecli.sh`
-Expected: FAIL — the four `dispatch_*` functions are undefined.
+Expected: FAIL — the five functions are undefined.
 
-- [ ] **Step 3: Add the long-dispatch cookbook section**
+- [ ] **Step 3: Add the long-dispatch section to the document**
 
-Insert a new section after the CLI invocation forms:
+Insert after the CLI invocation forms:
 
 ````markdown
-### Long dispatch — detach and poll
+### Long dispatch
 
-The implementer (300 min), plan writer (120 min) and deep Codex review (120 min)
-outlive any single bash invocation a harness will allow. They are launched
-detached and polled across short calls.
+Three roles have timeouts that exceed a single Bash tool call: `plan-writer` (120
+min), `implementer` (300 min) and `code-reviewer-codex` (120 min). For these, the
+orchestrator issues the dispatch as **one Bash tool call with
+`run_in_background: true`**. The harness keeps it running across turns and re-invokes
+the orchestrator when it exits, delivering the exit status.
 
-**One *dispatch* per phase** is the rule — polling calls are not phase bundling.
-Control files live beside the transcript:
+Do **not** hand-roll process supervision: no `setsid`, no `.pid` files, no polling
+loop, no PID-liveness checks. An earlier revision of this document specified exactly
+that and it accumulated a launch-intent file, a nonce lease, attempt-scoped control
+files and thirteen states — all reimplementing what the harness already does
+correctly. If a future harness lacks background execution, reduce the affected roles'
+timeouts instead; do not reintroduce the protocol.
 
-| File | Written by | When | Content |
-|---|---|---|---|
-Control files are **attempt-scoped**: each retry writes its own set under
-`<id>.<nonce>.*`, and the single unscoped `<id>.intent` names which nonce is
-authoritative. Sharing one `.rc` or `.json` across attempts is a data race — a
-revoked straggler would overwrite the lease holder's exit code or transcript.
+**One dispatch per phase still holds.** A background dispatch is one Bash call, and
+the orchestrator's next turn begins when it finishes. Nothing about it bundles phases.
 
-| File | Written by | When | Content |
-|---|---|---|---|
-| `<id>.intent` | parent | **before** the fork | `dispatch_id`, `role`, `vendor`, `model`, `timeout_s`, `nonce`, `intent_at`. The only unscoped file; it is the index that says which attempt owns this dispatch |
-| `<id>.<nonce>.started` | **child** | its first action | `dispatch_id`, `pid` (`$$`), `pid_starttime`, `nonce`, `started_at` |
-| `<id>.<nonce>.pid` | child | after `.started` | pid only, for cheap liveness checks |
-| `<id>.<nonce>.outcome` | child | at every terminal point | `kind:` ∈ {`cli_exit`, `launch_aborted`, `lease_revoked`, `render_failed`}, `rc:`, `nonce:` |
-| `<id>.<nonce>.rc` | child | on exit | exit code, one integer. A `lease_revoked` straggler writes none — that record belongs to the lease holder |
-| `<id>.<nonce>.json` / `.err` | the CLI | during the run | stdout / stderr |
-
-`dispatch_state` resolves the authoritative attempt through `.intent` and exports
-`DISPATCH_BASE`, so consumers (the readiness writer, failure classifiers) locate the
-right transcript without re-deriving the nonce themselves.
-
-There is deliberately **no `.prompt` file**. The child renders the appendix itself
-from `$PROCESS_PATH`, so appendix content is never written to disk — the rule at
-line 23 of the process document. `.tmp` files exist only momentarily during atomic
-`mv` publication.
-
-`.started` is written by the **child**, not the parent. It must contain the pid,
-which does not exist until after the fork, so a parent that wrote it would leave a
-window where a live child has no control file — `dispatch_state` would report
-`NEVER_LAUNCHED` and a resume would start a duplicate. Having the child publish its
-own `$$` closes that window entirely; the parent's `.intent` covers the remaining
-gap between "decided to launch" and "child running".
+Every dispatch, foreground or background, goes through the same helper:
 
 <!-- lint: cookbook -->
 ```bash
-# Publish a control file atomically, or fail cleanly. Reads content from stdin.
-#
-# This exists because the obvious inline form is WRONG:
-#     if ! { printf ...; } > x.tmp && mv x.tmp x; then abort; fi
-# `!` binds to the first pipeline only, so this parses as `(! write) && mv`.
-# When the write SUCCEEDS, `!` makes it false, the `&&` short-circuits — so `mv`
-# never runs — and the `then` branch is skipped too, so the abort never runs
-# either. Verified: moved=no, failure_branch=not_taken. The file silently stays a
-# .tmp forever and every reader sees the control file as absent.
-#
-# One helper, used everywhere, so the pattern is written correctly once and every
-# failure path removes its own .tmp.
-publish_atomic() {
-  # Usage: <producer> | publish_atomic <final-path>
-  local final="$1" tmp="$1.tmp"
-  if cat > "$tmp" && mv "$tmp" "$final"; then
-    return 0
-  fi
-  rm -f "$tmp"
-  echo "publish_atomic: could not publish $final" >&2
-  return 1
+# Record a dispatch BEFORE it runs. This is the only durable evidence that a
+# dispatch was attempted, and it is what a resume reads to tell "never started"
+# apart from "started and did not finish".
+log_dispatch_started() {
+  # Usage: log_dispatch_started <phase> <phase_name> <iter> <role>
+  {
+    printf -- '--- %s  event=DISPATCH_STARTED\n' "$(iso_now)"
+    printf 'phase:                    %s\n' "$1"
+    printf 'phase_name:               %s\n' "$2"
+    printf 'iteration:                %s\n' "$3"
+    printf 'role:                     %s\n' "$4"
+    printf 'dispatch_id:              %s\n' "$(dispatch_id "$1" "$3" "$4")"
+    printf 'model:                    %s\n' "$(role_model "$4")"
+    printf '\n'
+  } >> "$FEATURE_FOLDER/RUN_LOG.md"
 }
 
-dispatch_id() { printf '%s-iter%s-%s\n' "$1" "$2" "$3"; }
-
-_pid_starttime() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
-
-# Does this role mutate the working tree? An abandoned mutating dispatch cannot
-# simply be re-run: it may have left edits, commits, or artifacts behind.
-role_mutates() {
-  case "$1" in
-    spec-fixer|plan-writer|plan-fixer|implementer|impl-worker|debugger|\
-    test-fixer|all-tests-runner|finishing-branch) echo yes ;;
-    *) echo no ;;   # reviewers, summarizers, discovery, preflight, readiness
-  esac
-}
-
-appendix_exists() {
-  "$GREP_BIN" -qF "<!-- BEGIN: $1 -->" "$PROCESS_PATH" \
-    && "$GREP_BIN" -qF "<!-- END: $1 -->" "$PROCESS_PATH"
-}
-
-# Launch a dispatch that outlives this shell.
-#
-# Three-phase publication closes the launch window. The parent writes .intent
-# BEFORE forking; the CHILD writes .started with its own $$ as its first action.
-# Writing .started in the parent is impossible to do safely: it must contain the
-# pid, which does not exist until after the fork, so a parent crash in between
-# would leave a live child with no control file and dispatch_state would report
-# NEVER_LAUNCHED and start a duplicate.
-dispatch_detached() {
-  # Usage: dispatch_detached <phase> <iter> <role> [extra CLI args...]
-  # The prompt is rendered BY THE CHILD from $PROCESS_PATH — it is never written
-  # to disk, per "appendix content is NEVER written to disk".
-  local phase="$1" iter="$2" role="$3"; shift 3
-  local id tdir base vendor model timeout_s
+# Render, validate, record, dispatch. Used for every role; the ONLY difference for a
+# long-running role is that the orchestrator makes the Bash tool call with
+# run_in_background: true.
+dispatch_role() {
+  # Usage: dispatch_role <phase> <iter> <role> <status_path> [extra CLI args...]
+  local phase="$1" iter="$2" role="$3" status_path="$4"; shift 4
+  local id tdir base vendor prompt
   id="$(dispatch_id "$phase" "$iter" "$role")"
   tdir="$FEATURE_FOLDER/transcripts"; mkdir -p "$tdir"
+  base="$tdir/$id"
   vendor="$(role_vendor "$role")"
-  model="$(role_model "$role")"   || return 1
-  timeout_s=$(( $(role_timeout "$role") * 60 ))
 
-  # Fail before forking if the appendix is missing, rather than launching a
-  # child that would dispatch an empty prompt.
   appendix_exists "$role" \
     || { echo "halt: no appendix markers for role $role" >&2; return 1; }
 
-  # 1. Durable pre-launch intent, stamped with a NONCE that identifies this
-  #    launch attempt. No pid yet — that is the point.
-  #
-  #    The nonce is what makes a retry safe. A grace-period timeout alone cannot
-  #    prove no child will run: a child that was slow to schedule, or SIGSTOPped,
-  #    can miss the window, be classified LAUNCH_UNCERTAIN, and then wake up and
-  #    invoke the CLI *after* a replacement dispatch has started — two CLIs, one
-  #    dispatch id. Verified reproducible. So every child re-reads the intent
-  #    immediately before invoking the CLI and exits if its nonce no longer owns
-  #    it; a retry writes a fresh nonce, revoking the old one.
-  # ATTEMPT-SCOPED paths. Every retry gets its own file set, keyed by nonce.
-  # Sharing one .started/.pid/.rc/.json across attempts is a data race: a revoked
-  # straggler would overwrite the lease holder's exit code, pid record, or
-  # transcript. `.intent` is the only unscoped file, and it names the authoritative
-  # nonce -- so `<id>.intent` is the index and `<id>.<nonce>.*` are the attempts.
-  local nonce
-  nonce="$(_new_nonce)"
-  base="$tdir/$id.$nonce"
-  # A failed intent write MUST abort before forking, or the launch proceeds with
-  # no durable record — verified reaching "launch" after a failed intent write.
-  if ! { printf 'dispatch_id: %s\n' "$id"
-         printf 'role: %s\n' "$role"
-         printf 'vendor: %s\n' "$vendor"
-         printf 'model: %s\n' "$model"
-         printf 'timeout_s: %s\n' "$timeout_s"
-         printf 'nonce: %s\n' "$nonce"
-         printf 'intent_at: %s\n' "$(iso_now)"
-       } | publish_atomic "$tdir/$id.intent"; then
-    echo "halt: could not publish dispatch intent for $id" >&2
-    return 1
-  fi
+  # Render FIRST, into memory, and check it. Process substitution must not be used:
+  # `cmd < <(render_prompt ...)` discards the renderer's exit status entirely --
+  # verified, a renderer returning 42 still ran the consumer with zero bytes and
+  # yielded rc 0. That would send an EMPTY prompt to a real model and bill for it.
+  prompt="$(render_prompt "$role")" \
+    || { echo "halt: render failed for role $role" >&2; return 1; }
+  [ -n "$prompt" ] \
+    || { echo "halt: empty prompt for role $role" >&2; return 1; }
 
-  {
-    printf -- '--- %s  event=DISPATCH_STARTED\n' "$(iso_now)"
-    printf 'phase:                    %s\n' "$phase"
-    # PHASE_NAME is set by the orchestrator at the top of each phase block; the
-    # default keeps this safe under `set -u` if a caller forgets.
-    printf 'phase_name:               %s\n' "${PHASE_NAME:-unknown}"
-    printf 'iteration:                %s\n' "$iter"
-    printf 'role:                     %s\n' "$role"
-    printf 'dispatch_id:              %s\n' "$id"
-    printf 'model:                    %s\n' "$model"
-    printf '\n'
-  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+  log_dispatch_started "$phase" "${PHASE_NAME:-unknown}" "$iter" "$role"
 
-  # 2. Fork. The child needs both the FUNCTIONS and the VARIABLES they read:
-  #    ordinary assignments are NOT inherited across `bash -c`, and
-  #    codex_invoke reads REPO_ROOT / FEATURE_FOLDER / FEATURE_FOLDER_OUTSIDE_REPO
-  #    under `set -u`. Passing them via `env` is explicit and does not depend on
-  #    whatever the caller happened to export.
-  # EVERY function the child calls, transitively. render_prompt calls
-  # render_keys; omitting it made the child die with `render_keys: command not
-  # found` (rc 127) *after* publishing .started, which looks like a CLI failure.
-  # check_07_fakecli.sh asserts a detached dispatch actually completes, which is
-  # what catches an omission here.
-  export -f claude_invoke codex_invoke render_prompt render_keys \
-            appendix_exists publish_atomic \
-            role_model role_effort role_timeout role_vendor \
-            _role_row _role_field
-
-  # Forward every variable the child needs. Ordinary assignments are NOT
-  # inherited across `bash -c`, and render_prompt / codex_invoke read all of
-  # these. render_keys() supplies the substitution set so it stays in one place.
-  local child_env=(
-    REPO_ROOT="$REPO_ROOT"
-    FEATURE_FOLDER="$FEATURE_FOLDER"
-    FEATURE_FOLDER_OUTSIDE_REPO="${FEATURE_FOLDER_OUTSIDE_REPO:-}"
-    DISPATCH_TEST_PRELAUNCH_DELAY_S="${DISPATCH_TEST_PRELAUNCH_DELAY_S:-}"
-    PROCESS_PATH="$PROCESS_PATH"
-    PYTHON_BIN="$PYTHON_BIN"
-    GREP_BIN="$GREP_BIN"
-  )
-  for k in $(render_keys); do
-    [ -n "${!k+x}" ] && child_env+=("$k=${!k}")
-  done
-
-  setsid env "${child_env[@]}" bash -c '
-    set -uo pipefail
-    base="$1"; vendor="$2"; role="$3"; nonce="$4"; shift 4
-
-    # Test-only hook: simulate a child that is slow to be scheduled. It must sit
-    # BEFORE .started and before the lease check, because that is the window in
-    # which a straggler is mistaken for a failed launch. Unset in normal runs.
-    [ -n "${DISPATCH_TEST_PRELAUNCH_DELAY_S:-}" ] \
-      && sleep "$DISPATCH_TEST_PRELAUNCH_DELAY_S"
-
-    # 3. First action: publish .started with our OWN pid. No parent-side window.
-    #    A failed publication must abort BEFORE the CLI runs, or an unrecorded
-    #    child would burn tokens while the orchestrator believes nothing launched.
-    # Outcomes are recorded as a STRUCTURED kind, never as a reserved exit code.
-    # Overloading rc 71/75 would misclassify a real CLI that happens to exit 71 or
-    # 75 as "nothing was spent" -- a false certification with real cost attached.
-    _outcome() { printf "kind: %s\nrc: %s\nnonce: %s\n" "$1" "$2" "$nonce" \
-                   | publish_atomic "$base.outcome"; }
-
-    if ! { printf "dispatch_id: %s\n" "${base##*/}"
-           printf "pid: %s\n" "$$"
-           printf "pid_starttime: %s\n" "$(awk "{print \$22}" "/proc/$$/stat")"
-           printf "nonce: %s\n" "$nonce"
-           printf "started_at: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-         } | publish_atomic "$base.started"; then
-      _outcome launch_aborted 0
-      printf "%s\n" 0 | publish_atomic "$base.rc"
-      exit 0
-    fi
-    printf "%s\n" "$$" | publish_atomic "$base.pid" || true
-
-    # 4. LEASE CHECK, immediately before spending anything. If the orchestrator
-    #    gave up on us and re-dispatched, the intent now carries a different
-    #    nonce and we must not run: otherwise two CLIs share one dispatch id and
-    #    both write the same STATUS path.
-    # The intent is at the UNSCOPED path: it is the shared index that says which
-    # attempt currently owns this dispatch id.
-    intent="${base%.*}.intent"
-    current_nonce="$(sed -n "s/^nonce: //p" "$intent" 2>/dev/null)"
-    if [ "$current_nonce" != "$nonce" ]; then
-      _outcome lease_revoked 0
-      exit 0     # lease revoked; a replacement dispatch owns this id.
-                 # Deliberately does NOT touch .rc: that record belongs to
-                 # whichever attempt currently holds the lease.
-    fi
-
-    # Render FIRST, into memory, and check the status. Process substitution
-    # cannot be used here: `cmd < <(render_prompt ...)` discards the renderer's
-    # exit status entirely -- verified, a renderer returning 42 still ran the
-    # consumer with zero bytes and yielded rc 0. That would send an EMPTY prompt
-    # to a real model and bill for it.
-    if ! prompt="$(render_prompt "$role")" || [ -z "$prompt" ]; then
-      _outcome render_failed 0
-      printf "%s\n" 0 | publish_atomic "$base.rc"
-      exit 0           # no CLI was invoked; nothing was spent
-    fi
-    if [ "$vendor" = codex ]; then
-      codex_invoke "$role" "$base.json" "$base.err" "$@" <<< "$prompt"
-    else
-      claude_invoke "$role" "$base.json" "$base.err" "$@" <<< "$prompt"
-    fi
-    rc=$?
-    # A genuine CLI exit. The kind distinguishes it from the pre-spend outcomes
-    # above, so rc is free to be ANY value the CLI chooses -- including 71 or 75.
-    _outcome cli_exit "$rc"
-    # Atomic publication: a poller must never read a partial .rc.
-    printf "%s\n" "$rc" | publish_atomic "$base.rc"
-  ' _ "$base" "$vendor" "$role" "$nonce" "$@" >/dev/null 2>&1 &
-  disown $! 2>/dev/null || true
-  return 0
-}
-
-# A launch nonce: unique per attempt, no Date/Random dependency beyond the shell.
-_new_nonce() { printf '%s-%s\n' "$$" "${EPOCHREALTIME/[.,]/}"; }
-
-# Classify a dispatch. Sets the globals DISPATCH_STATE and DISPATCH_RC.
-#
-# It does NOT print the state for capture via "$(dispatch_state ...)": command
-# substitution runs in a subshell, so DISPATCH_RC would be discarded and the
-# caller would see it unset. Call directly, then read $DISPATCH_STATE.
-dispatch_state() {
-  # Usage: dispatch_state <phase> <iter> <role>  -> DISPATCH_STATE, DISPATCH_RC
-  # Also sets DISPATCH_BASE to the authoritative attempt's path prefix, so callers
-  # can locate its transcript without re-deriving the nonce.
-  local id idbase intent nonce base rc pid recorded current age
-  id="$(dispatch_id "$1" "$2" "$3")"
-  idbase="$FEATURE_FOLDER/transcripts/$id"
-  intent="$idbase.intent"
-  DISPATCH_RC=""
-  DISPATCH_STATE=""
-  DISPATCH_BASE=""
-
-  # Resolve which attempt is authoritative. Without .intent there is no dispatch.
-  if [ ! -f "$intent" ]; then
-    # A stray .rc with no intent means two runs are sharing this feature folder.
-    if compgen -G "$idbase.*.rc" >/dev/null 2>&1; then
-      DISPATCH_STATE=INCONSISTENT
-    else
-      DISPATCH_STATE=NEVER_LAUNCHED
-    fi
-    return 0
-  fi
-  nonce="$(status_field "$intent" nonce)"
-  base="$idbase.$nonce"
-  DISPATCH_BASE="$base"
-
-  # A pre-spend outcome is terminal even with no .rc: a revoked straggler
-  # deliberately leaves .rc to whichever attempt holds the lease.
-  if [ -f "$base.outcome" ] && [ ! -f "$base.rc" ]; then
-    case "$(status_field "$base.outcome" kind)" in
-      lease_revoked)  DISPATCH_STATE=LEASE_REVOKED; return 0 ;;
-      render_failed)  DISPATCH_STATE=RENDER_FAILED; return 0 ;;
-      launch_aborted) DISPATCH_STATE=LAUNCH_ABORTED; return 0 ;;
-    esac
-  fi
-
-  # A .rc is terminal regardless of anything else.
-  if [ -f "$base.rc" ]; then
-    rc="$(tr -d '[:space:]' < "$base.rc")"
-    case "$rc" in
-      ''|*[!0-9]*) DISPATCH_STATE=CORRUPT; return 0 ;;
-    esac
-    DISPATCH_RC="$rc"
-    # The KIND decides, not the exit code. A CLI is free to exit 71 or 75 and must
-    # not be mistaken for one of the pre-spend outcomes.
-    local kind=""
-    [ -f "$base.outcome" ] && kind="$(status_field "$base.outcome" kind)"
-    case "$kind" in
-      launch_aborted) DISPATCH_STATE=LAUNCH_ABORTED; return 0 ;;
-      lease_revoked)  DISPATCH_STATE=LEASE_REVOKED;  return 0 ;;
-      render_failed)  DISPATCH_STATE=RENDER_FAILED;  return 0 ;;
-    esac
-    case "$rc" in
-      0)   DISPATCH_STATE=COMPLETED ;;
-      124) DISPATCH_STATE=TIMED_OUT ;;
-      *)   DISPATCH_STATE=FAILED ;;
-    esac
-    return 0
-  fi
-
-  # Intent exists but the child has not published .started yet. Either it is
-  # about to, or the fork failed. Bound the ambiguity with a grace period.
-  #
-  # IMPORTANT: LAUNCH_UNCERTAIN does NOT prove no child will ever run — a child that
-  # was slow to schedule or SIGSTOPped can publish .started after this point.
-  # Safety comes from the NONCE LEASE, not from this timeout: re-dispatching
-  # writes a new nonce, and any late child checks the intent before spending and
-  # exits 75. Never treat this state as proof of non-execution on its own.
-  if [ ! -f "$base.started" ]; then
-    age=$(( $(date -u +%s) - $(date -u -r "$intent" +%s 2>/dev/null || date -u +%s) ))
-    if [ "$age" -lt "$DISPATCH_START_GRACE_S" ]; then
-      DISPATCH_STATE=LAUNCHING
-    else
-      # NOT "LAUNCH_FAILED": nothing here certifies that no CLI ran or will run.
-      # The name says exactly what is known -- the grace period expired without a
-      # .started. Certified non-execution is LAUNCH_ABORTED (kind: launch_aborted),
-      # which only the child itself can publish.
-      DISPATCH_STATE=LAUNCH_UNCERTAIN
-    fi
-    return 0
-  fi
-
-  # A bare pid is not a liveness token across a crash: it may have been
-  # recycled. Compare /proc starttime too.
-  pid="$(status_field "$base.started" pid)"
-  recorded="$(status_field "$base.started" pid_starttime)"
-  current="$(_pid_starttime "$pid")"
-  if [ -n "$current" ] && [ "$current" = "$recorded" ]; then
-    DISPATCH_STATE=RUNNING
+  # A herestring, not a pipe: a pipe would run the invoker in a subshell and
+  # discard the globals run_timed sets.
+  if [ "$vendor" = codex ]; then
+    run_timed codex_invoke "$role" "$base.json" "$base.err" "$@" <<< "$prompt"
   else
-    DISPATCH_STATE=ORPHANED
+    run_timed claude_invoke "$role" "$base.json" "$base.err" "$@" <<< "$prompt"
   fi
-  return 0
+
+  local usage_line verdict
+  usage_line="$(parse_usage "$vendor" "$base.json" "$DISPATCH_WALL_MS" "$(role_model "$role")")"
+  verdict=""
+  [ -f "$status_path" ] && verdict="$(status_field "$status_path" verdict)"
+  log_dispatch "$role" "$phase" "${PHASE_NAME:-unknown}" "$iter" \
+               "$status_path" "$verdict" "$usage_line"
+  return "$DISPATCH_RC"
 }
 
-# Poll until a terminal state or until max_wait_s elapses. Sets DISPATCH_STATE
-# and DISPATCH_RC; returns 0 on a terminal state, 1 if still non-terminal.
-await_dispatch() {
-  # Usage: await_dispatch <phase> <iter> <role> <max_wait_s>
-  local phase="$1" iter="$2" role="$3" max="$4" waited=0
-  while [ "$waited" -lt "$max" ]; do
-    dispatch_state "$phase" "$iter" "$role"
-    case "$DISPATCH_STATE" in
-      RUNNING|LAUNCHING) ;;
-      *) return 0 ;;
-    esac
-    sleep 2; waited=$((waited + 2))
-  done
-  return 1
+# Classify a dispatch for resume. Sets the global DISPATCH_STATE; echoes nothing,
+# because "$(dispatch_state ...)" would run it in a subshell.
+#
+# Three states, not thirteen. The harness owns process lifecycle, so the only
+# question a resume must answer is whether the dispatch finished — and the STATUS
+# file, written last and atomically, is the authoritative answer.
+dispatch_state() {
+  # Usage: dispatch_state <phase> <iter> <role> <status_path>
+  local phase="$1" iter="$2" role="$3" status_path="$4" id
+  id="$(dispatch_id "$phase" "$iter" "$role")"
+  DISPATCH_STATE=""
+
+  if ! "$GREP_BIN" -q "^dispatch_id: *${id}\$" "$FEATURE_FOLDER/RUN_LOG.md" 2>/dev/null; then
+    DISPATCH_STATE=NEVER_LAUNCHED
+    return 0
+  fi
+  # A STATUS file only counts when it VALIDATES. A truncated or malformed one means
+  # the subagent died mid-write, which is not completion.
+  if [ -f "$status_path" ] && validate_status "$status_path" "$role" >/dev/null 2>&1; then
+    DISPATCH_STATE=COMPLETED
+  else
+    DISPATCH_STATE=UNFINISHED
+  fi
+  return 0
 }
 ```
 
-**Resume.** On resume, call `dispatch_state` directly (never in `$(…)`) and act on
+**Resume.** Call `dispatch_state` directly (never in `$(…)`) and branch on
 `$DISPATCH_STATE`:
 
 | State | Meaning | Action |
 |---|---|---|
-| `NEVER_LAUNCHED` | no `.intent` | dispatch fresh |
-| `LAUNCHING` | `.intent` present, `.started` not yet, within grace | poll again; do **not** re-dispatch |
-| `LAUNCH_UNCERTAIN` | `.intent` older than the grace period, still no `.started` | **not** a certification. Re-dispatch (which revokes the old nonce), then treat the old attempt as `role_mutates`-dependent: a straggler that already ran a mutating CLI is indistinguishable from one that never started. |
-| `LAUNCH_ABORTED` | `kind: launch_aborted` — the child could not publish `.started` | certified: no CLI ran. Safe to re-dispatch for **any** role |
-| `RENDER_FAILED` | `kind: render_failed` — the prompt would not render | certified: no CLI ran. Fix the unset variable named in `.err`, then re-dispatch |
-| `LEASE_REVOKED` | `kind: lease_revoked` — a straggler found its nonce superseded | certified: this attempt spent nothing. Informational; the lease holder is authoritative |
-| `RUNNING` | live pid, `pid_starttime` matches | resume polling; do **not** re-dispatch |
-| `ORPHANED` | `.started` present, process gone, no `.rc` | see the table below — **depends on the role** |
-| `COMPLETED` | `.rc` = 0 | read STATUS, proceed |
-| `TIMED_OUT` | `.rc` = 124 | apply the Mode-2 policy |
-| `FAILED` | `.rc` non-zero, not 124 | apply the failure-mode classifier |
-| `CORRUPT` | `.rc` present but not an integer | treat as `FAILED`; surface the transcript path |
-| `INCONSISTENT` | `.rc` without `.intent` | HALT — two runs are sharing one feature folder |
+| `NEVER_LAUNCHED` | no `DISPATCH_STARTED` record for this id | dispatch fresh |
+| `COMPLETED` | recorded, and STATUS present **and valid** | read STATUS, proceed |
+| `UNFINISHED` | recorded, STATUS absent or invalid | **depends on `role_mutates`** — below |
 
-**`ORPHANED` recovery depends on whether the role mutates the repository.** Atomic
-STATUS publication guarantees a half-written *STATUS* is never mistaken for a
-finished one, but it says nothing about code edits, commits, or artifacts the dead
-process already made. Blind re-dispatch would double-apply them.
+`UNFINISHED` recovery is role-dependent, and this is the one place the process
+deliberately stops rather than recovering:
 
-| `role_mutates` | Action on `ORPHANED` |
+| `role_mutates` | Action on `UNFINISHED` |
 |---|---|
-| `no` (reviewers, summarizers, `context-discovery`, preflight, `readiness-writer`) | log `event=DISPATCH_ORPHANED`, re-dispatch once. These roles only read and write their own STATUS/findings, so a repeat is idempotent. |
-| `yes` (`implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `finishing-branch`) | log `event=DISPATCH_ORPHANED`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch, or to keep the partial work and continue. Never auto-retry. |
+| `no` — reviewers, summarizers, `context-discovery`, preflight, `readiness-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: no`, `action: redispatched`, and re-dispatch once. These roles only read and write their own STATUS and findings, so a repeat is idempotent. |
+| `yes` — `implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `finishing-branch` | log `event=DISPATCH_ORPHANED` with `role_mutates: yes`, `action: halted`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, the `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch or keep the partial work. **Never auto-retry.** After the fact nothing can distinguish "the task ran once" from "the task ran twice", and a re-run implementer duplicates commits and re-applies edits. |
 
-This is the one place the process deliberately stops rather than recovering:
-re-running a half-finished implementer is how you get duplicated commits and
-double-applied edits, and no automated check can distinguish "the task was done
-twice" from "the task was done once" after the fact.
+**Write contract.** Long dispatch adds no control files. The orchestrator writes only
+`RUN_LOG.md`, `full_log.md`, `process-improvement-proposition.md` and
+`transcripts/<dispatch-id>.{json,err}`. Nothing else. Appendix content is never written
+to disk: prompts are rendered into a shell variable and delivered by herestring.
+
+Removing the hand-rolled protocol also removed every atomic-publication site the
+orchestrator had, so no `.tmp` companion is written any more either.
 ````
 
 - [ ] **Step 4: Update the one-phase rule and resumability prose**
@@ -3672,26 +3302,27 @@ twice" from "the task was done once" after the fact.
 In the section at lines 88–109, add:
 
 ```markdown
-**Polling is not bundling.** A long dispatch is launched with
-`dispatch_detached` and then polled with `await_dispatch` across several short
-bash invocations. That is still one dispatch for one phase. What remains
-forbidden is combining two numbered phases into one block.
+**A background dispatch is not phase bundling.** Roles whose timeout exceeds a single
+Bash tool call are issued as one Bash call with `run_in_background: true`; the
+orchestrator's next turn begins when that call finishes. That is still one dispatch
+for one phase. What remains forbidden is combining two numbered phases into one block.
 ```
 
 In the resumability section at lines 1610–1619, add:
 
 ```markdown
-Resume reads `RUN_LOG.md` to find the last completed step **and** calls
-`dispatch_state` for the current phase's dispatch. `RUN_LOG.md` alone is
-insufficient: a crash after launch but before completion leaves no `dispatch`
-entry, only the `event=DISPATCH_STARTED` record, and the control files are what
-distinguish a still-running process from an abandoned one.
+Resume reads `RUN_LOG.md` for the last completed step **and** calls `dispatch_state`
+for the current phase's dispatch. `RUN_LOG.md` alone is insufficient: a session that
+died mid-dispatch leaves an `event=DISPATCH_STARTED` block with no matching `dispatch`
+block, and only the STATUS file distinguishes a finished subagent from one killed
+mid-write. A STATUS file that does not pass `validate_status` counts as unfinished.
 ```
 
 - [ ] **Step 5: Run the checks**
 
 Run: `bash tests/check_07_fakecli.sh`
-Expected: PASS — all ten state-machine assertions including PID reuse.
+Expected: PASS — all three states, the invalid-STATUS case, the four `role_mutates`
+rows, appendix validation, and zero CLI invocations on a render failure.
 
 Run: `bash tests/check_05_contract.sh`
 Expected: the `T18:` assertion PASSES.
@@ -3700,12 +3331,13 @@ Expected: the `T18:` assertion PASSES.
 
 ```bash
 git add develop-it-process.md tests/check_07_fakecli.sh
-git commit -m "feat: add resumable detached dispatch
+git commit -m "feat: delegate long dispatch to harness background execution
 
-Long dispatches now survive the launching shell. Adds a deterministic
-dispatch_id, atomic .rc/.started publication, PID-reuse detection via /proc
-starttime, a DISPATCH_STARTED event written before launch, and an eight-state
-classifier with a documented resume action per state."
+Roles exceeding a single Bash call are issued with run_in_background rather than
+a hand-rolled setsid/pid/nonce protocol. Keeps the two load-bearing rules: a
+dispatch is recorded before it runs, and an unfinished MUTATING dispatch halts
+for reconciliation instead of auto-retrying. Three resume states replace
+thirteen; no control files beyond transcripts."
 ```
 
 ---
@@ -3730,13 +3362,22 @@ names its dispatch, reference the role instead. For example, Phase 4:
 Dispatch one `claude` subprocess for role `plan-writer` with the `plan-writer`
 appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`. The subagent loads
 `superpowers:writing-plans` and produces the plan at the skill's default
-location. Because this role's timeout exceeds a single bash invocation, launch it
-with `dispatch_detached 4 00 plan-writer` and poll with `await_dispatch`.
+location. This role's timeout (120 min) exceeds a single Bash tool call, so issue
+the `dispatch_role 4 00 plan-writer <status-path>` call **with
+`run_in_background: true`**; your next turn begins when it finishes.
 ```
 
-Apply the same treatment to every phase. Roles whose timeout is 120 minutes or
-more (`plan-writer`, `implementer`, `code-reviewer-codex`) MUST use
-`dispatch_detached`; the rest may use `claude_invoke` / `codex_invoke` directly.
+Apply the same treatment to every phase. Every dispatch goes through
+`dispatch_role`, which renders, validates, records `event=DISPATCH_STARTED`, invokes
+the CLI, and writes the `dispatch` block. The only difference for a long-running role
+is the tool-call flag:
+
+| Role | Timeout | Bash tool call |
+|---|---|---|
+| `plan-writer`, `implementer`, `code-reviewer-codex` | 120–300 min | `run_in_background: true` |
+| everything else | ≤ 60 min | foreground |
+
+A background call is still one dispatch for one phase — it does not bundle phases.
 
 For Phase 6, the dispatch also pins the sub-subagent model at the CLI. Write it
 exactly as follows — the model must be **generated** from `role_model`, never
@@ -3752,10 +3393,12 @@ agents_json="$(jq -nc --arg m "$(role_model impl-worker)" \
                    prompt:"Follow the task instructions you are given.",
                    model:$m}}')"
 
-# No pipe: dispatch_detached reads no stdin -- the CHILD renders the appendix.
-# Piping into it would render twice, and the pipeline's exit status would report
-# a SIGPIPE from the discarded render *after* the child had already launched.
-dispatch_detached 6 00 implementer --agents "$agents_json"
+# dispatch_role renders internally and takes no stdin. Issue this call with
+# run_in_background: true -- the implementer's 300-minute timeout cannot fit in a
+# foreground Bash call.
+dispatch_role 6 00 implementer \
+  "$FEATURE_FOLDER/6-implementation/implementer-status.md" \
+  --agents "$agents_json"
 ```
 ````
 
@@ -3788,7 +3431,7 @@ git add develop-it-process.md
 git commit -m "refactor: resolve timeouts and models per role at every dispatch site
 
 Removes every literal minute value and every 'Opus'/'Sonnet' class word from the
-phase sections. Roles at 120 min or more are marked for dispatch_detached."
+phase sections. Roles at 120 min or more are marked for background execution."
 ```
 
 ---
@@ -3886,13 +3529,9 @@ Replace each of the four divergent statements with a reference to one canonical 
 - **Canonical write list.** The orchestrator may create directories with
   `mkdir -p` and may write ONLY: `RUN_LOG.md`, `full_log.md`,
   `process-improvement-proposition.md`, and
-  `transcripts/<dispatch-id>.{json,err,rc,pid,started,intent}` — all inside
-  `$FEATURE_FOLDER`. Also permitted: a `<allowed-control-file>.tmp` companion in
-  the SAME directory, and only as the write target of an atomic
-  `> x.tmp && mv x.tmp x` publication. Those temporaries are transient by
-  construction and never outlive the `mv`; a failed publication removes its own
-  `.tmp` and aborts. Nothing else, ever. Reading remains restricted to STATUS
-  files and the per-phase summaries they reference.
+  `transcripts/<dispatch-id>.{json,err}` — all inside `$FEATURE_FOLDER`. Nothing
+  else, ever. Reading remains restricted to STATUS files and the per-phase
+  summaries they reference.
 - **Appendix content is still never written to disk.** There is no `.prompt` file:
   a detached child renders its own appendix from `$PROCESS_PATH`, and an inline
   dispatch pipes it via process substitution. The control files above carry only
@@ -4339,9 +3978,9 @@ README covering the two-root setup and the test tiers."
 **Gap found and closed:** §5.10's `--agents` JSON generation initially had no
 step — Task 5 added the `impl-worker` row and Task 20 the appendix prose, but
 nothing actually built the JSON. Fixed by adding the dispatch form to Task 18
-Step 2, extending `dispatch_detached` to forward trailing arguments (Task 17),
-and giving `codex_invoke` a matching signature so both branches of the detached
-launcher are correct (Task 7).
+Step 2, extending the dispatch helper to forward trailing arguments (Task 17),
+and giving `codex_invoke` a matching signature so both vendor branches are
+correct (Task 7).
 
 **Second gap closed:** the detached child runs under `bash -c`, and shell
 functions do not cross that boundary. Task 17 now exports the functions the child
@@ -4375,6 +4014,14 @@ Nine findings, all reproduced first. Four blockers:
 
 ### Third revision after external review
 
+> **Note on the tables below.** They record what each review found and how it was
+> fixed at the time. Findings that concerned the hand-rolled detach-and-poll protocol
+> — `dispatch_detached`, `publish_atomic`, the nonce lease, attempt-scoped control
+> files, the thirteen-state machine — describe code that the **fourth** revision
+> removed entirely in favour of the harness's background execution. They are kept
+> because they are the evidence that motivated that removal, not because the code
+> still exists. Do not go looking for those helpers in the plan.
+
 Ten findings, all reproduced first. Five were blockers:
 
 | # | Defect | Fix |
@@ -4385,7 +4032,42 @@ Ten findings, all reproduced first. Five were blockers:
 | 4 | `check_03_varcoverage.sh` scraped a python `for key in [...]` literal that Task 14 removes, so it could never turn green | Sources the cookbook and calls `render_keys` |
 | 5 | `CONTEXT7_POLICY` was assigned once "after Phase 1", but every phase is a fresh bash invocation — Phase 4 onward would render with it unset, which is now a hard error | `context7_policy()` reconstructs it from Phase 1 STATUS or the RUN_LOG event at the top of every phase, and HALTs rather than guessing. `preflight-claude` must now write `context7:` and `validate_status` requires it |
 
-Five majors: the nonce test used `FAKE_DELAY`, which lives *inside* the stub and so
+### Fourth revision: launcher architecture reversed
+
+Three consecutive reviews found blockers in the hand-rolled detach-and-poll launcher —
+eleven findings in that one subsystem, each rewrite producing the next round. The tally
+that settled it:
+
+| Subsystem | pass 2 | pass 3 | pass 4 | total |
+|---|---|---|---|---|
+| detached-dispatch launcher | 3 | 3 | 5 | **11** |
+| test harness | 1 | 2 | 3 | 6 |
+| model / render layer | 2 | 2 | 1 | 5 |
+| doc contracts | 2 | 2 | 1 | 5 |
+
+The whole protocol existed to outlive a 10-minute Bash-tool cap, and it had grown a
+launch-intent file, a child-published `.started`, `/proc`-starttime PID-reuse detection,
+a nonce lease, attempt-scoped control files, structured outcome kinds and thirteen
+states. It was reimplementing process supervision the harness already provides.
+
+Task 17 now issues long dispatches as a single Bash tool call with
+`run_in_background: true`. Deleted: `dispatch_detached`, `await_dispatch`,
+`publish_atomic`, `_new_nonce`, `_pid_starttime`, the lease check, attempt scoping, and
+the `.intent`/`.started`/`.pid`/`.rc`/`.outcome` files. Three resume states replace
+thirteen; the section shrank from 661 lines to 292. The `setsid` and `flock`
+dependencies went with it.
+
+Two rules were kept because they were load-bearing rather than incidental: a dispatch is
+**recorded before it runs** (so a resume can tell "never started" from "started and
+died"), and an unfinished **mutating** dispatch **halts for reconciliation** instead of
+auto-retrying (because after the fact nothing distinguishes "ran once" from "ran twice").
+
+The original portability rationale for hand-rolling this — that it would work under a
+non-Claude-Code orchestrator — did not survive scrutiny: the document already depends on
+Claude-Code-shaped tooling at lines 1642, 1650 and 1774, which §8.4 addresses by
+describing those capabilities functionally rather than by removing the dependency.
+
+Third-revision majors: the nonce test used `FAKE_DELAY`, which lives *inside* the stub and so
 only fires after the lease check had already passed — replaced by a
 `DISPATCH_TEST_PRELAUNCH_DELAY_S` hook in the child, before `.started`, which is the
 window a straggler actually occupies; the "exhaustive" STATUS test drew its inputs
@@ -4438,6 +4120,6 @@ mechanical sweep.
 - `iso_now` — defined 10, used 12, 17.
 - `now_ms` / `run_timed` — defined 11, used in the Task 11 example. `run_timed` sets globals, so every call site renders into a variable first and feeds it with `run_timed cmd <<< "$prompt"` — never a pipe (subshell), never command substitution (subshell), and never process substitution (swallows the renderer's exit status).
 - `canon` / `path_in_tree` / `is_git_root` / `validate_roots` — defined 9, used 12, 16.
-- `dispatch_id` / `dispatch_state` / `await_dispatch` / `dispatch_detached` — defined 17, used 18.
+- `dispatch_id` / `dispatch_state` / `dispatch_role` / `log_dispatch_started` — defined 17, used 18. `dispatch_state` sets a global and must never be captured with `$(...)`.
 - `PROCESS_PATH_REL` — set by `validate_roots` (9), consumed by `process_identity` (10).
 - `FEATURE_FOLDER_OUTSIDE_REPO` — set by `validate_roots` (9), consumed by `codex_invoke` (7). **Forward reference:** Task 7 writes the consumer before Task 9 defines the setter. `codex_invoke` reads it as `${FEATURE_FOLDER_OUTSIDE_REPO:-}`, so it is safe under `set -u`; Task 16 is the first test that exercises both together.
