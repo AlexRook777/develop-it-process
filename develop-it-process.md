@@ -81,7 +81,12 @@ For every step that produces or modifies an artifact:
    verdict:                  <verdict>
    ```
 
-The `develop_it_git_sha` records the git HEAD at dispatch time, but the working-tree copy of `$PROCESS_PATH` may have unstaged edits. `develop_it_file_sha256` is the content-addressed identity of the prompt actually used; `develop_it_dirty` is `yes` when the file differs from `git show HEAD:$PROCESS_PATH`. These together let a future run reproduce the exact prompt content.
+`develop_it_git_sha` is `git -C "$PROCESS_REPO_ROOT" rev-parse HEAD`;
+`develop_it_file_sha256` is `sha256sum "$PROCESS_PATH" | cut -d' ' -f1`;
+`develop_it_dirty` is `yes` when the working-tree copy differs from
+`git -C "$PROCESS_REPO_ROOT" show "HEAD:$PROCESS_PATH_REL"`, `no` when it
+matches, and `unknown` outside a git repo. All three describe THIS document, not
+the project under development — a bare `git` call would report the wrong repo.
 
 Failure events (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`) use the event-tagged variant with `failure_mode: <n>`.
 
@@ -424,6 +429,24 @@ validate_roots() {
   fi
   return "$halt"
 }
+
+# ---- Process-file identity (logged in every dispatch entry) -----------------
+# All three fields describe THIS document, so every git call targets
+# PROCESS_REPO_ROOT. A bare `git` call would report the target project instead.
+process_identity() {
+  PROCESS_FILE_SHA256="$(sha256sum "$PROCESS_PATH" | cut -d' ' -f1)"
+  PROCESS_GIT_HEAD="$(git -C "$PROCESS_REPO_ROOT" rev-parse HEAD 2>/dev/null || echo non-git)"
+  if [ "$PROCESS_GIT_HEAD" = non-git ]; then
+    PROCESS_DIRTY=unknown
+  elif git -C "$PROCESS_REPO_ROOT" diff --quiet HEAD -- "$PROCESS_PATH_REL" 2>/dev/null; then
+    PROCESS_DIRTY=no
+  else
+    PROCESS_DIRTY=yes
+  fi
+}
+
+# ---- Timestamp helper (used by log_dispatch and event-tagged RUN_LOG blocks) -
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 ```
 
 All examples below use `python3` (never the bare `python`) and `$PROCESS_PATH` (never the literal `develop-it.md`).
@@ -828,61 +851,41 @@ Pass `$wall_ms` to `parse_usage` as the third argument. For Claude, the function
 This is **the standard helper** every phase step refers to. One call per subprocess invocation, immediately after `parse_usage`. It is the ONLY sanctioned way to record phase progress in `RUN_LOG.md` — do NOT hand-compose abbreviated entries (see the exhaustive-shapes rule in Resumability). It emits the full dispatch block from the Resumability grammar: identity fields, process-file content identity, and the nine telemetry fields.
 
 ```bash
-# log_dispatch <phase> <phase_name> <iteration> <role> <vendor> <appendix> <status_path> <verdict> "<usage_line>"
+# log_dispatch <role> <phase> <phase_name> <iteration> <status_path> <verdict> "<usage_line>"
 #   <usage_line> is the single-line nine-pair output of parse_usage, quoted as ONE argument.
-# Requires: $PROCESS_PATH, $FEATURE_FOLDER. Appends exactly one block + trailing blank line.
+# Requires: $PROCESS_PATH, $FEATURE_FOLDER, and process_identity to have run.
+# vendor/model/appendix are DERIVED from <role> — never pass them separately.
 log_dispatch() {
-  local phase="$1" phase_name="$2" iteration="$3" role="$4" vendor="$5"
-  local appendix="$6" status_path="$7" verdict="$8" usage_line="$9"
-
-  local git_sha file_sha dirty
-  git_sha="$(git rev-parse HEAD 2>/dev/null || echo non-git)"
-  file_sha="$(sha256sum "$PROCESS_PATH" | cut -d' ' -f1)"
-  if [ "$git_sha" = "non-git" ] || git diff --quiet HEAD -- "$PROCESS_PATH" 2>/dev/null; then
-    dirty=no
-  else
-    dirty=yes
-  fi
-
-  # Defaults guard a missing/short usage line — telemetry failure NEVER blocks logging.
-  local model=unknown dur=0 in_new=0 in_cached=0 cache_w=0 out=0 reasoning=0 cost=n/a status=unavailable kv
-  for kv in $usage_line; do
-    case "$kv" in
-      model=*)               model="${kv#*=}" ;;
-      duration_ms=*)         dur="${kv#*=}" ;;
-      tokens_input_new=*)    in_new="${kv#*=}" ;;
-      tokens_input_cached=*) in_cached="${kv#*=}" ;;
-      tokens_cache_write=*)  cache_w="${kv#*=}" ;;
-      tokens_output=*)       out="${kv#*=}" ;;
-      tokens_reasoning=*)    reasoning="${kv#*=}" ;;
-      cost_usd=*)            cost="${kv#*=}" ;;
-      usage_status=*)        status="${kv#*=}" ;;
-    esac
-  done
-
+  # Usage: log_dispatch <role> <phase> <phase_name> <iteration> <status_path> \
+  #                     <verdict> "<usage_line>"
+  # Appends exactly one block plus a trailing blank line. Requires
+  # process_identity to have run.
+  local role="$1" phase="$2" phase_name="$3" iter="$4" status_path="$5"
+  local verdict="$6" usage_line="$7"
+  local vendor model
+  vendor="$(role_vendor "$role")"
+  model="$(role_model "$role")"
   {
-    printf -- '--- %s  dispatch\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '%-26s%s\n' \
-      'phase:'                  "$phase" \
-      'phase_name:'             "$phase_name" \
-      'iteration:'              "$iteration" \
-      'role:'                   "$role" \
-      'vendor:'                 "$vendor" \
-      'appendix:'               "$appendix" \
-      'develop_it_git_sha:'     "$git_sha" \
-      'develop_it_file_sha256:' "$file_sha" \
-      'develop_it_dirty:'       "$dirty" \
-      'status_path:'            "$status_path" \
-      'verdict:'                "$verdict" \
-      'model:'                  "$model" \
-      'duration_ms:'            "$dur" \
-      'tokens_input_new:'       "$in_new" \
-      'tokens_input_cached:'    "$in_cached" \
-      'tokens_cache_write:'     "$cache_w" \
-      'tokens_output:'          "$out" \
-      'tokens_reasoning:'       "$reasoning" \
-      'cost_usd:'               "$cost" \
-      'usage_status:'           "$status"
+    printf -- '--- %s  dispatch\n' "$(iso_now)"
+    printf 'phase:                    %s\n' "$phase"
+    printf 'phase_name:               %s\n' "$phase_name"
+    printf 'iteration:                %s\n' "$iter"
+    printf 'role:                     %s\n' "$role"
+    printf 'vendor:                   %s\n' "$vendor"
+    printf 'model:                    %s\n' "$model"
+    printf 'appendix:                 %s\n' "$role"
+    printf 'develop_it_git_sha:       %s\n' "$PROCESS_GIT_HEAD"
+    printf 'develop_it_file_sha256:   %s\n' "$PROCESS_FILE_SHA256"
+    printf 'develop_it_dirty:         %s\n' "$PROCESS_DIRTY"
+    printf 'status_path:              %s\n' "$status_path"
+    printf 'verdict:                  %s\n' "$verdict"
+    # parse_usage's line ALSO begins with model=, so skip that pair here or the
+    # block would carry two `model:` keys and break the fixed-key-order grammar.
+    local kv
+    for kv in $usage_line; do
+      case "$kv" in model=*) continue ;; esac
+      printf '%-25s %s\n' "${kv%%=*}:" "${kv#*=}"
+    done
     printf '\n'
   } >> "$FEATURE_FOLDER/RUN_LOG.md"
 }
@@ -892,7 +895,7 @@ Usage at a dispatch site:
 
 ```bash
 usage_line="$(parse_usage claude "$out_json" "$wall_ms" claude-opus-4-8)"
-log_dispatch 3 spec-review 01 spec-reviewer-claude claude spec-reviewer-claude \
+log_dispatch spec-reviewer-claude 3 spec-review 01 \
   "3-spec-review/iteration-01/claude-opus-verdict.md" "$(grep -m1 '^verdict:' "$STATUS" | awk '{print $2}')" \
   "$usage_line"
 ```
@@ -1664,7 +1667,12 @@ Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 10 fix→re-revie
 
 `RUN_LOG.md` is append-only and is the source of truth for where the run stopped. **Each entry is a multi-line YAML-ish block separated from the next by a blank line.** Entries are read top-to-bottom; key order within an entry is fixed (as shown below) so humans can scan it. The first line of every entry is `--- <ISO-timestamp>  <event-or-dispatch-tag>` so blocks are visually distinct. There are four block shapes, distinguishable by their tag:
 
-**The block shapes below are EXHAUSTIVE — do not invent entry kinds.** Phase progress is recorded ONLY as one full `dispatch` entry per subprocess invocation, written via the `log_dispatch` cookbook helper — there are no phase-completion marker events and no free-form progress notes. A RUN_LOG made of blocks like `--- <ts>  event=PHASE3_SPEC_SUMMARY` / `verdict: DONE` (no `role`, no `vendor`, no `appendix`, no process-file identity, no telemetry) is the canonical degenerate failure mode this grammar exists to prevent: it destroys resumability, the per-phase Usage tables, the completion-criteria count checks, and the readiness rollup. The ONLY legal `event=` tags are: `CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `HALT`, `IMPLEMENTATION_BASELINE`, `IMPLEMENTATION_BASELINE_BLOCKED`, `CODEX_DISABLED_BY_USER_CONSENT`, `CODEX_SKIPPED_BY_USER_CONSENT`, `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE` (plus the reserved `CODEX_RE_ENABLED_BY_USER`). An event entry NEVER substitutes for the dispatch entry of a subprocess that actually ran.
+**The block shapes below are EXHAUSTIVE — do not invent entry kinds.** Phase progress is recorded ONLY as one full `dispatch` entry per subprocess invocation, written via the `log_dispatch` cookbook helper — there are no phase-completion marker events and no free-form progress notes. A RUN_LOG made of blocks like `--- <ts>  event=PHASE3_SPEC_SUMMARY` / `verdict: DONE` (no `role`, no `vendor`, no `appendix`, no process-file identity, no telemetry) is the canonical degenerate failure mode this grammar exists to prevent: it destroys resumability, the per-phase Usage tables, the completion-criteria count checks, and the readiness rollup. The ONLY legal `event=` tags are: `CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `HALT`,
+`IMPLEMENTATION_BASELINE`, `IMPLEMENTATION_BASELINE_BLOCKED`,
+`CODEX_DISABLED_BY_USER_CONSENT`, `CODEX_SKIPPED_BY_USER_CONSENT`,
+`ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE`, `MODEL_REJECTED`,
+`DISPATCH_STARTED`, `DISPATCH_ORPHANED`, `CONTEXT7_UNAVAILABLE` (plus the reserved
+`CODEX_RE_ENABLED_BY_USER`). An event entry NEVER substitutes for the dispatch entry of a subprocess that actually ran.
 
 **Dispatch entries** (one per subprocess invocation):
 
@@ -1681,7 +1689,7 @@ develop_it_file_sha256:   8c2f6bf5e9d3a4b1f5c7d8e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4
 develop_it_dirty:         no
 status_path:              3-spec-review/iteration-01/claude-opus-verdict.md
 verdict:                  CHANGES_REQUESTED
-model:                    claude-opus-4-8
+model:                    claude-opus-5
 duration_ms:              241830
 tokens_input_new:         18430
 tokens_input_cached:      0
@@ -1692,14 +1700,20 @@ cost_usd:                 0.4823
 usage_status:             ok
 ```
 
-(Relative `status_path` is encouraged; absolute is allowed when ambiguous. `develop_it_git_sha` is `git rev-parse HEAD` at dispatch; `develop_it_file_sha256` is `sha256sum $PROCESS_PATH | cut -d' ' -f1` at dispatch; `develop_it_dirty` is `yes` when the working-tree copy of the file differs from `git show HEAD:$PROCESS_PATH`.)
+(Relative `status_path` is encouraged; absolute is allowed when ambiguous.
+`develop_it_git_sha` is `git -C "$PROCESS_REPO_ROOT" rev-parse HEAD`;
+`develop_it_file_sha256` is `sha256sum "$PROCESS_PATH" | cut -d' ' -f1`;
+`develop_it_dirty` is `yes` when the working-tree copy differs from
+`git -C "$PROCESS_REPO_ROOT" show "HEAD:$PROCESS_PATH_REL"`, `no` when it
+matches, and `unknown` outside a git repo. All three describe THIS document, not
+the project under development — a bare `git` call would report the wrong repo.)
 
 **Usage telemetry fields.** Every dispatch entry MUST carry the nine telemetry fields shown above (`model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`, `usage_status`). Values come from `parse_usage` (see cookbook). Field semantics:
 
 - All token counts are integers; `0` when not applicable to the vendor (`tokens_reasoning` is `0` for Claude; `tokens_cache_write` is `0` for Codex).
 - `cost_usd` is numeric for Claude; the literal string `n/a` for Codex (subscription-priced, no per-call cost).
 - `usage_status` is `ok` or `unavailable`. When `unavailable`, all token fields are `0` and `cost_usd` is `n/a` — but the dispatch entry itself is still written normally. Telemetry parsing failure NEVER blocks logging.
-- `model` is the resolved concrete model id (e.g. `claude-opus-4-8`) of the dispatch's MAIN model. Claude sessions may additionally consume tokens on Claude Code's internal small-model helper (haiku); that auxiliary usage is included in `cost_usd` (which is the whole-subprocess `total_cost_usd`) but never changes `model` — `parse_usage` selects the `modelUsage` key matching the dispatched id. For Codex, use the value from `2-context-discovery/status.md`'s `resolved_models:` map; for pre-Phase-0 dispatches (canary, preflight), use the literal string `codex`.
+- `model` is the resolved concrete model id (e.g. `claude-opus-5`) of the dispatch's MAIN model. Claude sessions may additionally consume tokens on Claude Code's internal small-model helper (haiku); that auxiliary usage is included in `cost_usd` (which is the whole-subprocess `total_cost_usd`) but never changes `model` — `parse_usage` selects the `modelUsage` key matching the dispatched id. `log_dispatch` writes this field itself from `role_model <role>` — the single source of truth for per-role model ids — rather than from `parse_usage`'s output, so it is correct for both vendors and for pre-Phase-0 dispatches (canary, preflight) alike.
 - `duration_ms` is the CLI-reported wall time for Claude (`duration_ms` field in the JSON), and the orchestrator-measured wall time for Codex (Codex JSON omits a duration field).
 
 Existing entries written by prior versions of this process file MAY lack the nine fields. Readers (summarizers, readiness writer) MUST tolerate missing fields by treating them as `usage_status=unavailable` with zero values.
@@ -1783,6 +1797,65 @@ vendor:                   codex
 ```
 
 Downstream consumers (notably the readiness writer) treat a missing per-phase codex STATUS file plus a matching `CODEX_SKIPPED_BY_USER_CONSENT` event for the same `(phase, iteration)` as `SKIPPED`, not as an orchestration bug.
+
+**`MODEL_REJECTED` event** (a pinned model id was rejected by the vendor CLI at preflight):
+
+```
+--- <ISO-timestamp>  event=MODEL_REJECTED
+phase:                    -1
+phase_name:               preflight
+role:                     <role>
+model:                    <rejected id>
+vendor:                   claude | codex
+reason:                   <one line from the CLI>
+```
+
+Consumer: the readiness writer reports this as a HALT cause. The run does not
+continue; there is no substitute for a rejected id.
+
+**`DISPATCH_STARTED` event** (written immediately before a subprocess is launched):
+
+```
+--- <ISO-timestamp>  event=DISPATCH_STARTED
+phase:                    <n>
+phase_name:               <name>
+iteration:                <NN>
+role:                     <role>
+dispatch_id:              <phase>-iter<NN>-<role>
+model:                    <resolved id>
+```
+
+Consumer: resume. Its presence without a matching `dispatch` block means the
+dispatch was launched but never completed; `dispatch_state` then classifies it.
+This event NEVER substitutes for the `dispatch` block of a subprocess that ran to
+completion — both appear for a normal dispatch.
+
+**`DISPATCH_ORPHANED` event** (written by resume when a prior `DISPATCH_STARTED` has no matching `dispatch` block):
+
+```
+--- <ISO-timestamp>  event=DISPATCH_ORPHANED
+phase:                    <n>
+iteration:                <NN>
+role:                     <role>
+dispatch_id:              <phase>-iter<NN>-<role>
+role_mutates:             yes | no
+action:                   redispatched | halted
+```
+
+Consumer: resume and the readiness writer. `role_mutates: yes` always pairs with
+`action: halted` — see the ORPHANED recovery table.
+
+**`CONTEXT7_UNAVAILABLE` event** (context7 MCP tools were unreachable at Phase 1 preflight):
+
+```
+--- <ISO-timestamp>  event=CONTEXT7_UNAVAILABLE
+phase:                    1
+phase_name:               preflight
+degraded_roles:           plan-writer impl-worker debugger test-fixer
+```
+
+Consumer: the readiness writer lists this as a degradation note, and the affected
+appendices treat `context7` as best-effort rather than MUST for this run.
 
 **Per-phase preflight dispatch entries** use the standard dispatch shape with `iteration: 00` to mark them as pre-iteration-loop work. Example:
 

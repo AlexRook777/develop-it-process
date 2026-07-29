@@ -63,4 +63,12 @@ assert_absent 'setsid' "$D" "T8: setsid is not a dependency (no hand-rolled disp
 assert_absent 'for bin in claude codex ' "$D" "T8: codex is not in the hard-required list"
 assert_present 'probe_models\(\)' "$D" "T8: model probe helper exists"
 
+# --- Task 10: provenance targets the process repo ---
+assert_absent 'git rev-parse HEAD 2>/dev/null \|\| echo non-git' "$D" \
+  "T10: no bare git rev-parse for provenance"
+assert_present 'git -C "\$PROCESS_REPO_ROOT" rev-parse HEAD' "$D" \
+  "T10: provenance HEAD comes from the process repo"
+assert_present 'HEAD:\$PROCESS_PATH_REL|HEAD:\$\{PROCESS_PATH_REL\}' "$D" \
+  "T10: git show uses a repo-relative path"
+
 finish
