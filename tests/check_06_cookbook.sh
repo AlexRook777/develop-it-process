@@ -92,4 +92,63 @@ else
   _fail "parse_usage is not defined"
 fi
 
+# --- porcelain_offenders ---
+if declare -F porcelain_offenders >/dev/null; then
+  R="$(mktemp -d)"
+  git -C "$R" init -q
+  mkdir -p "$R/docs/keep" "$R/src"
+  printf 'x\n' > "$R/src/a b.txt"      # a path with a space
+  printf 'x\n' > "$R/src/plain.txt"
+  printf 'x\n' > "$R/docs/keep/k.txt"
+  git -C "$R" add -A
+  git -C "$R" -c user.email=t@t -c user.name=t commit -qm init
+
+  # 1. Clean tree.
+  assert_eq "" "$(porcelain_offenders "$R" docs/keep)" "clean tree yields no offenders"
+
+  # 2. An out-of-scope edit is an offender; an allow-listed one is not.
+  printf 'y\n' >> "$R/src/plain.txt"
+  printf 'y\n' >> "$R/docs/keep/k.txt"
+  assert_eq "src/plain.txt" "$(porcelain_offenders "$R" docs/keep)" \
+    "allow-listed dir is exempt, out-of-scope file is reported"
+  git -C "$R" checkout -q -- .
+
+  # 3. A path containing a space must survive parsing intact.
+  printf 'y\n' >> "$R/src/a b.txt"
+  assert_eq "src/a b.txt" "$(porcelain_offenders "$R" docs/keep)" \
+    "a path with a space is reported intact"
+  git -C "$R" checkout -q -- .
+
+  # 4. A rename is checked on BOTH paths. Moving an out-of-scope file INTO the
+  #    allow-listed dir must still be an offender: something outside it moved.
+  git -C "$R" mv "src/plain.txt" "docs/keep/plain.txt"
+  out="$(porcelain_offenders "$R" docs/keep)"
+  case "$out" in
+    *src/plain.txt*) _ok "rename reports the out-of-scope source path" ;;
+    *) _fail "rename must be checked on both paths, got: [$out]" ;;
+  esac
+  git -C "$R" reset -q --hard
+
+  # 5. Empty allow-list entries must not disable the gate. This was the
+  #    empty-alternation bug: the whole gate silently passed.
+  printf 'y\n' >> "$R/src/plain.txt"
+  assert_eq "src/plain.txt" "$(porcelain_offenders "$R" "" docs/keep "")" \
+    "empty allow-list entries are ignored, not gate-disabling"
+  git -C "$R" checkout -q -- .
+
+  # 6. Boundary-aware: a sibling with the allow-listed name as a prefix is NOT exempt.
+  mkdir -p "$R/docs/keep-backup"
+  printf 'y\n' > "$R/docs/keep-backup/b.txt"
+  git -C "$R" add -A -- docs/keep-backup >/dev/null
+  out="$(porcelain_offenders "$R" docs/keep)"
+  case "$out" in
+    *keep-backup*) _ok "sibling prefix directory is not exempted" ;;
+    *) _fail "docs/keep must not exempt docs/keep-backup, got: [$out]" ;;
+  esac
+
+  rm -rf "$R"
+else
+  _fail "porcelain_offenders is not defined"
+fi
+
 finish

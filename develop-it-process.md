@@ -958,30 +958,75 @@ log_dispatch "$role" 3 spec-review 01 "$status" "$verdict" "$usage_line"
 
 A clean working tree is required for Phase 6 to capture an unambiguous implementation baseline. Discovering the tree is dirty after hours of reviews is wasteful. Check it FIRST.
 
+<!-- lint: cookbook -->
 ```bash
+# Lists working-tree changes in <repo> that are NOT covered by the allow-list.
+# Prints one repo-relative path per line; prints nothing when clean.
+#
+# Four rules earn the complexity here:
+#  1. `--porcelain=v1 -z` is NUL-delimited, so paths with spaces survive.
+#     A rename emits TWO fields: "R  <new>" NUL "<old>" NUL.
+#  2. Allow-list entries are REPO-RELATIVE. Absolute paths can never match
+#     porcelain output.
+#  3. Empty entries are skipped. Joining them into a regex alternation produced
+#     `^(x||)`, which matches everything and silently disabled the gate.
+#  4. Directory entries match boundary-aware (equal, or under "<dir>/"), so
+#     `docs/keep` does not exempt `docs/keep-backup`.
+#
+# Note: git reports an untracked DIRECTORY with a trailing slash
+# ("docs/keep-backup/"), while files have none. Offender output therefore mixes
+# both forms; match with a glob, not an exact string, when asserting on dirs.
+porcelain_offenders() {
+  local repo="$1"; shift
+  local allow=()
+  local a
+  for a in "$@"; do [ -n "$a" ] && allow+=("${a%/}"); done
+
+  _allowed() {
+    local p="$1" d
+    for d in ${allow[@]+"${allow[@]}"}; do
+      [ "$p" = "$d" ] && return 0
+      case "$p" in "$d"/*) return 0 ;; esac
+    done
+    return 1
+  }
+
+  local status path old
+  while IFS= read -r -d '' entry; do
+    status="${entry:0:2}"
+    path="${entry:3}"
+    case "$status" in
+      R*|C*)
+        # Consume the second field: the ORIGINAL path.
+        IFS= read -r -d '' old || old=""
+        # Both sides must be in scope. Checking only the destination would hide
+        # a file being moved OUT of an out-of-scope location.
+        _allowed "$path" || printf '%s\n' "$path"
+        [ -n "$old" ] && { _allowed "$old" || printf '%s\n' "$old"; }
+        ;;
+      *)
+        _allowed "$path" || printf '%s\n' "$path"
+        ;;
+    esac
+  done < <(git -C "$repo" status --porcelain=v1 -z)
+  unset -f _allowed
+}
+
+# Gate: HALT when the target repo has changes outside the allow-list.
+# $PROCESS_PATH is deliberately NOT passed: it lives in the other repository, so
+# it can never appear in this repo's porcelain output. Passing it would be dead
+# weight, not protection.
 dirty_tree_check() {
-  # Allowed dirty paths during a run:
-  #   - $PROCESS_PATH itself (orchestrator may have intentional edits in flight)
-  #   - the canonical spec path (the user may be iterating on it)
-  #   - the canonical plan path AFTER Phase 4 produces it (caller manages this)
-  #   - the per-feature artifacts folder (orchestration state, gitignored or excluded)
-  # Anything else dirty here halts the run — the user must commit or stash.
-  local allow_re
-  allow_re="$(printf '%s|' \
-    "$PROCESS_PATH" \
-    "$SPEC_PATH" \
-    "$FEATURE_FOLDER" \
-    | sed 's/|$//')"
+  # Usage: dirty_tree_check [extra-repo-relative-allow-entries...]
+  local allow=("$@") offenders
+  [ -n "${SPEC_PATH:-}" ] && allow+=("${SPEC_PATH#"$REPO_ROOT"/}")
+  [ -n "${PLAN_PATH:-}" ] && allow+=("${PLAN_PATH#"$REPO_ROOT"/}")
+  [ -n "${FEATURE_FOLDER:-}" ] && allow+=("${FEATURE_FOLDER#"$REPO_ROOT"/}")
 
-  local offenders
-  offenders="$(git status --porcelain 2>/dev/null \
-    | awk '{print $2}' \
-    | grep -Ev "^(${allow_re})" || true)"
-
+  offenders="$(porcelain_offenders "$REPO_ROOT" ${allow[@]+"${allow[@]}"})"
   if [ -n "$offenders" ]; then
-    echo "halt: working tree has uncommitted changes outside allowed paths:" >&2
-    printf '  %s\n' $offenders >&2
-    echo "Commit or stash these, then re-run." >&2
+    echo "halt: working tree has changes outside the orchestration slice:" >&2
+    printf '  %s\n' "$offenders" >&2   # quoted: paths may contain spaces
     return 1
   fi
   return 0
@@ -989,7 +1034,7 @@ dirty_tree_check() {
 ```
 
 Run this twice:
-1. At the very start of Phase 1, **before** creating the feature folder — `$FEATURE_FOLDER` is not yet in the allow-list because it doesn't exist; that's fine, `grep -Ev` returns no offenders for a non-existent path.
+1. At the very start of Phase 1, **before** creating the feature folder — `$FEATURE_FOLDER` is not yet in the allow-list because it doesn't exist; that's fine, an allow-list entry for a non-existent path simply never matches anything in porcelain output.
 2. Again inside Phase 6 Step 6.0 with the artifacts folder included in the allow-list (orchestration artifacts inside `$FEATURE_FOLDER` are expected to be untracked / dirty by that point).
 
 ### Gitignore guard for the artifacts folder
@@ -1427,50 +1472,39 @@ Before dispatching the implementer, record the repository baseline so Phase 7 re
 
 The order of operations matters: the working-tree cleanliness check runs BEFORE the `IMPLEMENTATION_BASELINE` event is written, so a dirty halt never leaves a stale baseline in `RUN_LOG.md`.
 
+<!-- lint: cookbook -->
 ```bash
-# 1. Determine the candidate baseline SHA and tree state.
-IMPLEMENTATION_BASE_SHA=$(git rev-parse HEAD 2>/dev/null || echo non-git)
+capture_implementation_baseline() {
+  IMPLEMENTATION_BASE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo non-git)"
 
-# 2. Determine "dirty outside the implementation slice."
-#    We EXPECT $FEATURE_FOLDER (orchestration artifacts) to be untracked/dirty by this point,
-#    and the spec and plan paths may still be working-tree-only if the user hasn't committed
-#    them yet. Use the cookbook's `dirty_tree_check`, which has those paths in its allow-list,
-#    OR replicate the exclusion inline:
-EXCLUDED_PATHS=(
-  "$PROCESS_PATH"
-  "$SPEC_PATH"
-  "$PLAN_PATH"
-  "$FEATURE_FOLDER"
-)
-OFFENDERS=$(git status --porcelain 2>/dev/null \
-  | awk '{print $2}' \
-  | grep -Fvxf <(printf '%s\n' "${EXCLUDED_PATHS[@]}") \
-  | grep -Fv "$FEATURE_FOLDER/" \
-  || true)
-UNCOMMITTED=$([ -n "$OFFENDERS" ] && echo yes || echo no)
+  # Same allow-list semantics as dirty_tree_check — one helper, so the two
+  # gates cannot diverge. The previous code matched absolute paths against
+  # relative porcelain output with an exact-line filter, so nothing was ever
+  # excluded and Phase 6 HALTed unconditionally.
+  # dirty_tree_check reports offenders on STDERR and signals via its exit code,
+  # so branch on the code and let its diagnostic reach the user directly. Do not
+  # capture its stdout -- it prints nothing there.
+  if ! dirty_tree_check; then
+    echo "halt: uncommitted changes outside the implementation slice; commit or stash first" >&2
+    return 1
+  fi
 
-# 3. Gate on tree cleanliness BEFORE writing the baseline event.
-if [ "$UNCOMMITTED" = "yes" ]; then
-  # Optional advisory log entry, distinct from the consumable baseline event:
-  printf '%s  event=IMPLEMENTATION_BASELINE_BLOCKED  candidate_sha=%s  reason=dirty-tree  offenders=%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$IMPLEMENTATION_BASE_SHA" \
-    "$(echo "$OFFENDERS" | tr '\n' ',' | sed 's/,$//')" \
-    >> "$FEATURE_FOLDER/RUN_LOG.md"
-  # HALT — see narrative below for what to tell the user.
-  exit 1
-fi
-
-# 4. Tree is clean of out-of-scope changes (or non-git). Write the consumable baseline event.
-printf '%s  event=IMPLEMENTATION_BASELINE  base_sha=%s  uncommitted_changes=no\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$IMPLEMENTATION_BASE_SHA" \
-  >> "$FEATURE_FOLDER/RUN_LOG.md"
+  {
+    printf -- '--- %s  event=IMPLEMENTATION_BASELINE\n' "$(iso_now)"
+    printf 'phase:                    6\n'
+    printf 'phase_name:               implementation\n'
+    printf 'base_sha:                 %s\n' "$IMPLEMENTATION_BASE_SHA"
+    printf 'uncommitted_changes:      no\n'
+    printf '\n'
+  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+}
 ```
 
-If `UNCOMMITTED=yes` (i.e. offenders exist outside the allowed paths), HALT and surface to user with the offender list. Pre-existing uncommitted changes outside the implementation slice would pollute the Phase 6 diff scope and the Phase 9 staging scope (the finalizer cannot reliably distinguish "implementer-produced uncommitted changes" from "user's pre-existing uncommitted changes" without external knowledge). The user must resolve before proceeding by committing or stashing. The orchestrator does NOT auto-stash and does NOT accept "proceed anyway" — re-run this prompt after the working tree is clean of out-of-scope changes.
+Call `capture_implementation_baseline` here. On a non-zero return, HALT and surface the offender list — already printed to stderr by `dirty_tree_check` — to the user. Pre-existing uncommitted changes outside the implementation slice would pollute the Phase 6 diff scope and the Phase 9 staging scope (the finalizer cannot reliably distinguish "implementer-produced uncommitted changes" from "user's pre-existing uncommitted changes" without external knowledge). The user must resolve before proceeding by committing or stashing. The orchestrator does NOT auto-stash and does NOT accept "proceed anyway" — re-run this step after the working tree is clean of out-of-scope changes.
 
-Files INSIDE `$FEATURE_FOLDER` (RUN_LOG, STATUS files, transcripts) are expected to be untracked. They are excluded from the dirty check. If `.gitignore` does not yet ignore the `*-artifacts/` pattern, the user was warned in Phase 1; the runtime exclusion above keeps the run unblocked regardless.
+Files INSIDE `$FEATURE_FOLDER` (RUN_LOG, STATUS files, transcripts) are expected to be untracked. They are excluded from the dirty check via `dirty_tree_check`'s allow-list. If `.gitignore` does not yet ignore the `*-artifacts/` pattern, the user was warned in Phase 1; the runtime exclusion above keeps the run unblocked regardless.
 
-The dirty halt writes `event=IMPLEMENTATION_BASELINE_BLOCKED` (advisory, never consumed by downstream subagents) so the audit trail records the attempt. Only `event=IMPLEMENTATION_BASELINE` is the consumable event. Downstream consumers must read the LATEST `event=IMPLEMENTATION_BASELINE` entry in `RUN_LOG.md` (in case a prior failed/aborted run left one or the user resumes).
+The `event=IMPLEMENTATION_BASELINE` entry is a **multi-line block** matching the RUN_LOG grammar (a `--- <timestamp>  event=...` header line followed by `key: value` fields and a trailing blank line) — not the previous single-line form, which the summarizers and the readiness writer could not parse. On a dirty-tree halt, no baseline event is written at all (the function returns before reaching the `RUN_LOG.md` append), so a stale or blocked baseline can never be mistaken for a consumable one. Downstream consumers must read the LATEST `event=IMPLEMENTATION_BASELINE` entry in `RUN_LOG.md` (in case a prior failed/aborted run left one or the user resumes).
 
 If `IMPLEMENTATION_BASE_SHA=non-git`, Phase 9 will be SKIPPED and the code reviewers inspect the working tree directly. Pass `non-git` as the input value to downstream subagents that expect this variable. The baseline event is still written with `base_sha=non-git, uncommitted_changes=no` so consumers have a single source.
 
