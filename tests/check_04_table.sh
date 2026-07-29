@@ -16,9 +16,19 @@ done
 [ "$_FAILURES" -eq 0 ] || finish
 
 rows=0
-while IFS=$'\t' read -r role vendor model effort timeout; do
-  [ -n "$role" ] || continue
+# NOTE: `IFS=$'\t' read` collapses consecutive tabs and trims blank fields
+# because tab is an IFS-whitespace character regardless of what IFS is set
+# to -- it is NOT preserved as a plain delimiter the way e.g. ',' would be.
+# Several roles have a genuinely empty `effort` cell, so field-splitting via
+# `read` silently shifts columns. Use `cut` per field instead, which treats
+# tab as a literal delimiter and preserves empty fields.
+while IFS= read -r _row_line; do
+  [ -n "$_row_line" ] || continue
+  role="$(printf '%s' "$_row_line" | cut -f1)"
   case "$role" in orchestrator) continue ;; esac
+  model="$(printf '%s' "$_row_line" | cut -f3)"
+  effort="$(printf '%s' "$_row_line" | cut -f4)"
+  timeout="$(printf '%s' "$_row_line" | cut -f5)"
   rows=$((rows + 1))
   assert_eq "$model"   "$(role_model   "$role")" "role_model $role"
   assert_eq "$effort"  "$(role_effort  "$role")" "role_effort $role"
