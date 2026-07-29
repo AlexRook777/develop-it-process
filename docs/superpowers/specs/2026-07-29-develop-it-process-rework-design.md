@@ -626,7 +626,8 @@ after the fork instead leaves a window in which a live child has no control file
 resume would read `NEVER_LAUNCHED` and start a duplicate. The split resolves it: the
 parent commits `.intent` before forking, and the child publishes its own `$$` as its
 first action. The residual `.intent`-without-`.started` window is bounded by a grace
-period and classified `LAUNCHING` or `LAUNCH_FAILED`.
+period and classified `LAUNCHING` or `LAUNCH_UNCERTAIN` — the latter deliberately named
+so it cannot be mistaken for proof that no CLI ran.
 
 **No prompt file.** The child renders its own appendix from `$PROCESS_PATH`; inline
 dispatches pipe it via process substitution. Nothing here carries prompt text, so the
@@ -656,13 +657,20 @@ correctly identified, since resume logic at lines 1610–1619 reads only `RUN_LO
 |---|---|---|---|---|---|
 | absent | — | absent | — | `NEVER_LAUNCHED` | dispatch fresh |
 | present | absent | absent | within grace period | `LAUNCHING` | poll again; do **not** re-dispatch |
-| present | absent | absent | past grace period | `LAUNCH_FAILED` | re-dispatch — but see the lease rule below; the grace period alone does **not** prove no CLI will run |
+| present | absent | absent | past grace period | `LAUNCH_UNCERTAIN` | re-dispatch (revoking the old nonce), then treat the old attempt as `role_mutates`-dependent. The grace period alone does **not** prove no CLI ran |
 | present | present | absent | pid alive, starttime matches | `RUNNING` | resume polling; do **not** re-dispatch |
 | present | present | absent | pid dead or starttime differs | `ORPHANED` | **role-dependent** — see below |
 | present | — | valid, `0` | — | `COMPLETED` | read STATUS, proceed |
 | present | — | valid, `124` | — | `TIMED_OUT` | apply the existing Mode-2 policy |
-| present | — | valid, `75` | — | `LEASE_REVOKED` | a straggler found its nonce revoked and exited before spending; informational — the replacement dispatch is authoritative |
-| present | — | valid, `71` | — | `LAUNCH_FAILED` | the child could not publish `.started` and aborted before the CLI; nothing was spent |
+| present | — | any | `kind: lease_revoked` | `LEASE_REVOKED` | certified: this attempt spent nothing. The lease holder is authoritative |
+| present | — | any | `kind: launch_aborted` | `LAUNCH_ABORTED` | certified: the child could not publish `.started` and never invoked the CLI |
+| present | — | any | `kind: render_failed` | `RENDER_FAILED` | certified: the prompt would not render, so no CLI was invoked |
+
+Terminal outcomes are recorded as a structured `kind:` in an `.outcome` file, **not** as
+reserved exit codes. Overloading rc 71/75 would misclassify a real CLI that happens to
+exit with one of those values as "nothing was spent" — a false certification with real
+cost behind it. Only the three `kind:` values above certify non-execution, and only the
+child can write them.
 | present | — | valid, other | — | `FAILED` | apply the existing failure-mode classifier |
 | present | — | malformed | — | `CORRUPT` | treat as `FAILED`; surface the transcript path |
 | absent | — | present | — | `INCONSISTENT` | HALT; indicates concurrent runs on one feature folder |
@@ -684,7 +692,7 @@ artifacts the dead process already made, so blind re-dispatch would double-apply
 A `role_mutates <role>` helper encodes the split so the rule is executable rather than
 prose.
 
-**A launch nonce, not a timeout, is what makes retry safe.** `LAUNCH_FAILED` means only
+**A launch nonce, not a timeout, is what makes retry safe.** `LAUNCH_UNCERTAIN` means only
 "no `.started` appeared within the grace period" — it does **not** prove the child will
 never run. A child slow to schedule, or SIGSTOPped, can miss the window and then wake up
 and invoke the CLI after a replacement dispatch has begun: two CLIs writing one STATUS
@@ -699,7 +707,7 @@ with a deliberately delayed child plus a retry, exactly one CLI invocation occur
 failure branch, so a failed `.intent` or `.started` write would let the launch proceed with
 no durable record — verified reaching "launch" after a failed intent write. Both sites now
 abort: the parent returns non-zero without forking; the child publishes rc `71`
-(`LAUNCH_FAILED`) and exits before spending anything.
+(`kind: launch_aborted`) and exits before spending anything.
 
 Because `71` and `75` are both published *before* the CLI runs, they are the only two
 terminal states that certify nothing was spent.

@@ -41,6 +41,8 @@ Copied verbatim from the spec. Every task's requirements implicitly include thes
 | `tests/run.sh` | Discovers and runs `tests/check_*.sh`; tallies PASS/FAIL/SKIP; `--live` opts into tier 2 |
 | `tests/lib/assert.sh` | Assertion helpers and failure counter. Sourced by every check |
 | `tests/lib/extract.py` | Parses the document; extracts `lint: cookbook` and `lint: snippet` blocks; emits the role table as TSV |
+| `tests/lib/verdicts.py` | Emits `<appendix>\t<declared verdict line>` per appendix, read straight from the bodies. Independent of the cookbook, so the STATUS-schema test is not circular |
+| `tests/lib/sideeffects.sh` | Sources a file under `set -o functrace` with a DEBUG trap, listing every top-level command it executes |
 | `tests/check_01_lint.sh` | Tier 1 check 1 — `bash -n` all blocks, `shellcheck` the cookbook |
 | `tests/check_02_markers.sh` | Tier 1 check 3 — marker balance; no constructed appendix names |
 | `tests/check_03_varcoverage.sh` | Tier 1 check 4 — every `$VAR` in an appendix is substituted by `render_prompt` |
@@ -354,6 +356,63 @@ fi
 exit 0
 ```
 
+- [ ] **Step 5b: Add the two independent probe helpers**
+
+`tests/lib/verdicts.py` — reads verdict declarations straight from the appendix
+bodies. It deliberately does not touch the cookbook, so `check_06_cookbook.sh` can
+compare the document against `_status_verdicts` without the test feeding the
+validator its own table:
+
+```python
+#!/usr/bin/env python3
+"""Print "<appendix>\\t<declared verdict line>" for every appendix in the doc."""
+import re
+import sys
+
+text = open(sys.argv[1]).read()
+for m in re.finditer(r"<!-- BEGIN: ([a-z0-9-]+) -->(.*?)<!-- END: \1 -->", text, re.S):
+    name, body = m.group(1), m.group(2)
+    v = re.search(r"^verdict: (.+)$", body, re.M)
+    if v:
+        print(f"{name}\t{v.group(1).strip()}")
+```
+
+`tests/lib/sideeffects.sh` — lists every top-level command a file executes when
+sourced. `set -o functrace` is what makes the DEBUG trap fire inside a sourced
+file; without it the trap sees only the `source` call itself:
+
+```bash
+#!/usr/bin/env bash
+# Usage: sideeffects.sh <file-to-source>
+# Prints one line per top-level command the file executes. Silence means the file
+# is definitions-only. Exits 9 if the file cannot be sourced at all.
+#
+# functrace is REQUIRED: without it the DEBUG trap does not fire for commands
+# inside the sourced file. Verified: with functrace the trap reports `umask 000`
+# and `touch ...` but NOT `f() { :; }` -- function definitions are invisible to
+# it, which is exactly the discrimination this check needs.
+target="$1"
+# The probe's own statements would also be traced, so every line of this script
+# that runs while the trap is armed is in the ignore list. Patterns are
+# SINGLE-quoted: $BASH_COMMAND holds the literal text `source "$target"`, not the
+# resolved path.
+set -o functrace
+trap 'case "$BASH_COMMAND" in
+        '\''source "$target"'\''|'\''trap - DEBUG'\''|'\''exit 0'\'') ;;
+        *) printf "%s\n" "$BASH_COMMAND" ;;
+      esac' DEBUG
+# shellcheck source=/dev/null
+source "$target"
+trap - DEBUG
+exit 0
+```
+
+Note the exit-status contract: this script exits `0` when the file sourced, and
+non-zero when it did not — but **not with a chosen sentinel**. A top-level
+`${VAR:?}` kills the shell inside `source`, so nothing after it runs and the status
+is bash's own (1). Verified. Callers must therefore treat *any* non-zero as "did
+not source cleanly" rather than testing for a specific code.
+
 - [ ] **Step 6: Make scripts executable and ignore the build dir**
 
 ```bash
@@ -543,19 +602,18 @@ for b in bodies:
 PY
 )"
 
-# 2. Collect the substitution list from render_prompt's python body.
-subst="$(python3 - "$PROCESS_DOC" <<'PY' | sort -u
-import re, sys
-text = open(sys.argv[1]).read()
-m = re.search(r"for key in \[(.*?)\]:", text, re.S)
-if m:
-    for q in re.findall(r'"([A-Z][A-Z0-9_]*)"', m.group(1)):
-        print(q)
-PY
-)"
-
+# 2. Collect the substitution list by ASKING the cookbook, not by parsing it.
+#    The keys live in the shell function render_keys(). An earlier version of this
+#    check scraped a python `for key in [...]` literal that Task 14 removes, so it
+#    could never have turned green.
+load_cookbook || finish
+if ! declare -F render_keys >/dev/null; then
+  _fail "render_keys is not defined in the cookbook"
+  finish
+fi
+subst="$(render_keys | sort -u)"
 if [ -z "$subst" ]; then
-  _fail "could not locate render_prompt's substitution list"
+  _fail "render_keys returned nothing"
   finish
 fi
 
@@ -1130,6 +1188,10 @@ Add the `probe_models` helper to the same `<!-- lint: cookbook -->` block:
 # Verify every pinned model id is accepted. Cheap but NOT free: one minimal
 # call per distinct id. A rejection HALTs — there is no fallback.
 probe_models() {
+  # Usage: probe_models <codex_present:yes|no>
+  # A missing codex binary is NOT a rejected model; probing it anyway mislabels an
+  # environment defect as a Models-table error.
+  local codex_present="${1:-yes}"
   local role model rc=0
   local -A seen=()
   for role in $(_role_keys); do
@@ -1142,6 +1204,7 @@ probe_models() {
           --dangerously-skip-permissions - >/dev/null 2>&1 \
           || { echo "model rejected: role=$role model=$model vendor=claude" >&2; rc=1; } ;;
       codex)
+        [ "$codex_present" = yes ] || continue
         printf 'ok\n' | codex -a never -m "$model" exec -C "$REPO_ROOT" \
           -s read-only --skip-git-repo-check --json - >/dev/null 2>&1 \
           || { echo "model rejected: role=$role model=$model vendor=codex" >&2; rc=1; } ;;
@@ -1177,8 +1240,19 @@ _role_keys() {
 In Phase −1 Step 1.0, insert as a new numbered step after `canary_preflight`:
 
 ```markdown
-3. Run `probe_models`. Every pinned id in the Models table must be accepted by
-   its CLI. On any rejection, HALT: print each `role=<role> model=<id>` line,
+3. Run `probe_models`, **but branch on `codex_present` first**. The probe invokes
+   both CLIs; running it while the Codex binary is absent reports `MODEL_REJECTED`
+   for `gpt-5.6-sol` when the real condition is `CODEX_UNAVAILABLE` mode 0 — a
+   misdiagnosis that sends the user to edit the Models table instead of installing
+   the CLI. Pass the canary's flag through:
+
+   ```bash
+   probe_models "$codex_present"   # "yes" | "no"
+   ```
+
+   When it is `no`, every codex row is skipped and the existing Mode-0 branch below
+   handles the missing binary on its own terms. Every id it does probe must be
+   accepted. On any rejection, HALT: print each `role=<role> model=<id>` line,
    state that this document pins models deliberately and has no fallback, and
    instruct the user to update the Models table. Log
    `event=MODEL_REJECTED` with the offending roles to `RUN_LOG.md` before
@@ -1801,10 +1875,17 @@ appendix_exists "$role" || { echo "halt: no appendix for role $role" >&2; return
 #                                      which bash runs in a SUBSHELL, so both
 #                                      globals are discarded.
 #   wall="$(run_timed …)"           -> same problem, plus it captures nothing.
-#   run_timed … < <(render_prompt …) -> run_timed stays in THIS shell. Correct.
-# It also keeps the prompt off disk, satisfying "appendix content is NEVER
-# written to disk".
-run_timed claude_invoke "$role" "$out_json" "$err_txt" < <(render_prompt "$role")
+#   run_timed … <<< "$prompt"        -> run_timed stays in THIS shell. Correct.
+# A herestring, not process substitution: `< <(render_prompt …)` would also keep
+# run_timed in this shell, but it DISCARDS the renderer's exit status, so a failed
+# render silently becomes a zero-byte prompt with rc 0 (verified). Render into a
+# variable, check it, then feed it. The prompt still never touches a file we
+# manage, satisfying "appendix content is NEVER written to disk".
+# Render and CHECK before spending. Process substitution would swallow a render
+# failure and hand the CLI an empty prompt with rc 0 -- verified.
+prompt="$(render_prompt "$role")" || { echo "halt: render failed for $role" >&2; return 1; }
+[ -n "$prompt" ] || { echo "halt: empty prompt for $role" >&2; return 1; }
+run_timed claude_invoke "$role" "$out_json" "$err_txt" <<< "$prompt"
 
 usage_line="$(parse_usage claude "$out_json" "$DISPATCH_WALL_MS" "$(role_model "$role")")"
 verdict="$(status_field "$status" verdict)"
@@ -2498,9 +2579,23 @@ EOF
     && _fail "SKIPPED is not legal for spec-fixer" \
     || _ok "spec-fixer rejects SKIPPED"
 
-  # EXHAUSTIVE: every dispatched role must have a schema, and every verdict the
-  # role's appendix declares must validate. This is what stops the table from
-  # drifting away from the appendices.
+  # EXHAUSTIVE + NON-CIRCULAR. Inputs are extracted from the APPENDIX BODIES, not
+  # from _status_verdicts -- feeding the validator its own table would make schema
+  # drift invisible, which is the whole failure this check exists to prevent.
+  #
+  # Each appendix declares its verdicts on a line like:
+  #     verdict: DONE | FAILED | NEEDS_DEBUG | BLOCKED
+  drift=""
+  while IFS=$'\t' read -r a declared; do
+    [ -n "$a" ] || continue
+    coded="$(_status_verdicts "$a" 2>/dev/null | tr ' ' '\n' | sort | tr '\n' ' ')"
+    want="$(printf '%s' "$declared" | tr '|' '\n' | tr -d ' ' \
+            | "$GREP_BIN" -v '^$' | sort | tr '\n' ' ')"
+    [ "$coded" = "$want" ] || drift="$drift
+  $a: appendix declares [$want] but _status_verdicts returns [$coded]"
+  done < <(python3 "$_TESTS_DIR/lib/verdicts.py" "$PROCESS_DOC")
+  assert_eq "" "$drift" "_status_verdicts matches every appendix declared verdict line"
+
   missing_schema=""
   for r in $(_role_keys); do
     [ "$r" = impl-worker ] && continue    # sub-subagent: writes no STATUS
@@ -2967,7 +3062,9 @@ global options after exec, so it cannot mask that ordering bug."
   - `role_mutates <role>` → `yes|no` — drives `ORPHANED` recovery
   - `appendix_exists <role>` → rc 0/1 — pre-launch validation
   - `dispatch_detached <phase> <iter> <role> [extra CLI args...]` — writes `.intent`, forks; the **child** publishes `.started`/`.pid`/`.rc` and renders its own prompt. Reads no stdin.
-  - `dispatch_state <phase> <iter> <role>` — **sets the globals `DISPATCH_STATE` and `DISPATCH_RC`**; echoes nothing. One of `NEVER_LAUNCHED LAUNCHING LAUNCH_FAILED RUNNING ORPHANED COMPLETED TIMED_OUT FAILED CORRUPT INCONSISTENT`. Must be called directly: `$(dispatch_state …)` runs it in a subshell and discards `DISPATCH_RC`.
+  - `dispatch_state <phase> <iter> <role>` — **sets the globals `DISPATCH_STATE` and `DISPATCH_RC`**; echoes nothing. Must be called directly: `$(dispatch_state …)` runs it in a subshell and discards `DISPATCH_RC`. The complete state set, in two groups:
+    - *Nothing was spent* (safe to re-dispatch for any role): `NEVER_LAUNCHED`, `LAUNCH_ABORTED` (the child could not publish `.started`), `LEASE_REVOKED` (a straggler found its nonce superseded), `RENDER_FAILED` (the prompt would not render).
+    - *A CLI may have run* — recovery depends on `role_mutates`: `LAUNCHING`, `LAUNCH_UNCERTAIN` (grace expired with no `.started`; this does **not** certify non-execution), `RUNNING`, `ORPHANED`, `COMPLETED`, `TIMED_OUT`, `FAILED`, `CORRUPT`, `INCONSISTENT`.
   - `await_dispatch <phase> <iter> <role> <max_wait_s>` — polls, setting the same globals; returns 0 on a terminal state, 1 if still `RUNNING`/`LAUNCHING`
   - `DISPATCH_START_GRACE_S` — how long `.intent` may exist without `.started` before the launch is called failed
 
@@ -3049,11 +3146,28 @@ id="$(dispatch_id 3 09 summarizer-spec)"; mk_intent "$id"
 assert_eq LAUNCHING "$(state_of 3 09 summarizer-spec)" \
   "fresh intent without .started is LAUNCHING, not NEVER_LAUNCHED"
 
-# 10. LAUNCH_FAILED: the fork never took. Age the intent past the grace period.
+# 10. LAUNCH_UNCERTAIN: grace expired with no .started. This state does NOT
+#     certify that no CLI ran -- only the child can certify that, via
+#     kind: launch_aborted. Age the intent past the grace period.
 DISPATCH_START_GRACE_S=1
 touch -d '1 hour ago' "$T/$id.intent"
-assert_eq LAUNCH_FAILED "$(state_of 3 09 summarizer-spec)" \
-  "a stale intent with no .started is LAUNCH_FAILED"
+assert_eq LAUNCH_UNCERTAIN "$(state_of 3 09 summarizer-spec)" \
+  "a stale intent with no .started is LAUNCH_UNCERTAIN (not a certification)"
+
+# 10b. Certified non-execution is a KIND, not an exit code. A CLI that genuinely
+#      exits 71 must read as FAILED, not as "nothing was spent".
+id="$(dispatch_id 3 13 summarizer-spec)"; mk_intent "$id"; mk_started "$id" 999999 1
+printf 'kind: cli_exit\nrc: 71\n' > "$T/$id.outcome"
+printf '71\n' > "$T/$id.rc"
+assert_eq FAILED "$(state_of 3 13 summarizer-spec)" \
+  "a real CLI exiting 71 is FAILED, not LAUNCH_ABORTED"
+printf 'kind: launch_aborted\nrc: 0\n' > "$T/$id.outcome"
+printf '0\n' > "$T/$id.rc"
+assert_eq LAUNCH_ABORTED "$(state_of 3 13 summarizer-spec)" \
+  "kind: launch_aborted certifies that nothing was spent"
+printf 'kind: render_failed\nrc: 0\n' > "$T/$id.outcome"
+assert_eq RENDER_FAILED "$(state_of 3 13 summarizer-spec)" \
+  "kind: render_failed certifies that nothing was spent"
 DISPATCH_START_GRACE_S=30
 
 # 11. .rc without .intent -> INCONSISTENT (two runs on one folder).
@@ -3072,16 +3186,25 @@ assert_eq yes "$(role_mutates finishing-branch)" "the git finalizer mutates"
 assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" \
   "launch is recorded in RUN_LOG before the process starts"
 
-# 13a. NONCE LEASE: a straggler child must not run after a retry. Launch a slow
-#      child, re-dispatch over it, and assert exactly ONE CLI invocation.
+# 13a. NONCE LEASE: a straggler child must not run after a retry.
+#
+#      The delay MUST occur before the child reaches its lease check. FAKE_DELAY
+#      lives inside the stub, which only runs AFTER the lease check has already
+#      passed -- using it here would simply start two CLIs and prove nothing.
+#      DISPATCH_TEST_PRELAUNCH_DELAY_S is honoured by the child wrapper as its
+#      first action, before .started and before the lease check, which is the
+#      window a slow-to-schedule or SIGSTOPped child actually occupies.
 : > "$FAKE_ARGV_LOG"
-FAKE_DELAY=4 dispatch_detached 3 11 summarizer-spec    # slow to reach the CLI
+DISPATCH_TEST_PRELAUNCH_DELAY_S=6 dispatch_detached 3 11 summarizer-spec
 sleep 1
 dispatch_detached 3 11 summarizer-spec                 # retry revokes the nonce
 await_dispatch 3 11 summarizer-spec 60
-sleep 5                                                # let the straggler wake
-assert_eq 1 "$("$GREP_BIN" -c 'claude ' "$FAKE_ARGV_LOG")" \
+sleep 8                                                # let the straggler wake up
+assert_eq 1 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG")" \
   "the nonce lease admits exactly one CLI invocation after a retry"
+# And the straggler must have recorded WHY it declined.
+assert_present 'kind: lease_revoked' "$T/"*.outcome \
+  "the revoked straggler recorded a lease_revoked outcome"
 
 # 13b. A failed .intent publication must abort BEFORE forking.
 ro="$WORK/readonly"; mkdir -p "$ro/transcripts"; chmod 500 "$ro/transcripts"
@@ -3142,11 +3265,23 @@ Control files live beside the transcript:
 
 | File | Written by | When | Content |
 |---|---|---|---|
-| `<id>.intent` | parent | **before** the fork | `dispatch_id`, `role`, `vendor`, `model`, `timeout_s`, `intent_at` — no pid, which is the point |
-| `<id>.started` | **child** | its first action | `dispatch_id`, `pid` (`$$`), `pid_starttime`, `started_at` |
-| `<id>.pid` | child | after `.started` | pid only, for cheap liveness checks |
-| `<id>.rc` | child | on exit | exit code, one integer |
-| `<id>.json` / `.err` | the CLI | during the run | stdout / stderr |
+Control files are **attempt-scoped**: each retry writes its own set under
+`<id>.<nonce>.*`, and the single unscoped `<id>.intent` names which nonce is
+authoritative. Sharing one `.rc` or `.json` across attempts is a data race — a
+revoked straggler would overwrite the lease holder's exit code or transcript.
+
+| File | Written by | When | Content |
+|---|---|---|---|
+| `<id>.intent` | parent | **before** the fork | `dispatch_id`, `role`, `vendor`, `model`, `timeout_s`, `nonce`, `intent_at`. The only unscoped file; it is the index that says which attempt owns this dispatch |
+| `<id>.<nonce>.started` | **child** | its first action | `dispatch_id`, `pid` (`$$`), `pid_starttime`, `nonce`, `started_at` |
+| `<id>.<nonce>.pid` | child | after `.started` | pid only, for cheap liveness checks |
+| `<id>.<nonce>.outcome` | child | at every terminal point | `kind:` ∈ {`cli_exit`, `launch_aborted`, `lease_revoked`, `render_failed`}, `rc:`, `nonce:` |
+| `<id>.<nonce>.rc` | child | on exit | exit code, one integer. A `lease_revoked` straggler writes none — that record belongs to the lease holder |
+| `<id>.<nonce>.json` / `.err` | the CLI | during the run | stdout / stderr |
+
+`dispatch_state` resolves the authoritative attempt through `.intent` and exports
+`DISPATCH_BASE`, so consumers (the readiness writer, failure classifiers) locate the
+right transcript without re-deriving the nonce themselves.
 
 There is deliberately **no `.prompt` file**. The child renders the appendix itself
 from `$PROCESS_PATH`, so appendix content is never written to disk — the rule at
@@ -3162,6 +3297,29 @@ gap between "decided to launch" and "child running".
 
 <!-- lint: cookbook -->
 ```bash
+# Publish a control file atomically, or fail cleanly. Reads content from stdin.
+#
+# This exists because the obvious inline form is WRONG:
+#     if ! { printf ...; } > x.tmp && mv x.tmp x; then abort; fi
+# `!` binds to the first pipeline only, so this parses as `(! write) && mv`.
+# When the write SUCCEEDS, `!` makes it false, the `&&` short-circuits — so `mv`
+# never runs — and the `then` branch is skipped too, so the abort never runs
+# either. Verified: moved=no, failure_branch=not_taken. The file silently stays a
+# .tmp forever and every reader sees the control file as absent.
+#
+# One helper, used everywhere, so the pattern is written correctly once and every
+# failure path removes its own .tmp.
+publish_atomic() {
+  # Usage: <producer> | publish_atomic <final-path>
+  local final="$1" tmp="$1.tmp"
+  if cat > "$tmp" && mv "$tmp" "$final"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  echo "publish_atomic: could not publish $final" >&2
+  return 1
+}
+
 dispatch_id() { printf '%s-iter%s-%s\n' "$1" "$2" "$3"; }
 
 _pid_starttime() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
@@ -3197,7 +3355,6 @@ dispatch_detached() {
   local id tdir base vendor model timeout_s
   id="$(dispatch_id "$phase" "$iter" "$role")"
   tdir="$FEATURE_FOLDER/transcripts"; mkdir -p "$tdir"
-  base="$tdir/$id"
   vendor="$(role_vendor "$role")"
   model="$(role_model "$role")"   || return 1
   timeout_s=$(( $(role_timeout "$role") * 60 ))
@@ -3212,13 +3369,21 @@ dispatch_detached() {
   #
   #    The nonce is what makes a retry safe. A grace-period timeout alone cannot
   #    prove no child will run: a child that was slow to schedule, or SIGSTOPped,
-  #    can miss the window, be classified LAUNCH_FAILED, and then wake up and
+  #    can miss the window, be classified LAUNCH_UNCERTAIN, and then wake up and
   #    invoke the CLI *after* a replacement dispatch has started — two CLIs, one
   #    dispatch id. Verified reproducible. So every child re-reads the intent
   #    immediately before invoking the CLI and exits if its nonce no longer owns
   #    it; a retry writes a fresh nonce, revoking the old one.
+  # ATTEMPT-SCOPED paths. Every retry gets its own file set, keyed by nonce.
+  # Sharing one .started/.pid/.rc/.json across attempts is a data race: a revoked
+  # straggler would overwrite the lease holder's exit code, pid record, or
+  # transcript. `.intent` is the only unscoped file, and it names the authoritative
+  # nonce -- so `<id>.intent` is the index and `<id>.<nonce>.*` are the attempts.
   local nonce
   nonce="$(_new_nonce)"
+  base="$tdir/$id.$nonce"
+  # A failed intent write MUST abort before forking, or the launch proceeds with
+  # no durable record — verified reaching "launch" after a failed intent write.
   if ! { printf 'dispatch_id: %s\n' "$id"
          printf 'role: %s\n' "$role"
          printf 'vendor: %s\n' "$vendor"
@@ -3226,12 +3391,8 @@ dispatch_detached() {
          printf 'timeout_s: %s\n' "$timeout_s"
          printf 'nonce: %s\n' "$nonce"
          printf 'intent_at: %s\n' "$(iso_now)"
-       } > "$base.intent.tmp" && mv "$base.intent.tmp" "$base.intent"; then
-    # A failed intent write MUST abort. Without this branch the `&& mv` chain
-    # simply falls through and the launch proceeds with no durable record —
-    # verified: execution reached "launch" after a failed intent write.
-    echo "halt: could not publish dispatch intent at $base.intent" >&2
-    rm -f "$base.intent.tmp"
+       } | publish_atomic "$tdir/$id.intent"; then
+    echo "halt: could not publish dispatch intent for $id" >&2
     return 1
   fi
 
@@ -3253,7 +3414,13 @@ dispatch_detached() {
   #    codex_invoke reads REPO_ROOT / FEATURE_FOLDER / FEATURE_FOLDER_OUTSIDE_REPO
   #    under `set -u`. Passing them via `env` is explicit and does not depend on
   #    whatever the caller happened to export.
-  export -f claude_invoke codex_invoke render_prompt appendix_exists \
+  # EVERY function the child calls, transitively. render_prompt calls
+  # render_keys; omitting it made the child die with `render_keys: command not
+  # found` (rc 127) *after* publishing .started, which looks like a CLI failure.
+  # check_07_fakecli.sh asserts a detached dispatch actually completes, which is
+  # what catches an omission here.
+  export -f claude_invoke codex_invoke render_prompt render_keys \
+            appendix_exists publish_atomic \
             role_model role_effort role_timeout role_vendor \
             _role_row _role_field
 
@@ -3264,6 +3431,7 @@ dispatch_detached() {
     REPO_ROOT="$REPO_ROOT"
     FEATURE_FOLDER="$FEATURE_FOLDER"
     FEATURE_FOLDER_OUTSIDE_REPO="${FEATURE_FOLDER_OUTSIDE_REPO:-}"
+    DISPATCH_TEST_PRELAUNCH_DELAY_S="${DISPATCH_TEST_PRELAUNCH_DELAY_S:-}"
     PROCESS_PATH="$PROCESS_PATH"
     PYTHON_BIN="$PYTHON_BIN"
     GREP_BIN="$GREP_BIN"
@@ -3276,39 +3444,69 @@ dispatch_detached() {
     set -uo pipefail
     base="$1"; vendor="$2"; role="$3"; nonce="$4"; shift 4
 
+    # Test-only hook: simulate a child that is slow to be scheduled. It must sit
+    # BEFORE .started and before the lease check, because that is the window in
+    # which a straggler is mistaken for a failed launch. Unset in normal runs.
+    [ -n "${DISPATCH_TEST_PRELAUNCH_DELAY_S:-}" ] \
+      && sleep "$DISPATCH_TEST_PRELAUNCH_DELAY_S"
+
     # 3. First action: publish .started with our OWN pid. No parent-side window.
     #    A failed publication must abort BEFORE the CLI runs, or an unrecorded
     #    child would burn tokens while the orchestrator believes nothing launched.
+    # Outcomes are recorded as a STRUCTURED kind, never as a reserved exit code.
+    # Overloading rc 71/75 would misclassify a real CLI that happens to exit 71 or
+    # 75 as "nothing was spent" -- a false certification with real cost attached.
+    _outcome() { printf "kind: %s\nrc: %s\nnonce: %s\n" "$1" "$2" "$nonce" \
+                   | publish_atomic "$base.outcome"; }
+
     if ! { printf "dispatch_id: %s\n" "${base##*/}"
            printf "pid: %s\n" "$$"
            printf "pid_starttime: %s\n" "$(awk "{print \$22}" "/proc/$$/stat")"
            printf "nonce: %s\n" "$nonce"
            printf "started_at: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-         } > "$base.started.tmp" && mv "$base.started.tmp" "$base.started"; then
-      rm -f "$base.started.tmp"
-      printf "%s\n" 71 > "$base.rc.tmp" && mv "$base.rc.tmp" "$base.rc"
-      exit 71
+         } | publish_atomic "$base.started"; then
+      _outcome launch_aborted 0
+      printf "%s\n" 0 | publish_atomic "$base.rc"
+      exit 0
     fi
-    printf "%s\n" "$$" > "$base.pid.tmp" && mv "$base.pid.tmp" "$base.pid"
+    printf "%s\n" "$$" | publish_atomic "$base.pid" || true
 
     # 4. LEASE CHECK, immediately before spending anything. If the orchestrator
     #    gave up on us and re-dispatched, the intent now carries a different
     #    nonce and we must not run: otherwise two CLIs share one dispatch id and
     #    both write the same STATUS path.
-    current_nonce="$(sed -n "s/^nonce: //p" "$base.intent" 2>/dev/null)"
+    # The intent is at the UNSCOPED path: it is the shared index that says which
+    # attempt currently owns this dispatch id.
+    intent="${base%.*}.intent"
+    current_nonce="$(sed -n "s/^nonce: //p" "$intent" 2>/dev/null)"
     if [ "$current_nonce" != "$nonce" ]; then
-      printf "%s\n" 75 > "$base.rc.tmp" && mv "$base.rc.tmp" "$base.rc"
-      exit 75    # lease revoked; a replacement dispatch owns this id
+      _outcome lease_revoked 0
+      exit 0     # lease revoked; a replacement dispatch owns this id.
+                 # Deliberately does NOT touch .rc: that record belongs to
+                 # whichever attempt currently holds the lease.
     fi
 
+    # Render FIRST, into memory, and check the status. Process substitution
+    # cannot be used here: `cmd < <(render_prompt ...)` discards the renderer's
+    # exit status entirely -- verified, a renderer returning 42 still ran the
+    # consumer with zero bytes and yielded rc 0. That would send an EMPTY prompt
+    # to a real model and bill for it.
+    if ! prompt="$(render_prompt "$role")" || [ -z "$prompt" ]; then
+      _outcome render_failed 0
+      printf "%s\n" 0 | publish_atomic "$base.rc"
+      exit 0           # no CLI was invoked; nothing was spent
+    fi
     if [ "$vendor" = codex ]; then
-      codex_invoke "$role" "$base.json" "$base.err" "$@" < <(render_prompt "$role")
+      codex_invoke "$role" "$base.json" "$base.err" "$@" <<< "$prompt"
     else
-      claude_invoke "$role" "$base.json" "$base.err" "$@" < <(render_prompt "$role")
+      claude_invoke "$role" "$base.json" "$base.err" "$@" <<< "$prompt"
     fi
     rc=$?
+    # A genuine CLI exit. The kind distinguishes it from the pre-spend outcomes
+    # above, so rc is free to be ANY value the CLI chooses -- including 71 or 75.
+    _outcome cli_exit "$rc"
     # Atomic publication: a poller must never read a partial .rc.
-    printf "%s\n" "$rc" > "$base.rc.tmp" && mv "$base.rc.tmp" "$base.rc"
+    printf "%s\n" "$rc" | publish_atomic "$base.rc"
   ' _ "$base" "$vendor" "$role" "$nonce" "$@" >/dev/null 2>&1 &
   disown $! 2>/dev/null || true
   return 0
@@ -3324,53 +3522,82 @@ _new_nonce() { printf '%s-%s\n' "$$" "${EPOCHREALTIME/[.,]/}"; }
 # caller would see it unset. Call directly, then read $DISPATCH_STATE.
 dispatch_state() {
   # Usage: dispatch_state <phase> <iter> <role>  -> DISPATCH_STATE, DISPATCH_RC
-  local base rc pid recorded current age
-  base="$FEATURE_FOLDER/transcripts/$(dispatch_id "$1" "$2" "$3")"
+  # Also sets DISPATCH_BASE to the authoritative attempt's path prefix, so callers
+  # can locate its transcript without re-deriving the nonce.
+  local id idbase intent nonce base rc pid recorded current age
+  id="$(dispatch_id "$1" "$2" "$3")"
+  idbase="$FEATURE_FOLDER/transcripts/$id"
+  intent="$idbase.intent"
   DISPATCH_RC=""
   DISPATCH_STATE=""
+  DISPATCH_BASE=""
+
+  # Resolve which attempt is authoritative. Without .intent there is no dispatch.
+  if [ ! -f "$intent" ]; then
+    # A stray .rc with no intent means two runs are sharing this feature folder.
+    if compgen -G "$idbase.*.rc" >/dev/null 2>&1; then
+      DISPATCH_STATE=INCONSISTENT
+    else
+      DISPATCH_STATE=NEVER_LAUNCHED
+    fi
+    return 0
+  fi
+  nonce="$(status_field "$intent" nonce)"
+  base="$idbase.$nonce"
+  DISPATCH_BASE="$base"
+
+  # A pre-spend outcome is terminal even with no .rc: a revoked straggler
+  # deliberately leaves .rc to whichever attempt holds the lease.
+  if [ -f "$base.outcome" ] && [ ! -f "$base.rc" ]; then
+    case "$(status_field "$base.outcome" kind)" in
+      lease_revoked)  DISPATCH_STATE=LEASE_REVOKED; return 0 ;;
+      render_failed)  DISPATCH_STATE=RENDER_FAILED; return 0 ;;
+      launch_aborted) DISPATCH_STATE=LAUNCH_ABORTED; return 0 ;;
+    esac
+  fi
 
   # A .rc is terminal regardless of anything else.
   if [ -f "$base.rc" ]; then
-    if [ ! -f "$base.intent" ]; then
-      DISPATCH_STATE=INCONSISTENT; return 0   # two runs sharing one folder
-    fi
     rc="$(tr -d '[:space:]' < "$base.rc")"
     case "$rc" in
       ''|*[!0-9]*) DISPATCH_STATE=CORRUPT; return 0 ;;
     esac
     DISPATCH_RC="$rc"
+    # The KIND decides, not the exit code. A CLI is free to exit 71 or 75 and must
+    # not be mistaken for one of the pre-spend outcomes.
+    local kind=""
+    [ -f "$base.outcome" ] && kind="$(status_field "$base.outcome" kind)"
+    case "$kind" in
+      launch_aborted) DISPATCH_STATE=LAUNCH_ABORTED; return 0 ;;
+      lease_revoked)  DISPATCH_STATE=LEASE_REVOKED;  return 0 ;;
+      render_failed)  DISPATCH_STATE=RENDER_FAILED;  return 0 ;;
+    esac
     case "$rc" in
       0)   DISPATCH_STATE=COMPLETED ;;
       124) DISPATCH_STATE=TIMED_OUT ;;
-      # 75: the child found its lease revoked and exited without running the CLI.
-      # 71: the child could not publish .started and aborted before the CLI.
-      # Both mean NOTHING was spent, so the replacement dispatch is authoritative
-      # and this record is informational only.
-      75)  DISPATCH_STATE=LEASE_REVOKED ;;
-      71)  DISPATCH_STATE=LAUNCH_FAILED ;;
       *)   DISPATCH_STATE=FAILED ;;
     esac
     return 0
   fi
 
-  if [ ! -f "$base.intent" ]; then
-    DISPATCH_STATE=NEVER_LAUNCHED; return 0
-  fi
-
   # Intent exists but the child has not published .started yet. Either it is
   # about to, or the fork failed. Bound the ambiguity with a grace period.
   #
-  # IMPORTANT: LAUNCH_FAILED does NOT prove no child will ever run — a child that
+  # IMPORTANT: LAUNCH_UNCERTAIN does NOT prove no child will ever run — a child that
   # was slow to schedule or SIGSTOPped can publish .started after this point.
   # Safety comes from the NONCE LEASE, not from this timeout: re-dispatching
   # writes a new nonce, and any late child checks the intent before spending and
   # exits 75. Never treat this state as proof of non-execution on its own.
   if [ ! -f "$base.started" ]; then
-    age=$(( $(date -u +%s) - $(date -u -r "$base.intent" +%s 2>/dev/null || date -u +%s) ))
+    age=$(( $(date -u +%s) - $(date -u -r "$intent" +%s 2>/dev/null || date -u +%s) ))
     if [ "$age" -lt "$DISPATCH_START_GRACE_S" ]; then
       DISPATCH_STATE=LAUNCHING
     else
-      DISPATCH_STATE=LAUNCH_FAILED
+      # NOT "LAUNCH_FAILED": nothing here certifies that no CLI ran or will run.
+      # The name says exactly what is known -- the grace period expired without a
+      # .started. Certified non-execution is LAUNCH_ABORTED (kind: launch_aborted),
+      # which only the child itself can publish.
+      DISPATCH_STATE=LAUNCH_UNCERTAIN
     fi
     return 0
   fi
@@ -3412,7 +3639,10 @@ await_dispatch() {
 |---|---|---|
 | `NEVER_LAUNCHED` | no `.intent` | dispatch fresh |
 | `LAUNCHING` | `.intent` present, `.started` not yet, within grace | poll again; do **not** re-dispatch |
-| `LAUNCH_FAILED` | `.intent` older than the grace period, still no `.started` | the fork never took; safe to re-dispatch for **any** role — no CLI ran |
+| `LAUNCH_UNCERTAIN` | `.intent` older than the grace period, still no `.started` | **not** a certification. Re-dispatch (which revokes the old nonce), then treat the old attempt as `role_mutates`-dependent: a straggler that already ran a mutating CLI is indistinguishable from one that never started. |
+| `LAUNCH_ABORTED` | `kind: launch_aborted` — the child could not publish `.started` | certified: no CLI ran. Safe to re-dispatch for **any** role |
+| `RENDER_FAILED` | `kind: render_failed` — the prompt would not render | certified: no CLI ran. Fix the unset variable named in `.err`, then re-dispatch |
+| `LEASE_REVOKED` | `kind: lease_revoked` — a straggler found its nonce superseded | certified: this attempt spent nothing. Informational; the lease holder is authoritative |
 | `RUNNING` | live pid, `pid_starttime` matches | resume polling; do **not** re-dispatch |
 | `ORPHANED` | `.started` present, process gone, no `.rc` | see the table below — **depends on the role** |
 | `COMPLETED` | `.rc` = 0 | read STATUS, proceed |
@@ -3759,19 +3989,65 @@ only its rendered appendix — it cannot see a policy statement written elsewher
 this document, so "affected appendices downgrade to best-effort" is unenforceable on
 its own. Three concrete changes:
 
-1. The orchestrator sets a substitution variable after Phase 1:
+1. The orchestrator **reconstructs** the policy at the top of every phase block,
+   not once after Phase 1. Each phase is a separate bash invocation, so a variable
+   assigned during Phase 1 is gone by Phase 4 — and because `render_prompt` now
+   fails on any unset key, that would turn every later dispatch into a hard error.
+   Add to the cookbook:
 
    ```bash
-   # Read from 1-preflight/phase-1/claude-check-status.md's context7: field.
-   if [ "$(status_field "$FEATURE_FOLDER/1-preflight/phase-1/claude-check-status.md" context7)" = reachable ]; then
-     CONTEXT7_POLICY=required
-   else
-     CONTEXT7_POLICY=best-effort
-   fi
+   # Reconstruct the context7 policy from durable state. Called at the top of
+   # EVERY phase block and on resume -- never assigned once and relied upon later,
+   # because shell variables do not survive a phase boundary.
+   context7_policy() {
+     local st="$FEATURE_FOLDER/1-preflight/phase-1/claude-check-status.md"
+     if [ -f "$st" ] && [ "$(status_field "$st" context7)" = reachable ]; then
+       printf 'required\n'; return 0
+     fi
+     # Fall back to RUN_LOG: the STATUS file may have been relocated or the probe
+     # may have failed before writing one, and the event is the durable record.
+     if [ -f "$FEATURE_FOLDER/RUN_LOG.md" ] \
+        && "$GREP_BIN" -q 'event=CONTEXT7_UNAVAILABLE' "$FEATURE_FOLDER/RUN_LOG.md"; then
+       printf 'best-effort\n'; return 0
+     fi
+     # No evidence either way: refuse to guess. Guessing `required` would make
+     # every dispatch fail; guessing `best-effort` would silently weaken the run.
+     echo "halt: cannot determine context7 policy; Phase 1 STATUS and RUN_LOG both silent" >&2
+     return 1
+   }
    ```
 
-   `CONTEXT7_POLICY` is already in `render_keys()`, so every appendix receives it
-   and `render_prompt` fails loudly if it is ever left unset.
+   Every phase block then does:
+
+   ```bash
+   CONTEXT7_POLICY="$(context7_policy)" || exit 1
+   ```
+
+   `CONTEXT7_POLICY` is in `render_keys()`, so every appendix receives it and
+   `render_prompt` fails loudly if it is ever left unset.
+
+   `preflight-claude` must therefore **write** the field, and `validate_status` must
+   require it. Add `context7` to that role's required fields:
+
+   ```bash
+   # in _status_required_fields
+   preflight-claude)  echo "context7" ;;
+   ```
+
+   and validate its value:
+
+   ```bash
+   # in validate_status's per-field case
+   context7)
+     case "$v" in
+       reachable|unreachable) : ;;
+       *) echo "invalid status: context7 must be reachable|unreachable, got '$v' in $path" >&2
+          return 1 ;;
+     esac ;;
+   ```
+
+   The `preflight-claude` appendix's STATUS block gains
+   `context7: reachable | unreachable` alongside its existing `verdict:` line.
 
 2. Each of the four appendices that require `context7` (`plan-writer` line 2136,
    `implementer` line 2354, `debugger` line 2446, `test-fixer` line 2694) replaces
@@ -3866,40 +4142,40 @@ python3 lib/extract.py snippets
 # 2a. INVARIANT: the cookbook is definitions only. A top-level statement would
 #     execute on `source`, and a top-level ${VAR:?} would abort the sourcing
 #     shell -- which is exactly how the test suite loads these helpers.
-#     Detect this by OBSERVATION, not by parsing braces. A brace-counting awk
-#     heuristic is unreliable: a one-liner such as `f() { :; }` increments the
-#     depth and never matches a lone `^}`, so every following top-level statement
-#     is silently treated as inside a function. Verified -- such a detector
-#     reported no offender for a file containing a bare `LEAK=1`.
+#     Detect this by TRACING EXECUTION, not by parsing braces and not by diffing
+#     variables. Two weaker detectors were tried and both fail:
+#       - A brace-counting awk heuristic: a one-liner such as `f() { :; }`
+#         increments the depth and never matches a lone `^}`, so every following
+#         top-level statement is treated as inside a function. Verified: it
+#         reported no offender for a file containing a bare `LEAK=1`.
+#       - Diffing `compgen -v` before/after sourcing: it only sees NEW VARIABLE
+#         NAMES, so `umask 000`, `cd`, `trap`, `touch`, or reassigning an existing
+#         variable all pass. Verified: a file with top-level `umask 000` reported
+#         no leak.
 #
-#     Instead source the cookbook in a pristine shell and diff the variable set.
-#     A definitions-only file adds functions and nothing else.
-#     Note: any non-zero rc here means "did not source cleanly". A top-level
-#     ${VAR:?} kills the shell outright, so a trailing `|| exit N` never runs and
-#     the observed code is bash's own (127) -- do not test for a sentinel value.
-#     PIPESTATUS is filtered out: the `compgen -v | sort` pipeline sets it itself.
-IGNORE_VARS='_|PIPESTATUS|BASH_EXECUTION_STRING'
-before="$BUILD/vars-before.txt"; after="$BUILD/vars-after.txt"
-env -i bash --noprofile --norc -c 'compgen -v | sort' > "$before" 2>/dev/null
-env -i bash --noprofile --norc -c '
-  source "$1" || exit 9
-  compgen -v | sort' _ "$BUILD/cookbook.sh" > "$after" 2>/dev/null
+#     `set -o functrace` makes a DEBUG trap fire for commands inside a sourced
+#     file, and — verified — it fires for `umask 000` and `touch` but NOT for a
+#     function definition. So a definitions-only file executes zero top-level
+#     commands, and anything the trap reports is a real side effect.
+#     Note: any non-zero rc means "did not source cleanly". A top-level ${VAR:?}
+#     kills the shell outright, so a trailing `|| exit N` never runs and the
+#     observed code is bash's own -- do not test for a sentinel value.
+sidelog="$BUILD/sideeffects.txt"
+env -i bash --noprofile --norc lib/sideeffects.sh "$BUILD/cookbook.sh" > "$sidelog" 2>&1
 src_rc=$?
 
 if [ "$src_rc" -ne 0 ]; then
+  # Any non-zero status: the file did not source cleanly. The probe cannot use a
+  # sentinel code because a top-level ${VAR:?} kills the shell before the probe's
+  # own exit runs.
   _fail "cookbook does not source cleanly in a pristine shell (rc=$src_rc)"
   note "a top-level \${VAR:?} aborts the sourcing shell; move it into init_orchestration_vars"
-  env -i bash --noprofile --norc -c 'source "$1"' _ "$BUILD/cookbook.sh" 2>&1 | head -3 \
-    | while IFS= read -r l; do note "$l"; done
+  head -3 "$sidelog" | while IFS= read -r l; do note "$l"; done
+elif [ ! -s "$sidelog" ]; then
+  _ok "cookbook executes no top-level commands (definitions only)"
 else
-  _ok "cookbook sources cleanly in a pristine shell with no variables preset"
-  leaked="$(comm -13 "$before" "$after" | "$GREP_BIN" -vxE "$IGNORE_VARS" || true)"
-  if [ -z "$leaked" ]; then
-    _ok "cookbook assigns no variables at source time (definitions only)"
-  else
-    _fail "cookbook assigns variables at top level; move them into init_orchestration_vars"
-    printf '    %s\n' "$leaked"
-  fi
+  _fail "cookbook executes top-level commands; move them into init_orchestration_vars"
+  head -10 "$sidelog" | while IFS= read -r l; do note "$l"; done
 fi
 
 bash -n "$BUILD/cookbook.sh" && _ok "cookbook.sh is syntactically valid" \
@@ -4097,7 +4373,33 @@ Nine findings, all reproduced first. Four blockers:
 | 3 | `LAUNCH_FAILED` does not prove no CLI will run — a delayed child can wake after a retry; and `> x.tmp && mv` had no failure branch, so a failed intent write still "launched" | **Nonce lease**: `.intent` carries a per-attempt nonce, every child re-checks it immediately before spending and exits 75 if revoked. Both publication sites now abort. Verified: delayed child + retry ⇒ exactly one CLI invocation |
 | 4 | The implementer enum invented `DONE_WITH_CONCERNS` and rejected the legal `FAILED`, turning a correct failure report into a bogus Mode 4; generic categories could not express `all-tests-runner` or `finishing-branch` either | Role-keyed `_status_verdicts` / `_status_required_fields`, transcribed from all 23 appendices, with an exhaustive test that every role accepts every verdict its own appendix declares |
 
-Five majors: the top-level-statement detector was blind to one-line functions
+### Third revision after external review
+
+Ten findings, all reproduced first. Five were blockers:
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | `if ! { write; } > tmp && mv tmp final` parses as `(! write) && mv`: on **success** the `mv` is skipped *and* the failure branch is skipped — verified `moved=no, failure_branch=not_taken`. The control file stays a `.tmp` forever | One audited `publish_atomic` helper used at every site, which also gives the `.tmp` cleanup contract a single implementation |
+| 2 | `render_keys` was missing from the child's `export -f` list (rc 127 *after* `.started`, looking like a CLI failure); and process substitution discards the renderer's exit status — verified a renderer returning 42 still ran the consumer with zero bytes and rc 0 | Full transitive export list; render into a variable, check it and reject empty, then feed with a herestring. Applies to the inline path too |
+| 3 | All attempts shared `.started`/`.pid`/`.rc`/`.json`, so a revoked straggler could overwrite the lease holder's records; and reserved rc 71/75 falsely certified "nothing was spent" for a real CLI exiting 71 | Attempt-scoped `<id>.<nonce>.*` with `.intent` as the authoritative index and `DISPATCH_BASE` exported for consumers; terminal outcomes recorded as a structured `kind:` in `.outcome`, never as an exit code. Verified: straggler + holder produce exactly one transcript and one `.rc` |
+| 4 | `check_03_varcoverage.sh` scraped a python `for key in [...]` literal that Task 14 removes, so it could never turn green | Sources the cookbook and calls `render_keys` |
+| 5 | `CONTEXT7_POLICY` was assigned once "after Phase 1", but every phase is a fresh bash invocation — Phase 4 onward would render with it unset, which is now a hard error | `context7_policy()` reconstructs it from Phase 1 STATUS or the RUN_LOG event at the top of every phase, and HALTs rather than guessing. `preflight-claude` must now write `context7:` and `validate_status` requires it |
+
+Five majors: the nonce test used `FAKE_DELAY`, which lives *inside* the stub and so
+only fires after the lease check had already passed — replaced by a
+`DISPATCH_TEST_PRELAUNCH_DELAY_S` hook in the child, before `.started`, which is the
+window a straggler actually occupies; the "exhaustive" STATUS test drew its inputs
+from the same function it was testing, so it now extracts verdicts independently from
+the appendix bodies via `verdicts.py` and diffs the two maps; the definitions-only
+detector was still blind to `umask`, `cd`, `trap`, and reassignment (verified: top-level
+`umask 000` reported no leak) and is replaced by a `set -o functrace` DEBUG-trap probe
+that reports side effects while ignoring function definitions; `LAUNCH_FAILED` is split
+into `LAUNCH_UNCERTAIN` (grace expired — certifies nothing) and `LAUNCH_ABORTED`
+(`kind: launch_aborted` — certified), with `LEASE_REVOKED` and `RENDER_FAILED` added to
+the public interface; and `probe_models` now takes `codex_present`, so a missing Codex
+binary reports `CODEX_UNAVAILABLE` mode 0 instead of a bogus `MODEL_REJECTED`.
+
+Second-revision majors: the top-level-statement detector was blind to one-line functions
 (verified: it reported nothing for a file containing `LEAK=1`) and is replaced by
 sourcing in a pristine `env -i` shell and diffing `compgen -v` — which then caught two
 top-level assignments of my own, now moved into `init_orchestration_vars` and
@@ -4134,7 +4436,7 @@ mechanical sweep.
 - `porcelain_offenders <repo> <allow...>` — defined 12, used by `dirty_tree_check` and the Phase 6 baseline.
 - `status_field <path> <key>` — defined 15, used by `dispatch_state` in 17. **Ordering note:** Task 17 depends on Task 15; the plan already sequences 15 before 17.
 - `iso_now` — defined 10, used 12, 17.
-- `now_ms` / `run_timed` — defined 11, used in the Task 11 example. `run_timed` sets globals, so every call site uses `run_timed cmd < <(render_prompt …)`, never a pipe or command substitution.
+- `now_ms` / `run_timed` — defined 11, used in the Task 11 example. `run_timed` sets globals, so every call site renders into a variable first and feeds it with `run_timed cmd <<< "$prompt"` — never a pipe (subshell), never command substitution (subshell), and never process substitution (swallows the renderer's exit status).
 - `canon` / `path_in_tree` / `is_git_root` / `validate_roots` — defined 9, used 12, 16.
 - `dispatch_id` / `dispatch_state` / `await_dispatch` / `dispatch_detached` — defined 17, used 18.
 - `PROCESS_PATH_REL` — set by `validate_roots` (9), consumed by `process_identity` (10).
