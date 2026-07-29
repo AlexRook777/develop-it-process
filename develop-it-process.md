@@ -715,9 +715,10 @@ Pass the role; effort and timeout follow from the Models table.
 
 ### Long dispatch
 
-Three roles have timeouts that exceed a single Bash tool call: `plan-writer` (120
-min), `implementer` (300 min) and `code-reviewer-codex` (120 min). For these, the
-orchestrator issues the dispatch as **one Bash tool call with
+Three roles have timeouts that exceed a single Bash tool call: `plan-writer`,
+`implementer`, and `code-reviewer-codex` (see the Models table via `role_timeout`
+for the exact figures). For these, the orchestrator issues the dispatch as **one
+Bash tool call with
 `run_in_background: true`**. The harness keeps it running across turns and re-invokes
 the orchestrator when it exits, delivering the exit status.
 
@@ -1929,8 +1930,8 @@ agents_json="$(jq -nc --arg m "$(role_model impl-worker)" \
                    model:$m}}')"
 
 # dispatch_role renders internally and takes no stdin. Issue this call with
-# run_in_background: true -- the implementer's 300-minute timeout cannot fit in a
-# foreground Bash call.
+# run_in_background: true -- the implementer's timeout (see the Models table,
+# via role_timeout) cannot fit in a foreground Bash call.
 dispatch_role 6 00 implementer \
   "$FEATURE_FOLDER/6-implementation/implementer-status.md" \
   --agents "$agents_json"
@@ -2008,10 +2009,11 @@ For each iteration N (start at 1, hard cap at 10):
 2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=7, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 7.0) have completed.
    - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `code-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-verdict.md` and `claude-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `code-reviewer-codex`. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_reviewers_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
-   `code-reviewer-codex`'s timeout (120 min, from the Models table) exceeds a single
-   Bash tool call, so this step's `dispatch_reviewers_parallel` call must itself be
-   issued as **one Bash tool call with `run_in_background: true`** — the whole call
-   waits on both children, so it inherits the longer of the two roles' timeouts.
+   `code-reviewer-codex`'s timeout (see the Models table, via `role_timeout`) exceeds
+   a single Bash tool call, so this step's `dispatch_reviewers_parallel` call must
+   itself be issued as **one Bash tool call with `run_in_background: true`** — the
+   whole call waits on both children, so it inherits the longer of the two roles'
+   timeouts.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
 4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
