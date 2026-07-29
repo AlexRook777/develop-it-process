@@ -617,14 +617,11 @@ canary_preflight() {
   # which Phase 1 escalates to a HALT on its own terms.
   local codex_present=yes
   command -v codex >/dev/null 2>&1 || codex_present=no
-  # python3 is REQUIRED: render_prompt cannot function without it.
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "halt: python3 missing — render_prompt requires it" >&2
-    return 1
-  fi
 
   if [ "${#missing[@]}" -gt 0 ]; then
     echo "halt: required binaries missing: ${missing[*]}" >&2
+    echo "  note: python3 is required by render_prompt for multi-line variable" >&2
+    echo "  substitution; there is no sed-based alternative." >&2
     return 1
   fi
 
