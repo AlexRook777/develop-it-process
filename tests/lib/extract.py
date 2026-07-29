@@ -14,9 +14,9 @@ REPO_TOP = pathlib.Path(__file__).resolve().parents[2]
 DOC = pathlib.Path(os.environ.get("PROCESS_DOC", REPO_TOP / "develop-it-process.md"))
 BUILD = pathlib.Path(os.environ.get("BUILD", REPO_TOP / "tests" / ".build"))
 
-MARKER = re.compile(r"^<!--\s*lint:\s*(cookbook|snippet)\s*-->\s*$")
-FENCE_OPEN = re.compile(r"^```bash\s*$")
-FENCE_CLOSE = re.compile(r"^```\s*$")
+MARKER = re.compile(r"^[ \t]*<!--\s*lint:\s*(cookbook|snippet)\s*-->\s*$")
+FENCE_OPEN = re.compile(r"^([ \t]*)```bash[ \t]*$")
+FENCE_CLOSE = re.compile(r"^([ \t]*)```[ \t]*$")
 
 # Preamble for snippet blocks: they legitimately reference orchestration
 # variables they do not define, so declare them to keep `bash -n` and
@@ -34,12 +34,32 @@ codex_available=false; role=noop; out_json=/dev/null; wall_ms=0
 """
 
 
+def _dedent(line, indent):
+    """Strip exactly `indent` from `line`, tolerating blank lines that carry no
+    trailing whitespace of their own."""
+    if not indent:
+        return line
+    if line[:len(indent)] == indent:
+        return line[len(indent):]
+    if line.strip() == "":
+        return ""
+    return line
+
+
 def blocks():
-    """Yield (kind, start_line, [body_lines]) for every fenced bash block."""
+    """Yield (kind, start_line, [body_lines]) for every fenced bash block.
+
+    A fence may be indented (e.g. nested inside a numbered list item). The
+    indent of the OPENING fence is captured and stripped from every body line,
+    and the block only closes on a fence at that SAME indent -- a fence at a
+    different indent is body content, not the terminator.
+    """
     lines = DOC.read_text().splitlines()
     i = 0
     while i < len(lines):
-        if FENCE_OPEN.match(lines[i]):
+        m_open = FENCE_OPEN.match(lines[i])
+        if m_open:
+            indent = m_open.group(1)
             # Walk upward past blank lines looking for a lint marker.
             kind = "unmarked"
             j = i - 1
@@ -50,9 +70,13 @@ def blocks():
                 if m:
                     kind = m.group(1)
             body, k = [], i + 1
-            while k < len(lines) and not FENCE_CLOSE.match(lines[k]):
+            while k < len(lines):
+                m_close = FENCE_CLOSE.match(lines[k])
+                if m_close and m_close.group(1) == indent:
+                    break
                 body.append(lines[k])
                 k += 1
+            body = [_dedent(b, indent) for b in body]
             yield kind, i + 1, body
             i = k + 1
         else:

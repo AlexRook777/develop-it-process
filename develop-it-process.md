@@ -368,6 +368,14 @@ Skill defaults are not overridden by orchestration.
 
 This section is the orchestrator's operational toolkit. The phases above describe *what* to dispatch and *when*; this section gives the *exact* shell forms, helper functions, and classification rules learned from prior runs. Use these helpers verbatim — improvising on CLI invocation syntax, Python interpreter names, or substitution mechanics has reliably wasted dispatch budget in real runs.
 
+Every fenced `bash` block in this document carries a lint marker.
+`<!-- lint: cookbook -->` marks a complete, sourceable helper — these are
+extracted into one file and both syntax-checked and shellchecked.
+`<!-- lint: snippet -->` marks an illustrative fragment that references
+orchestration variables without defining them; those get a syntax check only.
+An unmarked block fails `tests/check_01_lint.sh`, so a new block cannot silently
+escape the linter.
+
 ### Orchestration variables
 
 <!-- lint: cookbook -->
@@ -517,7 +525,7 @@ role_timeout() { _role_field "$1" 3; }
 
 role_vendor() {
   case "$1" in
-    *-codex|preflight-codex) echo codex ;;
+    *-codex) echo codex ;;
     orchestrator) echo "" ;;
     *) echo claude ;;
   esac
@@ -1642,6 +1650,7 @@ These checks are free (no token spend) and catch environmental issues that previ
    misdiagnosis that sends the user to edit the Models table instead of installing
    the CLI. Pass the canary's flag through:
 
+   <!-- lint: snippet -->
    ```bash
    probe_models "$codex_present"   # "yes" | "no"
    ```
@@ -1711,6 +1720,7 @@ It does NOT run on the HALT paths (Mode 0 codex failure, claude failure, `N`/EOF
 
 Immediately after step 8 completes (or immediately after the consented-degradation branch in step 6 completes), and BEFORE Phase 2 begins or any per-phase preflight gate can run, relocate Phase 1's STATUS files:
 
+<!-- lint: snippet -->
 ```bash
 mkdir -p "$FEATURE_FOLDER/1-preflight/phase-1"
 for v in claude codex; do
@@ -1783,6 +1793,7 @@ Before iter 01's first reviewer dispatch (the gate's **first work dispatch**, de
 4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`), so the two parallel writes do not collide.
 5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
 
+   <!-- lint: snippet -->
    ```bash
    for v in claude codex; do
      src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
@@ -1866,6 +1877,7 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`), so the two parallel writes do not collide.
 5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
 
+   <!-- lint: snippet -->
    ```bash
    for v in claude codex; do
      src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
@@ -1923,6 +1935,7 @@ Before Step 6.0 (the gate's first work dispatch is the implementer dispatch in S
 4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`).
 5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
 
+   <!-- lint: snippet -->
    ```bash
    for v in claude codex; do
      src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
@@ -2068,6 +2081,7 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`).
 5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
 
+   <!-- lint: snippet -->
    ```bash
    for v in claude codex; do
      src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
@@ -3538,12 +3552,14 @@ Command budget: max 20 shell or read commands per dispatch.
 
 Recursive search over the whole repo is forbidden. If you need to grep for a symbol, constrain the search to files in the diff scope, e.g.:
 
+<!-- lint: snippet -->
 ```bash
 "$GREP_BIN" -rn "<symbol>" <dir> --include='*.ts'
 ```
 
 NOT:
 
+<!-- lint: snippet -->
 ```bash
 "$GREP_BIN" -rn "<symbol>" .
 ```
