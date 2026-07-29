@@ -49,3 +49,34 @@ finish() {
   printf '  -- %d assertion(s) failed\n' "$_FAILURES"
   exit 1
 }
+
+# Source the extracted cookbook and initialise orchestration variables with
+# throwaway fixture values. Never rely on the cookbook initialising itself: it
+# is definitions-only by design, so a top-level ${VAR:?} cannot abort this shell.
+load_cookbook() {
+  python3 "$_TESTS_DIR/lib/extract.py" cookbook >/dev/null 2>&1 || {
+    _fail "cookbook not extractable"; return 1; }
+  # shellcheck source=/dev/null
+  source "$BUILD/cookbook.sh" || { _fail "cookbook.sh failed to source"; return 1; }
+  return 0
+}
+
+# Build a throwaway target repo and feature folder, then initialise.
+# Usage: init_fixture_env [outside]   ("outside" puts the feature folder outside the repo)
+init_fixture_env() {
+  local where="${1:-inside}"
+  FIXTURE_ROOT="$(mktemp -d)"
+  REPO_ROOT="$FIXTURE_ROOT/target"
+  mkdir -p "$REPO_ROOT"
+  git -C "$REPO_ROOT" init -q
+  ( cd "$REPO_ROOT" && : > seed && git add seed \
+    && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+  if [ "$where" = outside ]; then
+    FEATURE_FOLDER="$FIXTURE_ROOT/outside-ff"
+  else
+    FEATURE_FOLDER="$REPO_ROOT/docs/superpowers/specs/fixture-artifacts"
+  fi
+  mkdir -p "$FEATURE_FOLDER/transcripts"
+  PROCESS_PATH="$PROCESS_DOC"
+  init_orchestration_vars
+}
