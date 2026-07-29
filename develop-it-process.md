@@ -350,33 +350,80 @@ This section is the orchestrator's operational toolkit. The phases above describ
 
 ### Orchestration variables
 
-Set these once at the top of the run. All later examples refer to them.
-
+<!-- lint: cookbook -->
 ```bash
-# Process file (this document)
-PROCESS_PATH="${PROCESS_PATH:-/home/worker/repos/GCP/develop-it-process.md}"
-REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+# ---- Path helpers -----------------------------------------------------------
+# `grep` may be a shell-function shim in some harnesses; that shim does not
+# exist in subprocess shells and errors differently on the same pattern.
+# GREP_BIN and PYTHON_BIN are set by init_orchestration_vars below, not here —
+# the cookbook must contain no top-level statements.
+canon() { realpath -e -- "$1"; }          # fails if the path does not exist
+is_git_root() { [ "$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" = "$1" ]; }
 
-# Feature folder (derived from the input spec; see Per-feature artifacts folder)
-FEATURE_FOLDER="${FEATURE_FOLDER:?must be set before dispatching any phase}"
+# True when $1 equals $2 or lies under "$2/". Plain prefix tests are wrong:
+# they would let /a/bc match the tree /a/b.
+path_in_tree() {
+  local p="$1" d="${2%/}"
+  [ "$p" = "$d" ] || case "$p" in "$d"/*) return 0 ;; *) return 1 ;; esac
+}
 
-# Python interpreter detection — this environment has python3, not python
-PYTHON_BIN="$(command -v python3 || command -v python || true)"
-if [ -z "$PYTHON_BIN" ]; then
-  echo "No python3/python found on PATH; refusing to proceed (multi-line variable" \
-       "substitution requires python3)." >&2
-  exit 1
-fi
+# ---- The two repositories ---------------------------------------------------
+# This document lives in its own repository and orchestrates OTHER projects.
+# PROCESS_REPO_ROOT is where this file lives; REPO_ROOT is the project under
+# development. They are never the same repository.
+#
+# CRITICAL: these checks live in a FUNCTION, never at top level. A top-level
+# `${VAR:?}` aborts any shell that sources the cookbook — including the test
+# suite, which sources it to unit-test the helpers. The cookbook must be pure
+# definitions with no executable top-level statements; check_01_lint.sh enforces
+# that invariant.
+init_orchestration_vars() {
+  PROCESS_PATH="${PROCESS_PATH:?must be set to the absolute path of this document}"
+  REPO_ROOT="${REPO_ROOT:?must be set to the target project repo root}"
+  FEATURE_FOLDER="${FEATURE_FOLDER:?must be set before dispatching any phase}"
+  GREP_BIN="${GREP_BIN:-/usr/bin/grep}"
+  PYTHON_BIN="$(command -v python3 || true)"
+  if [ -z "$PYTHON_BIN" ]; then
+    echo "halt: python3 not on PATH; render_prompt requires it" >&2
+    return 1
+  fi
+  codex_available="${codex_available:-false}"
+  codex_disabled_by_user="${codex_disabled_by_user:-false}"
+  validate_roots
+}
 
-# Process-file content identity (logged in every dispatch RUN_LOG entry)
-PROCESS_FILE_SHA256="$(sha256sum "$PROCESS_PATH" | cut -d' ' -f1)"
-PROCESS_GIT_HEAD="$(git rev-parse HEAD 2>/dev/null || echo non-git)"
-if git -C "$REPO_ROOT" diff --quiet -- "$PROCESS_PATH" 2>/dev/null \
-   && git -C "$REPO_ROOT" diff --cached --quiet -- "$PROCESS_PATH" 2>/dev/null; then
-  PROCESS_DIRTY=no
-else
-  PROCESS_DIRTY=yes
-fi
+validate_roots() {
+  local halt=0
+  [ -f "$PROCESS_PATH" ] && [ -r "$PROCESS_PATH" ] \
+    || { echo "halt: PROCESS_PATH is not a readable file: $PROCESS_PATH" >&2; return 1; }
+  PROCESS_PATH="$(canon "$PROCESS_PATH")" || return 1
+  REPO_ROOT="$(canon "$REPO_ROOT")"       || return 1
+  PROCESS_REPO_ROOT="$(git -C "$(dirname "$PROCESS_PATH")" rev-parse --show-toplevel 2>/dev/null)"
+  [ -n "$PROCESS_REPO_ROOT" ] \
+    || { echo "halt: $PROCESS_PATH is not inside a git repository" >&2; return 1; }
+  PROCESS_REPO_ROOT="$(canon "$PROCESS_REPO_ROOT")" || return 1
+
+  is_git_root "$REPO_ROOT" \
+    || { echo "halt: REPO_ROOT is not a git work-tree root: $REPO_ROOT" >&2; halt=1; }
+  path_in_tree "$PROCESS_PATH" "$PROCESS_REPO_ROOT" \
+    || { echo "halt: PROCESS_PATH is outside PROCESS_REPO_ROOT" >&2; halt=1; }
+  [ "$PROCESS_REPO_ROOT" != "$REPO_ROOT" ] \
+    || { echo "halt: PROCESS_REPO_ROOT equals REPO_ROOT; the orchestrator would review its own process file" >&2; halt=1; }
+
+  # Path of this document RELATIVE to its own repo — required by `git show
+  # HEAD:<path>`, which rejects absolute paths.
+  PROCESS_PATH_REL="${PROCESS_PATH#"$PROCESS_REPO_ROOT"/}"
+
+  # Codex's workspace-write sandbox is rooted at $REPO_ROOT. When the feature
+  # folder lies outside it, reviewers cannot write their own STATUS and the
+  # failure looks like a vendor outage. codex_invoke adds --add-dir in that case.
+  if path_in_tree "$(canon "$FEATURE_FOLDER" 2>/dev/null || echo "$FEATURE_FOLDER")" "$REPO_ROOT"; then
+    FEATURE_FOLDER_OUTSIDE_REPO=""
+  else
+    FEATURE_FOLDER_OUTSIDE_REPO=yes
+  fi
+  return "$halt"
+}
 ```
 
 All examples below use `python3` (never the bare `python`) and `$PROCESS_PATH` (never the literal `develop-it.md`).
