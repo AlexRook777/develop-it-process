@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Check 3: appendix marker integrity.
-# EXPECTED RED until Task 13 (parallel-dispatch appendix naming).
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 source lib/assert.sh

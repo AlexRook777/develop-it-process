@@ -1123,36 +1123,80 @@ If `validate_status` returns nonzero, the dispatch is Mode 4. Apply the policy f
 
 The two reviewers at each gate (Claude + Codex) read the same inputs and produce independent STATUS files. They have no inter-dependency. Dispatch them in parallel — sequential dispatch wastes wall-clock and adds nothing.
 
+<!-- lint: cookbook -->
 ```bash
+# Dispatch both reviewers concurrently for one gate iteration.
+#
+# Roles are passed EXPLICITLY. The previous version built appendix names as
+# "${phase}-reviewer-claude", which cannot produce `code-reviewer-claude` for
+# any value of $phase — Phase 7 rendered an empty prompt and render_prompt
+# raised ValueError.
+#
+# Each subshell ends with `exit "$rc"` so `wait` reports the truth. Previously
+# the last command was an `echo`, so `wait` returned 0 unconditionally and no
+# reviewer failure was ever detected.
+#
+# Prompts are rendered in the PARENT, before either subshell is launched, and
+# checked for failure/emptiness here. A pipeline's exit status is that of its
+# LAST command, so `render_prompt ... | claude_invoke ...` inside a subshell
+# would mask a render failure and still invoke the CLI with an empty prompt —
+# real spend on a prompt that says nothing. Rendering up front means a codex
+# render failure cannot leave a claude child already spending.
 dispatch_reviewers_parallel() {
-  local phase="$1" iter="$2"
+  # Usage: dispatch_reviewers_parallel <claude_role> <codex_role> <phase> <iter>
+  local claude_role="$1" codex_role="$2" phase="$3" iter="$4"
+  local tdir="$FEATURE_FOLDER/transcripts"
+  mkdir -p "$tdir"   # bash fails the redirect below if this is absent
 
-  # Claude reviewer in the background.
+  local base_c="$tdir/${phase}-iter${iter}-claude"
+  local base_x="$tdir/${phase}-iter${iter}-codex"
+  local claude_pid="" codex_pid=""
+
+  local claude_prompt codex_prompt
+  claude_prompt="$(render_prompt "$claude_role")" \
+    || { echo "halt: render failed for role $claude_role" >&2; return 1; }
+  [ -n "$claude_prompt" ] \
+    || { echo "halt: empty prompt for role $claude_role" >&2; return 1; }
+
+  if [ "${codex_available:-false}" = true ]; then
+    codex_prompt="$(render_prompt "$codex_role")" \
+      || { echo "halt: render failed for role $codex_role" >&2; return 1; }
+    [ -n "$codex_prompt" ] \
+      || { echo "halt: empty prompt for role $codex_role" >&2; return 1; }
+  fi
+
   (
-    render_prompt "${phase}-reviewer-claude" \
-      | timeout 20m claude --model "$CLAUDE_MODEL" -p --output-format=json --dangerously-skip-permissions - \
-        1> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.json" \
-        2> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.err"
-    echo "$?" > "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-claude.rc"
+    claude_invoke "$claude_role" "${base_c}.json" "${base_c}.err" <<< "$claude_prompt"
+    rc=$?
+    printf '%s\n' "$rc" > "${base_c}.rc.tmp" && mv "${base_c}.rc.tmp" "${base_c}.rc"
+    exit "$rc"
   ) &
-  local claude_pid=$!
+  claude_pid=$!
 
-  # Codex reviewer in the background (only if available).
-  local codex_pid=
-  if [ "$codex_available" = "true" ]; then
+  if [ "${codex_available:-false}" = true ]; then
     (
-      render_prompt "${phase}-reviewer-codex" \
-        | timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json - \
-          1> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.json" \
-          2> "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.err"
-      echo "$?" > "$FEATURE_FOLDER/transcripts/${phase}-iter${iter}-codex.rc"
+      codex_invoke "$codex_role" "${base_x}.json" "${base_x}.err" <<< "$codex_prompt"
+      rc=$?
+      printf '%s\n' "$rc" > "${base_x}.rc.tmp" && mv "${base_x}.rc.tmp" "${base_x}.rc"
+      exit "$rc"
     ) &
     codex_pid=$!
   fi
 
-  # Wait for both, then validate and apply per-vendor failover.
   wait "$claude_pid"
-  [ -n "$codex_pid" ] && wait "$codex_pid"
+  # shellcheck disable=SC2034  # consumed by the caller after this function returns
+  CLAUDE_RC=$?
+  if [ -n "$codex_pid" ]; then
+    wait "$codex_pid"
+    # shellcheck disable=SC2034  # consumed by the caller after this function returns
+    CODEX_RC=$?
+  else
+    # shellcheck disable=SC2034  # consumed by the caller after this function returns
+    CODEX_RC=-1   # not dispatched; distinct from rc=0
+  fi
+  # RUN_LOG appends are serialised here, after both children have exited, so
+  # concurrent writes cannot interleave and corrupt the block grammar.
+  return 0
 }
 ```
 
