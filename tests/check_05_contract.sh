@@ -40,8 +40,8 @@ assert_absent '(render_prompt|extract_appendix) +"?\$\{' "$D" \
 
 # --- Task 15: shell hygiene ---
 assert_absent 'export BASH_XTRACEFD' "$D" "T15: BASH_XTRACEFD is not exported"
-assert_absent '\\\\S' "$D" "T15: no non-POSIX \\S in ERE"
-assert_absent '\] && mv ' "$D" "T15: no trailing [ ] && mv"
+assert_absent '\\S' "$D" "T15: no non-POSIX \\S in ERE"
+assert_absent '\] && \\$' "$D" "T15: no trailing [ ] && mv"
 
 # --- Task 18/19: dispatch ---
 assert_present 'kill-after=60s' "$D" "T19: uniform kill-after grace"
