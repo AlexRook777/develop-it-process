@@ -267,9 +267,9 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
       claude-check-status.md
       codex-check-status.md
     iteration-01/
-      claude-opus-verdict.md
+      claude-verdict.md
       codex-verdict.md
-      claude-opus-findings.md
+      claude-findings.md
       codex-findings.md
     iteration-02/
       …
@@ -319,6 +319,10 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     <phase>-<iteration>-<role>.json
     <phase>-<iteration>-<role>.err
 ```
+
+Reviewer artifacts are named by **vendor**, not model: `claude-verdict.md`,
+`claude-findings.md`, `codex-verdict.md`, `codex-findings.md`. A filename must
+not assert a model, or it starts lying the moment the Models table changes.
 
 Phase 10 (`readiness-report`) intentionally has no `10-readiness-report/` folder: its two outputs (`final-readiness-report.md`, `readiness-status.md`) are cross-cutting feature-folder artifacts consumed by the user at the top level, not phase-internal scratch. The same rationale applies to `RUN_LOG.md`, `full_log.md`, `transcripts/`, and the optional `process-improvement-proposition.md`, which also live at the feature-folder root without a numeric prefix.
 
@@ -1725,7 +1729,7 @@ For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/3-spec-review/iteration-NN`.
 2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=3, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 3.0) have completed.
-   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `spec-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `3-spec-review/iteration-NN/claude-opus-verdict.md` (STATUS) and `claude-opus-findings.md` (findings). This role's timeout comes from the Models table via `role_timeout`.
+   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `spec-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `3-spec-review/iteration-NN/claude-verdict.md` (STATUS) and `claude-findings.md` (findings). This role's timeout comes from the Models table via `role_timeout`.
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `spec-reviewer-codex`. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_reviewers_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 3.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only the verdict files.
@@ -1800,7 +1804,7 @@ For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/5-plan-review/iteration-NN`.
 2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=5, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 5.0) have completed.
-   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `plan-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Outputs: `5-plan-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
+   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `plan-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Outputs: `5-plan-review/iteration-NN/claude-verdict.md` and `claude-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `plan-reviewer-codex`. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_reviewers_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
@@ -2002,7 +2006,7 @@ For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/7-code-review/iteration-NN`.
 2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=7, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 7.0) have completed.
-   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `code-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
+   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `code-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-verdict.md` and `claude-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `code-reviewer-codex`. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_reviewers_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
    `code-reviewer-codex`'s timeout (120 min, from the Models table) exceeds a single
    Bash tool call, so this step's `dispatch_reviewers_parallel` call must itself be
@@ -2202,7 +2206,7 @@ appendix:                 spec-reviewer-claude
 develop_it_git_sha:       fd705aef83efe207cf12f668980544576b8849bc
 develop_it_file_sha256:   8c2f6bf5e9d3a4b1f5c7d8e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9
 develop_it_dirty:         no
-status_path:              3-spec-review/iteration-01/claude-opus-verdict.md
+status_path:              3-spec-review/iteration-01/claude-verdict.md
 verdict:                  CHANGES_REQUESTED
 model:                    claude-opus-5
 duration_ms:              241830
@@ -2764,7 +2768,7 @@ You are a spec reviewer invoked as a fresh subprocess by the develop-it orchestr
 4. Write the full findings file:
 
 ```
-Path: $FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/claude-opus-findings.md
+Path: $FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/claude-findings.md
 ```
 
 Format for each finding:
@@ -2780,7 +2784,7 @@ Format for each finding:
 5. Write STATUS.md LAST and atomically:
 
 ```
-Path: $FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/claude-opus-verdict.md
+Path: $FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/claude-verdict.md
 ```
 
 ```
@@ -2788,7 +2792,7 @@ verdict: PASS | CHANGES_REQUESTED
 blockers: <int>
 majors: <int>
 minors: <int>
-findings: claude-opus-findings.md
+findings: claude-findings.md
 reason: <one line if CHANGES_REQUESTED>
 ```
 
@@ -2988,16 +2992,16 @@ You are a plan reviewer invoked as a fresh subprocess. You have no shared contex
 
 ## Output
 
-Findings: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/claude-opus-findings.md`
+Findings: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/claude-findings.md`
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/claude-opus-verdict.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/claude-verdict.md`
 
 ```
 verdict: PASS | CHANGES_REQUESTED
 blockers: <int>
 majors: <int>
 minors: <int>
-findings: claude-opus-findings.md
+findings: claude-findings.md
 reason: <one line if CHANGES_REQUESTED>
 ```
 
@@ -3323,16 +3327,16 @@ You are a code reviewer invoked as a fresh subprocess. You have no shared contex
 
 ## Output
 
-Findings: `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/claude-opus-findings.md`
+Findings: `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/claude-findings.md`
 
-STATUS LAST and atomically: `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/claude-opus-verdict.md`
+STATUS LAST and atomically: `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/claude-verdict.md`
 
 ```
 verdict: PASS | CHANGES_REQUESTED
 blockers: <int>
 majors: <int>
 minors: <int>
-findings: claude-opus-findings.md
+findings: claude-findings.md
 reason: <one line if CHANGES_REQUESTED>
 ```
 
@@ -3588,7 +3592,7 @@ You are a gate summarizer invoked as a fresh subprocess. You have no shared cont
 ## Behavior
 
 1. Enumerate iteration folders under `$FEATURE_FOLDER/3-spec-review/iteration-*`.
-2. For each iteration, read the verdict files (`claude-opus-verdict.md`, `codex-verdict.md` if present) and findings files.
+2. For each iteration, read the verdict files (`claude-verdict.md`, `codex-verdict.md` if present) and findings files.
 3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=3` (spec review). For each such entry, capture the `failure_mode=<n>` and the iteration number. These give you the reason Codex was unavailable.
 4. Aggregate statistics:
    - Number of iterations run.
@@ -3648,7 +3652,7 @@ You are a gate summarizer invoked as a fresh subprocess by the develop-it orches
 ## Behavior
 
 1. Enumerate iteration folders under `$FEATURE_FOLDER/5-plan-review/iteration-*`.
-2. For each iteration, read the verdict files (`claude-opus-verdict.md`, `codex-verdict.md` if present) and findings files.
+2. For each iteration, read the verdict files (`claude-verdict.md`, `codex-verdict.md` if present) and findings files.
 3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=5` (plan review). Capture `failure_mode=<n>` and the iteration number from each such entry.
 4. Aggregate statistics:
    - Number of iterations run.
@@ -3750,7 +3754,7 @@ You are a gate summarizer for the code review, invoked as a fresh subprocess by 
 ## Behavior
 
 1. Enumerate iteration folders under `$FEATURE_FOLDER/7-code-review/iteration-*`.
-2. For each iteration, read the verdict files (`claude-opus-verdict.md`, `codex-verdict.md` if present) and findings files.
+2. For each iteration, read the verdict files (`claude-verdict.md`, `codex-verdict.md` if present) and findings files.
 3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=7` (code review). Capture `failure_mode=<n>` and the iteration number from each such entry. Also locate the LATEST `event=IMPLEMENTATION_BASELINE` entry (exact match — ignore any `IMPLEMENTATION_BASELINE_BLOCKED` advisory entries) and record `base_sha`. If multiple `IMPLEMENTATION_BASELINE` entries exist (from a resumed run), the LAST one in file order is authoritative.
 4. Aggregate statistics:
    - Number of iterations run.
