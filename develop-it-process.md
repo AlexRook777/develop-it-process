@@ -598,16 +598,30 @@ Pass the role; effort and timeout follow from the Models table.
 
 Run BEFORE Phase 1 (skill probes) to catch missing binaries and CLI syntax mismatches with harmless invocations. This costs nothing and would have caught real failures observed in prior runs.
 
+<!-- lint: cookbook -->
 ```bash
 canary_preflight() {
+  # HARD-REQUIRED binaries. `codex` is deliberately NOT here: its absence is
+  # handled by the asymmetric failover policy below, and listing it in both places
+  # made the canary contradict itself — it would halt on a missing binary the very
+  # next lines describe as optional.
+  # `env` is required by render_prompt to pass substitution values explicitly;
+  # `realpath` by canon(). Long dispatch uses the harness's background execution,
+  # so no process-supervision tools are needed.
   local missing=()
-  for bin in claude timeout awk sed jq; do
+  for bin in claude timeout awk sed jq git date sha256sum cut mkdir mv tail tr \
+             grep realpath env python3; do
     command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
   done
-  # codex is optional — its absence triggers the asymmetric failover, not a halt.
+  # codex is optional here; a missing binary drives the failover policy (Mode 0),
+  # which Phase 1 escalates to a HALT on its own terms.
   local codex_present=yes
   command -v codex >/dev/null 2>&1 || codex_present=no
-  command -v python3 >/dev/null 2>&1 || echo "warn: python3 missing — multi-line substitution will fail" >&2
+  # python3 is REQUIRED: render_prompt cannot function without it.
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "halt: python3 missing — render_prompt requires it" >&2
+    return 1
+  fi
 
   if [ "${#missing[@]}" -gt 0 ]; then
     echo "halt: required binaries missing: ${missing[*]}" >&2
@@ -635,6 +649,34 @@ canary_preflight() {
 
   # Echo result so the caller can branch.
   printf 'canary_ok codex_present=%s\n' "$codex_present"
+}
+
+# Verify every pinned model id is accepted. Cheap but NOT free: one minimal
+# call per distinct id. A rejection HALTs — there is no fallback.
+probe_models() {
+  # Usage: probe_models <codex_present:yes|no>
+  # A missing codex binary is NOT a rejected model; probing it anyway mislabels an
+  # environment defect as a Models-table error.
+  local codex_present="${1:-yes}"
+  local role model rc=0
+  local -A seen=()
+  for role in $(_role_keys); do
+    model="$(role_model "$role")" || { rc=1; continue; }
+    [ -n "${seen[$model]:-}" ] && continue
+    seen[$model]=1
+    case "$(role_vendor "$role")" in
+      claude)
+        printf 'ok\n' | claude --model "$model" -p --output-format=json \
+          --dangerously-skip-permissions - >/dev/null 2>&1 \
+          || { echo "model rejected: role=$role model=$model vendor=claude" >&2; rc=1; } ;;
+      codex)
+        [ "$codex_present" = yes ] || continue
+        printf 'ok\n' | codex -a never -m "$model" exec -C "$REPO_ROOT" \
+          -s read-only --skip-git-repo-check --json - >/dev/null 2>&1 \
+          || { echo "model rejected: role=$role model=$model vendor=codex" >&2; rc=1; } ;;
+    esac
+  done
+  return "$rc"
 }
 ```
 
@@ -997,10 +1039,28 @@ Goal: confirm the environment is sound (binaries, CLI syntax, working tree) AND 
 These checks are free (no token spend) and catch environmental issues that previously consumed real dispatch attempts. Run them BEFORE creating the feature folder or invoking skill probes.
 
 1. Initialise the orchestration variables from the "Runtime cookbook & guardrails" section (`PROCESS_PATH`, `REPO_ROOT`, `PYTHON_BIN`, `PROCESS_FILE_SHA256`, `PROCESS_GIT_HEAD`, `PROCESS_DIRTY`).
-2. Run `canary_preflight` (see cookbook). It checks: `claude`, `codex`, `timeout`, `awk`, `sed` are on PATH; `python3` is on PATH (warn-only); `claude --help` and `codex exec --help` succeed. On halt, surface the missing binary or syntax-check failure to the user and STOP — do not proceed to skill probes.
-3. Run `dirty_tree_check` (see cookbook). Allowed dirty paths at this stage: `$PROCESS_PATH` only (the spec is provided by the user but may still be in the working tree; that is OK because the spec path is added to the allow-list once derived). On halt, list the offending files and ask the user to commit or stash before re-running.
-4. Verify the gitignore guard: confirm that `docs/superpowers/specs/*-artifacts/` (or the equivalent pattern matching the eventual `$FEATURE_FOLDER`) is either listed in `.gitignore` OR that the orchestrator's runtime dirty-check allow-list covers it (the cookbook's `dirty_tree_check` does cover it). If neither holds, emit a one-line warning recommending the `.gitignore` addition; do NOT halt.
-5. If `canary_preflight` returned `codex_present=no` (Mode 0 — binary missing, environmental), HALT unconditionally. Surface the remediation message ("Install the Codex CLI and re-run") and STOP. Do NOT prompt the user, do NOT continue in claude-only mode, do NOT proceed to Step 1.1. A missing Codex binary at Phase 1 is an environment defect that must be fixed before the run can proceed in any mode; the previous silent-degrade behavior masked broken setups. This matches the Phase 1 row of the Mode-specific response table (Mode 0 → HALT) and Step 1.1 step 6's Mode 0 branch — Phase 1 Mode 0 is the only failure mode at Phase 1 that bypasses the user consent prompt, because there is no working Codex CLI to even produce a meaningful stderr tail for the user to consent on. Log `event=CODEX_UNAVAILABLE` with `phase: 1`, `phase_name: preflight`, `failure_mode: 0`, and `stderr_tail: <canary output>` to `RUN_LOG.md` immediately before STOP so the HALT is auditable.
+2. Run `canary_preflight` (see cookbook). It checks: `claude`, `timeout`, `awk`, `sed`, `jq`, `git`, `date`, `sha256sum`, `cut`, `mkdir`, `mv`, `tail`, `tr`, `grep`, `realpath`, `env` are on PATH (hard-required); `codex` is optional (its absence sets `codex_present=no` and drives the failover policy below, not a halt); `python3` is on PATH (hard-required — render_prompt cannot function without it); `claude --help` and `codex exec --help` succeed. On halt, surface the missing binary or syntax-check failure to the user and STOP — do not proceed to skill probes.
+3. Run `probe_models`, **but branch on `codex_present` first**. The probe invokes
+   both CLIs; running it while the Codex binary is absent reports `MODEL_REJECTED`
+   for `gpt-5.6-sol` when the real condition is `CODEX_UNAVAILABLE` mode 0 — a
+   misdiagnosis that sends the user to edit the Models table instead of installing
+   the CLI. Pass the canary's flag through:
+
+   ```bash
+   probe_models "$codex_present"   # "yes" | "no"
+   ```
+
+   When it is `no`, every codex row is skipped and the existing Mode-0 branch below
+   handles the missing binary on its own terms. Every id it does probe must be
+   accepted. On any rejection, HALT: print each `role=<role> model=<id>` line,
+   noting that this document pins its models deliberately; there is
+   no fallback path. Instruct the user to update the Models table. Log
+   `event=MODEL_REJECTED` with the offending roles to `RUN_LOG.md` before
+   stopping. This is a runtime gate; `tests/check_90_live_models.sh` performs the
+   same probe as an opt-in test.
+4. Run `dirty_tree_check` (see cookbook). Allowed dirty paths at this stage: `$PROCESS_PATH` only (the spec is provided by the user but may still be in the working tree; that is OK because the spec path is added to the allow-list once derived). On halt, list the offending files and ask the user to commit or stash before re-running.
+5. Verify the gitignore guard: confirm that `docs/superpowers/specs/*-artifacts/` (or the equivalent pattern matching the eventual `$FEATURE_FOLDER`) is either listed in `.gitignore` OR that the orchestrator's runtime dirty-check allow-list covers it (the cookbook's `dirty_tree_check` does cover it). If neither holds, emit a one-line warning recommending the `.gitignore` addition; do NOT halt.
+6. If `canary_preflight` returned `codex_present=no` (Mode 0 — binary missing, environmental), HALT unconditionally. Surface the remediation message ("Install the Codex CLI and re-run") and STOP. Do NOT prompt the user, do NOT continue in claude-only mode, do NOT proceed to Step 1.1. A missing Codex binary at Phase 1 is an environment defect that must be fixed before the run can proceed in any mode; the previous silent-degrade behavior masked broken setups. This matches the Phase 1 row of the Mode-specific response table (Mode 0 → HALT) and Step 1.1 step 6's Mode 0 branch — Phase 1 Mode 0 is the only failure mode at Phase 1 that bypasses the user consent prompt, because there is no working Codex CLI to even produce a meaningful stderr tail for the user to consent on. Log `event=CODEX_UNAVAILABLE` with `phase: 1`, `phase_name: preflight`, `failure_mode: 0`, and `stderr_tail: <canary output>` to `RUN_LOG.md` immediately before STOP so the HALT is auditable.
 
 ### Required skills
 

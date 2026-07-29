@@ -55,4 +55,12 @@ assert_absent 'claude-opus-verdict\.md|claude-opus-findings\.md' "$D" \
 # --- Task 21: contradictions ---
 assert_present 'lint: cookbook' "$D" "T21: cookbook blocks are lint-classified"
 
+# --- Task 8: canary and model probe ---
+assert_present 'for bin in claude timeout awk sed jq git date sha256sum cut mkdir mv tail tr' \
+  "$D" "T8: canary checks every used binary"
+assert_present 'realpath env python3' "$D" "T8: canary checks the new runtime tools"
+assert_absent 'setsid' "$D" "T8: setsid is not a dependency (no hand-rolled dispatch protocol)"
+assert_absent 'for bin in claude codex ' "$D" "T8: codex is not in the hard-required list"
+assert_present 'probe_models\(\)' "$D" "T8: model probe helper exists"
+
 finish
