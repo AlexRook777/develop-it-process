@@ -337,6 +337,7 @@ EOF
           case "$k" in
             findings)      printf 'findings: %s\n' "f-$r.md"; : > "$BUILD/f-$r.md" ;;
             verification)  printf 'verification: PASS\n' ;;
+            context7)      printf 'context7: reachable\n' ;;
             *)             printf '%s: 0\n' "$k" ;;
           esac
         done

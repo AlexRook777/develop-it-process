@@ -71,4 +71,14 @@ assert_present 'git -C "\$PROCESS_REPO_ROOT" rev-parse HEAD' "$D" \
 assert_present 'HEAD:\$PROCESS_PATH_REL|HEAD:\$\{PROCESS_PATH_REL\}' "$D" \
   "T10: git show uses a repo-relative path"
 
+# --- Task 20: contradictions ---
+assert_absent 'Cheap \(micro\)|cheap mode|Cheap mode' "$D" "T20: cheap/deep renamed"
+assert_present 'scoped|diff-aware' "$D" "T20: modes renamed to scoped/diff-aware"
+assert_absent 'Phase 1 spec review|Phase 3 plan review|Phase 6 final review' "$D" \
+  "T20: Codex-mode phase numbers corrected"
+assert_absent 'frontend/src/features/canvas|Google ADK' "$D" "T20: leaked project specifics removed"
+assert_present 'uv run pytest' "$D" "T20: test discovery uses uv"
+assert_present 'CODEX_CONSENT' "$D" "T20: non-interactive consent override"
+assert_present 'context7.*MCP server' "$D" "T20: context7 is described as an MCP server"
+
 finish
