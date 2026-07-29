@@ -850,6 +850,7 @@ Pass `$wall_ms` to `parse_usage` as the third argument. For Claude, the function
 
 This is **the standard helper** every phase step refers to. One call per subprocess invocation, immediately after `parse_usage`. It is the ONLY sanctioned way to record phase progress in `RUN_LOG.md` — do NOT hand-compose abbreviated entries (see the exhaustive-shapes rule in Resumability). It emits the full dispatch block from the Resumability grammar: identity fields, process-file content identity, and the nine telemetry fields.
 
+<!-- lint: cookbook -->
 ```bash
 # log_dispatch <role> <phase> <phase_name> <iteration> <status_path> <verdict> "<usage_line>"
 #   <usage_line> is the single-line nine-pair output of parse_usage, quoted as ONE argument.
