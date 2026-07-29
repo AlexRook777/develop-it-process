@@ -335,7 +335,7 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     <phase>-iter<NN>-<role>.err
 ```
 
-Transcript and control files are named `<phase>-iter<NN>-<role>.<ext>`, exactly
+Transcripts are named `<phase>-iter<NN>-<role>.<ext>`, exactly
 what `dispatch_id` returns. The role is required, not the vendor: several roles of
 the same vendor run within one phase and iteration (e.g. Phase 3 iteration 1 can
 dispatch `spec-reviewer-claude` and, on a re-review round, `spec-fixer` and
@@ -920,11 +920,10 @@ deliberately stops rather than recovering:
 | `no` — reviewers, summarizers, `context-discovery`, preflight, `readiness-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: no`, `action: redispatched`, and re-dispatch once. These roles only read and write their own STATUS and findings, so a repeat is idempotent. |
 | `yes` — `implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `finishing-branch` | log `event=DISPATCH_ORPHANED` with `role_mutates: yes`, `action: halted`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, the `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch or keep the partial work. **Never auto-retry.** After the fact nothing can distinguish "the task ran once" from "the task ran twice", and a re-run implementer duplicates commits and re-applies edits. |
 
-**Write contract.** Long dispatch adds no control files — this mirrors the canonical
-write list under "Allowed actions" exactly: the orchestrator writes only
-`RUN_LOG.md`, `full_log.md`, `process-improvement-proposition.md` and
-`transcripts/<dispatch-id>.{json,err}`. Nothing else. Appendix content is never written
-to disk: prompts are rendered into a shell variable and delivered by herestring.
+**Write contract.** Long dispatch adds no control files. The orchestrator writes
+only the paths in the canonical write list under **Allowed actions** — nothing
+else. Appendix content is never written to disk: prompts are rendered into a
+shell variable and delivered by herestring.
 
 Removing the hand-rolled protocol also removed every atomic-publication site the
 orchestrator had, so no `.tmp` companion is written any more either.
