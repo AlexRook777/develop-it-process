@@ -309,6 +309,20 @@ EOF
   #
   # Each appendix declares its verdicts on a line like:
   #     verdict: DONE | FAILED | NEEDS_DEBUG | BLOCKED
+  # verdicts.py only emits a row for an appendix whose body has a `^verdict:`
+  # line -- an appendix reformatted so that line vanishes would silently drop
+  # out of the drift check below rather than fail it. Guard against that by
+  # requiring the row count to match the real BEGIN-marker count first. The
+  # marker regex is anchored at column 0: two lines in the cookbook itself
+  # (a Python f-string and a grep -qF pattern) contain the literal text
+  # "<!-- BEGIN: " but are not real markers and are indented/embedded, not at
+  # the start of the line.
+  verdict_rows="$(python3 "$_TESTS_DIR/lib/verdicts.py" "$PROCESS_DOC")"
+  verdict_row_count="$(printf '%s\n' "$verdict_rows" | "$GREP_BIN" -c . || true)"
+  begin_marker_count="$("$GREP_BIN" -c '^<!-- BEGIN: ' "$PROCESS_DOC" || true)"
+  assert_eq "$begin_marker_count" "$verdict_row_count" \
+    "every appendix has a verdict row (none silently dropped by verdicts.py)"
+
   drift=""
   while IFS=$'\t' read -r a declared; do
     [ -n "$a" ] || continue
@@ -317,7 +331,7 @@ EOF
             | "$GREP_BIN" -v '^$' | sort | tr '\n' ' ')"
     [ "$coded" = "$want" ] || drift="$drift
   $a: appendix declares [$want] but _status_verdicts returns [$coded]"
-  done < <(python3 "$_TESTS_DIR/lib/verdicts.py" "$PROCESS_DOC")
+  done < <(printf '%s\n' "$verdict_rows")
   assert_eq "" "$drift" "_status_verdicts matches every appendix declared verdict line"
 
   missing_schema=""
@@ -327,7 +341,9 @@ EOF
   done
   assert_eq "" "$missing_schema" "every dispatched role has a STATUS schema"
 
+  role_count=0
   for r in $(_role_keys); do
+    role_count=$((role_count + 1))
     [ "$r" = impl-worker ] && continue
     for vd in $(_status_verdicts "$r"); do
       f="$BUILD/x-$r-$vd.md"
@@ -346,7 +362,11 @@ EOF
         || _fail "role $r must accept its own declared verdict '$vd'"
     done
   done
-  _ok "every role accepts every verdict its appendix declares"
+  if [ "$role_count" -eq 0 ]; then
+    _fail "_role_keys returned zero roles -- the loop above checked nothing"
+  else
+    _ok "every role accepts every verdict its appendix declares ($role_count roles checked)"
+  fi
 else
   _fail "status_field / validate_status not defined"
 fi

@@ -16,7 +16,7 @@ assert_absent 'claude-sonnet-4-6' "$D" "T5: no claude-sonnet-4-6"
 assert_absent 'gpt-5\.3-codex|gpt-5\.2'  "$D" "T6: no nonexistent codex ids"
 assert_absent '[Ff]all ?back.*model|model.*[Ff]all ?back' "$D" \
   "T6: no model fallback language"
-assert_present 'codex .*-m "\$CODEX_MODEL"' "$D" "T6: codex model is bound explicitly"
+assert_present 'codex -a never -m "\$model"' "$D" "T6: codex model is bound explicitly"
 
 # --- Task 9: environment ---
 assert_absent '/home/worker|repos/GCP' "$D" "T9: no foreign hardcoded paths"
@@ -73,12 +73,30 @@ assert_present 'HEAD:\$PROCESS_PATH_REL|HEAD:\$\{PROCESS_PATH_REL\}' "$D" \
 
 # --- Task 20: contradictions ---
 assert_absent 'Cheap \(micro\)|cheap mode|Cheap mode' "$D" "T20: cheap/deep renamed"
-assert_present 'scoped|diff-aware' "$D" "T20: modes renamed to scoped/diff-aware"
+assert_present 'scoped' "$D" "T20: modes renamed to scoped"
+assert_present 'diff-aware' "$D" "T20: modes renamed to diff-aware"
 assert_absent 'Phase 1 spec review|Phase 3 plan review|Phase 6 final review' "$D" \
   "T20: Codex-mode phase numbers corrected"
 assert_absent 'frontend/src/features/canvas|Google ADK' "$D" "T20: leaked project specifics removed"
 assert_present 'uv run pytest' "$D" "T20: test discovery uses uv"
 assert_present 'CODEX_CONSENT' "$D" "T20: non-interactive consent override"
 assert_present 'context7.*MCP server' "$D" "T20: context7 is described as an MCP server"
+
+# --- Final review: non-fragile timeout-literal guard ---
+# `assert_absent 'timeout [0-9]+m '` (T19) and a hand-composed `Timeout:? +N
+# *min` guard both missed real regressions ("120 min", "300-minute") because
+# neither matches free-form prose. A literal minute/hour value is legitimate
+# ONLY inside the Models table, whose rows all start with `|`. assert_absent
+# takes a whole file, so this needs its own pipeline rather than that helper:
+# grep -n to keep the real doc line number, then drop table rows (content
+# starting with `|` immediately after the "N:" prefix `grep -n` adds).
+offenders="$("$GREP_BIN" -nE '[0-9]+ *-?(min|minute|hour|hr)\b' "$D" \
+             | "$GREP_BIN" -v -E '^[0-9]+:\|')"
+if [ -z "$offenders" ]; then
+  _ok "T-final: no literal minute/hour values outside the Models table"
+else
+  _fail "T-final: literal minute/hour values found outside the Models table"
+  printf '%s\n' "$offenders" | while IFS= read -r l; do note "$l"; done
+fi
 
 finish

@@ -171,7 +171,96 @@ appendix_exists implementer     && _ok "appendix_exists finds a real appendix" \
 appendix_exists no-such-role    && _fail "appendix_exists accepted a missing appendix" \
                                 || _ok "appendix_exists rejects a missing appendix"
 
-# 7. A render failure must produce ZERO CLI invocations. Asserting only that the
+# 7. dispatch_role run TO COMPLETION against the fakebin stubs. Every prior
+#    assertion in this file either called a helper directly or deliberately
+#    failed at render -- nothing exercised the success path all the way through
+#    log_dispatch, which is exactly where the Critical finding lived:
+#    process_identity had zero call sites, so PROCESS_GIT_HEAD was an unbound
+#    variable and log_dispatch died mid-`{ }` group under `set -uo pipefail`,
+#    AFTER the CLI had already been invoked, appending a TRUNCATED block to the
+#    append-only RUN_LOG. Isolate RUN_LOG first so the field-order and
+#    provenance checks below see exactly one dispatch block.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+: > "$FAKE_ARGV_LOG"
+dispatch_role 3 01 spec-reviewer-claude "$SD/dr7-status.md"
+assert_rc 0 $? "dispatch_role returns 0 end to end with a healthy stub"
+
+assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "RUN_LOG gained an event=DISPATCH_STARTED block"
+assert_present '^--- .*  dispatch$' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "RUN_LOG gained a full dispatch block"
+
+# Regression test for FIX 1: provenance fields must be REAL, not empty/unbound.
+git_sha="$(status_field "$FEATURE_FOLDER/RUN_LOG.md" develop_it_git_sha)"
+file_sha256="$(status_field "$FEATURE_FOLDER/RUN_LOG.md" develop_it_file_sha256)"
+if [ -n "$git_sha" ] && [ "$git_sha" != non-git ]; then
+  _ok "dispatch block's develop_it_git_sha is populated (FIX1 regression)"
+else
+  _fail "dispatch block's develop_it_git_sha is empty or non-git: [$git_sha]"
+fi
+if [ -n "$file_sha256" ]; then
+  _ok "dispatch block's develop_it_file_sha256 is populated (FIX1 regression)"
+else
+  _fail "dispatch block's develop_it_file_sha256 is empty"
+fi
+
+# Regression test for FIX 2: phase_name must be the canonical name, not 'unknown'.
+assert_eq "spec-review" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" phase_name)" \
+  "dispatch block's phase_name is canonical, not 'unknown' (FIX2 regression)"
+
+# Regression test for FIX 7: emitted key order must match the declared grammar
+# field-for-field. Walk the dispatch block's own lines rather than trusting any
+# single-key lookup, which cannot see ordering.
+dr_keys=""
+in_dispatch_block=0
+while IFS= read -r line; do
+  case "$line" in
+    "--- "*"  dispatch")
+      in_dispatch_block=1
+      continue
+      ;;
+  esac
+  if [ "$in_dispatch_block" -eq 1 ]; then
+    [ -z "$line" ] && break
+    dr_keys="$dr_keys ${line%%:*}"
+  fi
+done < "$FEATURE_FOLDER/RUN_LOG.md"
+dr_keys="${dr_keys# }"
+assert_eq \
+  "phase phase_name iteration role vendor appendix develop_it_git_sha develop_it_file_sha256 develop_it_dirty status_path verdict model duration_ms tokens_input_new tokens_input_cached tokens_cache_write tokens_output tokens_reasoning cost_usd usage_status" \
+  "$dr_keys" \
+  "log_dispatch emits keys in the declared grammar order (FIX7 regression)"
+
+# 7b. dispatch_reviewers_parallel with codex_available=true: exercises the
+# codex render path, the second subshell, the second `wait`, and CODEX_RC
+# coming from that wait -- none of which any existing assertion touched.
+# Also the regression test for FIX 3: BOTH roles must get a DISPATCH_STARTED
+# record before either subshell launches, or dispatch_state can never see them
+# on resume.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+: > "$FAKE_ARGV_LOG"
+codex_available=true dispatch_reviewers_parallel spec-reviewer-claude spec-reviewer-codex 3 02
+assert_rc 0 $? "dispatch_reviewers_parallel returns 0 with codex_available=true"
+assert_eq 0 "${CLAUDE_RC}" "codex path: claude subprocess succeeds (rc from wait)"
+assert_eq 0 "${CODEX_RC}" "codex path: codex subprocess succeeds (rc from the second wait)"
+assert_eq 2 "$("$GREP_BIN" -c 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "both claude and codex roles got a DISPATCH_STARTED record (FIX3 regression)"
+assert_present 'role:                     spec-reviewer-claude' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "the claude role's DISPATCH_STARTED record is present"
+assert_present 'role:                     spec-reviewer-codex' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "the codex role's DISPATCH_STARTED record is present"
+
+# 7c. post_dispatch must treat an empty rc, a non-numeric rc, and rc=124
+# (timeout's own exit code) as failure -- not a syntax error, not success.
+: > "$WORK/pd-status.md"; : > "$WORK/pd.err"
+post_dispatch "" "$WORK/pd-status.md" "$WORK/pd.err" >/dev/null 2>&1
+assert_rc 1 $? "post_dispatch treats an empty rc as failure"
+post_dispatch "abc" "$WORK/pd-status.md" "$WORK/pd.err" >/dev/null 2>&1
+assert_rc 1 $? "post_dispatch treats a non-numeric rc as failure"
+post_dispatch 124 "$WORK/pd-status.md" "$WORK/pd.err" >/dev/null 2>&1
+assert_rc 1 $? "post_dispatch treats rc=124 (timeout) as failure"
+
+# 8. A render failure must produce ZERO CLI invocations. Asserting only that the
 #    delivered prompt has no $VARS is insufficient: an empty prompt also passes
 #    that test.
 : > "$FAKE_ARGV_LOG"

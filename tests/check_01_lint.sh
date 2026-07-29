@@ -15,6 +15,10 @@ fi
 # 2. Syntax-check everything.
 python3 lib/extract.py cookbook >/dev/null 2>&1 || { _fail "cookbook not extractable"; finish; }
 python3 lib/extract.py snippets
+snippets_extract_rc=$?
+if [ "$snippets_extract_rc" -ne 0 ]; then
+  _fail "extract.py snippets exited non-zero (rc=$snippets_extract_rc)"
+fi
 
 # 2a. INVARIANT: the cookbook is definitions only. A top-level statement would
 #     execute on `source`, and a top-level ${VAR:?} would abort the sourcing
@@ -57,11 +61,18 @@ fi
 
 bash -n "$BUILD/cookbook.sh" && _ok "cookbook.sh is syntactically valid" \
                              || _fail "cookbook.sh has a syntax error"
+snippet_count=0
+snippet_syntax_bad=0
 for s in "$BUILD"/snippets/*.sh; do
   [ -e "$s" ] || break
-  bash -n "$s" || _fail "syntax error in snippet from document line ${s##*/}"
+  snippet_count=$((snippet_count + 1))
+  bash -n "$s" || { _fail "syntax error in snippet from document line ${s##*/}"; snippet_syntax_bad=1; }
 done
-_ok "all snippets are syntactically valid"
+if [ "$snippet_count" -eq 0 ]; then
+  _fail "zero snippets extracted -- extract.py snippets checked NOTHING (a snippet-extraction regression would silently pass here)"
+elif [ "$snippet_syntax_bad" -eq 0 ]; then
+  _ok "all $snippet_count snippets are syntactically valid"
+fi
 
 # 3. shellcheck the cookbook only. Snippets legitimately reference variables
 #    they do not define, so full linting there would be noise.
