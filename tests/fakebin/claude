@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Fake `claude` CLI for offline integration tests.
+#   FAKE_RC           exit code (default 0)
+#   FAKE_DELAY        seconds to sleep before responding (default 0)
+#   FAKE_IGNORE_TERM  when set, trap and ignore SIGTERM
+#   FAKE_ARGV_LOG     append the full argv to this file
+set -u
+[ -n "${FAKE_IGNORE_TERM:-}" ] && trap '' TERM
+[ -n "${FAKE_ARGV_LOG:-}" ] && printf 'claude %s\n' "$*" >> "$FAKE_ARGV_LOG"
+case " $* " in
+  *" --help "*) printf -- '--output-format --dangerously-skip-permissions --model --agents\n'; exit 0 ;;
+esac
+# Capture the prompt rather than discarding it: tests assert that what actually
+# reached the CLI is fully substituted (no literal $VARS survived render_prompt).
+prompt="$(cat || true)"
+[ "${FAKE_DELAY:-0}" != 0 ] && sleep "${FAKE_DELAY}"
+printf '{"type":"result","duration_ms":1234,"total_cost_usd":0.01,'
+printf '"modelUsage":{"claude-opus-5":{"inputTokens":10,"outputTokens":5}},'
+printf '"usage":{"input_tokens":10,"cache_read_input_tokens":0,'
+printf '"cache_creation_input_tokens":0,"output_tokens":5},'
+printf '"prompt_received":%s}\n' "$(printf '%s' "$prompt" | jq -Rs .)"
+exit "${FAKE_RC:-0}"

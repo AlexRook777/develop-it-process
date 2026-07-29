@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Fake `codex` CLI for offline integration tests. Same knobs as fakebin/claude.
+set -u
+[ -n "${FAKE_IGNORE_TERM:-}" ] && trap '' TERM
+[ -n "${FAKE_ARGV_LOG:-}" ] && printf 'codex %s\n' "$*" >> "$FAKE_ARGV_LOG"
+# Reject the real CLI's ordering bug so the stub cannot mask it: `-a` after
+# `exec` must fail exactly as codex 0.146.0 does.
+seen_exec=no
+for a in "$@"; do
+  case "$a" in
+    exec) seen_exec=yes ;;
+    -a|--ask-for-approval|-m|--model|-c|--config)
+      [ "$seen_exec" = yes ] && { printf "error: unexpected argument '%s' found\n" "$a" >&2; exit 2; } ;;
+  esac
+done
+case " $* " in
+  *" --help "*) printf -- '--json --skip-git-repo-check --add-dir --model\n'; exit 0 ;;
+esac
+prompt="$(cat || true)"
+[ "${FAKE_DELAY:-0}" != 0 ] && sleep "${FAKE_DELAY}"
+printf '%s\n' "{\"type\":\"turn.started\",\"prompt_received\":$(printf '%s' "$prompt" | jq -Rs .)}"
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":2100,"cached_input_tokens":1800,"output_tokens":640,"reasoning_output_tokens":2048}}'
+exit "${FAKE_RC:-0}"
