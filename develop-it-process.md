@@ -38,29 +38,10 @@ You are a strict orchestrator. You sequence subprocess agents. You do not do the
 For every step that produces or modifies an artifact:
 
 1. Pick the role: which CLI (`claude` or `codex`), which model (Opus / Sonnet / GPT-5.5), which appendix in this file defines its prompt, and which Superpowers skill it must load.
-2. Extract the appendix body with `awk`, substitute orchestration variables (paths, model name, iteration number), and pipe it into the subprocess. **Use the helpers from the "Runtime cookbook & guardrails" section** — they handle multi-line values (e.g. `$FINDINGS_PATHS`) correctly and use the right CLI option ordering for each vendor. Example (Claude reviewer, single-line values only):
-
-   ```bash
-   # Each appendix below is delimited by HTML-comment markers using the BEGIN-role and END-role
-   # phrasing (with full HTML comment syntax). The example regex below escapes those markers so
-   # this prompt's own marker count stays accurate; awk treats `\!` as `!`, so the regex still
-   # matches the real markers in the file.
-   awk '/<\!-- BEGIN: spec-reviewer-claude -\->/,/<\!-- END: spec-reviewer-claude -\->/' "$PROCESS_PATH" \
-     | sed "s|\$FEATURE_FOLDER|${FEATURE_FOLDER}|g; s|\$ITERATION|${ITER}|g; s|\$SPEC_PATH|${SPEC_PATH}|g" \
-     | timeout 20m claude --model opus -p --output-format=json --dangerously-skip-permissions - \
-       1> "${FEATURE_FOLDER}/transcripts/spec-review-iter${ITER}-claude.json" \
-       2> "${FEATURE_FOLDER}/transcripts/spec-review-iter${ITER}-claude.err"
-   ```
-
-   **For Codex subprocesses**, global options like `-a never` must appear BEFORE `exec`. The Codex CLI rejects `codex exec ... -a never` with `error: unexpected argument '-a' found`. Use the form:
-
-   ```bash
-   timeout 20m codex -a never exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json - \
-     1> "${FEATURE_FOLDER}/transcripts/<phase>-<iter>-codex.json" \
-     2> "${FEATURE_FOLDER}/transcripts/<phase>-<iter>-codex.err"
-   ```
-
-   For appendices that substitute multi-line values (any list-shaped variable: `$FINDINGS_PATHS`, multi-line summaries, etc.), use the `render_prompt` python3 helper from the cookbook — `sed` on a multi-line value will either break or silently mangle the result.
+2. Render the appendix with `render_prompt <appendix-name>` and pipe it into
+   `claude_invoke <role> …` or `codex_invoke <role> …`. Never use `sed` for
+   substitution: multi-line values break it, and the model/effort/timeout must
+   come from the role helpers rather than being written into the command.
 
 3. The subagent writes its artifact and a short `STATUS.md` to a pre-agreed path inside the feature folder. STATUS.md is written LAST and atomically (the subagent writes `STATUS.md.tmp` and renames).
 4. You read ONLY `STATUS.md` (and, for the final readiness writer, the per-phase summary files referenced by STATUS.md). You do not open the artifact, the findings file, or the transcripts. The only exception is surfacing a transcript path to the user when a failure halts the run.
@@ -565,40 +546,88 @@ The `awk` range is sufficient for extraction. The BEGIN and END markers are HTML
 
 `sed` is fine for single-line scalars (`$ITERATION`, `$SPEC_PATH`, `$PLAN_PATH`). It breaks or silently mangles output for multi-line values like `$FINDINGS_PATHS` (a newline-separated list). For any role that consumes a list-shaped variable, use this `render_prompt` helper instead:
 
+<!-- lint: cookbook -->
 ```bash
+# Extract one appendix and substitute orchestration variables into it.
+# `sed` is NOT an alternative: multi-line values such as $FINDINGS_PATHS break
+# it, and path values collide with any delimiter chosen.
+# Every variable any appendix may reference. Declared by render_keys() rather
+# than a top-level assignment, because the cookbook must be definitions-only:
+# check_01_lint.sh sources it in a pristine shell and fails on any variable it
+# sets. tests/check_03_varcoverage.sh asserts this list covers every $VAR used in
+# every appendix body, and render_prompt passes exactly this list to python3.
+render_keys() {
+  printf '%s\n' FEATURE_FOLDER ITERATION SPEC_PATH PLAN_PATH FINDINGS_PATHS \
+    IMPLEMENTATION_BASE_SHA IMPLEMENTATION_SUMMARY_PATH DEBUGGER_STATUS_PATH \
+    REPO_ROOT ROUND TEST_REPORT_PATH RESOLVED_MODELS CONTEXT7_POLICY
+}
+
 render_prompt() {
   # Usage: render_prompt <appendix-name>
-  # Reads $PROCESS_PATH, extracts the appendix, substitutes every $VARNAME that
-  # is exported in the environment, prints the result to stdout.
-  local appendix="$1"
-  APPENDIX="$appendix" PROCESS_PATH="$PROCESS_PATH" "$PYTHON_BIN" - <<'PY'
+  local appendix="$1" k
+  local set_keys=() envargs=()
+
+  # Pass values EXPLICITLY. Orchestration variables are ordinary shell
+  # assignments, not exports, so python3 would see none of them via os.environ —
+  # the prompt would render with every $VAR intact and the subagent would be told
+  # to read a file called literally "$SPEC_PATH".
+  #
+  # `${!k+x}` distinguishes "set but empty" from "unset", which the prefix form
+  # alone cannot: an unset variable would arrive as an empty string and silently
+  # substitute nothing.
+  for k in $(render_keys); do
+    if [ -n "${!k+x}" ]; then
+      set_keys+=("$k")
+      envargs+=("$k=${!k}")
+    fi
+  done
+
+  env APPENDIX="$appendix" PROCESS_PATH="$PROCESS_PATH" \
+      SET_KEYS="${set_keys[*]}" ${envargs[@]+"${envargs[@]}"} \
+      "$PYTHON_BIN" - <<'PY'
 import os
+import re
+import sys
 
 process = os.environ["PROCESS_PATH"]
 name = os.environ["APPENDIX"]
 
 text = open(process).read()
-start = f"<!-- BEGIN: {name} -->"
-end = f"<!-- END: {name} -->"
+start_marker = f"<!-- BEGIN: {name} -->"
+end_marker = f"<!-- END: {name} -->"
 
-body = text[text.index(start):text.index(end) + len(end)]
+start = text.find(start_marker)
+if start == -1:
+    sys.exit(f"render_prompt: no BEGIN marker for appendix '{name}' in {process}")
+# Search for the END marker AFTER start -- searching from 0 could match an
+# earlier appendix's END and silently truncate or invert the body.
+end = text.find(end_marker, start)
+if end == -1:
+    sys.exit(f"render_prompt: BEGIN without END for appendix '{name}' in {process}")
+body = text[start:end + len(end_marker)]
 
-# Substitute every known orchestration variable. Multi-line values (e.g.
-# FINDINGS_PATHS) are preserved verbatim — no shell quoting concerns.
-for key in [
-    "FEATURE_FOLDER",
-    "ITERATION",
-    "SPEC_PATH",
-    "PLAN_PATH",
-    "FINDINGS_PATHS",
-    "IMPLEMENTATION_BASE_SHA",
-    "IMPLEMENTATION_SUMMARY_PATH",
-    "DEBUGGER_STATUS_PATH",
-    "REPO_ROOT",
-]:
-    value = os.environ.get(key)
-    if value is not None:
-        body = body.replace(f"${key}", value)
+# Only the keys the CALLER actually had set. The shell computed this list with
+# ${!k+x}, so "set but empty" is honoured and "unset" is detectable here.
+set_keys = os.environ.get("SET_KEYS", "").split()
+
+# Longest name first, and a trailing boundary assertion, so a short name can
+# never partially replace a longer one (e.g. $ITERATION vs $ITERATION_CAP).
+for key in sorted(set_keys, key=len, reverse=True):
+    value = os.environ.get(key, "")
+    body = re.sub(rf"\${key}(?![A-Za-z0-9_])", value.replace("\\", "\\\\"), body)
+
+# FAIL LOUDLY on anything left unresolved. A prompt containing a literal
+# "$SPEC_PATH" tells the subagent to read a file by that name; it will either
+# error confusingly or, worse, proceed against the wrong input. This is the
+# check that turns "the orchestrator forgot to set $PLAN_PATH" from a silent
+# wrong-input bug into an immediate, named failure.
+leftover = sorted(set(re.findall(r"\$([A-Z][A-Z0-9_]{2,})", body)))
+if leftover:
+    sys.exit(
+        f"render_prompt: appendix '{name}' references unset variable(s): "
+        + ", ".join("$" + v for v in leftover)
+        + f"\n  set keys were: {' '.join(sorted(set_keys)) or '(none)'}"
+    )
 
 print(body)
 PY

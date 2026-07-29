@@ -151,4 +151,79 @@ else
   _fail "porcelain_offenders is not defined"
 fi
 
+# --- render_prompt ---
+if declare -F render_prompt >/dev/null; then
+  # PLAIN ASSIGNMENTS, deliberately NOT exported. The orchestrator sets these the
+  # same way, so an `export` here would mask the real defect: render_prompt reads
+  # them through python3's os.environ, which never sees an unexported shell
+  # variable. Verified: python3 reports None for a plain assignment.
+  PROCESS_PATH="$PROCESS_DOC"
+  ITERATION=07
+  FEATURE_FOLDER=/tmp/ff
+  SPEC_PATH=/tmp/spec.md
+  PLAN_PATH=/tmp/plan.md
+  FINDINGS_PATHS="/tmp/a.md
+/tmp/b.md"
+  IMPLEMENTATION_BASE_SHA=deadbeef
+  IMPLEMENTATION_SUMMARY_PATH=/tmp/impl.md
+  DEBUGGER_STATUS_PATH=/tmp/dbg.md
+  REPO_ROOT=/tmp/repo
+  ROUND=03
+  TEST_REPORT_PATH=/tmp/tr.md
+  RESOLVED_MODELS="  implementer: claude-opus-5"
+  CONTEXT7_POLICY=required
+
+  body="$(render_prompt spec-reviewer-claude)" \
+    && _ok "render_prompt extracts a known appendix from unexported variables" \
+    || _fail "render_prompt failed on spec-reviewer-claude"
+  case "$body" in
+    *'$ITERATION'*) _fail "render_prompt left \$ITERATION unsubstituted" ;;
+    *07*)           _ok "render_prompt substituted \$ITERATION" ;;
+    *)              _fail "render_prompt output lacks the substituted value" ;;
+  esac
+
+  # THE regression: no appendix may render with an unresolved variable. This one
+  # assertion covers every appendix and every key at once.
+  unresolved=""
+  for a in $(/usr/bin/grep -oP '^<!-- BEGIN: \K[a-z0-9-]+' "$PROCESS_DOC"); do
+    out="$(render_prompt "$a" 2>&1)" || { unresolved="$unresolved $a(rc)"; continue; }
+    case "$out" in
+      *'$'[A-Z][A-Z]*) unresolved="$unresolved $a" ;;
+    esac
+  done
+  assert_eq "" "$unresolved" "every appendix renders with no unresolved \$VARS"
+
+  # Multi-line values must survive verbatim -- this is why python3, not sed.
+  body="$(render_prompt spec-fixer)"
+  case "$body" in
+    *"/tmp/a.md"*"/tmp/b.md"*) _ok "multi-line \$FINDINGS_PATHS survives intact" ;;
+    *) _fail "multi-line substitution mangled \$FINDINGS_PATHS" ;;
+  esac
+
+  # An UNSET variable that the appendix uses must be a named failure, not a
+  # half-rendered prompt.
+  unset SPEC_PATH
+  err="$(render_prompt spec-reviewer-claude 2>&1 >/dev/null)"; rc=$?
+  [ "$rc" -ne 0 ] && _ok "render_prompt fails when an appendix variable is unset" \
+                  || _fail "render_prompt must fail on an unset appendix variable"
+  case "$err" in
+    *SPEC_PATH*) _ok "render_prompt names the unset variable" ;;
+    *) _fail "render_prompt did not name the unset variable: $err" ;;
+  esac
+  SPEC_PATH=/tmp/spec.md
+
+  # A missing marker must be a legible error, not a Python traceback that
+  # becomes the prompt.
+  err="$(render_prompt no-such-appendix 2>&1 >/dev/null)"; rc=$?
+  [ "$rc" -ne 0 ] && _ok "render_prompt fails on an unknown appendix" \
+                  || _fail "render_prompt must fail on an unknown appendix"
+  case "$err" in
+    *Traceback*) _fail "render_prompt emitted a Python traceback: $err" ;;
+    *no-such-appendix*) _ok "render_prompt names the missing appendix" ;;
+    *) _fail "render_prompt diagnostic is unhelpful: $err" ;;
+  esac
+else
+  _fail "render_prompt is not defined"
+fi
+
 finish
