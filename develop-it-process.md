@@ -134,7 +134,34 @@ A gate that passes in the relaxed tier (final passing iteration ≥ 3) forces th
 
 All non-orchestrator roles run as fresh subprocesses with isolated context. You never produce content a worker or reviewer would produce.
 
-**Forbidden codex models.** Do NOT pass `-m`, `--model`, or `-c model=...` with any of: `gpt-5.1-codex-max`, `gpt-5-codex-max`, `o3`, `o3-mini`, or any other `*-codex-max` / `o*` id. These require an OpenAI API key; the user's auth is a ChatGPT subscription and the request will fail with HTTP 400 `"model is not supported when using Codex with a ChatGPT account"`.
+**Pinned models.** The Models table names exact model ids. There is no class
+indirection and no fallback: an id that the CLI rejects HALTs the run with a
+remediation message naming the role and the id (see Phase −1). Changing a model
+is an edit to this document, which makes it reviewable.
+
+Resolve with the cookbook helpers — never by reading `~/.codex/config.toml`,
+and never from a model alias:
+
+<!-- lint: snippet -->
+```bash
+CLAUDE_MODEL="$(role_model "$role")"   # claude --model "$CLAUDE_MODEL"
+CODEX_MODEL="$(role_model "$role")"    # codex -m "$CODEX_MODEL" -a never exec …
+CODEX_EFFORT="$(role_effort "$role")"
+```
+
+**Both vendors are bound explicitly.** Passing effort and `--json` while
+omitting `-m` leaves the model set by ambient config outside this document —
+the same defect class as an unassigned `$CLAUDE_MODEL`. `codex` accepts
+`-m/--model`; it is a global option and appears before `exec`, alongside
+`-a never`.
+
+**Forbidden codex models.** Never pass `-m`, `--model`, or `-c model=...` with
+`gpt-5.1-codex-max`, `gpt-5-codex-max`, `o3`, `o3-mini`, or any other
+`*-codex-max` / `o*` id. These require an OpenAI API key; this account's auth is
+a ChatGPT subscription and the request fails with HTTP 400 `"model is not
+supported when using Codex with a ChatGPT account"`. This prohibition — not
+omitting `-m` — is what prevents that failure. `gpt-5.6-luna` and
+`gpt-5.6-terra` are available to this account but deliberately unused.
 
 | Role | Vendor | Model | Effort | Timeout (min) |
 |---|---|---|---|---|
@@ -419,6 +446,15 @@ _role_keys() {
     summarizer-plan summarizer-implementation summarizer-code-review \
     summarizer-all-tests readiness-writer
 }
+
+# Render the role->model map for injection into the context-discovery prompt.
+# The dispatched session cannot call role_model, so the orchestrator formats it.
+resolved_models_block() {
+  local role
+  for role in $(_role_keys); do
+    printf '  %s: %s\n' "$role" "$(role_model "$role")"
+  done
+}
 ```
 
 ### full_log.md — bash command log
@@ -503,74 +539,60 @@ Export each `$VARNAME` the appendix expects, then pipe `render_prompt <name>` in
 
 ### CLI invocation forms
 
-The two vendors take different option orders. Codex additionally distinguishes cheap vs. deep mode via reasoning effort. Memorise all three forms — getting them wrong wastes a dispatch attempt and pollutes the failure log.
+The two vendors take different option orders. Memorise both forms — getting them wrong wastes a dispatch attempt and pollutes the failure log.
 
+<!-- lint: cookbook -->
 ```bash
-# Claude — prompt via stdin, model selected via --model.
-# --output-format=json emits a single final JSON record on stdout (telemetry).
-# --dangerously-skip-permissions is REQUIRED: claude subprocesses run non-interactively
-# and cannot receive user approval for Write/Bash tool calls. Without this flag the
-# subprocess exits rc=0 but never writes its STATUS file (all tool calls are denied).
-timeout 20m claude --model "$CLAUDE_MODEL" -p --output-format=json --dangerously-skip-permissions - \
-  1> "$OUT_PATH" \
-  2> "$ERR_PATH"
+# Claude — prompt on stdin, model and timeout resolved from the role.
+# --dangerously-skip-permissions is REQUIRED: claude subprocesses run
+# non-interactively and cannot receive approval for Write/Bash calls. Without
+# it the subprocess exits rc=0 but never writes its STATUS file.
+claude_invoke() {
+  # Usage: claude_invoke <role> <out_path> <err_path> [extra args...]
+  local role="$1" out="$2" err="$3"; shift 3
+  local model timeout
+  model="$(role_model "$role")"     || return 1
+  timeout="$(role_timeout "$role")" || return 1
+  timeout --kill-after=60s "${timeout}m" \
+    claude --model "$model" -p --output-format=json \
+           --dangerously-skip-permissions "$@" - \
+    1> "$out" 2> "$err"
+}
 
-# Codex CHEAP — Phase −1 preflight, Phase 1 spec review, Phase 3 plan review.
-# Global options (-a, -c) appear BEFORE the `exec` subcommand.
-# -a never: never pause for approval (non-interactive equivalent of claude's --dangerously-skip-permissions).
-# --skip-git-repo-check: required when $REPO_ROOT is not in Codex's trusted-directory list;
-#   without it Codex refuses with "Not inside a trusted directory".
-timeout 40m codex -a never \
-  -c model_reasoning_effort="medium" \
-  exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check - \
-  1> "$OUT_PATH" \
-  2> "$ERR_PATH"
-
-# Codex DEEP — Phase 6 final implementation review only.
-timeout 90m codex -a never \
-  -c model_reasoning_effort="high" \
-  exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check - \
-  1> "$OUT_PATH" \
-  2> "$ERR_PATH"
+# Codex — global options (-a, -c, -m) MUST precede `exec`.
+#   -a never              : non-interactive, never pause for approval.
+#   -m                    : pins the model; never rely on ~/.codex/config.toml.
+#   --skip-git-repo-check : required when $REPO_ROOT is not a Codex trusted dir.
+#   --json                : REQUIRED — parse_usage reads JSONL from stdout.
+#   -s workspace-write    : read-only blocks the reviewer's own STATUS write.
+#   --add-dir             : only when $FEATURE_FOLDER is outside $REPO_ROOT.
+codex_invoke() {
+  # Usage: codex_invoke <role> <out_path> <err_path> [extra args...]
+  # Extra args are accepted for call-site symmetry with claude_invoke; note
+  # that --agents is claude-only and never reaches a codex role.
+  local role="$1" out="$2" err="$3"; shift 3
+  local model effort timeout add_dir=()
+  model="$(role_model "$role")"     || return 1
+  effort="$(role_effort "$role")"   || return 1
+  timeout="$(role_timeout "$role")" || return 1
+  [ -n "${FEATURE_FOLDER_OUTSIDE_REPO:-}" ] && add_dir=(--add-dir "$FEATURE_FOLDER")
+  timeout --kill-after=60s "${timeout}m" \
+    codex -a never -m "$model" -c model_reasoning_effort="$effort" \
+      exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json \
+      ${add_dir[@]+"${add_dir[@]}"} "$@" - \
+    1> "$out" 2> "$err"
+}
 ```
 
 If you find yourself writing `codex exec ... -a never` (global option after `exec`), STOP — that is the orchestrator-bug shape, not a Codex outage. See the "Distinguish orchestration bugs from vendor failures" rule in Failure handling.
 
-**Why both Codex modes use `-s workspace-write`.** The Codex CLI sandbox is coarse: `-s read-only` blocks ALL writes (including the reviewer's own findings + STATUS output files into `$FEATURE_FOLDER`), so it cannot be used for any reviewer. `-s workspace-write` allows writes inside the workspace but does NOT restrict reads outside the workspace (e.g. `~/.codex/skills/`). The actual cheap-mode allow-list is enforced by the appendix preamble + command budget, not by the sandbox flag.
+**Why both Codex roles use `-s workspace-write`.** The Codex CLI sandbox is coarse: `-s read-only` blocks ALL writes (including the reviewer's own findings + STATUS output files into `$FEATURE_FOLDER`), so it cannot be used for any reviewer. `-s workspace-write` allows writes inside the workspace but does NOT restrict reads outside the workspace (e.g. `~/.codex/skills/`). The actual role-scoped allow-list is enforced by the appendix preamble + command budget, not by the sandbox flag.
 
 **Why `--skip-git-repo-check` is required.** Codex performs a trusted-directory check before executing when `-C` is used with a path not explicitly trusted in `~/.codex/`. Without this flag it exits immediately with "Not inside a trusted directory and --skip-git-repo-check was not specified", producing an empty stdout and an empty STATUS file. This flag does not alter sandboxing or approval behaviour — it only bypasses the git-repo trust gate.
 
-**Why `-c model_reasoning_effort` is set per-dispatch.** The orchestrator does NOT rely on `~/.codex/config.toml`'s global `model_reasoning_effort`. Every Codex call sets effort explicitly: `medium` for cheap, `high` for deep. This removes a hidden global config that previously caused iterative review gates to run at maximum cost.
+**Why `-c model_reasoning_effort` is set per-dispatch.** The orchestrator does NOT rely on `~/.codex/config.toml`'s global `model_reasoning_effort`. Every Codex call sets effort explicitly, resolved per role via `role_effort`. This removes a hidden global config that previously caused iterative review gates to run at maximum cost.
 
-**Helper for picking the right form:**
-
-```bash
-codex_invoke() {
-  # Usage: codex_invoke <mode> <out_path> <err_path>
-  # mode is "cheap" or "deep". Reads the prompt from stdin.
-  local mode="$1" out="$2" err="$3"
-  case "$mode" in
-    cheap)
-      timeout 40m codex -a never \
-        -c model_reasoning_effort="medium" \
-        exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check - \
-        1> "$out" 2> "$err"
-      ;;
-    deep)
-      timeout 90m codex -a never \
-        -c model_reasoning_effort="high" \
-        exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check - \
-        1> "$out" 2> "$err"
-      ;;
-    *)
-      echo "codex_invoke: bad mode '$mode' (expected cheap|deep)" >&2
-      return 1
-      ;;
-  esac
-}
-```
-
-Pick the mode using the "Codex reviewer modes" table above: cheap for Phase −1 / 1 / 3, deep for Phase 6.
+Pass the role; effort and timeout follow from the Models table.
 
 ### CLI canary preflight
 
@@ -625,10 +647,10 @@ Every successful dispatch emits a final JSON record carrying token counts and (f
 The output of this helper is a single line: nine `key=value` pairs space-separated. The orchestrator pastes these into the RUN_LOG block (one field per line, formatted as `key: value`).
 
 ```bash
-# parse_usage <vendor> <stdout-path> <wall-duration-ms> <fallback-model>
+# parse_usage <vendor> <stdout-path> <wall-duration-ms> <declared-model>
 # Prints: model=<m> duration_ms=<n> tokens_input_new=<n> tokens_input_cached=<n> tokens_cache_write=<n> tokens_output=<n> tokens_reasoning=<n> cost_usd=<n|n/a> usage_status=<ok|unavailable>
 parse_usage() {
-  local vendor="$1" out_path="$2" wall_ms="$3" fallback_model="$4"
+  local vendor="$1" out_path="$2" wall_ms="$3" declared_model="$4"
   local model dur in_new in_cached cache_w out reasoning cost status
 
   if [ ! -s "$out_path" ]; then
@@ -641,9 +663,10 @@ parse_usage() {
     # .modelUsage can contain MORE than one model: Claude Code internally uses a small
     # Haiku helper alongside the dispatched main model. NEVER take the alphabetically
     # first key (haiku sorts before opus and misattributes the dispatch) — prefer the
-    # key matching the dispatched model id; fall back to the highest-output model.
+    # key matching the dispatched model id when present.
+    # Select the key with the highest total token count -- never alphabetically.
     local parsed
-    parsed=$(jq -r --arg fb "$fallback_model" '
+    parsed=$(jq -r --arg fb "$declared_model" '
       (.modelUsage // {}) as $mu
       | (if ($mu | has($fb)) then $fb
          elif ($mu | length) > 0 then ($mu | to_entries | max_by(.value.outputTokens // 0) | .key)
@@ -685,7 +708,7 @@ parse_usage() {
     fi
     IFS=$'\t' read -r _ in_new in_cached cache_w out reasoning <<< "$parsed"
     # Codex JSON has no model field; use the orchestrator-resolved model id.
-    model="$fallback_model"
+    model="$declared_model"
     dur="$wall_ms"
     cost="n/a"
     status="ok"
@@ -1057,6 +1080,19 @@ Dispatch one `claude` Opus subprocess with the `context-discovery` appendix. The
 - Reads `CLAUDE.md` (and any nested `CLAUDE.md` files).
 - Identifies project conventions relevant to the SDLC flow.
 - Writes a short context summary file at `<feature-folder>/2-context-discovery/status.md` with `verdict=READY` plus the resolved skill names per phase.
+
+Before rendering the appendix, resolve and export the role→model map so the
+dispatched session can copy it verbatim instead of calling `role_model` itself
+(it has no access to the orchestrator's shell functions):
+
+<!-- lint: snippet -->
+```bash
+RESOLVED_MODELS="$(resolved_models_block)"
+export RESOLVED_MODELS
+```
+
+Because `$RESOLVED_MODELS` is multi-line, this is exactly the case `sed`
+substitution cannot handle — it is why `render_prompt` uses python3.
 
 Timeout: 15 min.
 
@@ -1483,7 +1519,7 @@ appears anywhere else in this document.
 
 On ANY failure mode of a `codex` subprocess:
 - Append `CODEX_UNAVAILABLE` to `RUN_LOG.md` with failure mode, phase/iteration, and the last 40 lines of stderr.
-- **Before** setting `codex_available = false`, scan the captured stderr for the literal substring `is not supported when using Codex with a ChatGPT account`. If found, this is a model-resolution bug, NOT a Codex outage: HALT, surface the offending model id and the active model list from `~/.codex/models_cache.json`, and prompt the user to fix the resolved-model map in `2-context-discovery/status.md` (typically: drop `-m` so config.toml supplies the default, or pin `gpt-5.5`). Do not silently degrade.
+- **Before** setting `codex_available = false`, scan the captured stderr for the literal substring `is not supported when using Codex with a ChatGPT account`. If found, this is a model-resolution bug, NOT a Codex outage: HALT, surface the offending model id and the active model list from `~/.codex/models_cache.json`, and prompt the user to fix the resolved-model map in `2-context-discovery/status.md` (the fix is an edit to the Models table in this document — never dropping `-m`, which would let ambient config choose the model). Do not silently degrade.
 - Otherwise, set in-run flag `codex_available = false`.
 - Proceed with the Claude reviewer's verdict alone.
 - The active gate's summarizer (and the final readiness writer) record `partial_review = true` and `codex_unavailable_reason = <mode>` in their summaries.
@@ -1972,7 +2008,15 @@ Use only read-only inspection. You do NOT load `subagent-driven-development` her
 1. Enumerate Superpowers skills available in the environment. Use the platform's skill-listing mechanism.
 2. Read the root `CLAUDE.md` and any nested `CLAUDE.md` files relevant to the SDLC flow. Summarize project conventions in one paragraph.
 3. Inspect the input spec path (the orchestrator records this in `RUN_LOG.md` and the feature folder name encodes the slug — derive the spec path: take the feature folder name, strip `-artifacts`, append `-design.md`, prepend `docs/superpowers/specs/`). Confirm the spec exists. Do NOT read its body.
-4. Resolve concrete model ids for each role per the **Default model resolution** policy in the Models section. Defaults today: Opus → `claude-opus-4-8`, Sonnet → `claude-sonnet-4-6`, GPT-5.5 → `gpt-5.5`. Only deviate if the runtime environment lists a strictly newer Opus/Sonnet/Codex release. **Never** resolve GPT-5.5 to `gpt-5.1-codex-max`, `gpt-5-codex-max`, `o3`, `o3-mini`, or any other `*-codex-max` / `o*` id — those require an OpenAI API key and will 400 on a ChatGPT-account auth. Record the resolved map.
+4. Copy the resolved role→model map below verbatim into your STATUS file under
+   `resolved_models:`. It was produced by the orchestrator from the Models table.
+   Do NOT re-derive, alias, or substitute ids, and do NOT consult
+   `~/.codex/config.toml`. **Never** substitute any of `gpt-5.1-codex-max`,
+   `gpt-5-codex-max`, `o3`, `o3-mini`, or any other `*-codex-max` / `o*` id for a
+   codex role — those require an OpenAI API key and will 400 on a ChatGPT-account
+   auth:
+
+   $RESOLVED_MODELS
 
 ## Output
 
@@ -1984,9 +2028,8 @@ available_skills: [...]
 project_conventions: |
   <one paragraph>
 resolved_models:
-  opus: <model-id>
-  sonnet: <model-id>
-  gpt55: <model-id>
+  # one line per dispatched role, exactly as supplied in $RESOLVED_MODELS
+  <role-key>: <model-id>
 spec_path: <absolute>
 reason: <one line if BLOCKED>
 ```
