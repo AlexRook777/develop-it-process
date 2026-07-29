@@ -1,0 +1,5 @@
+{"type":"result","duration_ms":4210,"total_cost_usd":0.0731,
+ "modelUsage":{"claude-opus-5":{"inputTokens":1200,"outputTokens":800},
+               "claude-haiku-4-5-20251001":{"inputTokens":40,"outputTokens":10}},
+ "usage":{"input_tokens":1200,"cache_read_input_tokens":9000,
+          "cache_creation_input_tokens":300,"output_tokens":800}}

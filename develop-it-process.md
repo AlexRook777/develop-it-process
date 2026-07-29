@@ -755,6 +755,7 @@ Every successful dispatch emits a final JSON record carrying token counts and (f
 
 The output of this helper is a single line: nine `key=value` pairs space-separated. The orchestrator pastes these into the RUN_LOG block (one field per line, formatted as `key: value`).
 
+<!-- lint: cookbook -->
 ```bash
 # parse_usage <vendor> <stdout-path> <wall-duration-ms> <declared-model>
 # Prints: model=<m> duration_ms=<n> tokens_input_new=<n> tokens_input_cached=<n> tokens_cache_write=<n> tokens_output=<n> tokens_reasoning=<n> cost_usd=<n|n/a> usage_status=<ok|unavailable>
@@ -770,10 +771,10 @@ parse_usage() {
   if [ "$vendor" = "claude" ]; then
     # Single JSON object on stdout.
     # .modelUsage can contain MORE than one model: Claude Code internally uses a small
-    # Haiku helper alongside the dispatched main model. NEVER take the alphabetically
-    # first key (haiku sorts before opus and misattributes the dispatch) — prefer the
-    # key matching the dispatched model id when present.
-    # Select the key with the highest total token count -- never alphabetically.
+    # Haiku helper alongside the dispatched main model. Prefer the key matching the
+    # dispatched model id when present; never select alphabetically — with fable,
+    # haiku, opus and sonnet all possible, sort order is meaningless. Select the
+    # key with the highest total token count.
     local parsed
     parsed=$(jq -r --arg fb "$declared_model" '
       (.modelUsage // {}) as $mu
@@ -798,24 +799,25 @@ parse_usage() {
     IFS=$'\t' read -r model dur in_new in_cached cache_w out reasoning cost <<< "$parsed"
     status="ok"
   elif [ "$vendor" = "codex" ]; then
-    # JSONL; last `turn.completed` carries the usage.
+    # Take the LAST turn.completed record. If there is none, usage is
+    # unavailable — NOT zeros with usage_status=ok. A streaming filter is used
+    # rather than `-s`, which slurps a possibly enormous transcript into memory.
     local parsed
-    parsed=$(jq -s -r '
-      (map(select(.type == "turn.completed")) | last | .usage) as $u
-      | [
-        "codex",
-        ($u.input_tokens // 0) - ($u.cached_input_tokens // 0),
-        ($u.cached_input_tokens // 0),
-        0,
-        ($u.output_tokens // 0),
-        ($u.reasoning_output_tokens // 0)
-      ] | @tsv
-    ' "$out_path" 2>/dev/null) || parsed=""
+    parsed="$(jq -r 'select(.type == "turn.completed") | .usage
+                     | [(.input_tokens // 0), (.cached_input_tokens // 0),
+                        (.output_tokens // 0), (.reasoning_output_tokens // 0)]
+                     | @tsv' "$out_path" 2>/dev/null | tail -1)"
     if [ -z "$parsed" ]; then
       printf 'model=unknown duration_ms=%s tokens_input_new=0 tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 cost_usd=n/a usage_status=unavailable\n' "$wall_ms"
       return 0
     fi
-    IFS=$'\t' read -r _ in_new in_cached cache_w out reasoning <<< "$parsed"
+    local in_total
+    IFS=$'\t' read -r in_total in_cached out reasoning <<< "$parsed"
+    # tokens_input_new is NEW input only: Codex reports input_tokens as the
+    # TOTAL, cached included, so the difference must be taken and clamped at 0.
+    in_new=$(( in_total - in_cached ))
+    [ "$in_new" -lt 0 ] && in_new=0
+    cache_w=0
     # Codex JSON has no model field; use the orchestrator-resolved model id.
     model="$declared_model"
     dur="$wall_ms"
@@ -833,16 +835,42 @@ parse_usage() {
 
 **Wall-duration measurement.** Codex emits no `duration_ms` field, so the orchestrator times its own dispatches:
 
+<!-- lint: cookbook -->
 ```bash
-local t0=$(date +%s%3N)
-# ... run the CLI ...
-local t1=$(date +%s%3N)
-local wall_ms=$((t1 - t0))
+# ---- Wall-clock timing ------------------------------------------------------
+# Calling `date` with a `%3N`-style width specifier is NOT portable: uutils
+# coreutils ignores that width and emits full nanoseconds, inflating every
+# duration by ~10^6. EPOCHREALTIME is a bash builtin, so it does not depend on
+# which coreutils is installed.
+now_ms() { local t="${EPOCHREALTIME}"; local us="${t/[.,]/}"; printf '%s\n' "$((us / 1000))"; }
+
+# Runs a command and records BOTH its duration and its exit code in globals.
+#
+# It must NOT be called via `wall_ms="$(run_timed ...)"` or as the last element
+# of a pipe: both run it in a subshell, so any global the function sets is
+# discarded and the caller sees nothing. Call it directly and read the globals.
+#   run_timed claude_invoke "$role" "$out" "$err" < prompt
+#   echo "$DISPATCH_WALL_MS $DISPATCH_RC"
+#
+# `local` is also only legal inside a function — the previous snippet used it at
+# top level, so the assignment never happened and the duration was always empty.
+run_timed() {
+  # Usage: run_timed <command...>   -> sets DISPATCH_WALL_MS, DISPATCH_RC
+  local t0 t1
+  t0="$(now_ms)"
+  "$@"
+  # shellcheck disable=SC2034  # consumed by the caller after run_timed returns
+  DISPATCH_RC=$?
+  t1="$(now_ms)"
+  # shellcheck disable=SC2034  # consumed by the caller after run_timed returns
+  DISPATCH_WALL_MS=$((t1 - t0))
+  return 0
+}
 ```
 
-Pass `$wall_ms` to `parse_usage` as the third argument. For Claude, the function prefers the CLI-reported `duration_ms` (more accurate; excludes shell overhead); for Codex it returns `$wall_ms`.
+Pass `$DISPATCH_WALL_MS` (set by `run_timed`) to `parse_usage` as the third argument. For Claude, the function prefers the CLI-reported `duration_ms` (more accurate; excludes shell overhead); for Codex it returns the wall-clock value verbatim.
 
-**Resolved-model argument (4th) — pass it for BOTH vendors.** Always pass the dispatched resolved model id from `2-context-discovery/status.md`'s `resolved_models:` map as the fourth argument to `parse_usage`. For Codex: its JSON does not carry the model id, so the argument is used verbatim (for pre-Phase-0 dispatches — canary, preflight — where `resolved_models:` is not yet known, pass `"codex"` literally). For Claude: a session's `modelUsage` map can contain more than one model — Claude Code internally runs a small Haiku helper for auxiliary work alongside the dispatched main model — and the function reports the key matching the dispatched id, falling back to the highest-output model only when no key matches. (The previous behavior — alphabetically first key — misattributed Opus dispatches to Haiku, since `h` sorts before `o`.) If the printed `model` differs from the dispatched id, the subprocess genuinely ran on a different model than requested: surface a one-line warning to the user (not a HALT) and record it as a deviation per Process self-observation trigger #6.
+**Resolved-model argument (4th) — pass it for BOTH vendors.** Always pass the dispatched resolved model id from `2-context-discovery/status.md`'s `resolved_models:` map as the fourth argument to `parse_usage`. For Codex: its JSON does not carry the model id, so the argument is used verbatim (for pre-Phase-0 dispatches — canary, preflight — where `resolved_models:` is not yet known, pass `"codex"` literally). For Claude: a session's `modelUsage` map can contain more than one model — Claude Code internally runs a small Haiku helper for auxiliary work alongside the dispatched main model — and the function reports the key matching the dispatched id, falling back to the highest-output model only when no key matches. (Never select alphabetically — with fable, haiku, opus and sonnet all possible, sort order is meaningless; the previous alphabetical-first-key behavior misattributed dispatches to whichever model happened to sort first.) If the printed `model` differs from the dispatched id, the subprocess genuinely ran on a different model than requested: surface a one-line warning to the user (not a HALT) and record it as a deviation per Process self-observation trigger #6.
 
 **Failure handling.** The function ALWAYS exits 0 and ALWAYS prints a complete nine-field record. On any parse error or missing file, it prints `usage_status=unavailable` with zeros. The orchestrator never branches on `parse_usage` exit code — it always uses the output.
 
@@ -894,11 +922,36 @@ log_dispatch() {
 
 Usage at a dispatch site:
 
+<!-- lint: snippet -->
 ```bash
-usage_line="$(parse_usage claude "$out_json" "$wall_ms" claude-opus-4-8)"
-log_dispatch spec-reviewer-claude 3 spec-review 01 \
-  "3-spec-review/iteration-01/claude-opus-verdict.md" "$(grep -m1 '^verdict:' "$STATUS" | awk '{print $2}')" \
-  "$usage_line"
+role=spec-reviewer-claude
+out_json="$FEATURE_FOLDER/transcripts/3-spec-review-iter01-claude.json"
+err_txt="${out_json%.json}.err"
+status="$FEATURE_FOLDER/3-spec-review/iteration-01/claude-verdict.md"
+
+# Validate the appendix BEFORE dispatching: a failed render must not reach the
+# CLI as an empty prompt.
+appendix_exists "$role" || { echo "halt: no appendix for role $role" >&2; return 1; }
+
+# Process substitution, NOT a pipe and NOT "$(...)":
+#   render_prompt … | run_timed …   -> run_timed is the last pipeline element,
+#                                      which bash runs in a SUBSHELL, so both
+#                                      globals are discarded.
+#   wall="$(run_timed …)"           -> same problem, plus it captures nothing.
+#   run_timed … <<< "$prompt"        -> run_timed stays in THIS shell. Correct.
+# A herestring, not process substitution: `< <(render_prompt …)` would also keep
+# run_timed in this shell, but it DISCARDS the renderer's exit status, so a failed
+# render silently becomes a zero-byte prompt with rc 0 (verified). Render into a
+# variable, check it, then feed it. The prompt still never touches a file we
+# manage, satisfying "appendix content is NEVER written to disk".
+prompt="$(render_prompt "$role")" || { echo "halt: render failed for $role" >&2; return 1; }
+[ -n "$prompt" ] || { echo "halt: empty prompt for $role" >&2; return 1; }
+run_timed claude_invoke "$role" "$out_json" "$err_txt" <<< "$prompt"
+
+usage_line="$(parse_usage claude "$out_json" "$DISPATCH_WALL_MS" "$(role_model "$role")")"
+verdict="$(status_field "$status" verdict)"
+
+log_dispatch "$role" 3 spec-review 01 "$status" "$verdict" "$usage_line"
 ```
 
 ### Dirty-tree gate (early — runs at the very top of Phase 1, before any folder creation)
