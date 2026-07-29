@@ -30,6 +30,13 @@ You are a strict orchestrator. You sequence subprocess agents. You do not do the
   detached-child protocol removed every atomic-publication site the orchestrator
   had). Reading remains restricted to STATUS files and the per-phase summaries
   they reference.
+- **Relocation, not a general write.** The orchestrator may `mv` an already-written
+  vendor STATUS file to another path WITHIN `$FEATURE_FOLDER`, exactly as Step 1.2
+  (relocating the Phase 1 STATUS files into `1-preflight/phase-1/`) and the
+  per-phase preflight gates (Steps 3.0/5.0/6.−1/7.0, relocating into each phase's
+  `preflight/` subfolder) prescribe. This permits moving a file the subagent
+  already wrote; it does not permit writing new content, and it does not extend
+  to any path outside `$FEATURE_FOLDER`.
 - **Appendix content is never written to disk.** There is no `.prompt` file:
   prompts are rendered into a shell variable and delivered to the CLI by
   herestring.
@@ -417,7 +424,15 @@ init_orchestration_vars() {
   fi
   codex_available="${codex_available:-false}"
   codex_disabled_by_user="${codex_disabled_by_user:-false}"
+  local roots_rc
   validate_roots
+  roots_rc=$?
+  # Only compute process-file identity once the roots it depends on
+  # (PROCESS_PATH_REL, PROCESS_REPO_ROOT) are known good. A failed validate_roots
+  # must still be reported as failure -- a successful process_identity call must
+  # never mask it.
+  [ "$roots_rc" -eq 0 ] && process_identity
+  return "$roots_rc"
 }
 
 validate_roots() {
@@ -820,6 +835,29 @@ Every dispatch, foreground or background, goes through the same helper:
 
 <!-- lint: cookbook -->
 ```bash
+# Canonical phase_name lookup, mirroring the phase_name table in the
+# Resumability section exactly (tests/check_04_table.sh does not enforce this
+# one; keep the two in sync by hand if the table ever changes). -1 is the
+# pre-Phase-1 canary/model-probe stage: it is written as the ASCII hyphen
+# "-1" in `phase:` fields even though section headings render it with the
+# Unicode minus sign (U+2212), and it shares Phase 1's name.
+_phase_name() {
+  # Usage: _phase_name <phase>
+  case "$1" in
+    -1|1) echo preflight ;;
+    2)    echo context-discovery ;;
+    3)    echo spec-review ;;
+    4)    echo plan-writing ;;
+    5)    echo plan-review ;;
+    6)    echo implementation ;;
+    7)    echo code-review ;;
+    8)    echo all-tests ;;
+    9)    echo git-finalization ;;
+    10)   echo readiness-report ;;
+    *)    echo "unknown phase: $1" >&2; return 1 ;;
+  esac
+}
+
 # Record a dispatch BEFORE it runs. This is the only durable evidence that a
 # dispatch was attempted, and it is what a resume reads to tell "never started"
 # apart from "started and did not finish".
@@ -861,7 +899,7 @@ dispatch_role() {
   [ -n "$prompt" ] \
     || { echo "halt: empty prompt for role $role" >&2; return 1; }
 
-  log_dispatch_started "$phase" "${PHASE_NAME:-unknown}" "$iter" "$role"
+  log_dispatch_started "$phase" "$(_phase_name "$phase")" "$iter" "$role"
 
   # A herestring, not a pipe: a pipe would run the invoker in a subshell and
   # discard the globals run_timed sets.
@@ -875,7 +913,7 @@ dispatch_role() {
   usage_line="$(parse_usage "$vendor" "$base.json" "$DISPATCH_WALL_MS" "$(role_model "$role")")"
   verdict=""
   [ -f "$status_path" ] && verdict="$(status_field "$status_path" verdict)"
-  log_dispatch "$role" "$phase" "${PHASE_NAME:-unknown}" "$iter" \
+  log_dispatch "$role" "$phase" "$(_phase_name "$phase")" "$iter" \
                "$status_path" "$verdict" "$usage_line"
   return "$DISPATCH_RC"
 }
@@ -1154,18 +1192,24 @@ This is **the standard helper** every phase step refers to. One call per subproc
 ```bash
 # log_dispatch <role> <phase> <phase_name> <iteration> <status_path> <verdict> "<usage_line>"
 #   <usage_line> is the single-line nine-pair output of parse_usage, quoted as ONE argument.
-# Requires: $PROCESS_PATH, $FEATURE_FOLDER, and process_identity to have run.
+# Requires: $PROCESS_PATH, $FEATURE_FOLDER. Process-file identity
+# (PROCESS_GIT_HEAD/PROCESS_FILE_SHA256/PROCESS_DIRTY) runs as part of
+# init_orchestration_vars, before any dispatch.
 # vendor/model/appendix are DERIVED from <role> — never pass them separately.
 log_dispatch() {
   # Usage: log_dispatch <role> <phase> <phase_name> <iteration> <status_path> \
   #                     <verdict> "<usage_line>"
-  # Appends exactly one block plus a trailing blank line. Requires
-  # process_identity to have run.
+  # Appends exactly one block plus a trailing blank line. Process-file
+  # identity runs as part of init_orchestration_vars.
   local role="$1" phase="$2" phase_name="$3" iter="$4" status_path="$5"
   local verdict="$6" usage_line="$7"
   local vendor model
   vendor="$(role_vendor "$role")"
   model="$(role_model "$role")"
+  # Key order below matches the Resumability grammar's dispatch block
+  # field-for-field: phase, phase_name, iteration, role, vendor, appendix,
+  # develop_it_git_sha, develop_it_file_sha256, develop_it_dirty, status_path,
+  # verdict, model, then the telemetry fields from $usage_line.
   {
     printf -- '--- %s  dispatch\n' "$(iso_now)"
     printf 'phase:                    %s\n' "$phase"
@@ -1173,13 +1217,13 @@ log_dispatch() {
     printf 'iteration:                %s\n' "$iter"
     printf 'role:                     %s\n' "$role"
     printf 'vendor:                   %s\n' "$vendor"
-    printf 'model:                    %s\n' "$model"
     printf 'appendix:                 %s\n' "$role"
     printf 'develop_it_git_sha:       %s\n' "$PROCESS_GIT_HEAD"
     printf 'develop_it_file_sha256:   %s\n' "$PROCESS_FILE_SHA256"
     printf 'develop_it_dirty:         %s\n' "$PROCESS_DIRTY"
     printf 'status_path:              %s\n' "$status_path"
     printf 'verdict:                  %s\n' "$verdict"
+    printf 'model:                    %s\n' "$model"
     # parse_usage's line ALSO begins with model=, so skip that pair here or the
     # block would carry two `model:` keys and break the fixed-key-order grammar.
     local kv
@@ -1578,6 +1622,17 @@ dispatch_reviewers_parallel() {
       || { echo "halt: empty prompt for role $codex_role" >&2; return 1; }
   fi
 
+  # Record BOTH dispatches now that both prompts have rendered and validated,
+  # and BEFORE either subshell launches -- this is what makes dispatch_state's
+  # `^dispatch_id: *<id>$` scan find these roles on resume. Without it every
+  # reviewer role dispatched through this function looked NEVER_LAUNCHED on
+  # resume and was silently re-run over a completed result.
+  local phase_name
+  phase_name="$(_phase_name "$phase")"
+  log_dispatch_started "$phase" "$phase_name" "$iter" "$claude_role"
+  [ "${codex_available:-false}" = true ] \
+    && log_dispatch_started "$phase" "$phase_name" "$iter" "$codex_role"
+
   (
     claude_invoke "$claude_role" "${base_c}.json" "${base_c}.err" <<< "$claude_prompt"
     rc=$?
@@ -1696,8 +1751,9 @@ previous behaviour — hid the degradation from the final report.
 ### Step 1.1 — Skill probe flow
 
 1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `1-preflight/` subfolder with `mkdir -p`.
-2. Dispatch one `claude` subprocess for role `preflight-claude` via `dispatch_role 1 00 preflight-claude <feature-folder>/1-preflight/claude-check-status.md`. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Transcript: `<feature-folder>/transcripts/1-iter00-preflight-claude.json` (stdout) and `1-iter00-preflight-claude.err` (stderr) — the `dispatch_id` naming form. This role's timeout comes from the Models table via `role_timeout`.
-3. If `codex_available` is still `true`, dispatch one `codex` subprocess for role `preflight-codex` via `dispatch_role 1 00 preflight-codex <feature-folder>/1-preflight/codex-check-status.md`. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Transcript: `<feature-folder>/transcripts/1-iter00-preflight-codex.json` (stdout) and `1-iter00-preflight-codex.err` (stderr). **Dispatch in parallel with step 2** using the pattern in the "Reviewer parallelization" cookbook entry (preflight has no shared state between vendors); model and effort are resolved per-role from the Models table, which is what puts preflight in `micro` mode per the "Codex reviewer modes" table.
+2. **Dispatch both preflight subprocesses in parallel using `dispatch_reviewers_parallel preflight-claude preflight-codex 1 00`** (see "Reviewer parallelization" cookbook; preflight has no shared state between vendors, so this is safe as the very first dispatch of the run). This is the ONLY dispatch mechanism for Step 1.1 — there is no separate `dispatch_role` call for either preflight role.
+   - **Claude subprocess (always dispatched):** role `preflight-claude`. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Transcript: `<feature-folder>/transcripts/1-iter00-preflight-claude.json` (stdout) and `1-iter00-preflight-claude.err` (stderr) — the `dispatch_id` naming form. This role's timeout comes from the Models table via `role_timeout`.
+3. **Codex subprocess (dispatched if and only if `codex_available = true`):** role `preflight-codex`, dispatched by the SAME `dispatch_reviewers_parallel` call named in step 2 — not a second, separate dispatch. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Transcript: `<feature-folder>/transcripts/1-iter00-preflight-codex.json` (stdout) and `1-iter00-preflight-codex.err` (stderr). Model and effort are resolved per-role from the Models table, which is what puts preflight in `micro` mode per the "Codex reviewer modes" table.
 4. Read only the two STATUS files. Validate each with `validate_status` (see cookbook).
 4a. Read the `context7` field from `claude-check-status.md`. If it is `unreachable`, append one `event=CONTEXT7_UNAVAILABLE` entry to `RUN_LOG.md` (phase 1). Do NOT halt — this only affects `context7_policy()` (see cookbook) for the rest of the run. If it is `reachable`, no RUN_LOG entry is needed; `context7_policy()` reads the STATUS field directly.
 5. If either reports `verdict=MISSING_SKILLS`, print to the user: which CLI is missing which skills, plus an install hint ("Install the Superpowers plugin (e.g. `claude plugin install superpowers`) and re-run this prompt against the same feature folder"). HALT.
@@ -2411,7 +2467,7 @@ stderr_tail:              |
 
 `CODEX_DISABLED_BY_USER_CONSENT` is the canonical storage for the run-scoped `codex_disabled_by_user` flag. To reconstitute the flag on resume, scan `RUN_LOG.md` top-to-bottom for entries whose first-line tag is exactly `event=CODEX_DISABLED_BY_USER_CONSENT`. The flag is `true` if at least one such entry exists and no later entry carries the tag `event=CODEX_RE_ENABLED_BY_USER` (re-enabling is out of scope; the tag is reserved). Readers MUST match on the full first-line tag, NOT on `phase` / `phase_name`, since the event is unique per run.
 
-**`CODEX_SKIPPED_BY_USER_CONSENT` event** (emitted at the entry of each per-phase preflight gate — Phases 1, 3, 4, 6 — when `codex_disabled_by_user = true`):
+**`CODEX_SKIPPED_BY_USER_CONSENT` event** (emitted at the entry of each per-phase preflight gate — Phases 3, 5, 6, 7 — when `codex_disabled_by_user = true`):
 
 ```
 --- 2026-05-28T20:31:00Z  event=CODEX_SKIPPED_BY_USER_CONSENT
