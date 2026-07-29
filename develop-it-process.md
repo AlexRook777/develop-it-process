@@ -1595,8 +1595,8 @@ Codex CLI must be able to load:
 ### Step 1.1 — Skill probe flow
 
 1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `1-preflight/` subfolder with `mkdir -p`.
-2. Dispatch a `claude` subprocess using the `preflight-claude` appendix. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Transcript: `<feature-folder>/transcripts/preflight-iter00-claude.json` (stdout), `preflight-iter00-claude.err` (stderr), `preflight-iter00-claude.rc` (exit code). Timeout: 5 min.
-3. If `codex_available` is still `true`, dispatch a `codex` subprocess using the `preflight-codex` appendix. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Transcript: `<feature-folder>/transcripts/preflight-iter00-codex.json` (stdout), `preflight-iter00-codex.err` (stderr), `preflight-iter00-codex.rc` (exit code). Timeout: 5 min. **Dispatch in parallel with step 2** using the pattern in the "Reviewer parallelization" cookbook entry (preflight has no shared state between vendors). Use the **cheap** Codex invocation form (`codex_invoke cheap`) — preflight runs in cheap micro-mode per the "Codex reviewer modes" table.
+2. Dispatch one `claude` subprocess for role `preflight-claude` via `dispatch_role 1 00 preflight-claude <feature-folder>/1-preflight/claude-check-status.md`. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Transcript: `<feature-folder>/transcripts/1-iter00-preflight-claude.json` (stdout) and `1-iter00-preflight-claude.err` (stderr) — the `dispatch_id` naming form. This role's timeout comes from the Models table via `role_timeout`.
+3. If `codex_available` is still `true`, dispatch one `codex` subprocess for role `preflight-codex` via `dispatch_role 1 00 preflight-codex <feature-folder>/1-preflight/codex-check-status.md`. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Transcript: `<feature-folder>/transcripts/1-iter00-preflight-codex.json` (stdout) and `1-iter00-preflight-codex.err` (stderr). **Dispatch in parallel with step 2** using the pattern in the "Reviewer parallelization" cookbook entry (preflight has no shared state between vendors); model and effort are resolved per-role from the Models table, which is what puts preflight in cheap micro-mode per the "Codex reviewer modes" table.
 4. Read only the two STATUS files. Validate each with `validate_status` (see cookbook).
 5. If either reports `verdict=MISSING_SKILLS`, print to the user: which CLI is missing which skills, plus an install hint ("Install the Superpowers plugin (e.g. `claude plugin install superpowers`) and re-run this prompt against the same feature folder"). HALT.
 6. If the `codex` check fails, apply the "Distinguish orchestration bugs from vendor failures" filter from Failure handling first. If the captured stderr indicates a local CLI usage error (`unexpected argument`, `Usage:`, `unknown option`), this is an orchestration bug, not a Codex outage — correct the invocation per the cookbook's "CLI invocation forms" and retry once. Otherwise branch on the failure mode:
@@ -1651,7 +1651,7 @@ Phase 1 always runs in full on a fresh invocation. There is no cross-run preflig
 
 ## Phase 2 — Context discovery (delegated)
 
-Dispatch one `claude` Opus subprocess with the `context-discovery` appendix. The subagent:
+Dispatch one `claude` subprocess for role `context-discovery`. The subagent:
 - Lists available Superpowers skills in the environment.
 - Reads `CLAUDE.md` (and any nested `CLAUDE.md` files).
 - Identifies project conventions relevant to the SDLC flow.
@@ -1670,7 +1670,7 @@ export RESOLVED_MODELS
 Because `$RESOLVED_MODELS` is multi-line, this is exactly the case `sed`
 substitution cannot handle — it is why `render_prompt` uses python3.
 
-Timeout: 15 min.
+This role's timeout comes from the Models table via `role_timeout`.
 
 You read only `2-context-discovery/status.md`. On `READY`, proceed to Phase 3. On any other verdict, HALT and surface to user.
 
@@ -1725,25 +1725,31 @@ For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/3-spec-review/iteration-NN`.
 2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=3, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 3.0) have completed.
-   - **Claude subprocess (always dispatched):** `spec-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `3-spec-review/iteration-NN/claude-opus-verdict.md` (STATUS) and `claude-opus-findings.md` (findings). Timeout: 40 min.
-   - **Codex subprocess (dispatched if and only if `codex_available = true`):** `spec-reviewer-codex` appendix. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 40 min. Codex invocation form: **cheap** (`codex_invoke cheap`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 3.0 — do not dispatch and do not log a new event here.
+   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `spec-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `3-spec-review/iteration-NN/claude-opus-verdict.md` (STATUS) and `claude-opus-findings.md` (findings). This role's timeout comes from the Models table via `role_timeout`.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `spec-reviewer-codex`. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_reviewers_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 3.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only the verdict files.
 4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
-   - Dispatch a `claude` Opus spec-fixer subprocess with the `spec-fixer` appendix. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (newline-separated list of findings files from this iteration). The fixer edits the canonical spec in place. Timeout: 40 min.
+   - Dispatch one `claude` subprocess for role `spec-fixer`. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (newline-separated list of findings files from this iteration). The fixer edits the canonical spec in place. This role's timeout comes from the Models table via `role_timeout`.
    - Increment N. Loop from step 1.
 5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
-   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** dispatch a `claude` Opus spec-fixer subprocess with the `spec-fixer` appendix. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (findings files from the passing iteration). Timeout: 40 min. Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). If the fixer returns `BLOCKED`, HALT and surface to the user.
-   - Dispatch a `claude` Opus summarizer with the `summarizer-spec` appendix. Inputs: `$FEATURE_FOLDER`. Outputs: `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md`. Timeout: 20 min. The summarizer records any deferred majors in the summary file.
+   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** dispatch one `claude` subprocess for role `spec-fixer`. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (findings files from the passing iteration). Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). If the fixer returns `BLOCKED`, HALT and surface to the user.
+   - Dispatch one `claude` subprocess for role `summarizer-spec`. Inputs: `$FEATURE_FOLDER`. Outputs: `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md`. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 4.
 
 If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT and surface to user with residual findings paths and the spec path. A cap reached with `blockers=0` but majors outstanding is NOT a HALT — it gets the final fix pass and then passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
 
 ## Phase 4 — Plan writing (delegated)
 
-Dispatch one `claude` Opus subprocess with the `plan-writer` appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`. The subagent loads `superpowers:writing-plans` and produces the plan at the skill's default location (`docs/superpowers/plans/<YYYY-MM-DD>-<slug>-plan.md`).
+Dispatch one `claude` subprocess for role `plan-writer` with the `plan-writer`
+appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`. The subagent loads
+`superpowers:writing-plans` and produces the plan at the skill's default
+location (`docs/superpowers/plans/<YYYY-MM-DD>-<slug>-plan.md`). This role's timeout
+(from the Models table via `role_timeout`) exceeds a single Bash tool call, so issue
+the `dispatch_role 4 00 plan-writer <feature-folder>/4-plan-writing/plan-status.md`
+call **with `run_in_background: true`**; your next turn begins when it finishes.
 
-Output: `<feature-folder>/4-plan-writing/plan-status.md` with `verdict=DONE` and `plan_path=<absolute-path>`. Timeout: 120 min.
+Output: `<feature-folder>/4-plan-writing/plan-status.md` with `verdict=DONE` and `plan_path=<absolute-path>`.
 
 After the subprocess completes, **append one RUN_LOG dispatch entry** with `phase: 4`, `phase_name: plan-writing`, `iteration: 00`, `role: plan-writer`, `vendor: claude`, `appendix: plan-writer`, `status_path: 4-plan-writing/plan-status.md`, and `verdict:` read from the STATUS file. Use the standard `log_dispatch` helper.
 
@@ -1794,16 +1800,16 @@ For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/5-plan-review/iteration-NN`.
 2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=5, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 5.0) have completed.
-   - **Claude subprocess (always dispatched):** `plan-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Outputs: `5-plan-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 40 min.
-   - **Codex subprocess (dispatched if and only if `codex_available = true`):** `plan-reviewer-codex` appendix. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 40 min. Codex invocation form: **cheap** (`codex_invoke cheap`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
+   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `plan-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Outputs: `5-plan-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `plan-reviewer-codex`. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_reviewers_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
 4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
-   - Dispatch a `claude` Opus plan-fixer with the `plan-fixer` appendix. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS`. Timeout: 40 min.
+   - Dispatch one `claude` subprocess for role `plan-fixer`. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS`. This role's timeout comes from the Models table via `role_timeout`.
    - Increment N. Loop.
 5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
-   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** dispatch a `claude` Opus plan-fixer with the `plan-fixer` appendix. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS` (findings files from the passing iteration). Timeout: 40 min. Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). If the fixer returns `BLOCKED`, HALT and surface to the user.
-   - Dispatch a `claude` Opus summarizer with the `summarizer-plan` appendix. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. Timeout: 20 min. The summarizer records any deferred majors in the summary file.
+   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** dispatch one `claude` subprocess for role `plan-fixer`. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS` (findings files from the passing iteration). Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). If the fixer returns `BLOCKED`, HALT and surface to the user.
+   - Dispatch one `claude` subprocess for role `summarizer-plan`. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 6.
 
 If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT and surface to user. A cap reached with `blockers=0` but majors outstanding is NOT a HALT — it gets the final fix pass and then passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
@@ -1895,7 +1901,36 @@ If `IMPLEMENTATION_BASE_SHA=non-git`, Phase 9 will be SKIPPED and the code revie
 
 ### Step 6.1 — Dispatch implementer
 
-Dispatch one `claude` Sonnet subprocess with the `implementer` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$SPEC_PATH`, `$IMPLEMENTATION_BASE_SHA`. The subagent loads `superpowers:subagent-driven-development` and runs the full per-task implementation loop internally (it dispatches its own sub-subagents per plan task as the skill prescribes). Per-task logs go under `6-implementation/subagent-logs/`. Timeout: 300 min (5 hours; the implementer may take this long on large features).
+Dispatch one `claude` subprocess for role `implementer`. Inputs: `$FEATURE_FOLDER`,
+`$PLAN_PATH`, `$SPEC_PATH`, `$IMPLEMENTATION_BASE_SHA`. The subagent loads
+`superpowers:subagent-driven-development` and runs the full per-task implementation
+loop internally (it dispatches its own sub-subagents per plan task as the skill
+prescribes). Per-task logs go under `6-implementation/subagent-logs/`. This role's
+timeout (from the Models table via `role_timeout`; the implementer may take this long
+on large features) exceeds a single Bash tool call, so issue the dispatch as **one
+Bash tool call with `run_in_background: true`**; your next turn begins when it
+finishes.
+
+For Phase 6, the dispatch also pins the sub-subagent model at the CLI. Write it
+exactly as follows — the model must be **generated** from `role_model`, never
+written as a literal, or it becomes a fourth place the assignment can drift:
+
+<!-- lint: snippet -->
+```bash
+# Phase 6: --agents pins the sub-subagent model in the harness, so the pin holds
+# even if the supervisor disregards its instructions.
+agents_json="$(jq -nc --arg m "$(role_model impl-worker)" \
+  '{"impl-worker":{description:"Implementation sub-subagent",
+                   prompt:"Follow the task instructions you are given.",
+                   model:$m}}')"
+
+# dispatch_role renders internally and takes no stdin. Issue this call with
+# run_in_background: true -- the implementer's 300-minute timeout cannot fit in a
+# foreground Bash call.
+dispatch_role 6 00 implementer \
+  "$FEATURE_FOLDER/6-implementation/implementer-status.md" \
+  --agents "$agents_json"
+```
 
 Outputs (written by the implementer at the end):
 - `<feature-folder>/6-implementation/implementation-summary.md` — task count, commits, verification result, any DONE_WITH_CONCERNS notes.
@@ -1907,9 +1942,9 @@ You read only `implementer-status.md`. On `DONE` with `verification=PASS`, proce
 
 debugger-status.md is ADVISORY: the canonical implementation status remains `implementer-status.md`. The orchestrator does NOT gate Phase 7 on `debugger-status.md` directly.
 
-1. Dispatch a `claude` Sonnet debugger subprocess with the `debugger` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_SUMMARY_PATH`, `$IMPLEMENTATION_BASE_SHA`. The debugger loads `superpowers:systematic-debugging`. It edits source/tests as needed and writes `<feature-folder>/6-implementation/debugger-status.md`. Timeout: 60 min.
+1. Dispatch one `claude` subprocess for role `debugger`. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_SUMMARY_PATH`, `$IMPLEMENTATION_BASE_SHA`. The debugger loads `superpowers:systematic-debugging`. It edits source/tests as needed and writes `<feature-folder>/6-implementation/debugger-status.md`. This role's timeout comes from the Models table via `role_timeout`.
 2. On debugger `verdict=DONE`:
-   - **Re-dispatch the implementer** with the `implementer` appendix, additionally passing `$DEBUGGER_STATUS_PATH=<feature-folder>/6-implementation/debugger-status.md`. The implementer re-runs the plan's verification (it does NOT re-do task work), appends the post-debug verification result to `implementation-summary.md`, and atomically rewrites `implementer-status.md`. Timeout: 60 min for this re-run.
+   - **Re-dispatch the implementer** (role `implementer`), additionally passing `$DEBUGGER_STATUS_PATH=<feature-folder>/6-implementation/debugger-status.md`. The implementer re-runs the plan's verification (it does NOT re-do task work), appends the post-debug verification result to `implementation-summary.md`, and atomically rewrites `implementer-status.md`. This is still the `implementer` role, so its timeout (from the Models table via `role_timeout`) exceeds a single Bash tool call — issue this re-dispatch as **one Bash tool call with `run_in_background: true`** as well.
    - Read the rewritten `implementer-status.md`. Proceed to Phase 7 only when `verdict=DONE` and `verification=PASS`.
    - If the re-run still reports `verification != PASS`, loop back to Step 6.2 step 1 (debugger). Cap at 3 debugger→re-verify iterations; on cap, HALT.
 3. On debugger `verdict=BLOCKED`, HALT.
@@ -1918,7 +1953,7 @@ On `BLOCKED` directly from the implementer in Step 6.1, HALT.
 
 ### Step 6.3 — Dispatch summarizer-implementation
 
-After the implementer reports `DONE` with `verification=PASS` (Step 6.1 or, after debugger reconciliation, Step 6.2), dispatch one `claude` Opus summarizer subprocess with the `summarizer-implementation` appendix. Inputs: `$FEATURE_FOLDER`. The subagent reads phase=6 dispatches from `RUN_LOG.md` and appends a `## Usage` section to `6-implementation/implementation-summary.md` (the file already exists; the summarizer appends, does not rewrite). Outputs: `<feature-folder>/6-implementation/summarizer-status.md`. Timeout: 20 min.
+After the implementer reports `DONE` with `verification=PASS` (Step 6.1 or, after debugger reconciliation, Step 6.2), dispatch one `claude` subprocess for role `summarizer-implementation`. Inputs: `$FEATURE_FOLDER`. The subagent reads phase=6 dispatches from `RUN_LOG.md` and appends a `## Usage` section to `6-implementation/implementation-summary.md` (the file already exists; the summarizer appends, does not rewrite). Outputs: `<feature-folder>/6-implementation/summarizer-status.md`. This role's timeout comes from the Models table via `role_timeout`.
 
 Proceed to Phase 7 only after the summarizer reports `DONE`. If the summarizer fails (Mode 1/2/3/4/5), HALT — the readiness report depends on this `## Usage` section.
 
@@ -1967,16 +2002,20 @@ For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/7-code-review/iteration-NN`.
 2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=7, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 7.0) have completed.
-   - **Claude subprocess (always dispatched):** `code-reviewer-claude` appendix. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. Timeout: 60 min.
-   - **Codex subprocess (dispatched if and only if `codex_available = true`):** `code-reviewer-codex` appendix. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Timeout: 60 min. Codex invocation form: **deep** (`codex_invoke deep`). If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
+   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `code-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-opus-verdict.md` and `claude-opus-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `code-reviewer-codex`. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_reviewers_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
+   `code-reviewer-codex`'s timeout (120 min, from the Models table) exceeds a single
+   Bash tool call, so this step's `dispatch_reviewers_parallel` call must itself be
+   issued as **one Bash tool call with `run_in_background: true`** — the whole call
+   waits on both children, so it inherits the longer of the two roles' timeouts.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
 4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
-   - Re-dispatch the implementer subagent (Phase 6 appendix) with `$FINDINGS_PATHS` so it patches the implementation. Timeout: 300 min.
+   - Re-dispatch the implementer subagent (role `implementer`, Phase 6 appendix) with `$FINDINGS_PATHS` so it patches the implementation. This role's timeout (from the Models table via `role_timeout`) exceeds a single Bash tool call, so issue this re-dispatch as **one Bash tool call with `run_in_background: true`**.
    - Increment N. Loop.
 5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
-   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** re-dispatch the implementer subagent (Phase 6 appendix) with `$FINDINGS_PATHS` (findings files from the passing iteration) so it patches the implementation. Timeout: 300 min. Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). The implementer's own verification must still PASS; if it reports `BLOCKED` or verification fails, HALT and surface to the user.
-   - Dispatch a `claude` Opus summarizer with the `summarizer-code-review` appendix. Outputs: `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`. Timeout: 20 min. The summarizer records any deferred majors in the summary file.
+   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** re-dispatch the implementer subagent (role `implementer`, Phase 6 appendix) with `$FINDINGS_PATHS` (findings files from the passing iteration) so it patches the implementation, again as **one Bash tool call with `run_in_background: true`**. Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). The implementer's own verification must still PASS; if it reports `BLOCKED` or verification fails, HALT and surface to the user.
+   - Dispatch one `claude` subprocess for role `summarizer-code-review`. Outputs: `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 8.
 
 If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT. A cap reached with `blockers=0` but majors outstanding is NOT a HALT — it gets the final fix pass and then passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
@@ -1990,7 +2029,7 @@ Runs after the Phase 7 code-review gate passes. Non-gated phase: no per-phase pr
 For each round N (start at 1, hard cap at 4 — the initial run plus at most 3 fix→re-run rounds):
 
 1. `mkdir -p <feature-folder>/8-all-tests/round-NN`.
-2. Dispatch one `claude` Sonnet subprocess with the `all-tests-runner` appendix. Inputs: `$FEATURE_FOLDER`, `$REPO_ROOT`, `$ROUND=NN`. Timeout: 60 min. The runner:
+2. Dispatch one `claude` subprocess for role `all-tests-runner`. Inputs: `$FEATURE_FOLDER`, `$REPO_ROOT`, `$ROUND=NN`. This role's timeout comes from the Models table via `role_timeout`. The runner:
    - If `$REPO_ROOT/start-all-tests.sh` exists, runs it (the canonical full-suite entry point).
    - Otherwise discovers every test suite present in the repo (pytest/uv suites, `package.json` test scripts, etc.) and runs each.
    - If neither the script nor any test suite exists, reports `verdict=SKIPPED, reason=no-tests-found`.
@@ -1998,35 +2037,35 @@ For each round N (start at 1, hard cap at 4 — the initial run plus at most 3 f
 3. Read only `test-runner-status.md`. Append the RUN_LOG dispatch entry (`phase: 8`, `phase_name: all-tests`, `iteration: NN`, `role: all-tests-runner`).
 4. Branch on the verdict:
    - **`PASS` or `SKIPPED`** → proceed to Step 8.2.
-   - **`FAIL` with fix rounds used < 3:** dispatch one `claude` Sonnet subprocess with the `test-fixer` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$ROUND=NN`, `$TEST_REPORT_PATH` (= `8-all-tests/round-NN/test-report.md`), `$IMPLEMENTATION_BASE_SHA`. Timeout: 60 min. STATUS: `8-all-tests/round-NN/test-fixer-status.md`. On `verdict=DONE`, increment N and loop from step 1. On `verdict=BLOCKED`, stop the fix loop early — do NOT HALT; proceed to Step 8.2 with the round's failures as residual.
+   - **`FAIL` with fix rounds used < 3:** dispatch one `claude` subprocess for role `test-fixer`. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$ROUND=NN`, `$TEST_REPORT_PATH` (= `8-all-tests/round-NN/test-report.md`), `$IMPLEMENTATION_BASE_SHA`. This role's timeout comes from the Models table via `role_timeout`. STATUS: `8-all-tests/round-NN/test-fixer-status.md`. On `verdict=DONE`, increment N and loop from step 1. On `verdict=BLOCKED`, stop the fix loop early — do NOT HALT; proceed to Step 8.2 with the round's failures as residual.
    - **`FAIL` with fix rounds exhausted (3 used):** do NOT HALT. Proceed to Step 8.2 — the final test verdict is `FAILED`, and `all-test-summary.md` MUST carry the detailed residual-failure record (failing test names, error excerpts, suspected causes, and what each fix round attempted).
 
 ### Step 8.2 — Summarizer
 
-Dispatch a `claude` Opus summarizer with the `summarizer-all-tests` appendix. Inputs: `$FEATURE_FOLDER`. The summarizer APPENDS the `## Usage` section to `8-all-tests/all-test-summary.md` (the runner already wrote the content) and writes `8-all-tests/summarizer-status.md` carrying `final_test_verdict: PASS | FAILED | SKIPPED`. Timeout: 20 min.
+Dispatch one `claude` subprocess for role `summarizer-all-tests`. Inputs: `$FEATURE_FOLDER`. The summarizer APPENDS the `## Usage` section to `8-all-tests/all-test-summary.md` (the runner already wrote the content) and writes `8-all-tests/summarizer-status.md` carrying `final_test_verdict: PASS | FAILED | SKIPPED`. This role's timeout comes from the Models table via `role_timeout`.
 
 You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 9 — regardless of `final_test_verdict`. A `FAILED` final test verdict never halts the run; it is recorded in detail in `all-test-summary.md` and forces the final readiness verdict to `NOT_READY` (see the readiness-writer appendix).
 
 ## Phase 9 — Git finalization (delegated)
 
-Skip this phase entirely if the working directory is not a git repository (detected via `git status` exit code != 0). In that case, write `<feature-folder>/9-git-finalization/git-status.md` with `verdict=SKIPPED` and `reason=not-a-git-repo` by dispatching a one-shot `claude` Sonnet subprocess with the `finishing-branch` appendix — the appendix detects the no-git case and writes SKIPPED itself.
+Skip this phase entirely if the working directory is not a git repository (detected via `git status` exit code != 0). In that case, write `<feature-folder>/9-git-finalization/git-status.md` with `verdict=SKIPPED` and `reason=not-a-git-repo` by dispatching a one-shot `claude` subprocess for role `finishing-branch` — the appendix detects the no-git case and writes SKIPPED itself.
 
 Otherwise:
 
-Dispatch one `claude` Sonnet subprocess with the `finishing-branch` appendix. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. The subagent loads `superpowers:finishing-a-development-branch`, reviews the diff against the captured baseline, stages only intended files (no `.env`, secrets, or large binaries; nothing outside the implementation slice), and commits per the plan's git rules and the project's `CLAUDE.md` git policy.
+Dispatch one `claude` subprocess for role `finishing-branch`. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. The subagent loads `superpowers:finishing-a-development-branch`, reviews the diff against the captured baseline, stages only intended files (no `.env`, secrets, or large binaries; nothing outside the implementation slice), and commits per the plan's git rules and the project's `CLAUDE.md` git policy.
 
-Output: `<feature-folder>/9-git-finalization/git-status.md` with `verdict ∈ {DONE, SKIPPED, FAILED}`, `implementation_base_sha`, plus commit SHAs (if any). Timeout: 30 min.
+Output: `<feature-folder>/9-git-finalization/git-status.md` with `verdict ∈ {DONE, SKIPPED, FAILED}`, `implementation_base_sha`, plus commit SHAs (if any). This role's timeout comes from the Models table via `role_timeout`.
 
 You read only `git-status.md`.
 
 ## Phase 10 — Final readiness report (delegated)
 
-Dispatch one `claude` Opus subprocess with the `readiness-writer` appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`, `$PLAN_PATH`. The subagent reads every per-phase summary file inside the feature folder (preflight statuses, phase-0 status, spec-review summary, plan-review summary, implementation summary, code-review summary, all-test summary, git status) and writes:
+Dispatch one `claude` subprocess for role `readiness-writer`. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`, `$PLAN_PATH`. The subagent reads every per-phase summary file inside the feature folder (preflight statuses, phase-0 status, spec-review summary, plan-review summary, implementation summary, code-review summary, all-test summary, git status) and writes:
 
 - `<feature-folder>/final-readiness-report.md` — the human-facing report covering: artifacts, reviewer verdicts (including `partial_review` flag if Codex was unavailable), implementation result, verification result, git result, skipped optional steps, residual MINOR/NIT items, and overall readiness verdict.
 - `<feature-folder>/readiness-status.md` — STATUS with `verdict=DONE` and `report_path=<absolute>`.
 
-Timeout: 20 min.
+This role's timeout comes from the Models table via `role_timeout`.
 
 You read only `readiness-status.md`. After it reports `DONE`:
 
@@ -3115,6 +3154,18 @@ Additional skills the subagents you dispatch must load:
 
 If the plan requires browser/UI QA, also load `dogfood` (or the closest available browser-QA skill) for the verification step.
 
+## Sub-subagent dispatch
+
+Every sub-subagent you dispatch — implementation workers, spec-compliance
+reviewers, and code-quality reviewers alike — MUST be spawned with
+`subagent_type: impl-worker`. This is what lets the orchestrator's `--agents`
+flag (see the Phase 6 dispatch cookbook snippet) pin every one of your
+sub-subagents to the model named for the `impl-worker` role in the Models
+table, regardless of which per-task job (implementation / spec-compliance
+review / code-quality review) you are conceptually assigning it. Record the
+agent type each task actually used in `implementation-summary.md` (see
+Output) so any drift from `impl-worker` is auditable.
+
 ## Behavior
 
 Three modes, mutually exclusive — determined by which optional inputs are set:
@@ -3158,6 +3209,9 @@ Contents:
 - Verification commands run and their results.
 - No-secret check result.
 - Browser-QA result (if applicable).
+- Agent type used per task (implementation worker, spec-compliance reviewer,
+  code-quality reviewer) — every one MUST read `impl-worker`; flag any task
+  where it does not, so a drift from `subagent_type: impl-worker` is auditable.
 - Any DONE_WITH_CONCERNS notes.
 - Outstanding follow-ups (if any).
 
