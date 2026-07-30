@@ -45,7 +45,9 @@ export FEATURE_FOLDER="$REPO_ROOT/docs/superpowers/specs/<date>-<slug>-artifacts
 ```
 
 Then hand `develop-it-process.md` to an orchestrating agent (a Claude Code
-session) and let it drive the phases. Each phase runs as one bash invocation;
+session) and let it drive the phases. `RUNBOOK.md` is the step-by-step version of
+this — environment checks, the exact launch command, the kickoff prompt, resume,
+and how to override a cap for one run. Each phase runs as one bash invocation;
 per-phase STATUS files are the branch points the orchestrator reads between
 phases. Some roles (the plan writer, the implementer, and any re-dispatch of
 either) have a timeout that exceeds a single Bash tool call — those are issued
