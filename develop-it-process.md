@@ -53,7 +53,7 @@ You are a strict orchestrator. You sequence subprocess agents. You do not do the
 
 For every step that produces or modifies an artifact:
 
-1. Pick the role: which CLI (`claude` or `codex`), which model (Opus / Sonnet / GPT-5.5), which appendix in this file defines its prompt, and which Superpowers skill it must load.
+1. Pick the role: which CLI (`claude` or `codex`), which model (Opus / Sonnet / GPT-5.6), which appendix in this file defines its prompt, and which Superpowers skill it must load.
 2. Render the appendix with `render_prompt <appendix-name>` and pipe it into
    `claude_invoke <role> …` or `codex_invoke <role> …`. Never use `sed` for
    substitution: multi-line values break it, and the model/effort/timeout must
@@ -173,21 +173,21 @@ omitting `-m` — is what prevents that failure. `gpt-5.6-luna` and
 | Role | Vendor | Model | Effort | Timeout (min) |
 |---|---|---|---|---|
 | `orchestrator` | — | — | — | — |
-| `preflight-claude` | `claude` | `claude-sonnet-5` | — | 5 |
-| `preflight-codex` | `codex` | `gpt-5.6-sol` | `medium` | 5 |
-| `context-discovery` | `claude` | `claude-sonnet-5` | — | 15 |
-| `spec-reviewer-claude` | `claude` | `claude-opus-5` | — | 40 |
+| `preflight-claude` | `claude` | `claude-haiku-latest` | — | 5 |
+| `preflight-codex` | `codex` | `gpt-5.6-luna` | `medium` | 5 |
+| `context-discovery` | `claude` | `claude-sonnet-5` | — | 30 |
+| `spec-reviewer-claude` | `claude` | `claude-opus-5` | — | 60 |
 | `spec-reviewer-codex` | `codex` | `gpt-5.6-sol` | `high` | 60 |
-| `spec-fixer` | `claude` | `claude-fable-5` | — | 40 |
-| `plan-writer` | `claude` | `claude-fable-5` | — | 120 |
-| `plan-reviewer-claude` | `claude` | `claude-opus-5` | — | 40 |
+| `spec-fixer` | `claude` | `claude-opus-5` | — | 60 |
+| `plan-writer` | `claude` | `claude-opus-5` | — | 120 |
+| `plan-reviewer-claude` | `claude` | `claude-opus-5` | — | 60 |
 | `plan-reviewer-codex` | `codex` | `gpt-5.6-sol` | `high` | 60 |
-| `plan-fixer` | `claude` | `claude-fable-5` | — | 40 |
+| `plan-fixer` | `claude` | `claude-opus-5` | — | 60 |
 | `implementer` | `claude` | `claude-opus-5` | — | 300 |
 | `impl-worker` | `claude` | `claude-sonnet-5` | — | 300 |
 | `debugger` | `claude` | `claude-opus-5` | — | 60 |
 | `code-reviewer-claude` | `claude` | `claude-opus-5` | — | 60 |
-| `code-reviewer-codex` | `codex` | `gpt-5.6-sol` | `high` | 120 |
+| `code-reviewer-codex` | `codex` | `gpt-5.6-sol` | `high` | 60 |
 | `all-tests-runner` | `claude` | `claude-sonnet-5` | — | 60 |
 | `test-fixer` | `claude` | `claude-sonnet-5` | — | 60 |
 | `finishing-branch` | `claude` | `claude-sonnet-5` | — | 30 |
@@ -196,7 +196,7 @@ omitting `-m` — is what prevents that failure. `gpt-5.6-luna` and
 | `summarizer-implementation` | `claude` | `claude-sonnet-5` | — | 20 |
 | `summarizer-code-review` | `claude` | `claude-sonnet-5` | — | 20 |
 | `summarizer-all-tests` | `claude` | `claude-sonnet-5` | — | 20 |
-| `readiness-writer` | `claude` | `claude-sonnet-5` | — | 20 |
+| `readiness-writer` | `claude` | `claude-opus-5` | — | 20 |
 
 This table is the only place a model, effort, or timeout is stated. The
 `role_model` / `role_effort` / `role_timeout` helpers in the Runtime cookbook
