@@ -144,8 +144,10 @@ dirty-tree gate + model probe). Hold to the document's rules, in particular:
 - One phase per bash invocation. Never bundle two numbered phases into one block.
 - Paste the cookbook helpers at the top of each block. set -uo pipefail, never
   set -e. Call init_orchestration_vars, and re-derive CONTEXT7_POLICY every block.
-- Dispatch plan-writer, implementer, and any re-dispatch of either with
-  run_in_background: true — their timeouts exceed one Bash call.
+- Dispatch any role whose role_timeout exceeds this harness's foreground Bash
+  ceiling with run_in_background: true — compare the two, do not work from a
+  memorised list of roles. When the ceiling is unknown, background it: the cost
+  is one extra turn, and the opposite mistake forfeits the dispatch.
 - You are a strict orchestrator. You never read the spec, the plan, source,
   tests, reviewer findings, or transcripts — only STATUS files and the per-phase
   summaries they reference. You never review, fix, or write code, and you are

@@ -167,13 +167,14 @@ the same defect class as an unassigned `$CLAUDE_MODEL`. `codex` accepts
 `*-codex-max` / `o*` id. These require an OpenAI API key; this account's auth is
 a ChatGPT subscription and the request fails with HTTP 400 `"model is not
 supported when using Codex with a ChatGPT account"`. This prohibition — not
-omitting `-m` — is what prevents that failure. `gpt-5.6-luna` and
-`gpt-5.6-terra` are available to this account but deliberately unused.
+omitting `-m` — is what prevents that failure. `gpt-5.6-luna` is available to
+this account and is used for the cheap `preflight-codex` probe;
+`gpt-5.6-terra` is available but deliberately unused.
 
 | Role | Vendor | Model | Effort | Timeout (min) |
 |---|---|---|---|---|
 | `orchestrator` | — | — | — | — |
-| `preflight-claude` | `claude` | `claude-haiku-latest` | — | 5 |
+| `preflight-claude` | `claude` | `claude-haiku-4-5` | — | 5 |
 | `preflight-codex` | `codex` | `gpt-5.6-luna` | `medium` | 5 |
 | `context-discovery` | `claude` | `claude-sonnet-5` | — | 30 |
 | `spec-reviewer-claude` | `claude` | `claude-opus-5` | — | 60 |
@@ -498,21 +499,21 @@ All examples below use `python3` (never the bare `python`) and `$PROCESS_PATH` (
 # Fields: <model> <effort> <timeout_minutes>.  '-' means empty.
 _role_row() {
   case "$1" in
-    preflight-claude)          echo "claude-sonnet-5 - 5" ;;
-    preflight-codex)           echo "gpt-5.6-sol medium 5" ;;
-    context-discovery)         echo "claude-sonnet-5 - 15" ;;
-    spec-reviewer-claude)      echo "claude-opus-5 - 40" ;;
+    preflight-claude)          echo "claude-haiku-4-5 - 5" ;;
+    preflight-codex)           echo "gpt-5.6-luna medium 5" ;;
+    context-discovery)         echo "claude-sonnet-5 - 30" ;;
+    spec-reviewer-claude)      echo "claude-opus-5 - 60" ;;
     spec-reviewer-codex)       echo "gpt-5.6-sol high 60" ;;
-    spec-fixer)                echo "claude-fable-5 - 40" ;;
-    plan-writer)               echo "claude-fable-5 - 120" ;;
-    plan-reviewer-claude)      echo "claude-opus-5 - 40" ;;
+    spec-fixer)                echo "claude-opus-5 - 60" ;;
+    plan-writer)               echo "claude-opus-5 - 120" ;;
+    plan-reviewer-claude)      echo "claude-opus-5 - 60" ;;
     plan-reviewer-codex)       echo "gpt-5.6-sol high 60" ;;
-    plan-fixer)                echo "claude-fable-5 - 40" ;;
+    plan-fixer)                echo "claude-opus-5 - 60" ;;
     implementer)               echo "claude-opus-5 - 300" ;;
     impl-worker)               echo "claude-sonnet-5 - 300" ;;
     debugger)                  echo "claude-opus-5 - 60" ;;
     code-reviewer-claude)      echo "claude-opus-5 - 60" ;;
-    code-reviewer-codex)       echo "gpt-5.6-sol high 120" ;;
+    code-reviewer-codex)       echo "gpt-5.6-sol high 60" ;;
     all-tests-runner)          echo "claude-sonnet-5 - 60" ;;
     test-fixer)                echo "claude-sonnet-5 - 60" ;;
     finishing-branch)          echo "claude-sonnet-5 - 30" ;;
@@ -521,7 +522,7 @@ _role_row() {
     summarizer-implementation) echo "claude-sonnet-5 - 20" ;;
     summarizer-code-review)    echo "claude-sonnet-5 - 20" ;;
     summarizer-all-tests)      echo "claude-sonnet-5 - 20" ;;
-    readiness-writer)          echo "claude-sonnet-5 - 20" ;;
+    readiness-writer)          echo "claude-opus-5 - 20" ;;
     *) echo "unknown role: $1" >&2; return 1 ;;
   esac
 }
@@ -763,12 +764,26 @@ Pass the role; effort and timeout follow from the Models table.
 
 ### Long dispatch
 
-Three roles have timeouts that exceed a single Bash tool call: `plan-writer`,
-`implementer`, and `code-reviewer-codex` (see the Models table via `role_timeout`
-for the exact figures). For these, the orchestrator issues the dispatch as **one
-Bash tool call with
-`run_in_background: true`**. The harness keeps it running across turns and re-invokes
-the orchestrator when it exits, delivering the exit status.
+A role is a **long dispatch** when its `role_timeout` exceeds the host harness's
+ceiling on a single foreground Bash tool call. For these, the orchestrator issues
+the dispatch as **one Bash tool call with `run_in_background: true`**. The harness
+keeps it running across turns and re-invokes the orchestrator when it exits,
+delivering the exit status.
+
+**The criterion is the comparison, not a list of roles.** Do not hardcode which
+roles qualify. An earlier revision of this section named exactly three
+(`plan-writer`, `implementer`, `code-reviewer-codex`), which silently encoded one
+harness's generous foreground budget. On a host with a much tighter foreground
+cap — a real, observed configuration — nearly every role above the preflight tier
+qualifies, and following the enumeration instead of the rule loses the dispatch.
+Determine the host's ceiling, compare `role_timeout <role>` against it, and
+background everything at or above it.
+
+**When the ceiling is unknown, background it.** The error is one-directional:
+backgrounding a short role costs one extra turn and nothing else, while
+foregrounding a long one truncates the call and forfeits a dispatch that may
+already have burned an hour of model time. There is no role for which
+backgrounding is incorrect.
 
 Do **not** hand-roll process supervision: no session-detaching wrapper, no `.pid`
 files, no polling loop, no PID-liveness checks. An earlier revision of this document
@@ -915,6 +930,18 @@ dispatch_role() {
   [ -f "$status_path" ] && verdict="$(status_field "$status_path" verdict)"
   log_dispatch "$role" "$phase" "$(_phase_name "$phase")" "$iter" \
                "$status_path" "$verdict" "$usage_line"
+
+  # Classify AFTER logging, so RUN_LOG keeps its evidence even for a failed
+  # dispatch, and BEFORE returning, so the caller never has to re-derive the
+  # diagnosis. This is the call that makes post_dispatch the actual
+  # implementation of the transcript-read policy rather than a helper the
+  # phases were each expected to remember. Its exit status is deliberately
+  # discarded: `$DISPATCH_RC` remains dispatch_role's contract, and the
+  # missing-STATUS case is owned by `dispatch_state`/`validate_status`, which
+  # every gate already consults. post_dispatch runs here for its diagnostic
+  # output — notably the stdout-JSON vendor error a zero-byte stderr hides.
+  post_dispatch "$DISPATCH_RC" "$status_path" "$base.err" "$base.json" || :
+
   return "$DISPATCH_RC"
 }
 
@@ -963,7 +990,7 @@ deliberately stops rather than recovering:
 
 | `role_mutates` | Action on `UNFINISHED` |
 |---|---|
-| `no` — reviewers, summarizers, `context-discovery`, preflight, `readiness-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: no`, `action: redispatched`, and re-dispatch once. These roles only read and write their own STATUS and findings, so a repeat is idempotent. |
+| `no` — reviewers, summarizers, `context-discovery`, preflight, `readiness-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: no`, `action: redispatched`, and re-dispatch once. These roles only read and write their own STATUS and findings, so a repeat is idempotent. **Exception:** if the run-scoped `claude_spend_exhausted` / `codex_spend_exhausted` flag is set for this role's vendor (Mode 5b), do NOT re-dispatch — log `action: halted` with `reason: vendor spend ceiling`, and halt. Idempotence makes a repeat *safe*, not *useful*; under a ceiling it cannot succeed, and it buries the real cause under a second identical failure. |
 | `yes` — `implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `finishing-branch` | log `event=DISPATCH_ORPHANED` with `role_mutates: yes`, `action: halted`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, the `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch or keep the partial work. **Never auto-retry.** After the fact nothing can distinguish "the task ran once" from "the task ran twice", and a re-run implementer duplicates commits and re-applies edits. |
 
 **Write contract.** Long dispatch adds no control files. The orchestrator writes
@@ -1268,6 +1295,11 @@ usage_line="$(parse_usage claude "$out_json" "$DISPATCH_WALL_MS" "$(role_model "
 verdict="$(status_field "$status" verdict)"
 
 log_dispatch "$role" 3 spec-review 01 "$status" "$verdict" "$usage_line"
+
+# Classify last. Pass BOTH transcripts: the stderr tail carries local CLI usage
+# errors, the stdout JSON carries the vendor's own refusal text, and a
+# quota/spend failure appears ONLY in the latter.
+post_dispatch "$DISPATCH_RC" "$status" "$err_txt" "$out_json" || :
 ```
 
 ### Dirty-tree gate (early — runs at the very top of Phase 1, before any folder creation)
@@ -1368,12 +1400,57 @@ If neither holds, surface a one-line note to the user during Phase 1: "Recommend
 The strict orchestrator rules say "STATUS files only." During failure handling you may need a few more bytes. Distinguish carefully:
 
 - **On subprocess SUCCESS** (`rc == 0` AND `STATUS.md` exists AND parses): read ONLY `STATUS.md`. Do NOT tail transcripts "out of curiosity" — the verdict is whatever STATUS.md says.
-- **On subprocess FAILURE** (`rc != 0` OR `STATUS.md` missing OR malformed): read up to 40 lines of stderr to classify the failure mode. Surface that tail to the user when halting.
+- **On subprocess FAILURE** (`rc != 0` OR `STATUS.md` missing OR malformed): read the vendor's own error text from the stdout transcript AND up to 40 lines of stderr to classify the failure mode. Surface both to the user when halting.
+
+**Stderr is not the only failure channel, and often not the one carrying the
+diagnosis.** Claude is invoked with `--output-format=json`, so a vendor-side
+refusal — quota exhaustion, an org spend ceiling, an auth failure — is reported
+in the stdout envelope as `is_error: true` plus a human-readable `.result`
+string, while stderr stays **zero bytes**. A zero-byte `.err` alongside a
+non-empty `.result` is the NORMAL shape for that class of failure, not an
+anomaly. Classifying on the stderr tail alone yields no diagnostic at all and
+makes a hard billing stop look like a bare Mode 3. Always consult the stdout
+JSON first; the stderr tail is the fallback, and carries the local CLI usage
+errors described under "Distinguish orchestration bugs from vendor failures".
 
 <!-- lint: cookbook -->
 ```bash
+# Extract the vendor's own error text from a dispatch's stdout transcript.
+# Handles both shapes in one slurped pass: Claude's single `--output-format=json`
+# envelope (`is_error` + `.result`) and Codex's `--json` JSONL error items.
+# Prints nothing — and still succeeds — when the transcript holds no vendor
+# error, so the caller distinguishes "no vendor error" from "no transcript" by
+# emptiness, never by exit code.
+vendor_error_text() {
+  # Usage: vendor_error_text <stdout-transcript-path>
+  local out="$1" txt=""
+  [ -s "${out:-}" ] || return 0
+  # `-s` (slurp) is what lets ONE filter serve both vendors: it reads a single
+  # object into a 1-element array and JSONL into an N-element one. Without it
+  # the Codex arm would need a second, near-identical invocation.
+  txt="$(jq -rs '
+    .[]
+    | select(type == "object")
+    | if .is_error == true then (.result // empty)
+      elif (.error? != null) then (.error | if type == "string" then . else tojson end)
+      else empty end
+  ' "$out" 2>/dev/null)" || txt=""
+  [ -n "$txt" ] || return 0
+  # Bound it the same way the stderr tail is bounded: a .result can carry a
+  # multi-kilobyte payload, and this text is destined for a user-facing halt.
+  # Substring expansion, NOT `| head -c`: under the mandated `set -o pipefail`,
+  # head closing the pipe early sends printf SIGPIPE and the function returns
+  # 141 on exactly the inputs it handled correctly.
+  printf '%s\n' "${txt:0:2000}"
+}
+
 post_dispatch() {
-  local rc="$1" status_path="$2" err_path="$3"
+  # Usage: post_dispatch <rc> <status_path> <err_path> [out_path]
+  # <out_path> is the stdout transcript ("$base.json"). It is the 4th and
+  # optional argument only so that call sites predating the stdout-JSON rule
+  # keep working; every new call site MUST pass it, or vendor-side refusals go
+  # undiagnosed.
+  local rc="$1" status_path="$2" err_path="$3" out_path="${4:-}"
   # An empty or non-numeric rc must be treated as a failure, not a syntax
   # error. Nothing writes a `.rc` file: this rc is passed in by the caller
   # (from `wait`'s exit status), so a bad value here means the caller itself
@@ -1386,7 +1463,17 @@ post_dispatch() {
   esac
   if [ "$rc_bad" = yes ] || [ ! -f "$status_path" ]; then
     echo "subprocess failed (rc=$rc, status_present=$( [ -f "$status_path" ] && echo yes || echo no ))" >&2
-    tail -n 40 "$err_path" >&2
+    local verr=""
+    [ -n "$out_path" ] && verr="$(vendor_error_text "$out_path")"
+    if [ -n "$verr" ]; then
+      echo "vendor error (stdout JSON is_error):" >&2
+      printf '%s\n' "$verr" >&2
+    fi
+    if [ -s "$err_path" ]; then
+      tail -n 40 "$err_path" >&2
+    else
+      echo "(stderr empty — expected for vendor-side refusals; see the vendor error above)" >&2
+    fi
     return 1
   fi
   return 0
@@ -1697,8 +1784,32 @@ Goal: confirm the environment is sound (binaries, CLI syntax, working tree) AND 
 
 These checks are free (no token spend) and catch environmental issues that previously consumed real dispatch attempts. Run them BEFORE creating the feature folder or invoking skill probes.
 
+**Every halting gate in Step 1.0 is logged, and creates `$FEATURE_FOLDER` in
+order to log it.** This resolves an ambiguity the gates would otherwise carry:
+they run before the feature folder exists, yet steps 3 and 6 below prescribe a
+RUN_LOG write. The rule is uniform — a Step 1.0 gate that HALTs first creates
+`$FEATURE_FOLDER` (and `RUN_LOG.md` inside it), then appends its entry, then
+STOPs. Use the gate's own event tag where one exists (`MODEL_REJECTED` for step
+3, `CODEX_UNAVAILABLE` for step 6) and `event=HALT` for the gates that have none
+(the step 2 canary and the step 4 dirty-tree check). Do not skip the folder to
+avoid the write, and do not invent an event tag outside the legal set in
+Resumability.
+
+This is implementable at every gate because `$FEATURE_FOLDER` is a pure string
+transform of the spec path (see "Naming convention") and `init_orchestration_vars`
+already requires it to be set at step 1 — only the *directory* is missing, never
+the path. The one exception is the unnamed-spec case in "Naming convention",
+where the folder name is not yet known because a subagent must propose it: there,
+HALT without the RUN_LOG write rather than inventing a folder to log into.
+
+This is resume-safe: a `RUN_LOG.md` containing only pre-dispatch event entries
+has no `DISPATCH_STARTED` records, so `dispatch_state` reports `NEVER_LAUNCHED`
+for every role and the retry is a genuine fresh Phase 1, not a resume. The cost
+is one empty folder after a failed gate; the benefit is that no HALT in this
+process is silent.
+
 1. Initialise the orchestration variables from the "Runtime cookbook & guardrails" section (`PROCESS_PATH`, `REPO_ROOT`, `PYTHON_BIN`, `PROCESS_FILE_SHA256`, `PROCESS_GIT_HEAD`, `PROCESS_DIRTY`).
-2. Run `canary_preflight` (see cookbook). It checks: `claude`, `timeout`, `awk`, `sed`, `jq`, `git`, `date`, `sha256sum`, `cut`, `mkdir`, `mv`, `tail`, `tr`, `grep`, `realpath`, `env` are on PATH (hard-required); `codex` is optional (its absence sets `codex_present=no` and drives the failover policy below, not a halt); `python3` is on PATH (hard-required — render_prompt cannot function without it); `claude --help` and `codex exec --help` succeed. On halt, surface the missing binary or syntax-check failure to the user and STOP — do not proceed to skill probes.
+2. Run `canary_preflight` (see cookbook). It checks: `claude`, `timeout`, `awk`, `sed`, `jq`, `git`, `date`, `sha256sum`, `cut`, `mkdir`, `mv`, `tail`, `tr`, `grep`, `realpath`, `env` are on PATH (hard-required); `codex` is optional (its absence sets `codex_present=no` and drives the failover policy below, not a halt); `python3` is on PATH (hard-required — render_prompt cannot function without it); `claude --help` and `codex exec --help` succeed. On halt, create `$FEATURE_FOLDER`, append an `event=HALT` entry naming the missing binary or the failing syntax check (per the logging rule above), surface the same to the user, and STOP — do not proceed to skill probes.
 3. Run `probe_models`, **but branch on `codex_present` first**. The probe invokes
    both CLIs; running it while the Codex binary is absent reports `MODEL_REJECTED`
    for `gpt-5.6-sol` when the real condition is `CODEX_UNAVAILABLE` mode 0 — a
@@ -1718,7 +1829,7 @@ These checks are free (no token spend) and catch environmental issues that previ
    `event=MODEL_REJECTED` with the offending roles to `RUN_LOG.md` before
    stopping. This is a runtime gate; `tests/check_90_live_models.sh` performs the
    same probe as an opt-in test.
-4. Run `dirty_tree_check` (see cookbook). Allowed dirty paths at this stage: `$PROCESS_PATH` only (the spec is provided by the user but may still be in the working tree; that is OK because the spec path is added to the allow-list once derived). On halt, list the offending files and ask the user to commit or stash before re-running.
+4. Run `dirty_tree_check` (see cookbook). Allowed dirty paths at this stage: `$PROCESS_PATH` only (the spec is provided by the user but may still be in the working tree; that is OK because the spec path is added to the allow-list once derived). On halt, create `$FEATURE_FOLDER`, append an `event=HALT` entry listing the offending paths (per the logging rule above), then list them to the user and ask them to commit or stash before re-running.
 5. Verify the gitignore guard: confirm that `docs/superpowers/specs/*-artifacts/` (or the equivalent pattern matching the eventual `$FEATURE_FOLDER`) is either listed in `.gitignore` OR that the orchestrator's runtime dirty-check allow-list covers it (the cookbook's `dirty_tree_check` does cover it). If neither holds, emit a one-line warning recommending the `.gitignore` addition; do NOT halt.
 6. If `canary_preflight` returned `codex_present=no` (Mode 0 — binary missing, environmental), HALT unconditionally. Surface the remediation message ("Install the Codex CLI and re-run") and STOP. Do NOT prompt the user, do NOT continue in claude-only mode, do NOT proceed to Step 1.1. A missing Codex binary at Phase 1 is an environment defect that must be fixed before the run can proceed in any mode; the previous silent-degrade behavior masked broken setups. This matches the Phase 1 row of the Mode-specific response table (Mode 0 → HALT) and Step 1.1 step 6's Mode 0 branch — Phase 1 Mode 0 is the only failure mode at Phase 1 that bypasses the user consent prompt, because there is no working Codex CLI to even produce a meaningful stderr tail for the user to consent on. Log `event=CODEX_UNAVAILABLE` with `phase: 1`, `phase_name: preflight`, `failure_mode: 0`, and `stderr_tail: <canary output>` to `RUN_LOG.md` immediately before STOP so the HALT is auditable.
 
@@ -1764,7 +1875,16 @@ previous behaviour — hid the degradation from the final report.
      - On `N`, `CODEX_CONSENT=n`, or any non-`y` response: HALT and surface the same remediation as Mode 0.
      - On EOF with `CODEX_CONSENT` unset and stdin not a TTY: HALT and surface the same remediation as Mode 0 — do not treat the EOF itself as an answer.
 7. If the `claude` check fails, HALT. Claude is required for every phase — there is no claude-less degraded mode and no user prompt.
-8. If both report `READY`, append one `RUN_LOG.md` entry per subprocess and proceed to Step 1.2 (artifact relocation, defined immediately below). After Step 1.2 completes, proceed to Phase 2.
+8. If both report `READY`, run Step 1.2 (artifact relocation, defined immediately below) **FIRST**, then append one `RUN_LOG.md` entry per subprocess whose `status_path` names the **relocated** path (`1-preflight/phase-1/<vendor>-check-status.md`). After the entries are written, proceed to Phase 2.
+
+   **Relocate, then log — never the reverse.** Logging first would record
+   `1-preflight/<vendor>-check-status.md`, a path Step 1.2 vacates microseconds
+   later and that the per-phase preflight gates then reuse as scratch. The RUN_LOG
+   entry would point at a slot holding some later phase's file, or nothing at all,
+   and the readiness writer — which Step 1.2 requires to read from
+   `1-preflight/phase-1/` — would disagree with the log that is supposed to be the
+   run's source of truth. This ordering matches the per-phase gates (Steps 3.0,
+   5.0, 6.−1, 7.0), which all relocate before they log; Phase 1 is not an exception.
 
 ### Step 1.2 — Relocate Phase 1 STATUS artifacts
 
@@ -2259,7 +2379,59 @@ Subprocess subagents can fail in five ways. You detect each and respond per the 
 | 2 | Subprocess timed out              | Wrapped in `timeout <N>m`; exit code 124                           |
 | 3 | STATUS.md missing                 | Path doesn't exist after subprocess returns                        |
 | 4 | STATUS.md malformed               | Required keys missing or unparseable (see `validate_status`)       |
-| 5 | Quota / rate-limit signal         | Stderr contains vendor-specific quota markers                      |
+| 5 | Quota / rate-limit signal         | Vendor quota markers in the stdout JSON `.result` **or** the stderr tail (see "Mode 5 has two shapes") |
+
+### Mode 5 has two shapes: a throttle and a ceiling
+
+Mode 5 covers two failures that look alike in a transcript and behave nothing
+alike in a run. Classifying them together produces the wrong remediation for
+both, so decide which one you have BEFORE acting.
+
+**Detection.** Read the vendor error via `vendor_error_text` first (a spend
+ceiling typically writes NOTHING to stderr — see the transcript-read policy),
+then the stderr tail. Match against these signatures:
+
+| Shape | Signature (case-insensitive, in `.result` or stderr) | Clears by waiting? |
+|---|---|---|
+| **5a — throttle** | `rate limit`, `rate_limit_error`, `429`, `Too Many Requests`, `overloaded_error`, `please try again`, `retry after` | Yes — minutes to hours |
+| **5b — ceiling** | `spend limit`, `monthly spend`, `usage limit reached`, `credit balance is too low`, `billing`, `quota exceeded`, `contact your organization administrator`, `insufficient_quota` | **No** — not until a human changes a billing setting |
+
+When the signature is ambiguous, treat it as **5b**. Waiting out a ceiling
+wastes the whole run; halting on a throttle costs one resume.
+
+**A ceiling is run-scoped, not dispatch-scoped.** This is the part that is easy
+to get wrong. A 5b failure is a property of the *account*, so it will kill every
+subsequent dispatch to that vendor in this run — it is one incident, not one
+incident per role. On detecting 5b:
+
+1. Set the run-scoped flag `claude_spend_exhausted = true` (or
+   `codex_spend_exhausted`), and log `event=CLAUDE_FAILED` (resp.
+   `CODEX_UNAVAILABLE`) with `failure_mode: 5` and `mode_shape: 5b`.
+2. **HALT the whole run immediately** and surface the ceiling itself — the
+   vendor's `.result` text, the affected role, and the fact that no further
+   dispatch to that vendor can succeed until billing changes. Do not present it
+   as a single role's problem.
+3. While the flag is set, **suppress every remaining dispatch to that vendor**,
+   including the idempotent single re-dispatch that the `UNFINISHED` recovery
+   table's `role_mutates: no` branch would otherwise permit. That branch assumes
+   a repeat has some chance of succeeding; under a ceiling it has none, and
+   re-dispatching only burns wall-clock and buries the real cause under a second
+   identical failure. The flag survives resume: clear it only when the user
+   states the ceiling is lifted.
+
+A 5a throttle keeps its existing behaviour — HALT the affected gate, surface the
+signal, suggest a wait, and leave the rest of the policy untouched. It sets no
+run-scoped flag, because a throttle genuinely may have cleared by the time the
+user resumes.
+
+**5b overrides the sticky-within-phase rule.** The per-phase preflight gates
+(Steps 3.0, 5.0, 6.−1, 7.0) each say a codex failure in "Modes 0, 1, 2, 3, 4, or
+5" sets `codex_available = false` *for the remainder of that phase only*. That
+scoping is correct for every mode except 5b: a spend ceiling does not expire at a
+phase boundary, so re-probing codex at the next gate can only fail again and cost
+another dispatch. Where those sections say "for the remainder of Phase N only",
+read 5b as "for the remainder of the run", carried by
+`codex_spend_exhausted`. Modes 0–4 and 5a keep the per-phase scoping unchanged.
 
 ### Distinguish orchestration bugs from vendor failures
 
@@ -2279,7 +2451,7 @@ Concretely for Codex: the most common orchestration bug is `codex exec ... -a ne
 
 The orchestrator must NOT inspect transcript stdout/stderr after a successful subprocess (`rc=0` AND STATUS.md exists AND `validate_status` returns clean). The verdict is whatever STATUS.md says. Tailing transcripts "out of curiosity" or "to confirm" leaks the orchestrator into the subagent's reasoning and routinely creates the temptation to override a STATUS.
 
-Transcript tails are read ONLY when classifying a failure (`rc != 0`, missing STATUS, or malformed STATUS — Modes 1–5). The `post_dispatch` helper from the cookbook implements this rule. Surface the tail only when halting the run or logging a vendor-failover event.
+Transcript tails are read ONLY when classifying a failure (`rc != 0`, missing STATUS, or malformed STATUS — Modes 1–5). The `post_dispatch` helper from the cookbook implements this rule, and `dispatch_role` calls it on every dispatch — do not hand-roll a tail at a phase step. "Transcript" here means BOTH streams: the stderr tail and the stdout JSON envelope that `vendor_error_text` parses. Reading the stdout envelope on failure is not a widening of this policy — it is the same one-look-on-failure rule applied to the stream the vendor actually writes its refusals to. Surface both only when halting the run or logging a vendor-failover event.
 
 ### STATUS.md contract
 
@@ -2339,7 +2511,8 @@ The "Codex subprocess" column below applies AT A PER-PHASE GATE (Phases 3, 5, 6,
 | 2    | HALT, surface               | Set `codex_available=false` for the phase, log with `phase=<n>`, continue for the phase |
 | 3    | HALT, surface, hint at token/quota hard stop | Set `codex_available=false` for the phase, log with `phase=<n>`, continue for the phase |
 | 4    | Retry ONCE same prompt. If still malformed, HALT | Retry ONCE. If still malformed, set `codex_available=false` for the phase, continue for the phase |
-| 5    | HALT, surface, suggest quota-reset wait | Set `codex_available=false` for the phase, log with `phase=<n>`, continue for the phase |
+| 5a   | HALT, surface, suggest quota-reset wait | Set `codex_available=false` for the phase, log with `phase=<n>`, continue for the phase |
+| 5b   | Set `claude_spend_exhausted`, HALT the RUN (not just the gate), surface the ceiling; suppress all further claude dispatch including the ORPHANED idempotent re-dispatch | Set `codex_spend_exhausted` and `codex_available=false` for the REST OF THE RUN (not just the phase), log with `phase=<n>`, continue Claude-only |
 
 ### Iteration cap
 
@@ -2430,6 +2603,16 @@ failure_mode:             1
 status_path:              missing
 verdict:                  none
 ```
+
+`mode_shape:` is an OPTIONAL extra field on this shape, written **only** when
+`failure_mode: 5`, with value `5a` (throttle) or `5b` (spend ceiling) per "Mode 5
+has two shapes". It goes immediately after `failure_mode:`. `failure_mode:`
+itself stays numeric `0..5` — the shape is a refinement, not a sixth mode, so
+every existing consumer that reads `failure_mode` keeps working unchanged. A
+`5b` entry is the durable record of the run-scoped `claude_spend_exhausted` /
+`codex_spend_exhausted` flag: reconstitute the flag on resume by scanning for a
+failure event carrying `mode_shape: 5b` for that vendor, exactly as
+`codex_disabled_by_user` is reconstituted from its own event below.
 
 **Baseline event** (written before Phase 6 dispatch, only after the orchestrator confirms the working tree is clean):
 
@@ -2668,6 +2851,22 @@ The orchestrator **MUST append an entry** on each of these events:
 1. Any `event=CODEX_UNAVAILABLE` (regardless of phase or failure_mode).
 2. Any `event=CLAUDE_FAILED`.
 3. Any retry of a dispatch within the same iteration (e.g. Mode 4 retry-once policy after a transient failure). Normal next-iteration progression of an iteration loop (spec-review, plan-review, code-review) or next-round progression of the Phase 8 all-tests loop is NOT a "retry" for this purpose — iteration number is already recorded in `RUN_LOG.md` and need not be re-logged here unless the orchestrator has a specific observation to record. The iteration-cap trigger (#5) covers the terminal case. Concretely: a "retry within iteration" is identified in `RUN_LOG.md` by a second `dispatch` entry whose `iteration:` field is unchanged from the immediately preceding failed dispatch in the same `phase:` AND whose `role:` matches that preceding failed dispatch; the completion-check uses this pair as the countable event. Phases without an iteration loop (preflight, context-discovery, plan-writing, implementation, git-finalization, readiness-report) only trigger this rule when the same `role:` is dispatched a second time within the same `phase:` after a failed first dispatch — the `iteration:` field, if present at all in those phases, is treated as trivially satisfied and the `role:` equality check is the load-bearing condition. **Example exclusion:** a `debugger` dispatch after a failed `implementer` dispatch in Phase 6 is NOT a retry — different roles, so trigger #3 does not fire (this is structured remediation, not a retry). A second `implementer` dispatch after a failed `implementer` dispatch in Phase 6 IS a retry and DOES fire trigger #3. Likewise, a `test-fixer` dispatch after a FAIL test round in Phase 8 is NOT a retry (different roles — structured remediation), but a second `all-tests-runner` dispatch with an unchanged `iteration:` after a failed first one IS. The same logic applies to Phase 9 (`finishing-branch`): trigger #3 fires only on a second `finishing-branch` dispatch after a failed first one.
+
+   **Say which kind of re-dispatch it was.** The shape test above is purely
+   structural, so it cannot tell an *automatic* retry (the Mode-4 retry-once
+   policy) from a *user-authorised re-dispatch after a HALT* (the sanctioned
+   recovery path when a mutating role orphans, or when the user restores spend
+   and asks the run to continue). Both produce an identical `(phase, iteration,
+   role)` repeat, and both fire trigger #3 — that part is deliberate, because the
+   1:1 count check in Completion criteria depends on the structural rule and must
+   stay mechanical. What the entry MUST do is disambiguate in its body: state
+   explicitly whether the second dispatch was automatic or user-authorised, and
+   for a user-authorised one, name the HALT it followed. Without that sentence the
+   log reads as though the orchestrator auto-retried a failure class the policy
+   forbids auto-retrying (Mode 5, or any `role_mutates: yes` orphan), which is a
+   policy violation rather than the correct recovery. Do NOT add a separate
+   trigger or `trigger:` tag value for the authorised case; the tag stays
+   `RETRY_WITHIN_ITERATION`.
 4. Any `event=HALT` (graceful or otherwise).
 5. Any `event=ITERATION_CAP_REACHED` AND any `event=ITERATION_CAP_OVERRIDE`. These two are counted **independently** — when a cap is reached and then overridden, that incident yields two distinct `RUN_LOG.md` events and therefore requires two distinct entries in `process-improvement-proposition.md`. A single entry cannot cover both.
 6. Any deviation from this process file's prescribed shape — when the orchestrator interprets an ambiguous instruction, works around an undocumented CLI quirk, or has to compose behavior the process file did not explicitly cover. Illustrative (non-exhaustive) examples: "had to choose between two readings of `Step 6.−1` vs `Step 6.0`"; "process file did not specify behavior when summarizer returns empty output, composed best-effort fallback"; "CLI emitted an undocumented stderr warning that required ad-hoc handling". Deviation is NOT a structured `RUN_LOG.md` event type — it is recognized only by the orchestrator's own judgment at the moment it makes the deviating choice. Because it has no countable RUN_LOG counterpart, deviation entries are explicitly excluded from the strict 1:1 count check in Completion criteria (see that section for the exhaustive list of count-matched event types); deviation remains a mandatory append trigger here regardless.
@@ -3840,7 +4039,7 @@ You are a gate summarizer invoked as a fresh subprocess. You have no shared cont
    - Findings counts table per iteration.
    - Deferred MAJOR list — MAJOR findings open at the final (passing) iteration, each addressed by the final fix pass (fixed, not re-reviewed). Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass (final iteration ≤ 2 with `majors=0`). For each deferred major, record its source reviewer, location, and one-line summary so the readiness writer can surface it. Note in the list that these items were fixed by the final fix pass without reviewer re-verification (extract the fix outcome from the passing iteration's `spec-fixer-status.md` if present).
    - Residual MINOR/NIT list.
-   - `partial_review` flag and `codex_unavailable_reason` (if any), with one sentence of human-readable context per mode (e.g. "mode=5: Codex hit a rate-limit / quota signal in iteration 02").
+   - `partial_review` flag and `codex_unavailable_reason` (if any), with one sentence of human-readable context per mode (e.g. "mode=5a: Codex hit a rate limit in iteration 02"; for `mode_shape: 5b` say the account hit a spend ceiling and that no retry can clear it).
    - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
    - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
      - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).

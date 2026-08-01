@@ -38,7 +38,9 @@ done < "$BUILD/roles.tsv"
 assert_eq 24 "$rows" "role table covers all 24 dispatched roles"
 
 # No stale ids, and no model may be named only in the table.
-for m in claude-fable-5 claude-opus-5 claude-sonnet-5 gpt-5.6-sol; do
+# `claude-fable-5` was dropped from the table in 19eb57e (spec-fixer, plan-writer
+# and plan-fixer moved to opus); it is intentionally absent from this list.
+for m in claude-haiku-4-5 claude-opus-5 claude-sonnet-5 gpt-5.6-luna gpt-5.6-sol; do
   "$GREP_BIN" -qF "$m" "$BUILD/roles.tsv" || _fail "table never assigns $m"
 done
 

@@ -1,0 +1,2 @@
+{"type":"session.created","session_id":"abc123"}
+{"type":"error","error":"stream error: 429 Too Many Requests; retry limit reached"}

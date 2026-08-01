@@ -375,7 +375,103 @@ fi
 if declare -F post_dispatch >/dev/null; then
   _ok "post_dispatch was preserved (it implements the transcript-read policy)"
 else
-  _fail "post_dispatch was deleted; doc line 1390 references it"
+  _fail "post_dispatch was deleted; the transcript-read policy and dispatch_role both reference it"
+fi
+
+# --- vendor_error_text: the stdout channel a zero-byte stderr hides ---
+# Regression for the real incident: an org monthly spend limit killed a dispatch
+# with rc=1, NO stderr, and the entire diagnosis on stdout. Classifying on the
+# stderr tail alone reported nothing and looked like a bare Mode 3.
+if declare -F vendor_error_text >/dev/null; then
+  out="$(vendor_error_text fixtures/claude-spend-ceiling.json)"
+  case "$out" in
+    *"monthly spend limit"*) _ok "vendor_error_text extracts claude .result when is_error=true" ;;
+    *) _fail "vendor_error_text missed the claude spend-ceiling result: [$out]" ;;
+  esac
+
+  # A SUCCESSFUL transcript must yield nothing: this function is only ever
+  # called on the failure path, and a non-empty return here would print a bogus
+  # "vendor error" banner under every healthy dispatch.
+  out="$(vendor_error_text fixtures/claude-usage.json)"
+  assert_eq "" "$out" "vendor_error_text is silent on a successful claude transcript"
+
+  # Codex JSONL: same filter, N-element slurp.
+  out="$(vendor_error_text fixtures/codex-error.jsonl)"
+  case "$out" in
+    *"429 Too Many Requests"*) _ok "vendor_error_text extracts a codex JSONL error item" ;;
+    *) _fail "vendor_error_text missed the codex error: [$out]" ;;
+  esac
+
+  out="$(vendor_error_text fixtures/codex-usage.jsonl)"
+  assert_eq "" "$out" "vendor_error_text is silent on a successful codex transcript"
+
+  # Absent and empty transcripts must be silent successes, not errors: the
+  # caller distinguishes "no vendor error" from "no transcript" by emptiness.
+  vendor_error_text /nonexistent/transcript.json >/dev/null 2>&1
+  assert_rc 0 $? "vendor_error_text succeeds on a missing transcript"
+  assert_eq "" "$(vendor_error_text /nonexistent/transcript.json 2>/dev/null)" \
+    "vendor_error_text prints nothing for a missing transcript"
+
+  # Non-JSON must degrade to empty, never leak raw bytes into a halt message.
+  _tmp_nonjson="$(mktemp)"; printf 'not json at all\n' > "$_tmp_nonjson"
+  assert_eq "" "$(vendor_error_text "$_tmp_nonjson" 2>/dev/null)" \
+    "vendor_error_text prints nothing for a non-JSON transcript"
+  rm -f "$_tmp_nonjson"
+
+  # Truncation must not be implemented with `| head -c`: under the mandated
+  # `set -o pipefail` that sends printf SIGPIPE and returns 141 on precisely the
+  # oversized inputs the bound exists for. Assert both the bound and the rc.
+  _tmp_big="$(mktemp)"
+  python3 -c 'import json,sys; sys.stdout.write(json.dumps({"type":"result","is_error":True,"result":"X"*9000}))' \
+    > "$_tmp_big"
+  ( set -o pipefail; vendor_error_text "$_tmp_big" >/dev/null 2>&1 )
+  assert_rc 0 $? "vendor_error_text returns 0 under pipefail when truncating"
+  _big_len="$(vendor_error_text "$_tmp_big" 2>/dev/null | tr -d '\n' | wc -c)"
+  assert_eq 2000 "$_big_len" "vendor_error_text bounds the vendor text at 2000 chars"
+  rm -f "$_tmp_big"
+else
+  _fail "vendor_error_text is not defined"
+fi
+
+# --- post_dispatch surfaces the stdout vendor error, not just the stderr tail ---
+if declare -F post_dispatch >/dev/null; then
+  _pd_status="$(mktemp -u)"          # deliberately absent -> failure path
+  _pd_err="$(mktemp)"; : > "$_pd_err" # deliberately EMPTY -> the real shape
+  _pd_out="$(post_dispatch 1 "$_pd_status" "$_pd_err" fixtures/claude-spend-ceiling.json 2>&1)"
+  case "$_pd_out" in
+    *"monthly spend limit"*) _ok "post_dispatch surfaces the vendor error when stderr is empty" ;;
+    *) _fail "post_dispatch lost the stdout diagnosis: [$_pd_out]" ;;
+  esac
+  case "$_pd_out" in
+    *"stderr empty"*) _ok "post_dispatch names the empty-stderr case explicitly" ;;
+    *) _fail "post_dispatch did not explain the empty stderr: [$_pd_out]" ;;
+  esac
+
+  # Backward compatibility: the 4th argument is optional and its absence must
+  # not break the pre-existing three-argument call shape.
+  post_dispatch 1 "$_pd_status" "$_pd_err" >/dev/null 2>&1
+  assert_rc 1 $? "post_dispatch still works with the legacy 3-argument form"
+  rm -f "$_pd_err"
+fi
+
+# --- dispatch_role actually CALLS post_dispatch, with the stdout transcript ---
+# post_dispatch spent a revision as an orphan: defined, documented as "the"
+# implementation of the transcript-read policy, and invoked from nowhere. That
+# is why a spend-ceiling failure reached the user with no diagnostic. Pin both
+# the call and the 4th argument.
+if declare -F dispatch_role >/dev/null; then
+  _dr_body="$(declare -f dispatch_role)"
+  case "$_dr_body" in
+    *post_dispatch*) _ok "dispatch_role calls post_dispatch" ;;
+    *) _fail "dispatch_role no longer calls post_dispatch — the policy is unenforced again" ;;
+  esac
+  case "$_dr_body" in
+    *'post_dispatch "$DISPATCH_RC" "$status_path" "$base.err" "$base.json"'*)
+      _ok "dispatch_role passes the stdout transcript to post_dispatch" ;;
+    *) _fail "dispatch_role's post_dispatch call is missing the stdout transcript argument" ;;
+  esac
+else
+  _fail "dispatch_role is not defined"
 fi
 
 finish
