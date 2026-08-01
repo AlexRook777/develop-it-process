@@ -9,6 +9,42 @@ between runs — everything else derives from it.
 
 ---
 
+## Quick start
+
+Everything below Step 1 is automated by `./develop-it.sh`. One argument, no
+flags:
+
+```bash
+./develop-it.sh /home/oleks/repos/prism/docs/superpowers/specs/2026-07-30-foo-design.md
+```
+
+It does three things: derives `REPO_ROOT`, `FEATURE_FOLDER`, and `PROCESS_PATH`
+from that one path and exports them; runs `./tests/run.sh` so a broken cookbook
+block fails at launch rather than mid-run (`DEVELOP_IT_SKIP_TESTS=1` skips that);
+and hands the terminal to an **interactive** Claude Code session whose system
+prompt is `develop-it-process.md` itself, verbatim — the same TUI as launching by
+hand. See Step 5 for the exact command.
+
+The script writes no prompt of its own, and does nothing else on purpose. It does
+**not** re-check binaries, the dirty tree, or the gitignore guard: Phase −1 Step
+1.0 already gates all three, and a second copy in the launcher would be a second
+thing to keep in sync. For the same reason these three decisions are the
+document's, made by the orchestrator, and are not launcher flags:
+
+| Decision | How the orchestrator makes it |
+|---|---|
+| Fresh run or resume | `RUN_LOG.md` in the artifacts folder is the source of truth — it classifies each prior dispatch per the Resumability section. You are never asked. |
+| Which branch | Before Phase 6 it checks the current branch; if the target repo is on `main`/`master`/`dev` it creates `feat/<slug>` (derived from the spec filename) so the implementation doesn't land on the default branch. Any other branch is left alone. |
+| Codex consent | `CODEX_CONSENT` is left unset, so a Modes 1–5 probe failure HALTs and asks you in the TUI instead of silently degrading. Mode 0 still halts unconditionally. |
+
+The run parameters are inherited from the environment, so the orchestrator picks
+them up on its first bash block without being told the values.
+
+The rest of this file is the manual equivalent — read it to understand what the
+script is doing, or to drive a run by hand when you want to vary something.
+
+---
+
 ## Step 0 — Verify the environment (once per machine)
 
 ```bash
@@ -82,6 +118,9 @@ git -C "$REPO_ROOT" status --short      # must print nothing
 ./tests/run.sh                          # process-doc health: offline, free
 ```
 
+`develop-it.sh` runs the second command for you and refuses to launch if it
+fails; run it by hand only when driving a run manually.
+
 A dirty target tree HALTs at the top of Phase 1 and again at Phase 6. The
 orchestrator will not auto-stash and does not accept "proceed anyway".
 
@@ -118,57 +157,29 @@ claude --model opus --add-dir "$REPO_ROOT" --dangerously-skip-permissions
 
 ## Step 5 — The kickoff prompt
 
-Generate a ready-to-paste copy with the real paths filled in (run this in the
-shell from Step 2, *before* launching `claude`):
+There isn't one. `develop-it.sh` passes `develop-it-process.md` itself, verbatim,
+as the session's system prompt:
 
 ```bash
-cat <<EOF > /tmp/kickoff.txt
-You are the orchestrator for the develop-it SDLC pipeline.
-
-Read $PROCESS_PATH in full — the whole file including all appendices — before
-doing anything. It is your complete instruction set. Do not summarize it, do not
-turn it into your own plan, and do not invent phase procedures.
-
-Run parameters. Export these at the top of EVERY bash block — shell state does
-not survive a phase boundary:
-
-  export PROCESS_PATH=$PROCESS_PATH
-  export REPO_ROOT=$REPO_ROOT
-  export SPEC_PATH=$SPEC_PATH
-  export FEATURE_FOLDER=$FEATURE_FOLDER
-  export CODEX_CONSENT=$CODEX_CONSENT
-
-Execute the pipeline end to end, starting at Phase -1 Step 1.0 (CLI canary +
-dirty-tree gate + model probe). Hold to the document's rules, in particular:
-
-- One phase per bash invocation. Never bundle two numbered phases into one block.
-- Paste the cookbook helpers at the top of each block. set -uo pipefail, never
-  set -e. Call init_orchestration_vars, and re-derive CONTEXT7_POLICY every block.
-- Dispatch any role whose role_timeout exceeds this harness's foreground Bash
-  ceiling with run_in_background: true — compare the two, do not work from a
-  memorised list of roles. When the ceiling is unknown, background it: the cost
-  is one extra turn, and the opposite mistake forfeits the dispatch.
-- You are a strict orchestrator. You never read the spec, the plan, source,
-  tests, reviewer findings, or transcripts — only STATUS files and the per-phase
-  summaries they reference. You never review, fix, or write code, and you are
-  never a reviewer in your own context. Run the Anti-leak self-check at every
-  phase boundary.
-- Log every dispatch with log_dispatch, including the nine usage-telemetry fields.
-- HALT and surface to me on any BLOCKED verdict, HALT condition, or iteration cap.
-
-Between phases, report to me in one short block: phase, verdict, severity counts
-(blockers/majors/minors), and what you are dispatching next.
-
-Before Phase -1, print the five run parameters back to me and wait for my
-confirmation.
-EOF
-
-cat /tmp/kickoff.txt
+claude --model opus --add-dir "$REPO_ROOT" --dangerously-skip-permissions \
+       --append-system-prompt-file "$PROCESS_PATH" Begin.
 ```
 
-The heredoc is unquoted so `$PROCESS_PATH` and friends expand. If you edit the
-prompt text, keep it free of backticks and of any other `$NAME` you don't want
-substituted.
+- **`--append-system-prompt-file`, not a positional prompt.** The document is
+  ~280 KB, past the kernel's 128 KB ceiling on a single argv element, so it
+  cannot be an argument. The system prompt is also the one place a multi-hour
+  run cannot lose it to context compaction. It *appends*, so Claude Code's own
+  tool instructions stay intact.
+- **`Begin.` is the trigger, not a prompt.** It submits the first turn, the same
+  as typing it into the TUI yourself. The launcher authors nothing else —
+  `tests/check_08_launcher.sh` fails if that argument ever grows into a second
+  copy of the document's rules.
+- **The run parameters travel in the environment.** `develop-it.sh` exports
+  `PROCESS_PATH`, `REPO_ROOT`, `SPEC_PATH`, and `FEATURE_FOLDER` before exec, so
+  every bash block the orchestrator runs inherits them and
+  `init_orchestration_vars` picks them up without being told the values.
+
+Driving a run by hand is the same command with the exports set as in Step 2.
 
 ---
 

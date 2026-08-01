@@ -34,6 +34,21 @@ subagent and re-reviewing — until it passes or hits its iteration cap (10).
 
 ## How to use it
 
+The short version — hand `./develop-it.sh` a design file and it does the rest:
+
+```bash
+./develop-it.sh /path/to/project/docs/superpowers/specs/<date>-<slug>-design.md
+```
+
+One argument, no flags. It derives every run parameter from that path and exports
+them, runs `./tests/run.sh` as part of preparing the environment, and hands the
+terminal to an interactive Claude Code session whose system prompt is
+`develop-it-process.md` itself, passed verbatim. The launcher writes no prompt of
+its own — every rule, including resume-vs-fresh, the branch, and the
+codex-consent question, is the document's. See `RUNBOOK.md` §Quick start.
+
+The long version, and what the launcher is doing under the hood:
+
 This repository orchestrates *other* projects, so its own root and the target
 project's root are never the same path. Set both explicitly, plus the feature
 folder for this run:

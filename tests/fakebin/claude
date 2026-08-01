@@ -4,9 +4,11 @@
 #   FAKE_DELAY        seconds to sleep before responding (default 0)
 #   FAKE_IGNORE_TERM  when set, trap and ignore SIGTERM
 #   FAKE_ARGV_LOG     append the full argv to this file
+#   FAKE_ENV_LOG      write the inherited environment to this file
 set -u
 [ -n "${FAKE_IGNORE_TERM:-}" ] && trap '' TERM
 [ -n "${FAKE_ARGV_LOG:-}" ] && printf 'claude %s\n' "$*" >> "$FAKE_ARGV_LOG"
+[ -n "${FAKE_ENV_LOG:-}" ] && env > "$FAKE_ENV_LOG"
 case " $* " in
   *" --help "*) printf -- '--output-format --dangerously-skip-permissions --model --agents\n'; exit 0 ;;
 esac
