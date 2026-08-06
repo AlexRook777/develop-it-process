@@ -1,6 +1,6 @@
 # Runbook — starting a develop-it run
 
-How to drive `develop-it-process.md` against a target project, end to end.
+How to drive `develop-it-prompt.md` against a target project, end to end.
 `README.md` describes what the pipeline *is*; this file is the operational
 checklist for launching one.
 
@@ -14,7 +14,10 @@ between runs — everything else derives from it.
 Everything below Step 1 is automated by `./develop-it.sh`. One argument, no
 flags:
 
+
 ```bash
+# make sure git tree is clean
+cd /home/oleks/repos/develop-it-process
 ./develop-it.sh /home/oleks/repos/prism/docs/superpowers/specs/2026-07-30-foo-design.md
 ```
 
@@ -22,7 +25,7 @@ It does three things: derives `REPO_ROOT`, `FEATURE_FOLDER`, and `PROCESS_PATH`
 from that one path and exports them; runs `./tests/run.sh` so a broken cookbook
 block fails at launch rather than mid-run (`DEVELOP_IT_SKIP_TESTS=1` skips that);
 and hands the terminal to an **interactive** Claude Code session whose system
-prompt is `develop-it-process.md` itself, verbatim — the same TUI as launching by
+prompt is `develop-it-prompt.md` itself, verbatim — the same TUI as launching by
 hand. See Step 5 for the exact command.
 
 The script writes no prompt of its own, and does nothing else on purpose. It does
@@ -91,7 +94,7 @@ confirmation — so prefer the convention.
 ```bash
 cd /home/oleks/repos/develop-it-process
 
-export PROCESS_PATH="$PWD/develop-it-process.md"
+export PROCESS_PATH="$PWD/develop-it-prompt.md"
 export REPO_ROOT="/home/oleks/repos/prism"
 export SPEC_PATH="$REPO_ROOT/docs/superpowers/specs/2026-07-30-raw-event-v3-date-columns-design.md"
 export FEATURE_FOLDER="${SPEC_PATH%-design.md}-artifacts"
@@ -157,7 +160,7 @@ claude --model opus --add-dir "$REPO_ROOT" --dangerously-skip-permissions
 
 ## Step 5 — The kickoff prompt
 
-There isn't one. `develop-it.sh` passes `develop-it-process.md` itself, verbatim,
+There isn't one. `develop-it.sh` passes `develop-it-prompt.md` itself, verbatim,
 as the session's system prompt:
 
 ```bash
@@ -267,7 +270,7 @@ Verdict semantics:
 
 | Cap | Value | Where |
 |---|---|---|
-| Review-gate fix→re-review iterations (Phases 3, 5, 7) | **10** | `develop-it-process.md` §Review-gate severity policy |
+| Review-gate fix→re-review iterations (Phases 3, 5, 7) | **10** | `develop-it-prompt.md` §Review-gate severity policy |
 | Strict→relaxed threshold | after iteration **2** | same |
 | Phase 8 test rounds | **4** (initial run + 3 fix rounds) | §Phase 8 Step 8.1 |
 | Codex command budget per reviewer dispatch | 2 / 4 / 20 by mode | §Codex reviewer modes |

@@ -15,12 +15,13 @@ If you find yourself reading an artifact, drafting review feedback, editing the 
 ## Orchestration contract
 
 You are a strict orchestrator. You sequence subprocess agents. You do not do their work.
+You work independently and solo. You do not ask the user for help. You have full autonomy to execute this process. Use all caps and rules and conditions as only one source of trueth and do not reask user to confirm them. 
 
 ### Allowed actions
 
 - Invoke `claude` and `codex` CLIs as subprocesses, passing prompt content via stdin or `-p` and capturing stdout/stderr to disk under `<feature-folder>/transcripts/`.
 - Read short STATUS files written by subagents (specifically `STATUS.md` files and the per-phase summary files those STATUS files reference for the final readiness writer).
-- Read this file (`$PROCESS_PATH`, default `develop-it-process.md`) — including appendices — and extract per-role appendix bodies with read-only shell (`cat`, `awk`, `sed`, `grep`, `python3`). Appendix content is NEVER written to disk.
+- Read this file (`$PROCESS_PATH`, default `develop-it-prompt.md`) — including appendices — and extract per-role appendix bodies with read-only shell (`cat`, `awk`, `sed`, `grep`, `python3`). Appendix content is NEVER written to disk.
 - Run `ls`, `git status`, `git log`, `git diff --stat` for orchestration awareness.
 - Create the per-feature folder and its required empty subfolders with `mkdir -p`. This is orchestration state, not an artifact.
 - **Canonical write list.** The orchestrator may `mkdir -p` and may write ONLY:
@@ -488,7 +489,7 @@ process_identity() {
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 ```
 
-All examples below use `python3` (never the bare `python`) and `$PROCESS_PATH` (never the literal `develop-it.md`).
+All examples below use `python3` (never the bare `python`) and `$PROCESS_PATH` (never the literal `develop-it-prompt.md`).
 
 ### Role → model / effort / timeout
 
@@ -2894,7 +2895,7 @@ The `trigger: <TRIGGER_TYPE>` segment is REQUIRED on mandatory entries (triggers
 - `ambiguity` — instruction in the process file that admits two readings
 - `failure` — an event that broke flow (failover, HALT, cap reached)
 - `success` — pattern worth preserving
-- `idea` — orchestrator's own suggestion not tied to a specific incident. Must still be a statement about `develop-it-process.md` itself; do not motivate ideas by quoting the spec, plan, diff, or any other content of the current run.
+- `idea` — orchestrator's own suggestion not tied to a specific incident. Must still be a statement about `develop-it-prompt.md` itself; do not motivate ideas by quoting the spec, plan, diff, or any other content of the current run.
 
 If a kind does not fit, choose the closest match — do not invent new kinds. (Future cycles may extend the enum; today's set is fixed.)
 

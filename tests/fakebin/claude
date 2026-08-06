@@ -14,7 +14,10 @@ case " $* " in
 esac
 # Capture the prompt rather than discarding it: tests assert that what actually
 # reached the CLI is fully substituted (no literal $VARS survived render_prompt).
-prompt="$(cat || true)"
+# Only when it is piped in, though. The real CLI takes an interactive launch's
+# prompt in argv and never drains the terminal; draining it here would hang the
+# launcher's own pre-launch gate, which runs with the operator's TTY attached.
+if [ -t 0 ]; then prompt=""; else prompt="$(cat || true)"; fi
 [ "${FAKE_DELAY:-0}" != 0 ] && sleep "${FAKE_DELAY}"
 printf '{"type":"result","duration_ms":1234,"total_cost_usd":0.01,'
 printf '"modelUsage":{"claude-opus-5":{"inputTokens":10,"outputTokens":5}},'

@@ -16,7 +16,8 @@ done
 case " $* " in
   *" --help "*) printf -- '--json --skip-git-repo-check --add-dir --model\n'; exit 0 ;;
 esac
-prompt="$(cat || true)"
+# Piped prompts only; a terminal on stdin is never drained. See fakebin/claude.
+if [ -t 0 ]; then prompt=""; else prompt="$(cat || true)"; fi
 [ "${FAKE_DELAY:-0}" != 0 ] && sleep "${FAKE_DELAY}"
 printf '%s\n' "{\"type\":\"turn.started\",\"prompt_received\":$(printf '%s' "$prompt" | jq -Rs .)}"
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":2100,"cached_input_tokens":1800,"output_tokens":640,"reasoning_output_tokens":2048}}'

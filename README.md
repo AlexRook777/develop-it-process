@@ -1,6 +1,6 @@
 # develop-it-process
 
-`develop-it-process.md` is a single self-contained orchestration prompt. An
+`develop-it-prompt.md` is a single self-contained orchestration prompt. An
 orchestrating agent reads it and drives `claude` and `codex` CLI subprocesses
 through a phased spec -> plan -> implement -> review pipeline. The document is
 the single source of truth: there is no framework code and no runtime. The
@@ -43,7 +43,7 @@ The short version — hand `./develop-it.sh` a design file and it does the rest:
 One argument, no flags. It derives every run parameter from that path and exports
 them, runs `./tests/run.sh` as part of preparing the environment, and hands the
 terminal to an interactive Claude Code session whose system prompt is
-`develop-it-process.md` itself, passed verbatim. The launcher writes no prompt of
+`develop-it-prompt.md` itself, passed verbatim. The launcher writes no prompt of
 its own — every rule, including resume-vs-fresh, the branch, and the
 codex-consent question, is the document's. See `RUNBOOK.md` §Quick start.
 
@@ -54,12 +54,12 @@ project's root are never the same path. Set both explicitly, plus the feature
 folder for this run:
 
 ```bash
-export PROCESS_PATH="$PWD/develop-it-process.md"
+export PROCESS_PATH="$PWD/develop-it-prompt.md"
 export REPO_ROOT="/path/to/the/target/project"
 export FEATURE_FOLDER="$REPO_ROOT/docs/superpowers/specs/<date>-<slug>-artifacts"
 ```
 
-Then hand `develop-it-process.md` to an orchestrating agent (a Claude Code
+Then hand `develop-it-prompt.md` to an orchestrating agent (a Claude Code
 session) and let it drive the phases. `RUNBOOK.md` is the step-by-step version of
 this — environment checks, the exact launch command, the kickoff prompt, resume,
 and how to override a cap for one run. Each phase runs as one bash invocation;
@@ -71,7 +71,7 @@ with `run_in_background: true` so the harness keeps them running across turns.
 ## Models
 
 Model, reasoning effort, and timeout are pinned per role in the Models table in
-`develop-it-process.md`, and implemented by the `role_model` / `role_effort` /
+`develop-it-prompt.md`, and implemented by the `role_model` / `role_effort` /
 `role_timeout` helpers. `tests/check_04_table.sh` asserts the table and the
 functions agree for every row, so they cannot drift apart. There is no
 fallback: a rejected model id halts the run rather than silently substituting

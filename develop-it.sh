@@ -6,11 +6,11 @@
 # Three things happen here and nothing else:
 #   1. the run parameters are derived from that one path and exported,
 #   2. the process repo's own checks are run as part of preparing the env,
-#   3. claude is exec'd, permissions bypassed, with develop-it-process.md itself
+#   3. claude is exec'd, permissions bypassed, with develop-it-prompt.md itself
 #      as the orchestrator's prompt.
 #
 # This script writes no prompt of its own — not a summary, not a kickoff, not a
-# restatement of any rule. develop-it-process.md is the tuned prompt and is
+# restatement of any rule. develop-it-prompt.md is the tuned prompt and is
 # passed verbatim; the only thing this script knows that the document cannot is
 # the per-run values, and those travel in the environment.
 set -uo pipefail
@@ -30,7 +30,7 @@ fi
 SELF="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null)" || die "cannot resolve own path"
 PROCESS_REPO_ROOT="$(git -C "$(dirname "$SELF")" rev-parse --show-toplevel 2>/dev/null)" \
   || die "this script must live inside the develop-it-process repository"
-PROCESS_PATH="$PROCESS_REPO_ROOT/develop-it-process.md"
+PROCESS_PATH="$PROCESS_REPO_ROOT/develop-it-prompt.md"
 [ -f "$PROCESS_PATH" ] || die "process file not found at $PROCESS_PATH"
 command -v claude >/dev/null 2>&1 || die "the 'claude' CLI is not on PATH"
 

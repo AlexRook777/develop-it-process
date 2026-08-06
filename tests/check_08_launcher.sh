@@ -82,7 +82,7 @@ esac
 
 # --- the process document itself is the prompt -------------------------------
 case "$argv" in
-  *"--append-system-prompt-file $REPO_TOP/develop-it-process.md"*)
+  *"--append-system-prompt-file $REPO_TOP/develop-it-prompt.md"*)
     _ok "the process document is passed verbatim as the system prompt" ;;
   *) _fail "--append-system-prompt-file PROCESS_PATH missing from argv" ;;
 esac
@@ -99,7 +99,7 @@ else
 fi
 
 # --- the derived parameters reach claude through the environment -------------
-assert_present "^PROCESS_PATH=$REPO_TOP/develop-it-process\.md$" "$ENV_LOG" \
+assert_present "^PROCESS_PATH=$REPO_TOP/develop-it-prompt\.md$" "$ENV_LOG" \
   "PROCESS_PATH is exported into claude's environment"
 assert_present "^REPO_ROOT=$FIX/proj$" "$ENV_LOG" \
   "REPO_ROOT derived from the spec's git toplevel"
@@ -162,6 +162,36 @@ printf 'junk\n' > "$FIX/proj/unrelated.py"
 launch "$SPEC"; rc=$?
 assert_rc 0 $rc "a dirty target tree does not block the launch (Phase 1 owns that gate)"
 rm -f "$FIX/proj/unrelated.py"
+
+# --- the launch must not block on an interactive terminal --------------------
+# develop-it.sh is run by hand and runs this suite as its pre-launch gate, so
+# every process it starts inherits the operator's TTY on stdin. A stub that
+# drains stdin blocks there forever: the gate never returns, and the operator
+# sees the checks stop mid-suite with no claude and no error. Only a pty
+# reproduces it — with a pipe or /dev/null on stdin the read hits EOF at once.
+if command -v script >/dev/null 2>&1; then
+  TTY_PROBE="$FIX/tty-probe.sh"
+  cat > "$TTY_PROBE" <<PROBE
+#!/usr/bin/env bash
+PATH="$REPO_TOP/tests/fakebin:\$PATH" FAKE_ARGV_LOG="$FIX/tty-argv.log" \\
+  DEVELOP_IT_SKIP_TESTS=1 "$LAUNCHER" "$SPEC" >/dev/null 2>&1
+PROBE
+  chmod +x "$TTY_PROBE"
+  : > "$FIX/tty-argv.log"
+  # script gives the launcher a real pty; the sleep keeps that pty from seeing
+  # EOF, which is what a waiting operator's terminal looks like.
+  timeout 20 script -qec "$TTY_PROBE" /dev/null 0< <(sleep 22) >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 124 ]; then
+    _fail "the launch hangs when stdin is a terminal; the pre-launch gate never returns"
+  else
+    _ok "the launch completes with an interactive terminal on stdin"
+  fi
+  [ -s "$FIX/tty-argv.log" ] && _ok "claude was still reached under a pty" \
+    || _fail "the pty launch never reached claude"
+else
+  note "util-linux script not installed; skipping the pty assertion only"
+fi
 
 # --- the pre-launch check gate is real ---------------------------------------
 # Drop a failing check into the suite the launcher runs, then launch WITHOUT the

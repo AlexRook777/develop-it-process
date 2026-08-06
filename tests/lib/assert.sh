@@ -5,7 +5,7 @@
 GREP_BIN="${GREP_BIN:-/usr/bin/grep}"
 _TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_TOP="$(cd "$_TESTS_DIR/.." && pwd)"
-PROCESS_DOC="${PROCESS_DOC:-$REPO_TOP/develop-it-process.md}"
+PROCESS_DOC="${PROCESS_DOC:-$REPO_TOP/develop-it-prompt.md}"
 BUILD="${BUILD:-$_TESTS_DIR/.build}"
 mkdir -p "$BUILD"
 

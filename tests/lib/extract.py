@@ -11,7 +11,7 @@ import re
 import sys
 
 REPO_TOP = pathlib.Path(__file__).resolve().parents[2]
-DOC = pathlib.Path(os.environ.get("PROCESS_DOC", REPO_TOP / "develop-it-process.md"))
+DOC = pathlib.Path(os.environ.get("PROCESS_DOC", REPO_TOP / "develop-it-prompt.md"))
 BUILD = pathlib.Path(os.environ.get("BUILD", REPO_TOP / "tests" / ".build"))
 
 MARKER = re.compile(r"^[ \t]*<!--\s*lint:\s*(cookbook|snippet)\s*-->\s*$")
