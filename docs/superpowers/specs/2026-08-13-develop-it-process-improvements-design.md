@@ -149,7 +149,7 @@ Each row SHALL define:
 | `checkpoint_kind` | `none`, `review`, `document`, or `implementation` |
 | `phases` | Legal phase numbers |
 
-The current top-level roles remain, and the registry adds exactly two top-level roles:
+The current top-level roles remain except `finishing-branch`, which is retired because Phase 10 finalization becomes an orchestrator-owned local operation rather than a vendor dispatch. The registry adds exactly two top-level roles:
 
 - `implementation-fixer`, replacing reuse of the full implementer in Phase 7;
 - `documentation-writer` for the new documentation/handoff phase.
@@ -217,9 +217,14 @@ The runtime directory is process-owned, not a product artifact. Each phase:
 
 1. derives the runtime path;
 2. checks `manifest.sha256` against the current process-file SHA and extracted content;
-3. re-extracts atomically if the runtime is absent before any run work exists;
-4. HALTs on a hash mismatch after work has started rather than source altered code;
-5. sources only `develop-it-runtime.sh`, whose top level contains definitions and validated registry loading but no phase action.
+3. creates a unique sibling staging directory named `$FEATURE_FOLDER/.orchestration/.runtime.tmp.<bootstrap-attempt>/` when the final runtime is absent;
+4. extracts every runtime file into the staging directory, validates the registry/scripts, writes `manifest.sha256` last, flushes the files, and `fsync`s the staging directory;
+5. atomically renames the complete staging directory to `$FEATURE_FOLDER/.orchestration/runtime/`, then `fsync`s `.orchestration/`; no phase ever sources directly from a `.runtime.tmp.*` path;
+6. on resume, treats an orphan `.runtime.tmp.*` as an interrupted prepublication attempt: if final `runtime/` exists, validate and use only the final directory; if it does not, quarantine the orphan and perform a fresh staged extraction rather than complete or source unknown partial contents;
+7. HALTs on a final-runtime hash mismatch after work has started rather than source altered code;
+8. sources only `runtime/develop-it-runtime.sh`, whose top level contains definitions and validated registry loading but no phase action.
+
+The rename MUST fail rather than merge when `runtime/` already exists. If another bootstrap created the target first, the losing bootstrap validates the final directory and classifies its own staging directory as an orphan; it never overlays files into the winner.
 
 Existing feature folders are never given this directory because the schema-version gate runs before folder mutation.
 
@@ -331,6 +336,9 @@ If the process exits without final STATUS but an attempt-specific temporary file
 - never reads it as a verdict;
 - never promotes it;
 - preserves it in the attempt directory as diagnostics;
+- records `tmp_path`, `tmp_size_bytes`, and `tmp_sha256` in the failed-attempt event;
+- records `tmp_header_preview` as one escaped, control-character-sanitized line derived from at most the first 12 records and 512 bytes; values for keys matching `token`, `secret`, `credential`, `password`, `authorization`, or `cookie` are replaced with `[REDACTED]`;
+- uses the preview only for post-mortem diagnosis—the classifier MUST NOT parse or branch on its apparent verdict/reason;
 - may authorize one cheap retry for a non-mutating role under `publication_retry_cap`;
 - treats a second publication loss as terminal for that logical dispatch.
 
@@ -398,21 +406,23 @@ The role verifies this input before mutation, reconciles one dirty partial unit,
 
 ### 11.1 Exclusive lease
 
-Before a mutating attempt launches, the dispatch engine atomically creates:
+Before a mutating role attempt launches—or before direct orchestrator mutation in Phase 10—the current controller atomically creates:
 
 ```text
 $FEATURE_FOLDER/.orchestration/write-lease.json
 ```
 
-The lease contains schema version, dispatch ID, role, phase, acquired time, baseline HEAD, declared write paths, declared foreign paths/commits, and snapshot manifest path.
+The lease contains schema version, dispatch ID (`null` only for direct Phase 10 finalization), role/lease owner, authority, phase, acquired time, baseline HEAD, declared write paths, declared foreign paths/commits, and snapshot manifest path.
 
 Only one lease may exist. A second mutating attempt is `PRELAUNCH_FAILED`; read-only roles may run concurrently only when their inputs are immutable revisions.
 
 While a lease exists:
 
-- the orchestrator MUST NOT edit or commit in the target repository;
+- only the named lease owner may mutate the declared paths/history;
+- when a dispatched role owns the lease, the orchestrator MUST NOT edit or commit in the target repository;
+- when `lease_owner: orchestrator-finalization` and `authority: orchestrator`, Phase 10 may stage and commit only the lease's declared paths; this is the sole orchestrator-mutation case inside the process;
 - no other mutating role may launch;
-- the owning role checks input hashes before each commit/publication boundary;
+- the owner checks input hashes before each commit/publication boundary;
 - unexpected changes yield `ARTIFACT_INTEGRITY_BLOCKED` with exact paths and hashes;
 - other-writer work is preserved, never reverted or overwritten.
 
@@ -560,20 +570,20 @@ Read-only roles always use `NO_SIDE_EFFECTS` unless they violated their contract
 
 ### 14.3 Recovery matrix
 
-| Classification/state | Automatic response |
-|---|---|
-| `PRELAUNCH_FAILED`, correctable contract/input/render/CWD defect | Emit `ORCHESTRATION_CORRECTION`; correct once up to `prelaunch_correction_cap`; never emit a vendor-failure event |
-| `PRELAUNCH_FAILED`, active lease owner | Wait for/classify the owner; do not spend the correction budget and do not launch another writer |
-| `PRELAUNCH_FAILED`, stale/ambiguous lease or snapshot integrity failure | HALT for integrity reconciliation; no automatic correction |
-| `PUBLICATION_LOST`, non-mutating | Retry once up to `publication_retry_cap`; never promote `.tmp` |
-| `TRANSIENT_TRANSPORT_ERROR` or `EXITED_NO_STATUS`, `NO_SIDE_EFFECTS` | Fresh retry once up to `transient_retry_cap` |
-| `TIMED_OUT`/transient/no-STATUS, `CLEAN_CHECKPOINTED` | Dispatch continuation up to `continuation_cap` |
-| Same, `DIRTY_CHECKPOINTED` | Run integrity reconciliation, then continuation if the partial unit is isolated |
-| Any failure, `DIRTY_UNCHECKPOINTED` or `INTEGRITY_UNKNOWN` | HALT with exact paths/state; no second writer launches |
-| `SPEND_CEILING` | Emit one run-scoped vendor-unavailable event; suppress later calls to that vendor; halt or use an explicitly accepted degraded path |
-| `PERMANENT_VENDOR_ERROR`/`UNKNOWN_VENDOR_ERROR` | No automatic retry; halt or use the documented vendor-degradation decision |
-| `MALFORMED_STATUS` | Non-mutating: one correction retry; mutating: reconcile mutation first, then continue/retry only if safe |
-| `COMPLETED` | Branch only on validated role verdict; release lease after final state is recorded |
+| ID | Classification/state | Automatic response |
+|---|---|---|
+| RM01 | `PRELAUNCH_FAILED`, correctable contract/input/render/CWD defect | Emit `ORCHESTRATION_CORRECTION`; correct once up to `prelaunch_correction_cap`; never emit a vendor-failure event |
+| RM02 | `PRELAUNCH_FAILED`, active lease owner | Wait for/classify the owner; do not spend the correction budget and do not launch another writer |
+| RM03 | `PRELAUNCH_FAILED`, stale/ambiguous lease or snapshot integrity failure | HALT for integrity reconciliation; no automatic correction |
+| RM04 | `PUBLICATION_LOST`, non-mutating | Retry once up to `publication_retry_cap`; never promote `.tmp` |
+| RM05 | `TRANSIENT_TRANSPORT_ERROR` or `EXITED_NO_STATUS`, `NO_SIDE_EFFECTS` | Fresh retry once up to `transient_retry_cap` |
+| RM06 | `TIMED_OUT`/transient/no-STATUS, `CLEAN_CHECKPOINTED` | Dispatch continuation up to `continuation_cap` |
+| RM07 | Same, `DIRTY_CHECKPOINTED` | Run integrity reconciliation, then continuation if the partial unit is isolated |
+| RM08 | Any failure, `DIRTY_UNCHECKPOINTED` or `INTEGRITY_UNKNOWN` | HALT with exact paths/state; no second writer launches |
+| RM09 | `SPEND_CEILING` | Emit one run-scoped vendor-unavailable event; suppress later calls to that vendor; halt or use an explicitly accepted degraded path |
+| RM10 | `PERMANENT_VENDOR_ERROR`/`UNKNOWN_VENDOR_ERROR` | No automatic retry; halt or use the documented vendor-degradation decision |
+| RM11 | `MALFORMED_STATUS` | Non-mutating: one correction retry; mutating: reconcile mutation first, then continue/retry only if safe |
+| RM12 | `COMPLETED` | Branch only on validated role verdict; release lease after final state is recorded |
 
 Retry budgets are keyed by logical dispatch and cause. A continuation is related to the prior attempt but consumes its own attempt ID. When a cap is reached, emit `RECOVERY_CAP_REACHED` and follow the role/phase's explicit halt or owner-decision path.
 
@@ -635,6 +645,7 @@ The event vocabulary includes:
 - `WRITE_LEASE_ACQUIRED`
 - `WRITE_LEASE_RELEASED`
 - `ARTIFACT_INTEGRITY_BLOCKED`
+- `GIT_FINALIZATION_RESULT`
 - `ITERATION_CAP_REACHED`
 - `ITERATION_CAP_OVERRIDE`
 
@@ -772,7 +783,11 @@ related_finding_ids
 status: open|fixed|verified|accepted_risk|deferred|superseded
 ```
 
-Each reviewer emits a vendor-local source ID plus a required normalized location and issue key. A deterministic ingestion helper assigns the canonical `finding_id` from artifact kind, normalized location, and normalized issue key; models do not invent the canonical hash themselves. Re-reviewers receive the prior canonical catalog and reuse its location/issue key when the same issue recurs. `related_finding_ids` records splits, merges, and supersession. The summarizer rejects canonical-ID collisions with conflicting content and sends them to an explicit classification correction rather than guessing.
+Each reviewer emits a vendor-local source ID plus a required normalized location and issue key. A deterministic ingestion helper assigns the canonical `finding_id` from artifact kind, normalized location, and normalized issue key; models do not invent the canonical hash themselves.
+
+For Markdown specifications and plans, `normalized_location` is the enclosing Markdown AST heading path, rendered as the ordered breadcrumb of normalized heading anchors from the document root to the finding's section. Repeated sibling headings are disambiguated by their occurrence within the same parent. A secondary node locator uses the block kind plus an explicit anchor or normalized content fingerprint when multiple targets exist inside one section. Source line/range is retained as review evidence only and MUST NOT participate in `finding_id`; inserting text before an unchanged section therefore preserves the ID. For source-code findings, use repository-relative path plus language-aware symbol/AST path when available, with line/range again treated only as evidence.
+
+Re-reviewers receive the prior canonical catalog and reuse its location/issue key when the same issue recurs. `related_finding_ids` records splits, merges, and supersession. The summarizer rejects canonical-ID collisions with conflicting content and sends them to an explicit classification correction rather than guessing.
 
 ### 17.3 Fixer disposition
 
@@ -916,7 +931,7 @@ The new sequence for fresh schema-v2 runs is:
 | 7 | Code review gate | Accepted reviewed implementation revision |
 | 8 | All tests | Final test verdict and evidence |
 | 9 | Documentation and handoff | Updated durable docs, UAT, follow-ups |
-| 10 | Git finalization | Local-only finalization STATUS |
+| 10 | Git finalization | Local-only orchestrator finalization event |
 | 11 | Readiness | Audited final readiness report |
 
 ### 20.1 Phases -1 and 1 — bootstrap/preflight
@@ -1032,9 +1047,17 @@ Documentation work does not edit historical run artifacts or source proposition 
 
 ### 20.10 Phase 10 — git finalization
 
-Git finalization moves after documentation so the final local commit can include all intended product documentation changes. It may stage and commit according to project policy. It MUST NOT push, open a pull request, merge, publish, deploy, or rewrite shared history without an explicit separately scoped owner action.
+Git finalization moves after documentation so the final local commit can include all intended product documentation changes. It is executed directly by the orchestrator; Phase 10 MUST NOT dispatch `finishing-branch` or any other external writer/model role.
 
-It validates that no write lease remains, all accepted outputs are represented, and unexplained dirty paths are blocked.
+The phase performs this sequence:
+
+1. Assert that no prior write lease or live mutating child remains, all accepted outputs are represented, and unexplained dirty paths are blocked.
+2. Acquire the ordinary exclusive write lease with `authority: orchestrator`, `lease_owner: orchestrator-finalization`, `dispatch_id: null`, baseline HEAD/tree state, and the exact candidate staging paths.
+3. Re-check the tree against that lease, stage only the declared paths, and create the final local commit according to project policy. A no-change result is valid and does not create an empty commit.
+4. Emit one `GIT_FINALIZATION_RESULT` carrying `verdict: COMMITTED|NO_CHANGES|BLOCKED|FAILED`, baseline/final HEAD, staged path manifest, commit SHA or `null`, and `push_performed: no`.
+5. Release the lease only after the result is durable. If the orchestrator is interrupted, the durable lease is recovered through §11.3 before any later writer or repeat finalization.
+
+Phase 10 MUST NOT push, open a pull request, merge, publish, deploy, or rewrite shared history. Such work requires a new, separately scoped owner action outside this process run.
 
 ### 20.11 Phase 11 — readiness
 
@@ -1100,6 +1123,7 @@ Extend the current table/extraction checks to prove:
 - status/output templates remain inside allowed roots and contain attempt identity;
 - the policy and role tables parse without lossy empty columns;
 - extracted runtime/registries hash-match the prompt and source with no top-level phase action;
+- an interrupted extraction leaves only `.runtime.tmp.*`, which no phase can source, and a complete retry becomes visible only through one atomic directory rename;
 - phase snippets source the generated runtime and do not carry copied helper bodies.
 
 ### 22.2 STATUS publisher tests
@@ -1112,6 +1136,7 @@ Use temporary directories to cover:
 - attempted output path outside allowed roots;
 - failed temporary write, failed rename, and failed final re-read;
 - sibling temporary file with no final file;
+- publication-loss diagnostics containing exact byte size/SHA-256 and a bounded, escaped, secret-redacted header preview;
 - refusal to overwrite an existing attempt STATUS;
 - one-command use from the constrained Codex preflight role.
 
@@ -1130,9 +1155,11 @@ Extend fake Claude/Codex to assert and simulate:
 - caller-side duplicate completion is detected;
 - no process sends a signal to extend a live timeout wrapper.
 
+`tests/check_07_fakecli.sh` SHALL expose deterministic fake-CLI modes for every launched-attempt signature consumed by §14.1/§14.3, including timeout, transient transport, spend ceiling, permanent/unknown vendor failure, exited-no-STATUS, publication loss, malformed STATUS, and valid completion. These modes are reused by the recovery-matrix suite rather than reimplemented as ad hoc shell conditions.
+
 ### 22.4 Failure-state table tests
 
-Create a table-driven offline test for every precedence row and relevant mutation state. It includes:
+Create `tests/check_09_recovery.sh` as a table-driven offline test with at least one named case for every RM01–RM12 row and every relevant mutation-state branch. Launched-attempt rows MUST use the deterministic fake-CLI modes from `tests/check_07_fakecli.sh`; prelaunch/lease rows use local fixture state without invoking a vendor. A coverage assertion compares the matrix IDs extracted from the specification with the case IDs implemented by the test and fails when any row is absent. Cases include:
 
 - timeout plus missing STATUS;
 - spend signature in stdout with non-zero/zero wrapper variants;
@@ -1145,7 +1172,7 @@ Create a table-driven offline test for every precedence row and relevant mutatio
 - each recovery cap and terminal event;
 - run-scoped vendor suppression.
 
-No classifier test may depend on free-form orchestrator interpretation.
+No classifier test may depend on free-form orchestrator interpretation. Task 7 is incomplete until both `tests/check_07_fakecli.sh` and `tests/check_09_recovery.sh` pass with RM01–RM12 fully covered.
 
 ### 22.5 Lease and continuation tests
 
@@ -1166,6 +1193,7 @@ Use disposable Git repositories to simulate:
 Fixture review/fixer records SHALL cover:
 
 - stable recurring IDs versus newly surfaced findings;
+- a Markdown paragraph shifted by edits in an earlier section retaining the same heading-path-based finding ID;
 - a finding subsumed by another;
 - partial fixer disposition rejection;
 - fix-induced blocker recurrence;
@@ -1190,7 +1218,7 @@ Contract fixtures SHALL prove:
 - valid verification exclusion bypasses debugger but appears in readiness;
 - dedicated implementation fixer cannot add unrelated scope;
 - documentation/UAT/follow-up outputs precede git finalization;
-- finalizer remains local-only;
+- Phase 10 makes no vendor dispatch, acquires an orchestrator-owned lease, and remains local-only;
 - exact event/proposition reconciliation by event ID;
 - every readiness verdict boundary, including incomplete documentation, degraded coverage, integrity blocks, exclusions, and failed audit.
 
@@ -1214,11 +1242,11 @@ The implementation may extend current checks and add focused scripts, with this 
 
 ## 23. Implementation work packages
 
-All work packages belong to one implementation iteration. The sequence is contract-first so intermediate edits do not create competing definitions; the branch is complete only after every package and the full offline suite pass.
+All work packages belong to one implementation iteration and MUST execute in strict numerical order. Task N+1 cannot begin until Task N's focused tests pass and its new/changed contracts are durable in the branch. The sequence is contract-first so intermediate edits do not create competing definitions; the branch is complete only after every package and the full offline suite pass.
 
 ### Task 1 — Establish schema-v2 contract tests
 
-Add failing fixtures/assertions for process schema, immutable old-run rejection, registry completeness, attempt identity, status publication, event envelope, and phase renumbering. Preserve useful current tests instead of replacing them with weaker string checks.
+Add failing fixtures/assertions for process schema, immutable old-run rejection, registry completeness, attempt identity, status publication, event envelope, phase renumbering, and recovery-matrix ID coverage. Preserve useful current tests instead of replacing them with weaker string checks.
 
 ### Task 2 — Consolidate policy and role registries
 
@@ -1226,7 +1254,7 @@ Extend the Models/role source into the full contract registry, add the policy/ev
 
 ### Task 3 — Extract and verify the shared runtime
 
-Implement run-local extraction, manifests, hashing, phase sourcing, and bootstrap/reconstruction behavior. Remove copied cookbook instructions from phase bodies while keeping the prompt normative.
+Implement run-local extraction into `.runtime.tmp.<bootstrap-attempt>`, manifest-last validation, directory `fsync`, atomic rename to `runtime/`, orphan-staging quarantine/re-extraction, hashing, phase sourcing, and bootstrap/reconstruction behavior. Remove copied cookbook instructions from phase bodies while keeping the prompt normative.
 
 ### Task 4 — Introduce attempt-scoped identity and STATUS publication
 
@@ -1242,7 +1270,7 @@ Implement the single-child primitive, parallel composition, monotonic timing, ex
 
 ### Task 7 — Implement failure classification and bounded recovery
 
-Add the ordered classifier, mutation states, recovery matrix, budgets, observed/orphaned resume states, run-scoped vendor suppression, and cap events. Remove contradictory legacy Mode/ORPHANED prose.
+Add the ordered classifier, mutation states, RM01–RM12 recovery matrix, budgets, observed/orphaned resume states, run-scoped vendor suppression, and cap events. Remove contradictory legacy Mode/ORPHANED prose. Task completion requires deterministic fake-CLI coverage for every launched-attempt row and full `check_09_recovery.sh` row coverage.
 
 ### Task 8 — Add typed decisions, corrections, leases, and snapshots
 
@@ -1258,7 +1286,7 @@ Reorder free/paid gates, add typed process identity, validate runtime/registries
 
 ### Task 11 — Rebuild review gates around stable findings
 
-Add finding/disposition schemas, diff/provenance/growth metrics, bounded document fixer batches, convergence/divergence handling, consolidation, artifact sanity, mandatory re-review, and reviewed-revision acceptance.
+Add finding/disposition schemas, document locations derived from Markdown heading/AST paths rather than line numbers, diff/provenance/growth metrics, bounded document fixer batches, convergence/divergence handling, consolidation, artifact sanity, mandatory re-review, and reviewed-revision acceptance.
 
 ### Task 12 — Make plans and verification executable
 
@@ -1270,7 +1298,7 @@ Update implementer modes/progress and introduce the bounded `implementation-fixe
 
 ### Task 14 — Add documentation/handoff and renumber final phases
 
-Implement `followups.jsonl`, documentation writer, UAT/planned-vs-realized/validation outputs, Phase 9 validation/fix cap, Phase 10 local-only finalization, and Phase 11 readiness inputs.
+Implement `followups.jsonl`, documentation writer, UAT/planned-vs-realized/validation outputs, and the Phase 9 validation/fix cap. Retire the dispatched `finishing-branch` role and implement Phase 10 as a direct orchestrator operation that first asserts lease clearance, acquires `authority: orchestrator`, records `GIT_FINALIZATION_RESULT`, and never invokes an external writer. Add the Phase 11 readiness inputs.
 
 ### Task 15 — Automate audit and readiness
 
@@ -1278,7 +1306,7 @@ Implement event-ID proposition reconciliation, phase/artifact acceptance audit, 
 
 ### Task 16 — Remove obsolete contradictions and complete verification
 
-Delete superseded helper/prose variants, update README/RUNBOOK phase descriptions as process documentation, run focused tests after each package, then run the full offline suite. Confirm no existing Prism artifact file changed.
+Delete superseded helper/prose variants, including the old `finishing-branch` registry row/appendix/dispatch path. Verify that Phase 10 has exactly one orchestrator-owned finalization path, update README/RUNBOOK phase descriptions as process documentation, run focused tests after each package, then run the full offline suite. Confirm no existing Prism artifact file changed.
 
 ## 24. Acceptance criteria
 
@@ -1324,7 +1352,7 @@ The design is implemented only when all criteria below hold.
 24. Optional skills are routed only when installed and task-relevant.
 25. A later context7 degradation event overrides earlier reachability.
 26. Documentation, UAT, planned-versus-realized state, and follow-ups exist before local git finalization.
-27. Git finalization performs no push/publication operation.
+27. Git finalization runs directly under an orchestrator-owned lease, dispatches no external writer, and performs no push/publication operation.
 28. RUN_LOG/proposition reconciliation is exact by event ID and blocks readiness on mismatch.
 29. Readiness exposes coverage degradation, decisions, exclusions, continuations, residual risk, and follow-ups.
 30. All deterministic offline tests pass, and the six historical Prism artifact folders have no changes.
