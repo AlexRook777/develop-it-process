@@ -111,4 +111,90 @@ rc=0
 ( cd "$RUNTIME_DIR" && sha256sum -c manifest.sha256 ) >/dev/null 2>"$BUILD/manifest-check.err" || rc=$?
 assert_rc 0 "$rc" "the four generated-file entries validate with sha256sum -c"
 
+# --- Task 4 Step 6: every top-level appendix publishes through the ONE
+# generated publisher, exactly once, and no appendix hand-rolls its own
+# atomic-write shell or a role-local STATUS validator any more. -------------
+appendix_pub_report="$(python3 - "$PROCESS_DOC" <<'PY'
+import re
+text = open(__import__("sys").argv[1]).read()
+bodies = re.findall(r"<!-- BEGIN: ([a-z0-9-]+) -->(.*?)<!-- END: \1 -->", text, re.S)
+bad = []
+for role, body in bodies:
+    n = body.count("$STATUS_PUBLISHER_PATH")
+    if n != 1:
+        bad.append(f"{role}:{n}")
+print(",".join(bad))
+print(len(bodies))
+PY
+)"
+appendix_pub_bad="$(printf '%s\n' "$appendix_pub_report" | sed -n 1p)"
+appendix_pub_count="$(printf '%s\n' "$appendix_pub_report" | sed -n 2p)"
+assert_eq "" "$appendix_pub_bad" \
+  "every appendix calls \$STATUS_PUBLISHER_PATH exactly once (offenders: role:count)"
+assert_eq 24 "$appendix_pub_count" "24 top-level role appendices were scanned"
+
+# The retired v1 phrasing ("write STATUS ... atomically (write .tmp then
+# rename)") must be gone from every appendix -- a hand-rolled atomic-write
+# shell is exactly what Step 6 replaces with the one-command publisher.
+retired_phrase=$(grep -c 'write `\.tmp` then rename' "$PROCESS_DOC" || true)
+assert_eq 0 "$retired_phrase" "no appendix still instructs its own .tmp-then-rename STATUS write"
+
+# No appendix may hand-write its own STATUS file directly (a role-local
+# writer/validator). Two shapes are retired, both checked:
+#   (a) a REAL shell command (line starts with cat/mv, not prose ABOUT
+#       cat/mv inside backticks) targeting a STATUS path;
+#   (b) a PROSE directive naming a write verb (write/rewrite/overwrite,
+#       singular or plural) alongside a *-status.md / STATUS.md filename on
+#       the same line -- e.g. "ATOMICALLY rewrite `implementer-status.md`",
+#       which a plain `cat >`/`mv` grep does not catch at all. Matching is
+#       restricted to `.md` filenames (never the bare word STATUS/status, a
+#       common field/section name) so this cannot fire on the publisher's own
+#       "do not hand-write your own validator" sentence or on read-only prose
+#       like "the STATUS file" / "publish STATUS".
+direct_status_write=$(grep -cE '^[[:space:]]*(cat[[:space:]]*>|mv[[:space:]])[^`]*STATUS' "$PROCESS_DOC" || true)
+prose_status_write=$(python3 "$REPO_TOP/tests/lib/scan_status_write_prose.py" "$PROCESS_DOC")
+assert_eq 0 "$direct_status_write" "no appendix writes or renames a STATUS file directly (cat >/mv)"
+assert_eq 0 "$prose_status_write" "no appendix prose instructs writing/rewriting a *-status.md file directly"
+
+# impl-worker is the one documented exception (status_template=none, child-only
+# contract) -- it must have no top-level appendix at all.
+implworker_appendix=$(grep -c -- '<!-- BEGIN: impl-worker -->' "$PROCESS_DOC" || true)
+assert_eq 0 "$implworker_appendix" "impl-worker has no appendix (status_template=none, child-only)"
+
+# Every dispatched role's STATUS path template names an attempt ID.
+# NOTE: bash `read` collapses consecutive tab delimiters (tab is IFS
+# "whitespace" to bash regardless of what IFS is set to), which would
+# silently misalign columns for a row with an empty cell (e.g. `effort`) --
+# use awk -F '\t', the same tool tsv_column/tsv_value already rely on, which
+# does not collapse.
+python3 "$REPO_TOP/tests/lib/extract.py" roles > "$BUILD/roles-t4.tsv"
+status_paths_missing_attempt="$(awk -F '\t' '
+  NR==1 { for (i=1;i<=NF;i++) col[$i]=i; next }
+  {
+    st = $col["status_template"]
+    if (st == "none") next
+    if (index(st, "$DISPATCH_ID") == 0) print $col["role"]
+  }
+' "$BUILD/roles-t4.tsv" | tr '\n' ' ' | sed 's/ *$//')"
+assert_eq "" "$status_paths_missing_attempt" \
+  "every dispatched role's STATUS path names \$DISPATCH_ID (an attempt ID)"
+
+# Every appendix's declared output_count/output_NN lines must agree with its
+# own registry row's `outputs` cell -- Task 4 code review fix #3: all 24
+# appendices previously hardcoded output_count: 0, so the publisher's
+# contiguity/absolute-path/realpath-containment validation (the core safety
+# property Step 4 built) was never exercised by a single real role.
+output_decl_problems="$(python3 "$REPO_TOP/tests/lib/check_output_declarations.py" "$PROCESS_DOC" "$BUILD/roles-t4.tsv" || true)"
+assert_eq "" "$output_decl_problems" \
+  "every appendix's output_count/output_NN agrees with its registry outputs cell"
+
+# Code review fix #1: Step 6 must not silently drop an appendix's non-STATUS
+# role contract (verdict rules, findings-file format, progress.jsonl
+# durability notes, etc.) while converting its STATUS write to one-command
+# publication -- an earlier pass replaced whole `## Output` sections and lost
+# ~54 lines of contract this way.
+appendix_content_missing="$(python3 "$REPO_TOP/tests/lib/check_appendix_content.py" "$PROCESS_DOC" || true)"
+assert_eq "" "$appendix_content_missing" \
+  "every restored appendix still carries its non-STATUS role contract (verdict rules / findings format / progress.jsonl notes)"
+
 finish

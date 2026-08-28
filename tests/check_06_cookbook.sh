@@ -195,6 +195,9 @@ if declare -F render_prompt >/dev/null; then
   DOCS_INVENTORY=/tmp/docs.txt
   PHASE_DIR=/tmp/ff/7-code-review
   DISPATCH_ID=p07-i00-implementation-fixer-a01
+  LOGICAL_DISPATCH_ID=p07-i00-implementation-fixer
+  ATTEMPT=01
+  STATUS_PUBLISHER_PATH=/tmp/ff/.orchestration/runtime/publish-status
 
   body="$(render_prompt spec-reviewer-claude)" \
     && _ok "render_prompt extracts a known appendix from unexported variables" \
@@ -1041,5 +1044,327 @@ for _artifact in "$BUILD/cookbook.sh" "$BUILD/publish-status"; do
   _bare=$(grep -cE '^[[:space:]]*os\.write\(fd, data\)[[:space:]]*$' "$_artifact" || true)
   assert_eq 0 "$_bare" "$(basename "$_artifact") has no unchecked single os.write"
 done
+
+# --- Task 4 Step 1/3: allocate_attempt -- exact identity, monotonic attempts,
+# collision safety, lock serialization, and the launched:false prelaunch
+# record ----------------------------------------------------------------------
+python3 "$REPO_TOP/tests/lib/extract.py" roles > "$BUILD/roles.tsv"
+
+_aa_dir="$(mktemp -d)"
+REPO_ROOT="$_aa_dir/target"; mkdir -p "$REPO_ROOT"
+git -C "$REPO_ROOT" init -q
+( cd "$REPO_ROOT" && : > seed && git add seed \
+  && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+FEATURE_FOLDER="$_aa_dir/ff"
+ORCHESTRATION_DIR="$FEATURE_FOLDER/.orchestration"
+mkdir -p "$ORCHESTRATION_DIR" "$FEATURE_FOLDER/transcripts"
+ROLE_CONTRACTS_PATH="$BUILD/roles.tsv"
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+
+allocate_attempt -1 0 preflight-claude
+assert_eq "pm1-i00-preflight-claude" "$LOGICAL_DISPATCH_ID" \
+  "allocate_attempt -1 0 preflight-claude: logical_dispatch_id"
+assert_eq "pm1-i00-preflight-claude-a01" "$DISPATCH_ID" \
+  "allocate_attempt -1 0 preflight-claude: dispatch_id"
+
+allocate_attempt 5 2 plan-fixer
+assert_eq "p05-i02-plan-fixer" "$LOGICAL_DISPATCH_ID" \
+  "allocate_attempt 5 2 plan-fixer: logical_dispatch_id"
+assert_eq "p05-i02-plan-fixer-a01" "$DISPATCH_ID" \
+  "allocate_attempt 5 2 plan-fixer: dispatch_id (first attempt)"
+_aa_first_dir="$ATTEMPT_DIR"
+
+allocate_attempt 5 2 plan-fixer
+assert_eq "p05-i02-plan-fixer-a02" "$DISPATCH_ID" \
+  "a second attempt of the same logical dispatch gets -a02"
+assert_eq 2 "$ATTEMPT" "\$ATTEMPT is the raw (unpadded) attempt number"
+if [ "$_aa_first_dir" != "$ATTEMPT_DIR" ]; then
+  _ok "the second attempt gets its own directory, never reusing the first"
+else
+  _fail "the second attempt reused the first attempt's directory"
+fi
+assert_exists "$_aa_first_dir" "the FIRST attempt's directory still exists (never moved/deleted)"
+
+assert_eq 3 "$("$GREP_BIN" -c 'event=ATTEMPT_ALLOCATED$' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "three allocations recorded three ATTEMPT_ALLOCATED events"
+assert_eq 3 "$("$GREP_BIN" -c '^launched: *false$' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "every allocation records launched: false (this is what a prelaunch failure leaves as its terminal record)"
+
+# allocate_attempt sets EXACTLY the nine documented variables -- in
+# particular it must never clobber the caller's own $ITERATION.
+ITERATION=sentinel-untouched
+allocate_attempt 5 2 plan-fixer
+assert_eq "sentinel-untouched" "$ITERATION" "allocate_attempt does not set/clobber \$ITERATION"
+for v in PHASE_TOKEN LOGICAL_DISPATCH_ID ATTEMPT DISPATCH_ID ATTEMPT_DIR \
+         STATUS_PATH STDOUT_PATH STDERR_PATH SNAPSHOT_DIR; do
+  [ -n "${!v:-}" ] && _ok "allocate_attempt sets \$$v" || _fail "allocate_attempt left \$$v unset"
+done
+unset ITERATION
+
+# Collision safety: if the computed attempt directory was somehow already
+# created on disk out-of-band, allocate_attempt must fail loudly rather than
+# merge into it -- this is the backstop behind the RUN_LOG-derived number.
+_aa_next_num="$(next_unused_attempt p05-i02-plan-fixer)"
+_aa_next_dispatch="p05-i02-plan-fixer-a$(printf '%02d' "$_aa_next_num")"
+_aa_next_dir="$(role_attempt_dir plan-fixer "$_aa_next_dispatch")"
+mkdir -p "$_aa_next_dir"
+rc=0
+allocate_attempt 5 2 plan-fixer >"$BUILD/aa-collision.out" 2>"$BUILD/aa-collision.err" || rc=$?
+assert_rc 1 "$rc" "allocate_attempt fails when its computed attempt directory already exists"
+assert_contains "ATTEMPT_DIR_COLLISION" "$BUILD/aa-collision.err" "collision failure names itself"
+
+# Lock serialization: allocate_attempt must actually WAIT for the run-log
+# lock, not merely define lock helpers nobody calls.
+mkdir -p "$ORCHESTRATION_DIR/run-log.lock.d"   # simulate a lock held by someone else
+rm -f "$BUILD/aa-lock-done"
+( allocate_attempt 5 4 plan-fixer >/dev/null 2>&1; : > "$BUILD/aa-lock-done" ) &
+_aa_bg_pid=$!
+sleep 0.3
+if [ -f "$BUILD/aa-lock-done" ]; then
+  _fail "allocate_attempt proceeded despite a run-log lock held by someone else"
+else
+  _ok "allocate_attempt blocks while the run-log lock is held by someone else"
+fi
+rmdir "$ORCHESTRATION_DIR/run-log.lock.d"
+wait "$_aa_bg_pid"
+assert_exists "$BUILD/aa-lock-done" "allocate_attempt proceeds once the lock is released"
+rm -f "$BUILD/aa-lock-done"
+
+# Code review fix #5: attempt identity is fixed two-digit by design; a 100th
+# attempt must fail loudly (ATTEMPT_OVERFLOW), never silently produce a
+# 3-digit "-a100" that then stops matching next_unused_attempt's own regex
+# and collides with the pre-existing a99 directory.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+printf 'dispatch_id:              p05-i02-plan-fixer-a99
+
+' >> "$FEATURE_FOLDER/RUN_LOG.md"
+rc=0
+out="$(next_unused_attempt p05-i02-plan-fixer 2>"$BUILD/aa-overflow.err")" || rc=$?
+assert_rc 1 "$rc" "next_unused_attempt refuses to derive a 100th attempt"
+assert_contains "ATTEMPT_OVERFLOW:p05-i02-plan-fixer" "$BUILD/aa-overflow.err"   "attempt-overflow failure names the logical dispatch"
+rc=0
+allocate_attempt 5 2 plan-fixer >/dev/null 2>"$BUILD/aa-overflow2.err" || rc=$?
+assert_rc 1 "$rc" "allocate_attempt itself fails (not just next_unused_attempt in isolation) at the 100th attempt"
+assert_contains "ATTEMPT_OVERFLOW" "$BUILD/aa-overflow2.err" "allocate_attempt surfaces the overflow token, not a bare non-zero exit"
+
+rm -rf "$_aa_dir"
+
+# --- Task 4 Step 4/5: the generated publish-status CLI -----------------------
+python3 "$REPO_TOP/tests/lib/extract.py" publisher >/dev/null
+_ps="$BUILD/publish-status"
+_ps_dir="$(mktemp -d)"
+_ps_ff="$_ps_dir/ff"; mkdir -p "$_ps_ff"
+cat > "$_ps_dir/roles.tsv" <<'TSV'
+role	vendor	model	effort	timeout_minutes	mutates	long_running	may_spawn_children	required_inputs	optional_inputs	status_template	outputs	verdicts	required_status_fields	checkpoint_kind	phases
+spec-reviewer-claude	claude	claude-opus-5	—	60	no	yes	no	feature_folder;iteration;spec_path	—	x	verdict;findings	PASS;CHANGES_REQUESTED	common_v2;blockers;majors;minors;findings	review	3
+TSV
+
+_ps_common=(--contracts "$_ps_dir/roles.tsv" --role spec-reviewer-claude \
+  --dispatch-id p03-i01-spec-reviewer-claude-a01 \
+  --logical-dispatch-id p03-i01-spec-reviewer-claude \
+  --phase 3 --iteration 01 --attempt 01 --allowed-root "$_ps_ff")
+
+_ps_baseline() {
+  cat <<EOF
+schema_version: 2
+dispatch_id: p03-i01-spec-reviewer-claude-a01
+logical_dispatch_id: p03-i01-spec-reviewer-claude
+role: spec-reviewer-claude
+phase: 3
+iteration: 01
+attempt: 01
+verdict: PASS
+reason: null
+published_at: 2026-08-29T12:00:00Z
+artifact_revision: null
+output_count: 0
+checkpoint_path: null
+blockers: 0
+majors: 0
+minors: 0
+findings: none
+EOF
+}
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+_ps_baseline | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >"$BUILD/ps-happy.out" 2>"$BUILD/ps-happy.err" || rc=$?
+assert_rc 0 "$rc" "publish-status: valid STATUS with reason: null publishes successfully"
+assert_exists "$_ps_ff/STATUS.md" "publish-status: the final STATUS file was created"
+assert_contains "reason: null" "$_ps_ff/STATUS.md" "publish-status: reason: null is a valid, accepted value"
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+( _ps_baseline; echo "x_note: hello" ) | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-xok.err" || rc=$?
+assert_rc 0 "$rc" "publish-status: an x_-namespaced extension field is accepted"
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+( _ps_baseline; echo "blockers: 1" ) | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-dup.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a duplicate key is rejected"
+assert_contains "STATUS_DUPLICATE_KEY" "$BUILD/ps-dup.err" "duplicate-key failure names itself"
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+( _ps_baseline; echo "bogus: 1" ) | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-unk.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: an unnamespaced unknown key is rejected"
+assert_contains "STATUS_UNKNOWN_FIELD" "$BUILD/ps-unk.err" "unnamespaced-unknown-key failure names itself"
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+_ps_baseline | grep -v '^published_at' | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-miss-common.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a missing common field is rejected"
+assert_contains "STATUS_MISSING_FIELD:published_at" "$BUILD/ps-miss-common.err" \
+  "missing-common-field failure names the field"
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+_ps_baseline | grep -v '^findings' | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-miss-role.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a missing role-specific required field is rejected"
+assert_contains "STATUS_MISSING_ROLE_FIELD:findings" "$BUILD/ps-miss-role.err" \
+  "missing-role-field failure names the field"
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+_ps_baseline | sed 's/-a01$/-a02/' | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-wrongid.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a dispatch_id that disagrees with --dispatch-id is rejected"
+assert_contains "STATUS_DISPATCH_ID_MISMATCH" "$BUILD/ps-wrongid.err" "wrong-dispatch-id failure names itself"
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+_ps_baseline | sed 's/^verdict: PASS/verdict: MAYBE/' | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-verdict.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a verdict outside the role's registry-declared set is rejected"
+assert_contains "STATUS_BAD_VERDICT" "$BUILD/ps-verdict.err" "invalid-verdict failure names itself"
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+( _ps_baseline | sed "s#^output_count: 0#output_count: 2#; \
+    s#^checkpoint_path: null#output_01: $_ps_ff/a.md\ncheckpoint_path: null#" ) \
+  | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-missout.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a missing output_NN index (count=2, only output_01) is rejected"
+assert_contains "STATUS_MISSING_OUTPUT:output_02" "$BUILD/ps-missout.err" "missing-output failure names the index"
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+( _ps_baseline | sed "s#^output_count: 0#output_count: 1#; \
+    s#^checkpoint_path: null#output_01: $_ps_ff/a.md\noutput_02: $_ps_ff/b.md\ncheckpoint_path: null#" ) \
+  | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-extraout.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: an extra undeclared output_NN (count=1, output_01 and output_02) is rejected"
+assert_contains "STATUS_EXTRA_OUTPUT:output_02" "$BUILD/ps-extraout.err" "extra-output failure names the index"
+
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+( _ps_baseline | sed "s#^output_count: 0#output_count: 1#; \
+    s#^checkpoint_path: null#output_01: /etc/passwd\ncheckpoint_path: null#" ) \
+  | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-outside.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a declared output path outside every --allowed-root is rejected"
+assert_contains "STATUS_OUTPUT_OUTSIDE_ROOT" "$BUILD/ps-outside.err" "outside-root failure names itself"
+
+: > "$_ps_ff/STATUS.md"
+rc=0
+_ps_baseline | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-exists.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: refuses to publish when the final STATUS path already exists"
+assert_contains "STATUS_ALREADY_EXISTS" "$BUILD/ps-exists.err" "existing-final-STATUS failure names itself"
+rm -f "$_ps_ff/STATUS.md"
+
+rc=0
+_ps_baseline | PUBLISH_STATUS_FAIL_RENAME=1 python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >"$BUILD/ps-rename.out" 2>"$BUILD/ps-rename.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a rename failure is reported, not silently swallowed"
+assert_contains "classification=PUBLICATION_LOST" "$BUILD/ps-rename.out" "rename failure reports classification=PUBLICATION_LOST"
+assert_contains "tmp_path=" "$BUILD/ps-rename.out" "rename failure reports tmp_path"
+assert_contains "tmp_sha256=" "$BUILD/ps-rename.out" "rename failure reports tmp_sha256"
+assert_not_exists "$_ps_ff/STATUS.md" "rename failure never leaves a final STATUS file behind"
+assert_exists "$_ps_ff/STATUS.md.tmp.p03-i01-spec-reviewer-claude-a01" \
+  "rename failure preserves the temp file as diagnostics"
+rm -f "$_ps_ff/STATUS.md.tmp."*
+
+_ps_tmp="$_ps_ff/STATUS.md.tmp.p03-i01-spec-reviewer-claude-a01"
+printf 'leaked-token: abc123\nsome-other-field: fine\n' > "$_ps_tmp"
+rc=0
+_ps_baseline | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >"$BUILD/ps-sibling.out" 2>"$BUILD/ps-sibling.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a pre-existing sibling temp (no final) is refused, not overwritten"
+assert_contains "STATUS_TMP_SIBLING_EXISTS" "$BUILD/ps-sibling.err" "sibling-temp failure names itself"
+assert_contains "classification=PUBLICATION_LOST" "$BUILD/ps-sibling.out" "sibling temp is reported as PUBLICATION_LOST evidence"
+assert_eq "leaked-token: abc123" "$(head -1 "$_ps_tmp")" \
+  "the pre-existing sibling temp's content is left untouched, not overwritten"
+assert_absent "abc123" "$BUILD/ps-sibling.out" \
+  "a secret-shaped key in the preserved temp is redacted before it is ever logged"
+rm -f "$_ps_tmp"
+
+rc=0
+_ps_baseline | PUBLISH_STATUS_CORRUPT_AFTER_RENAME=1 python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >"$BUILD/ps-reread.out" 2>"$BUILD/ps-reread.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a final file that fails reread validation is rejected, not accepted"
+assert_contains "STATUS_REREAD_INVALID" "$BUILD/ps-reread.err" "reread-mismatch failure names itself"
+assert_contains "classification=PUBLICATION_LOST" "$BUILD/ps-reread.out" "reread mismatch reports PUBLICATION_LOST"
+assert_not_exists "$_ps_ff/STATUS.md" \
+  "reread mismatch never leaves the (invalid) final content sitting at the canonical STATUS path"
+rm -f "$_ps_ff/STATUS.md.tmp."*
+
+mkdir -p "$_ps_ff/locked" && chmod 555 "$_ps_ff/locked"
+rc=0
+_ps_baseline | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/locked/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-tmpfail.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a temp-file creation failure (permission denied) is reported"
+assert_contains "STATUS_TMP_CREATE_FAILED" "$BUILD/ps-tmpfail.err" "temp-create failure names itself"
+chmod 755 "$_ps_ff/locked"; rm -rf "$_ps_ff/locked"
+
+# Code review fix #6a: bare int() accepts "0_0" (Python digit-group
+# separators), so output_count must be validated with a strict digit-only
+# check first.
+rm -f "$_ps_ff/STATUS.md"
+rc=0
+_ps_baseline | sed 's/^output_count: 0/output_count: 0_0/' | python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >/dev/null 2>"$BUILD/ps-badcount.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: output_count: 0_0 is rejected (int() would silently accept it)"
+assert_contains "STATUS_BAD_OUTPUT_COUNT" "$BUILD/ps-badcount.err" "bad-output-count failure names itself"
+
+# Code review fix #6b: tmp_header_preview must cap at 512 BYTES, not 512
+# characters -- a naive preview[:512] under-truncates multi-byte UTF-8.
+rc=0
+_ps_python_preview_check() {
+  python3 - "$1" <<'CHECKPY'
+import sys
+ns = {"__name__": "_publish_status_under_test"}
+exec(compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec"), ns)
+raw = ("x: " + ("\u20ac" * 600) + "\n").encode("utf-8")
+preview = ns["_redact_preview"](raw)
+print(len(preview.encode("utf-8")))
+CHECKPY
+}
+_preview_bytes="$(_ps_python_preview_check "$_ps")"
+if [ "$_preview_bytes" -le 512 ]; then
+  _ok "tmp_header_preview caps at 512 BYTES for multi-byte UTF-8 content (got $_preview_bytes)"
+else
+  _fail "tmp_header_preview exceeded 512 bytes for multi-byte UTF-8 content (got $_preview_bytes)"
+fi
+
+# Code review: STATUS_TMP_WRITE_FAILED was previously untested (only the
+# temp-CREATE failure was). Exercise the write-failure path via its
+# equivalent test hook to PUBLISH_STATUS_FAIL_RENAME above.
+rm -f "$_ps_ff/STATUS.md" "$_ps_ff/STATUS.md.tmp."*
+rc=0
+_ps_baseline | PUBLISH_STATUS_FAIL_WRITE=1 python3 "$_ps" "${_ps_common[@]}" --status "$_ps_ff/STATUS.md" \
+  >"$BUILD/ps-writefail.out" 2>"$BUILD/ps-writefail.err" || rc=$?
+assert_rc 1 "$rc" "publish-status: a write failure (not just a create failure) is reported"
+assert_contains "STATUS_TMP_WRITE_FAILED" "$BUILD/ps-writefail.err" "write failure names itself (distinct from create failure)"
+assert_contains "classification=PUBLICATION_LOST" "$BUILD/ps-writefail.out" "write failure reports PUBLICATION_LOST evidence"
+rm -f "$_ps_ff/STATUS.md.tmp."*
+
+rm -rf "$_ps_dir"
 
 finish

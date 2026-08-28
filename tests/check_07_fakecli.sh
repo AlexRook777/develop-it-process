@@ -52,6 +52,11 @@ ROUND=1
 TEST_REPORT_PATH="$FEATURE_FOLDER/transcripts/test-report.md"
 RESOLVED_MODELS="$(resolved_models_block)"
 CONTEXT7_POLICY="disabled"
+PHASE_DIR="$FEATURE_FOLDER/3-spec-review"
+DISPATCH_ID="p03-i01-spec-reviewer-claude-a01"
+LOGICAL_DISPATCH_ID="p03-i01-spec-reviewer-claude"
+ATTEMPT=01
+STATUS_PUBLISHER_PATH="$FEATURE_FOLDER/../.orchestration/runtime/publish-status"
 
 # --- Sanity check: render_prompt must succeed with these fixture values -----
 # If this fails, every assertion below fails for the wrong reason (an unset

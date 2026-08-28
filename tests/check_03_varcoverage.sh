@@ -45,4 +45,26 @@ assert_eq "" "$missing" "every appendix variable is in render_prompt's substitut
 note "appendix vars found: $(printf '%s' "$used" | tr '\n' ' ')"
 note "substituted:         $(printf '%s' "$subst" | tr '\n' ' ')"
 
+# Task 4: attempt identity and canonical STATUS publication introduced four
+# new render-time variables every converted appendix's publish-status
+# invocation depends on. Assert them by name (not just via the generic loop
+# above) so a future accidental removal of one from render_keys() is a named
+# failure here, not just a silent drop in appendix coverage.
+for v in LOGICAL_DISPATCH_ID ATTEMPT ROLE_CONTRACTS_PATH STATUS_PUBLISHER_PATH; do
+  printf '%s\n' "$subst" | "$GREP_BIN" -qxF "$v" \
+    && _ok "render_keys() carries \$$v" \
+    || _fail "render_keys() is missing \$$v"
+done
+
+# Code review fix #4: render_prompt proving a $VAR IS substitutable says
+# nothing about whether the ROLE dispatching it actually declared that input
+# in its own registry row -- that gap is exactly how $ITERATION/$ROUND ended
+# up hardcoded into 16 roles that never declare either. Cross-check every
+# appendix's own $VARs against its own required_inputs/optional_inputs cell.
+python3 "$REPO_TOP/tests/lib/extract.py" roles > "$BUILD/roles-varcov.tsv"
+registry_var_problems="$(python3 "$REPO_TOP/tests/lib/check_registry_var_coverage.py" \
+  "$PROCESS_DOC" "$BUILD/roles-varcov.tsv" || true)"
+assert_eq "" "$registry_var_problems" \
+  "every appendix only references \$VARs its OWN registry row declares (plus mechanical plumbing)"
+
 finish
