@@ -723,6 +723,391 @@ reconstruct_durable_inputs() {
 
 All examples below use `python3` (never the bare `python`) and `$PROCESS_PATH` (never the literal `develop-it-prompt.md`).
 
+### Runtime extraction contract (`bootstrap_runtime`)
+
+Every other cookbook helper below (`role_contract_field`, `policy_value`, `render_prompt`, dispatch helpers, and the rest) is reached by later phases only via `source "$RUNTIME_DIR/develop-it-runtime.sh"` — the generated runtime, materialized once per feature folder (spec §7.1). `bootstrap_runtime` is the one exception: it is what BUILDS that file, so it (together with the small "Orchestration variables" block above it, which it depends on) must be pasted directly into every phase's fresh shell BEFORE the generated runtime can be sourced. It is cheap and idempotent — a phase whose runtime already exists and verifies gets `BOOTSTRAP_REUSED` back immediately.
+
+`bootstrap_runtime` reuses this repository's own extractor (`$PROCESS_REPO_ROOT/tests/lib/extract.py`) rather than re-implementing Markdown parsing a second time inside the generated artifact — the same tool the offline test suite already uses to validate this document. **The process *repository*, not the lone `develop-it-prompt.md` file, is the distribution unit**: `develop-it.sh` already hard-requires `tests/run.sh` to pass before it will launch any run, so a checkout carrying the prompt without `tests/` cannot launch in the first place — `bootstrap_runtime` depending on `tests/lib/extract.py` introduces no new requirement. That dependency must still fail with a named token rather than silently, though: it writes into a unique sibling staging directory, verifies before publishing, and publishes with a syscall that fails rather than merges on a collision:
+
+<!-- lint: cookbook -->
+```bash
+# ---- Generated runtime (spec §7.1 / §7.2) -----------------------------------
+# bootstrap_runtime materializes $RUNTIME_DIR from the extracted cookbook,
+# role-contract registry, policy registry, and publisher program -- an
+# all-or-nothing operation. Sets (non-local, for the rest of this phase's
+# shell): ORCHESTRATION_DIR, RUNTIME_DIR.
+#
+# Test hooks (read only here; production never sets them):
+#   BOOTSTRAP_FAIL_AFTER=<n>          stop extraction after the n-th generated
+#                                     file, leaving the staging dir in place
+#                                     with NO manifest.sha256.
+#   BOOTSTRAP_ORPHAN_AGE_SECONDS=<n>  override the default 300s freshness
+#                                     window before an orphan staging
+#                                     directory is swept (see step 2 below).
+#
+# Prints exactly one of BOOTSTRAP_OK, BOOTSTRAP_REUSED, or
+# BOOTSTRAP_RACE_LOST_VALID on stdout and returns 0; or prints one of
+# BOOTSTRAP_INTERRUPTED:<n>, RUNTIME_MANIFEST_INVALID:<path>,
+# BOOTSTRAP_RACE_LOST_INVALID:<path>, or BOOTSTRAP_IO_ERROR:<path> on stderr
+# -- with the failing command's own diagnostic surfaced beneath it, never
+# buried in a discarded temp file -- and returns 1. EVERY failure path prints
+# one of these tokens; there is no silent `return 1`.
+
+# The ONE place every extraction failure funnels through: emits TOKEN on
+# stderr, plus DETAIL_FILE's content (if given and non-empty) indented
+# beneath it, so no `|| return 1` in this section can ever be silent.
+_bootstrap_die() {
+  local token="$1" detail_file="${2:-}"
+  echo "$token" >&2
+  if [ -n "$detail_file" ] && [ -s "$detail_file" ]; then
+    sed 's/^/  /' "$detail_file" >&2
+  fi
+  return 1
+}
+
+_bootstrap_atomic_write() {
+  # Usage: _bootstrap_atomic_write DEST MODE < content
+  # O_CREAT|O_EXCL + a write LOOP (a single os.write can return short even for
+  # a regular file, and a truncated write would have its hash certified as
+  # correct by the manifest) + fsync-before-close: durable, complete bytes.
+  local dest="$1" mode="$2"
+  "$PYTHON_BIN" -c '
+import os, sys
+dest = sys.argv[1]
+mode = int(sys.argv[2], 8)
+data = sys.stdin.buffer.read()
+fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+try:
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+    os.fsync(fd)
+finally:
+    os.close(fd)
+' "$dest" "$mode"
+}
+
+_bootstrap_fsync_path() {
+  # Works for both a regular file and a directory fd on Linux.
+  "$PYTHON_BIN" -c '
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+' "$1"
+}
+
+_bootstrap_rename_noreplace() {
+  # Usage: _bootstrap_rename_noreplace TMP_DIR FINAL_DIR
+  # renameat2(..., RENAME_NOREPLACE) via ctypes (stdlib only): fails with
+  # EEXIST rather than merging when FINAL_DIR already exists -- even an EMPTY
+  # FINAL_DIR, which plain rename(2) would otherwise happily replace. A race
+  # result, never a licence to merge or overwrite the winner.
+  "$PYTHON_BIN" -c '
+import ctypes, os, sys
+tmp, final = sys.argv[1], sys.argv[2]
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+rc = libc.renameat2(AT_FDCWD, os.fsencode(tmp), AT_FDCWD, os.fsencode(final), RENAME_NOREPLACE)
+if rc != 0:
+    sys.exit(1)
+' "$1" "$2"
+}
+
+# The four generated-file names, in the fixed order they are extracted and
+# the fixed order the manifest records them.
+_bootstrap_manifest_names() {
+  printf '%s\n' develop-it-runtime.sh role-contracts.tsv policy.tsv publish-status
+}
+
+# Returns 0 iff $1/manifest.sha256 records the CURRENT process-document
+# SHA-256 AND the CURRENT extractor's SHA-256 -- editing tests/lib/extract.py
+# with the document unchanged must invalidate every existing runtime, since
+# the GENERATOR, not just the document, determines the generated bytes --
+# lists EXACTLY the four generated-file entries (never fewer, never extra),
+# every listed file exists with the right permissions, and `sha256sum -c`
+# validates all four.
+_bootstrap_verify_manifest() {
+  local dir="$1" manifest doc_sha recorded_sha extractor_sha recorded_extractor_sha names entries f mode
+  manifest="$dir/manifest.sha256"
+  [ -f "$manifest" ] || return 1
+  doc_sha="$(sha256sum "$PROCESS_PATH" | cut -d' ' -f1)"
+  recorded_sha="$("$GREP_BIN" -m1 '^process_document_sha256=' "$manifest" | cut -d'=' -f2)"
+  [ -n "$recorded_sha" ] || return 1
+  [ "$recorded_sha" = "$doc_sha" ] || return 1
+
+  extractor_sha="$(sha256sum "$PROCESS_REPO_ROOT/tests/lib/extract.py" 2>/dev/null | cut -d' ' -f1)"
+  recorded_extractor_sha="$("$GREP_BIN" -m1 '^extractor_sha256=' "$manifest" | cut -d'=' -f2)"
+  [ -n "$extractor_sha" ] || return 1
+  [ -n "$recorded_extractor_sha" ] || return 1
+  [ "$recorded_extractor_sha" = "$extractor_sha" ] || return 1
+
+  names="$("$GREP_BIN" -E '^[0-9a-f]{64}  .+$' "$manifest" | sed -E 's/^[0-9a-f]{64}  //' | sort)"
+  entries="$(_bootstrap_manifest_names | sort)"
+  [ "$names" = "$entries" ] || return 1
+
+  for f in $(_bootstrap_manifest_names); do
+    [ -f "$dir/$f" ] || return 1
+  done
+  if ! ( cd "$dir" && sha256sum -c manifest.sha256 ) >/dev/null 2>&1; then
+    return 1
+  fi
+
+  for f in develop-it-runtime.sh publish-status; do
+    mode="$(stat -c %a "$dir/$f" 2>/dev/null)"
+    [ "$mode" = 700 ] || return 1
+  done
+  for f in role-contracts.tsv policy.tsv; do
+    mode="$(stat -c %a "$dir/$f" 2>/dev/null)"
+    [ "$mode" = 600 ] || return 1
+  done
+  return 0
+}
+
+# Extracts all four generated files into $1 (a fresh, empty staging
+# directory) via this repository's own extractor, honouring
+# $BOOTSTRAP_FAIL_AFTER, and writes manifest.sha256 LAST -- only ever after
+# all four files exist and are individually fsynced. Returns 0 on complete
+# success; on interruption, returns 1 having written strictly fewer than four
+# files and no manifest. EVERY failure path names itself via _bootstrap_die,
+# and the extractor's own stderr (its real diagnostic -- missing file,
+# traceback, or a "no cookbook blocks found"-style SystemExit) rides along
+# with the token instead of being buried in a discarded temp file.
+_bootstrap_extract_all() {
+  local tmp="$1" extractor raw written
+  extractor="$PROCESS_REPO_ROOT/tests/lib/extract.py"
+  raw="$tmp/.raw"
+  written=0
+  mkdir -p "$raw" || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$raw"; return 1; }
+
+  written=$((written + 1))
+  PROCESS_DOC="$PROCESS_PATH" BUILD="$raw" "$PYTHON_BIN" "$extractor" cookbook \
+    >/dev/null 2>"$raw/.err" || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$extractor" "$raw/.err"; return 1; }
+  _bootstrap_atomic_write "$tmp/develop-it-runtime.sh" 700 < "$raw/cookbook.sh" \
+    || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$tmp/develop-it-runtime.sh"; return 1; }
+  if [ -n "${BOOTSTRAP_FAIL_AFTER:-}" ] && [ "$written" -ge "$BOOTSTRAP_FAIL_AFTER" ]; then
+    echo "BOOTSTRAP_INTERRUPTED:$written" >&2
+    return 1
+  fi
+
+  written=$((written + 1))
+  PROCESS_DOC="$PROCESS_PATH" BUILD="$raw" "$PYTHON_BIN" "$extractor" roles \
+    >/dev/null 2>"$raw/.err" || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$extractor" "$raw/.err"; return 1; }
+  _bootstrap_atomic_write "$tmp/role-contracts.tsv" 600 < "$raw/roles.tsv" \
+    || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$tmp/role-contracts.tsv"; return 1; }
+  if [ -n "${BOOTSTRAP_FAIL_AFTER:-}" ] && [ "$written" -ge "$BOOTSTRAP_FAIL_AFTER" ]; then
+    echo "BOOTSTRAP_INTERRUPTED:$written" >&2
+    return 1
+  fi
+
+  written=$((written + 1))
+  PROCESS_DOC="$PROCESS_PATH" BUILD="$raw" "$PYTHON_BIN" "$extractor" policies \
+    >/dev/null 2>"$raw/.err" || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$extractor" "$raw/.err"; return 1; }
+  _bootstrap_atomic_write "$tmp/policy.tsv" 600 < "$raw/policies.tsv" \
+    || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$tmp/policy.tsv"; return 1; }
+  if [ -n "${BOOTSTRAP_FAIL_AFTER:-}" ] && [ "$written" -ge "$BOOTSTRAP_FAIL_AFTER" ]; then
+    echo "BOOTSTRAP_INTERRUPTED:$written" >&2
+    return 1
+  fi
+
+  written=$((written + 1))
+  PROCESS_DOC="$PROCESS_PATH" BUILD="$raw" "$PYTHON_BIN" "$extractor" publisher \
+    >/dev/null 2>"$raw/.err" || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$extractor" "$raw/.err"; return 1; }
+  _bootstrap_atomic_write "$tmp/publish-status" 700 < "$raw/publish-status" \
+    || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$tmp/publish-status"; return 1; }
+  if [ -n "${BOOTSTRAP_FAIL_AFTER:-}" ] && [ "$written" -ge "$BOOTSTRAP_FAIL_AFTER" ]; then
+    echo "BOOTSTRAP_INTERRUPTED:$written" >&2
+    return 1
+  fi
+
+  rm -rf "$raw"
+
+  for f in develop-it-runtime.sh role-contracts.tsv policy.tsv publish-status; do
+    _bootstrap_fsync_path "$tmp/$f" || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$tmp/$f"; return 1; }
+  done
+
+  local manifest doc_sha extractor_sha
+  manifest="$tmp/manifest.sha256"
+  doc_sha="$(sha256sum "$PROCESS_PATH" | cut -d' ' -f1)"
+  extractor_sha="$(sha256sum "$extractor" | cut -d' ' -f1)"
+  {
+    printf 'process_document_sha256=%s\n' "$doc_sha"
+    printf 'extractor_sha256=%s\n' "$extractor_sha"
+    ( cd "$tmp" && sha256sum develop-it-runtime.sh role-contracts.tsv policy.tsv publish-status )
+  } > "$manifest.part"
+  _bootstrap_fsync_path "$manifest.part" || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$manifest.part"; return 1; }
+  mv "$manifest.part" "$manifest" || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$manifest"; return 1; }
+  _bootstrap_fsync_path "$manifest" || { _bootstrap_die "BOOTSTRAP_IO_ERROR:$manifest"; return 1; }
+  return 0
+}
+
+# Publishes a complete, verified staging directory to $RUNTIME_DIR via
+# renameat2(..., RENAME_NOREPLACE): a race MUST fail rather than merge. Then
+# verifies the JUST-PUBLISHED runtime before ever reporting BOOTSTRAP_OK --
+# spec 7.1(7) wants a corrupt publish surfaced at THIS Phase -1, not deferred
+# to the NEXT phase's BOOTSTRAP_REUSED check. If another bootstrap already
+# published first, validate ITS manifest before trusting it -- never overlay
+# files into the winner.
+_bootstrap_publish() {
+  local tmp="$1"
+  if _bootstrap_rename_noreplace "$tmp" "$RUNTIME_DIR"; then
+    _bootstrap_fsync_path "$ORCHESTRATION_DIR"
+    if _bootstrap_verify_manifest "$RUNTIME_DIR"; then
+      echo BOOTSTRAP_OK
+      return 0
+    fi
+    echo "RUNTIME_MANIFEST_INVALID:$RUNTIME_DIR" >&2
+    return 1
+  fi
+  if [ ! -d "$RUNTIME_DIR" ]; then
+    echo "BOOTSTRAP_IO_ERROR:$RUNTIME_DIR" >&2
+    return 1
+  fi
+  if _bootstrap_verify_manifest "$RUNTIME_DIR"; then
+    mv "$tmp" "$ORCHESTRATION_DIR/quarantine/$(basename "$tmp").$$.$RANDOM"
+    echo BOOTSTRAP_RACE_LOST_VALID
+    return 0
+  fi
+  mv "$tmp" "$ORCHESTRATION_DIR/quarantine/$(basename "$tmp").$$.$RANDOM"
+  echo "BOOTSTRAP_RACE_LOST_INVALID:$RUNTIME_DIR" >&2
+  return 1
+}
+
+# Quarantine every .runtime.tmp.* older than the freshness window. A RECENT
+# staging directory may belong to a bootstrap racing us concurrently in this
+# SAME feature folder; sweeping it out from under a live extraction would
+# corrupt that attempt -- the renameat2(..., RENAME_NOREPLACE) publish step is
+# what makes that race safe, and an unconditional sweep would defeat it by
+# moving one side of the race away before it ever gets to publish. The
+# directory's mtime is refreshed by each file the live extraction creates, so
+# the effective window is "since the last file appeared", not "since start".
+# A failed `stat` is treated as live: never sweeping is the fail-safe direction.
+_bootstrap_sweep_orphans() {
+  local quarantine="$1" orphan now orphan_age orphan_age_threshold
+  orphan_age_threshold="${BOOTSTRAP_ORPHAN_AGE_SECONDS:-300}"
+  now="$(date +%s)"
+  for orphan in "$ORCHESTRATION_DIR"/.runtime.tmp.*; do
+    [ -e "$orphan" ] || continue
+    orphan_age=$(( now - $(stat -c %Y "$orphan" 2>/dev/null || echo "$now") ))
+    [ "$orphan_age" -ge "$orphan_age_threshold" ] || continue
+    mv "$orphan" "$quarantine/$(basename "$orphan").$$.$RANDOM"
+  done
+}
+
+bootstrap_runtime() {
+  ORCHESTRATION_DIR="$FEATURE_FOLDER/.orchestration"
+  RUNTIME_DIR="$ORCHESTRATION_DIR/runtime"
+  local quarantine attempt tmp
+  quarantine="$ORCHESTRATION_DIR/quarantine"
+
+  mkdir -p "$ORCHESTRATION_DIR" "$quarantine"
+  if [ $? -ne 0 ]; then
+    _bootstrap_die "BOOTSTRAP_IO_ERROR:$ORCHESTRATION_DIR"
+    return 1
+  fi
+
+  # 1. The final runtime already exists: reuse it if it verifies; a corrupt
+  #    final runtime HALTs rather than being silently rebuilt over.
+  if [ -d "$RUNTIME_DIR" ]; then
+    if _bootstrap_verify_manifest "$RUNTIME_DIR"; then
+      # Collect any stale orphan left by the interrupted attempt that preceded
+      # this runtime. Without this, a crash-then-immediate-resume leaks its
+      # staging directory forever: every later phase short-circuits here and
+      # never reaches the sweep below.
+      _bootstrap_sweep_orphans "$quarantine"
+      echo BOOTSTRAP_REUSED
+      return 0
+    fi
+    echo "RUNTIME_MANIFEST_INVALID:$RUNTIME_DIR" >&2
+    return 1
+  fi
+
+  # 2. No final runtime yet: any .runtime.tmp.* OLDER than the freshness
+  #    window is an orphan from an interrupted prior attempt -- quarantine
+  #    it. A RECENT staging directory may instead belong to a bootstrap
+  #    racing us concurrently in this SAME feature folder; sweeping it out
+  #    from under a live extraction would corrupt that attempt -- the
+  #    renameat2(..., RENAME_NOREPLACE) publish step is what makes that race
+  #    safe, and an unconditional sweep here would defeat it by deleting one
+  #    side of the race before it ever gets to publish.
+  orphan_age_threshold="${BOOTSTRAP_ORPHAN_AGE_SECONDS:-300}"
+  now="$(date +%s)"
+  for orphan in "$ORCHESTRATION_DIR"/.runtime.tmp.*; do
+    [ -e "$orphan" ] || continue
+    orphan_age=$(( now - $(stat -c %Y "$orphan" 2>/dev/null || echo "$now") ))
+    [ "$orphan_age" -ge "$orphan_age_threshold" ] || continue
+    mv "$orphan" "$quarantine/$(basename "$orphan").$$.$RANDOM"
+  done
+
+  # 3. Create a unique staging directory (mkdir already gives O_EXCL-equivalent
+  #    directory-creation semantics) under umask 077.
+  attempt="$$.$RANDOM.$RANDOM"
+  tmp="$ORCHESTRATION_DIR/.runtime.tmp.$attempt"
+  if ! ( umask 077; mkdir "$tmp" ); then
+    _bootstrap_die "BOOTSTRAP_IO_ERROR:$tmp"
+    return 1
+  fi
+
+  # 4. Extract every runtime file, validate, and write the manifest last.
+  if ! _bootstrap_extract_all "$tmp"; then
+    return 1
+  fi
+  _bootstrap_fsync_path "$tmp"
+
+  # 5. Publish atomically, verify immediately, and classify a lost race by
+  #    validating the winner.
+  _bootstrap_publish "$tmp"
+}
+```
+
+
+### Generated `publish-status` utility
+
+Every role publishes its STATUS through the ONE generated `publish-status` program rather than inventing its own atomic-write shell (design §17). `bootstrap_runtime` extracts it from the single `<!-- lint: publisher -->`-marked Python block below — exactly one such block must exist in this document, and it must be complete enough to `python3 -m py_compile` on its own.
+
+<!-- lint: publisher -->
+```python
+#!/usr/bin/env python3
+"""Generated by bootstrap_runtime (extract.py `publisher` command) --
+$RUNTIME_DIR/publish-status. Atomically publishes STATUS content read from
+stdin to a destination path: write to a sibling temp file, fsync, then
+os.replace (same-filesystem atomic rename) -- never a partially written
+STATUS file visible to a reader.
+
+Usage: publish-status DEST_PATH
+"""
+import os
+import sys
+
+
+def main(argv):
+    if len(argv) != 2:
+        sys.stderr.write("usage: publish-status DEST_PATH\n")
+        return 2
+    dest = argv[1]
+    data = sys.stdin.buffer.read()
+    tmp = f"{dest}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, dest)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+```
+
 ### Role contract registry lookup
 
 <!-- lint: cookbook -->
@@ -2018,16 +2403,22 @@ context7_policy() {
 }
 ```
 
-Every phase block begins by reconstructing its durable inputs. Substitute the
-block's own phase number for the literal below; a phase shell never inherits a
-variable from the phase before it, so this call — not an inherited assignment —
-is what makes `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`,
-`$CONTEXT7_POLICY`, `$codex_available` and the rest defined:
+Every phase block begins by reconstructing its durable inputs, then bootstrapping
+and sourcing the generated runtime (spec §7.1) — no phase ever hand-copies a
+runtime helper's body, and no phase reads from a `.runtime.tmp.*` staging path.
+Substitute the block's own phase number for the literal below; a phase shell
+never inherits a variable from the phase before it, so this call — not an
+inherited assignment — is what makes `$SPEC_PATH`, `$PLAN_PATH`,
+`$IMPLEMENTATION_BASE_SHA`, `$CONTEXT7_POLICY`, `$codex_available` and the
+rest defined:
 
 <!-- lint: snippet -->
 ```bash
-# Phase 7's block, for example, opens with exactly this line.
+# Phase 7's block, for example, opens with exactly this line, followed
+# immediately by bootstrapping and sourcing the verified runtime.
 init_orchestration_vars 7 || exit 1
+bootstrap_runtime || exit 1
+source "$RUNTIME_DIR/develop-it-runtime.sh"
 ```
 
 `init_orchestration_vars <phase>` calls `reconstruct_durable_inputs <phase>`
@@ -2035,6 +2426,16 @@ unconditionally (spec §6.3). It sets `CONTEXT7_POLICY` itself, so a phase block
 never calls `context7_policy` directly; a missing durable input exits non-zero
 with `PRELAUNCH_FAILED:<contract-name>` rather than letting a later
 `render_prompt` fail as an unset-variable render error.
+
+`bootstrap_runtime` is small enough (together with the "Orchestration
+variables" block it depends on) to paste directly into every phase's fresh
+shell; the whole point of extraction is that every OTHER helper this document
+defines is reached only via the `source` line above, never by re-pasting the
+rest of this cookbook. `bootstrap_runtime` on a phase after Phase 1 is cheap —
+the generated runtime already exists and verifies, so it returns
+`BOOTSTRAP_REUSED` immediately; it only re-extracts when the runtime is
+missing, interrupted, or its manifest fails to verify against the current
+`$PROCESS_PATH`.
 
 `CONTEXT7_POLICY` is in `render_keys()`, so every appendix receives it and
 `render_prompt` fails loudly if it is ever left unset.
@@ -2238,7 +2639,7 @@ previous behaviour — hid the degradation from the final report.
 
 ### Step 1.1 — Skill probe flow
 
-1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `1-preflight/` subfolder with `mkdir -p`.
+1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `1-preflight/` subfolder with `mkdir -p`. Then call `bootstrap_runtime` (see "Runtime extraction contract" in the cookbook) to materialize `$FEATURE_FOLDER/.orchestration/runtime/` — this is the run's first bootstrap, so it always extracts fresh (`BOOTSTRAP_OK`). On any non-zero return, HALT: create `$FEATURE_FOLDER` (already done by this step) and append an `event=HALT` entry naming the token printed on stderr (`RUNTIME_MANIFEST_INVALID:...`, `BOOTSTRAP_RACE_LOST_INVALID:...`, or `BOOTSTRAP_IO_ERROR:...`), then STOP before any subprocess dispatch. Immediately `source "$RUNTIME_DIR/develop-it-runtime.sh"` — every helper referenced below (`dispatch_reviewers_parallel`, `validate_status`, `context7_policy`, ...) comes from that sourced file, not from re-pasting this cookbook.
 2. **Dispatch both preflight subprocesses in parallel using `dispatch_reviewers_parallel preflight-claude preflight-codex 1 00`** (see "Reviewer parallelization" cookbook; preflight has no shared state between vendors, so this is safe as the very first dispatch of the run). This is the ONLY dispatch mechanism for Step 1.1 — there is no separate `dispatch_role` call for either preflight role.
    - **Claude subprocess (always dispatched):** role `preflight-claude`. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Transcript: `<feature-folder>/transcripts/1-iter00-preflight-claude.json` (stdout) and `1-iter00-preflight-claude.err` (stderr) — the `dispatch_id` naming form. This role's timeout comes from the Models table via `role_timeout`.
 3. **Codex subprocess (dispatched if and only if `codex_available = true`):** role `preflight-codex`, dispatched by the SAME `dispatch_reviewers_parallel` call named in step 2 — not a second, separate dispatch. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Transcript: `<feature-folder>/transcripts/1-iter00-preflight-codex.json` (stdout) and `1-iter00-preflight-codex.err` (stderr). Model and effort are resolved per-role from the Models table, which is what puts preflight in `micro` mode per the "Codex reviewer modes" table.

@@ -48,7 +48,11 @@ assert_exists() { local p=$1 m=$2; [ -e "$p" ] && _ok "$m" || _fail "$m"; }
 assert_not_exists() { local p=$1 m=$2; [ ! -e "$p" ] && _ok "$m" || _fail "$m"; }
 assert_glob_count() {
   local expected=$1 pattern=$2 m=$3 actual
-  actual=$(compgen -G "$pattern" | wc -l | tr -d ' ')
+  # `compgen -G` exits 1 on zero matches; under pipefail that makes it the
+  # pipeline's (and this assignment's) exit status even though `wc -l` still
+  # correctly captured "0" -- guard with `|| actual=0` so a legitimate
+  # zero-match case is recorded as a FAIL by assert_eq, not an aborted script.
+  actual=$(compgen -G "$pattern" | wc -l | tr -d ' ') || actual=0
   assert_eq "$expected" "$actual" "$m"
 }
 

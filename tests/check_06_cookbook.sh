@@ -689,4 +689,357 @@ case "$recon_out" in
   *) _fail "CONTEXT7_POLICY was not reconstructed: [$recon_out]" ;;
 esac
 
+# --- Task 3 Step 6: bootstrap_runtime -- six named outcomes ----------------
+# shellcheck source=lib/v2_fixtures.sh
+source "$REPO_TOP/tests/lib/v2_fixtures.sh"
+init_v2_fixture
+
+# 1. Fresh extraction -> BOOTSTRAP_OK, all four generated files plus manifest.
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+rc=0; out="$(bootstrap_runtime 2>"$BUILD/b1.err")" || rc=$?
+assert_rc 0 "$rc" "1 fresh: bootstrap_runtime succeeds"
+assert_eq "BOOTSTRAP_OK" "$out" "1 fresh: reports BOOTSTRAP_OK"
+for f in develop-it-runtime.sh role-contracts.tsv policy.tsv publish-status manifest.sha256; do
+  assert_exists "$RUNTIME_DIR/$f" "1 fresh: writes $f"
+done
+
+# 2. Idempotent rerun -> BOOTSTRAP_REUSED, no new staging directory.
+rc=0; out="$(bootstrap_runtime 2>"$BUILD/b2.err")" || rc=$?
+assert_rc 0 "$rc" "2 idempotent: rerun succeeds"
+assert_eq "BOOTSTRAP_REUSED" "$out" "2 idempotent: reports BOOTSTRAP_REUSED"
+assert_glob_count 0 "$ORCHESTRATION_DIR/.runtime.tmp.*" "2 idempotent: creates no staging directory"
+
+# 3. Interrupted extraction -> BOOTSTRAP_INTERRUPTED, never a usable runtime/.
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+rc=0
+BOOTSTRAP_FAIL_AFTER=1 bootstrap_runtime >"$BUILD/b3.out" 2>"$BUILD/b3.err" || rc=$?
+assert_rc 1 "$rc" "3 interrupted: bootstrap_runtime fails"
+assert_contains "BOOTSTRAP_INTERRUPTED" "$BUILD/b3.err" "3 interrupted: names itself"
+assert_not_exists "$RUNTIME_DIR" "3 interrupted: never leaves a usable runtime/"
+
+# 4. A final runtime that exists but fails to verify -> RUNTIME_MANIFEST_INVALID.
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+bootstrap_runtime >/dev/null 2>&1
+printf 'tampered\n' >> "$RUNTIME_DIR/role-contracts.tsv"
+rc=0; bootstrap_runtime >"$BUILD/b4.out" 2>"$BUILD/b4.err" || rc=$?
+assert_rc 1 "$rc" "4 corrupt final: bootstrap_runtime fails closed"
+assert_contains "RUNTIME_MANIFEST_INVALID" "$BUILD/b4.err" "4 corrupt final: names itself"
+
+# 5. Race lost to a VALID winner -> BOOTSTRAP_RACE_LOST_VALID. Build a second,
+#    independently valid staging directory and publish it against the winner
+#    bootstrap_runtime already produced -- exercises _bootstrap_publish's
+#    race branch directly, since a genuine concurrent race cannot be forced
+#    deterministically from a single-process test.
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+bootstrap_runtime >/dev/null 2>&1
+tmp5="$ORCHESTRATION_DIR/.runtime.tmp.race-valid"
+mkdir -p "$tmp5"
+_bootstrap_extract_all "$tmp5" >/dev/null 2>&1
+rc=0; out5="$(_bootstrap_publish "$tmp5" 2>"$BUILD/b5.err")" || rc=$?
+assert_rc 0 "$rc" "5 race-lost-valid: publish against a valid winner succeeds"
+assert_eq "BOOTSTRAP_RACE_LOST_VALID" "$out5" "5 race-lost-valid: reports BOOTSTRAP_RACE_LOST_VALID"
+assert_not_exists "$tmp5" "5 race-lost-valid: losing directory moved out of .orchestration/"
+assert_glob_count 1 "$ORCHESTRATION_DIR/quarantine/$(basename "$tmp5")"'*' \
+  "5 race-lost-valid: losing directory is quarantined, not deleted or merged"
+
+# 6. Race lost to an INVALID winner -> BOOTSTRAP_RACE_LOST_INVALID (distinct
+#    from case 4: the failure is discovered while publishing, not at entry).
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+bootstrap_runtime >/dev/null 2>&1
+printf 'tampered\n' >> "$RUNTIME_DIR/policy.tsv"
+tmp6="$ORCHESTRATION_DIR/.runtime.tmp.race-invalid"
+mkdir -p "$tmp6"
+_bootstrap_extract_all "$tmp6" >/dev/null 2>&1
+rc=0; out6="$(_bootstrap_publish "$tmp6" 2>"$BUILD/b6.err")" || rc=$?
+assert_rc 1 "$rc" "6 race-lost-invalid: publish against an invalid winner fails"
+assert_contains "BOOTSTRAP_RACE_LOST_INVALID" "$BUILD/b6.err" "6 race-lost-invalid: names itself"
+assert_not_exists "$tmp6" "6 race-lost-invalid: losing directory still moved out, not left dangling"
+
+# --- Task 3 Step 6: shell-rule assertions (spec §7.2) -----------------------
+
+# The generated runtime file is bit-for-bit the extracted cookbook: it must
+# execute zero top-level commands when sourced (same probe check_01 uses).
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+bootstrap_runtime >/dev/null 2>&1
+_runtime_sidelog="$BUILD/runtime-sideeffects.txt"
+env -i bash --noprofile --norc "$REPO_TOP/tests/lib/sideeffects.sh" \
+  "$RUNTIME_DIR/develop-it-runtime.sh" > "$_runtime_sidelog" 2>&1
+_runtime_side_rc=$?
+if [ "$_runtime_side_rc" -eq 0 ] && [ ! -s "$_runtime_sidelog" ]; then
+  _ok "the generated runtime has no top-level phase action"
+else
+  _fail "the generated runtime executed a top-level action or failed to source"
+fi
+
+# --- F5: enumerate EVERY phase-opening snippet (one with a numeric
+# `init_orchestration_vars <phase>` call), not just prove >=1 occurrence of
+# the source line somewhere in the document. Reuses extract.py's own block
+# parser rather than re-implementing fence detection here.
+_phase_snippet_report="$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_TOP/tests/lib" "$PYTHON_BIN" - <<'PY'
+import re
+import extract
+
+total = 0
+missing = []
+for kind, language, line, body in extract.blocks():
+    if kind != "snippet":
+        continue
+    text = "\n".join(body)
+    if not re.search(r'\binit_orchestration_vars\s+[0-9]', text):
+        continue
+    total += 1
+    if "bootstrap_runtime" not in text or 'source "$RUNTIME_DIR/develop-it-runtime.sh"' not in text:
+        missing.append(str(line))
+print(total)
+print(" ".join(missing))
+PY
+)"
+_phase_snippet_total="$(printf '%s\n' "$_phase_snippet_report" | sed -n '1p')"
+_phase_snippet_missing="$(printf '%s\n' "$_phase_snippet_report" | sed -n '2p')"
+if [ "${_phase_snippet_total:-0}" -ge 1 ] 2>/dev/null; then
+  _ok "found $_phase_snippet_total phase-opening snippet(s) to enumerate"
+else
+  _fail "zero phase-opening snippets found -- the enumeration checked nothing"
+fi
+assert_eq "" "$_phase_snippet_missing" \
+  "every phase-opening snippet bootstraps and sources the verified final runtime"
+
+# --- F5: widen the 'local' detector to the STATED rule (split a 'local'
+# declaration from any assignment that MASKS $? or REFERENCES a sibling
+# declared earlier in the SAME statement) -- not just the narrower
+# `local X=$(...)` shape.
+local_mask_hits=$(python3 - "$PROCESS_DOC" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+hits = 0
+for m in re.finditer(r'^[ \t]*local\s+(.+)$', text, re.MULTILINE):
+    decl = m.group(1)
+    tokens = re.findall(r'([A-Za-z_][A-Za-z0-9_]*)=("(?:[^"\\]|\\.)*"|\S*)|([A-Za-z_][A-Za-z0-9_]*)(?![=])', decl)
+    declared = []
+    for name_eq, value, bare_name in tokens:
+        name = name_eq or bare_name
+        if not name:
+            continue
+        if name_eq:
+            if re.search(r'\$\?', value):
+                hits += 1  # local NAME=$? -- masks the preceding command's exit status
+            elif re.match(r'^\$\(', value):
+                hits += 1  # local NAME=$(...) -- masks the command substitution's exit status
+            for prior in declared:
+                if re.search(r'\$\{?' + re.escape(prior) + r'\b', value):
+                    hits += 1  # local a=.. b=$a -- b references a sibling from the SAME statement
+        declared.append(name)
+print(hits)
+PY
+)
+assert_eq 0 "$local_mask_hits" \
+  "a 'local' declaration is split from any assignment that masks \$? or references a sibling in the same statement"
+
+pipeline_global_hits=$(grep -cE '\| *(while|read) ' "$BUILD/cookbook.sh" || true)
+assert_eq 0 "$pipeline_global_hits" \
+  "no helper relies on a pipeline/subshell to preserve a global result variable"
+
+# --- F5: widen the trailing-&&-finalizer detector beyond the `[ ... ] &&`
+# shape to ANY top-level `cmd && cmd` (bracket test, `test`, `[[ ]]`, or two
+# plain commands) as the literal last statement before a function's closing
+# brace -- the documented anti-pattern (see the doc's own "An `if` is
+# required, not `[ -f … ] && mv`" comment) generalizes to any such pair.
+trailing_and_hits=$(python3 - "$BUILD/cookbook.sh" <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+hits = 0
+for i, line in enumerate(lines):
+    if line.strip() == "}" and i > 0:
+        prev = lines[i - 1].strip()
+        if not prev or prev.startswith(("if ", "elif ", "while ", "until ", "#")):
+            continue
+        # A bare "cmd &&" with nothing after it is itself a syntax error, so
+        # it can never occur in code that actually sources -- require
+        # trailing content to distinguish a real finalizer from that.
+        if re.search(r'&&\s*\S', prev):
+            hits += 1
+print(hits)
+PY
+)
+assert_eq 0 "$trailing_and_hits" \
+  "no publication ends with a conditional && as its final statement"
+
+# --- F5: widen the set -e detector to also catch the long-option spelling
+# `set -o errexit`, not just a short `-e`-containing flag cluster.
+set_e_hits=$(( $(grep -cE '^[[:space:]]*set[[:space:]]+-[a-zA-Z]*e[a-zA-Z]*([[:space:]]|$)' "$BUILD/cookbook.sh" || true) \
+             + $(grep -cE '^[[:space:]]*set\b.*-o[[:space:]]+errexit\b' "$BUILD/cookbook.sh" || true) ))
+assert_eq 0 "$set_e_hits" "no runtime block enables set -e (short or -o errexit form)"
+
+dupe_defs=""
+for fn in $(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\) \{' "$BUILD/cookbook.sh" | sed -E 's/\(\) \{$//'); do
+  fn_count=$(grep -cE "^${fn}\\(\\) \\{" "$PROCESS_DOC" || true)
+  if [ "$fn_count" -gt 1 ]; then
+    dupe_defs="$dupe_defs $fn($fn_count)"
+  fi
+done
+assert_eq "" "$dupe_defs" \
+  "no phase block copies a runtime helper body (every helper is defined exactly once)"
+
+# --- Code review fixes: F1(a) every _bootstrap_extract_all failure path names
+# itself, and surfaces the failing command's own stderr ---------------------
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+_saved_process_repo_root="$PROCESS_REPO_ROOT"
+
+# 1. Missing extractor (e.g. a checkout whose tests/ directory is absent):
+#    empty stdout/stderr was the bug -- now must be a named token, and the
+#    interpreter's own "can't open file" diagnostic must ride along.
+PROCESS_REPO_ROOT="$(mktemp -d)"   # a repo with no tests/lib/extract.py at all
+rc=0; out="$(bootstrap_runtime 2>"$BUILD/f1a-missing.err")" || rc=$?
+PROCESS_REPO_ROOT="$_saved_process_repo_root"
+assert_rc 1 "$rc" "F1a missing-extractor: bootstrap_runtime fails"
+assert_eq "" "$out" "F1a missing-extractor: nothing on stdout"
+assert_contains "BOOTSTRAP_IO_ERROR" "$BUILD/f1a-missing.err" "F1a missing-extractor: names itself with a token"
+[ -s "$BUILD/f1a-missing.err" ] && [ "$(wc -l < "$BUILD/f1a-missing.err")" -ge 2 ]   && _ok "F1a missing-extractor: the interpreter's own diagnostic rides along with the token"   || _fail "F1a missing-extractor: stderr is just the bare token, no underlying diagnostic: $(cat "$BUILD/f1a-missing.err")"
+
+# 2. Extractor present but exits non-zero (a malformed process document, or
+#    any other extractor failure): its own stderr (a SystemExit message, a
+#    traceback, ...) must be surfaced, not swallowed into a discarded temp file.
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+_fake_repo="$(mktemp -d)"
+mkdir -p "$_fake_repo/tests/lib"
+printf '#!/usr/bin/env python3
+import sys
+sys.stderr.write("BOGUS_EXTRACTOR_FAILURE: synthetic\n")
+sys.exit(1)
+'   > "$_fake_repo/tests/lib/extract.py"
+PROCESS_REPO_ROOT="$_fake_repo"
+rc=0; out="$(bootstrap_runtime 2>"$BUILD/f1a-nonzero.err")" || rc=$?
+PROCESS_REPO_ROOT="$_saved_process_repo_root"
+assert_rc 1 "$rc" "F1a extractor-non-zero: bootstrap_runtime fails"
+assert_contains "BOOTSTRAP_IO_ERROR" "$BUILD/f1a-nonzero.err" "F1a extractor-non-zero: names itself with a token"
+assert_contains "BOGUS_EXTRACTOR_FAILURE" "$BUILD/f1a-nonzero.err"   "F1a extractor-non-zero: the extractor's own stderr is surfaced, not buried"
+rm -rf "$_fake_repo"
+
+# --- F1(b): the GENERATOR is pinned in the manifest, not just the document --
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+bootstrap_runtime >/dev/null 2>&1
+assert_present '^extractor_sha256=[0-9a-f]{64}$' "$RUNTIME_DIR/manifest.sha256"   "F1b: manifest records the extractor's own SHA-256"
+# Editing tests/lib/extract.py with the document UNCHANGED must invalidate
+# the existing runtime: copy the real extractor to a scratch repo, mutate
+# it, and confirm a runtime whose manifest pins the ORIGINAL extractor hash
+# no longer verifies against the mutated one.
+_pin_repo="$(mktemp -d)"
+mkdir -p "$_pin_repo/tests/lib"
+cp "$REPO_TOP/tests/lib/extract.py" "$_pin_repo/tests/lib/extract.py"
+printf '
+# harmless trailing comment -- changes the extractor bytes only
+'   >> "$_pin_repo/tests/lib/extract.py"
+PROCESS_REPO_ROOT="$_pin_repo"
+rc=0; _bootstrap_verify_manifest "$RUNTIME_DIR" || rc=$?
+PROCESS_REPO_ROOT="$_saved_process_repo_root"
+assert_rc 1 "$rc"   "F1b: a runtime verifies against the extractor that built it, not a since-edited one"
+rm -rf "$_pin_repo"
+
+# --- F2: BOOTSTRAP_OK verifies the just-published runtime before reporting --
+# A staging directory that is fully valid right up until publish, then
+# corrupted in the instant BEFORE _bootstrap_publish is called, must fail on
+# THIS call (Phase -1), not be deferred to the next phase's BOOTSTRAP_REUSED.
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+tmp_f2="$ORCHESTRATION_DIR/.runtime.tmp.corrupt-before-publish"
+mkdir -p "$tmp_f2"
+_bootstrap_extract_all "$tmp_f2" >/dev/null 2>&1
+printf 'tampered
+' >> "$tmp_f2/policy.tsv"   # corrupt AFTER extraction, BEFORE publish
+rc=0; out="$(_bootstrap_publish "$tmp_f2" 2>"$BUILD/f2.err")" || rc=$?
+assert_rc 1 "$rc" "F2: publishing a since-corrupted staging directory fails immediately"
+assert_contains "RUNTIME_MANIFEST_INVALID" "$BUILD/f2.err" "F2: names itself"
+assert_eq "" "$out" "F2: never reports BOOTSTRAP_OK for a runtime that does not verify"
+
+# The write-loop fix (short os.write can truncate a file whose hash the
+# manifest would then certify): round-trip a payload through
+# _bootstrap_atomic_write and confirm every byte survives intact. This
+# exercises the actual deployed code path (unlike a mocked unit test), even
+# though forcing a genuine short write against a regular file is not
+# reliably reproducible in a sandboxed test -- see the mocked-loop self-check
+# immediately below for a deterministic proof of the retry pattern itself.
+_wl_src="$(mktemp)"; _wl_dst="$(mktemp -u)"
+head -c 5000000 /dev/urandom > "$_wl_src"
+_bootstrap_atomic_write "$_wl_dst" 600 < "$_wl_src"
+assert_eq "$(sha256sum < "$_wl_src")" "$(sha256sum < "$_wl_dst")"   "_bootstrap_atomic_write round-trips a 5MB payload byte-for-byte"
+rm -f "$_wl_src" "$_wl_dst"
+
+# Deterministic proof that the retry-LOOP shape (as deployed in both
+# _bootstrap_atomic_write and publish-status) is what makes a short write
+# safe: monkeypatch os.write to always return a short count and confirm the
+# loop still delivers every byte, where a single-call `os.write(fd, data)`
+# would silently truncate.
+_loop_proof="$(python3 - <<'PY'
+import os
+
+written = bytearray()
+
+def fake_write(fd, data):
+    # Simulate a short write: never accept more than 3 bytes at a time.
+    chunk = bytes(data)[:3]
+    written.extend(chunk)
+    return len(chunk)
+
+real_write = os.write
+os.write = fake_write
+try:
+    payload = b"x" * 97
+    view = memoryview(payload)
+    while view:
+        n = os.write(1234, view)
+        view = view[n:]
+finally:
+    os.write = real_write
+
+print("OK" if bytes(written) == payload else "TRUNCATED")
+PY
+)"
+assert_eq "OK" "$_loop_proof"   "the write-retry loop delivers every byte even when each os.write call is short"
+
+# --- F3: the orphan sweep must not sweep a LIVE concurrent bootstrap's -----
+# staging directory (only genuinely stale ones, by age).
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+live_orphan="$ORCHESTRATION_DIR/.runtime.tmp.concurrent-live"
+mkdir -p "$live_orphan"
+: > "$live_orphan/develop-it-runtime.sh"   # as if another bootstrap is mid-write
+stale_orphan="$ORCHESTRATION_DIR/.runtime.tmp.stale"
+mkdir -p "$stale_orphan"
+touch -d '@1' "$stale_orphan"   # ancient mtime -- genuinely abandoned
+
+bootstrap_runtime >/dev/null 2>&1
+assert_exists "$live_orphan"   "F3: a fresh (live-looking) staging directory is NOT swept out from under a concurrent bootstrap"
+assert_not_exists "$stale_orphan" "F3: a genuinely stale orphan is still swept"
+assert_glob_count 1 "$ORCHESTRATION_DIR/quarantine/.runtime.tmp.stale"'*'   "F3: only the stale orphan was quarantined"
+rm -rf "$live_orphan"
+
+# --- F4: prove RENAME_NOREPLACE itself, not merely "target dir non-empty" --
+# Plain rename(2) already refuses to replace a NON-EMPTY directory, so racing
+# against one (as cases 5/6 above do) cannot distinguish RENAME_NOREPLACE
+# from that unrelated behaviour. Race against an EMPTY existing runtime/,
+# which plain rename(2) WOULD happily replace -- only the flag stops it.
+rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
+mkdir -p "$RUNTIME_DIR"   # empty target
+tmp_f4="$ORCHESTRATION_DIR/.runtime.tmp.empty-target-race"
+mkdir -p "$tmp_f4"
+rc=0
+_bootstrap_rename_noreplace "$tmp_f4" "$RUNTIME_DIR" || rc=$?
+assert_rc 1 "$rc"   "F4: renaming onto an EMPTY existing runtime/ still fails -- proves RENAME_NOREPLACE, not just ENOTEMPTY"
+assert_exists "$tmp_f4" "F4: the staging directory is untouched on refusal"
+rm -rf "$tmp_f4" "$RUNTIME_DIR"
+
+# Short-write guard on the GENERATED artifacts, not on a copy of the pattern.
+# A single os.write(fd, data) can return short, leaving a truncated file whose
+# hash the manifest then certifies as correct. No behavioural test reaches this:
+# a 5MB write to a regular Linux file never short-writes, and neither helper
+# takes an injectable fd. Greping for a literal is normally worthless -- it
+# earns its place here precisely because the behaviour is unobservable from
+# outside, so this is the only thing standing between a reversion and silence.
+python3 "$REPO_TOP/tests/lib/extract.py" cookbook >/dev/null
+python3 "$REPO_TOP/tests/lib/extract.py" publisher >/dev/null
+for _artifact in "$BUILD/cookbook.sh" "$BUILD/publish-status"; do
+  _loops=$(grep -c 'while view:' "$_artifact" || true)
+  assert_eq 1 "$_loops" "$(basename "$_artifact") writes through a short-write retry loop"
+  _bare=$(grep -cE '^[[:space:]]*os\.write\(fd, data\)[[:space:]]*$' "$_artifact" || true)
+  assert_eq 0 "$_bare" "$(basename "$_artifact") has no unchecked single os.write"
+done
+
 finish

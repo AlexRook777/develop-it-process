@@ -67,4 +67,48 @@ assert_present '^init_orchestration_vars [0-9-]+ \|\| exit 1$' "$PROCESS_DOC" \
 stale=$(grep -c '^CONTEXT7_POLICY=' "$PROCESS_DOC" || true)
 assert_eq 0 "$stale" "no phase block reconstructs only the context7 policy"
 
+# --- Task 3 Step 1: bootstrap_runtime extracts atomically -------------------
+# The substantive red signal (not a "command not found" artifact): the helper
+# itself must be a defined function before any behavioural assertion below
+# means anything.
+if declare -F bootstrap_runtime >/dev/null; then
+  _ok "bootstrap_runtime is defined"
+else
+  _fail "bootstrap_runtime is not defined"
+fi
+
+rm -rf "$ORCHESTRATION_DIR"
+mkdir -p "$ORCHESTRATION_DIR"
+
+rc=0
+BOOTSTRAP_FAIL_AFTER=2 bootstrap_runtime >"$BUILD/bootstrap1.out" 2>"$BUILD/bootstrap1.err" || rc=$?
+assert_rc 1 "$rc" "bootstrap_runtime aborts when BOOTSTRAP_FAIL_AFTER=2 fires"
+assert_contains 'BOOTSTRAP_INTERRUPTED' "$BUILD/bootstrap1.err" "interruption names itself"
+assert_not_exists "$RUNTIME_DIR" "interrupted bootstrap leaves no final runtime/"
+assert_glob_count 1 "$ORCHESTRATION_DIR/.runtime.tmp.*" "one interrupted staging directory"
+assert_glob_count 0 "$ORCHESTRATION_DIR/.runtime.tmp.*/manifest.sha256" "manifest is written last"
+
+# A second, clean bootstrap must quarantine that orphan and still succeed --
+# never complete or source the orphan's unknown partial contents. The orphan
+# sweep is age-gated (a FRESH staging dir may belong to a concurrent live
+# bootstrap -- see check_06's dedicated concurrency-safety case), so force
+# the freshness window to zero here: this orphan really is stale (the prior
+# call already returned before this one starts), we just don't want to sleep
+# 300s in a test to prove it.
+rc=0
+BOOTSTRAP_ORPHAN_AGE_SECONDS=0 bootstrap_runtime >"$BUILD/bootstrap2.out" 2>"$BUILD/bootstrap2.err" || rc=$?
+assert_rc 0 "$rc" "a clean rerun succeeds despite the orphaned staging directory"
+assert_glob_count 0 "$ORCHESTRATION_DIR/.runtime.tmp.*" "the orphan no longer sits beside runtime/"
+assert_glob_count 1 "$ORCHESTRATION_DIR/quarantine/.runtime.tmp.*" \
+  "the orphan was quarantined, not deleted or merged"
+assert_exists "$RUNTIME_DIR/manifest.sha256" "the rerun produced a final manifest"
+
+doc_sha="$(sha256sum "$PROCESS_DOC" | cut -d' ' -f1)"
+assert_contains "process_document_sha256=$doc_sha" "$RUNTIME_DIR/manifest.sha256" \
+  "manifest records the current process-document SHA-256"
+
+rc=0
+( cd "$RUNTIME_DIR" && sha256sum -c manifest.sha256 ) >/dev/null 2>"$BUILD/manifest-check.err" || rc=$?
+assert_rc 0 "$rc" "the four generated-file entries validate with sha256sum -c"
+
 finish

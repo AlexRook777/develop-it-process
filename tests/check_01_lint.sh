@@ -20,6 +20,22 @@ if [ "$snippets_extract_rc" -ne 0 ]; then
   _fail "extract.py snippets exited non-zero (rc=$snippets_extract_rc)"
 fi
 
+# 2b. The publisher program: exactly one `lint: publisher` block, and it must
+#     compile as Python -- the counterpart to the bash-cookbook `bash -n` check
+#     below, for the other language the runtime now generates.
+publisher_err="$BUILD/publisher.err"
+python3 lib/extract.py publisher >/dev/null 2>"$publisher_err"
+publisher_rc=$?
+if [ "$publisher_rc" -ne 0 ]; then
+  _fail "publisher block not extractable (rc=$publisher_rc)"
+  note "$(cat "$publisher_err")"
+else
+  _ok "exactly one publisher block extracts cleanly"
+  python3 -m py_compile "$BUILD/publish-status" \
+    && _ok "publish-status compiles with python3 -m py_compile" \
+    || _fail "publish-status has a Python syntax error"
+fi
+
 # 2a. INVARIANT: the cookbook is definitions only. A top-level statement would
 #     execute on `source`, and a top-level ${VAR:?} would abort the sourcing
 #     shell -- which is exactly how the test suite loads these helpers.
