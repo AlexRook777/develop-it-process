@@ -5,6 +5,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 source lib/assert.sh
 
 load_cookbook || finish
+
+# Every role_* lookup below resolves through the extracted role-contract
+# registry, not a hand-maintained case statement -- point it at a freshly
+# extracted copy.
+python3 "$REPO_TOP/tests/lib/extract.py" roles > /dev/null
+export ROLE_CONTRACTS_PATH="$BUILD/roles.tsv"
 init_fixture_env || { _fail "fixture env setup failed"; finish; }
 
 # --- path_in_tree: boundary-aware directory matching ---
@@ -172,6 +178,23 @@ if declare -F render_prompt >/dev/null; then
   TEST_REPORT_PATH=/tmp/tr.md
   RESOLVED_MODELS="  implementer: claude-opus-5"
   CONTEXT7_POLICY=required
+  ACCEPTED_PLAN=/tmp/plan.md
+  REVIEWED_REVISION=deadbeef
+  FINDING_IDS="F1 F2"
+  WRITE_LEASE=held
+  RUN_LOG=/tmp/ff/RUN_LOG.md
+  RELEVANT_ARTIFACTS=/tmp/a.md
+  FINAL_DIFF=/tmp/final.diff
+  ACCEPTED_SPEC=/tmp/spec.md
+  IMPLEMENTATION_SUMMARY=/tmp/impl.md
+  TEST_SUMMARY=/tmp/tests.md
+  REVIEW_SUMMARY=/tmp/review.md
+  DECISIONS=none
+  EXCLUSIONS=none
+  FOLLOWUPS=none
+  DOCS_INVENTORY=/tmp/docs.txt
+  PHASE_DIR=/tmp/ff/7-code-review
+  DISPATCH_ID=p07-i00-implementation-fixer-a01
 
   body="$(render_prompt spec-reviewer-claude)" \
     && _ok "render_prompt extracts a known appendix from unexported variables" \
@@ -308,10 +331,11 @@ EOF
   # drift invisible, which is the whole failure this check exists to prevent.
   #
   # Each appendix declares its verdicts on a line like:
-  #     verdict: DONE | FAILED | NEEDS_DEBUG | BLOCKED
-  # verdicts.py only emits a row for an appendix whose body has a `^verdict:`
-  # line -- an appendix reformatted so that line vanishes would silently drop
-  # out of the drift check below rather than fail it. Guard against that by
+  #     - Allowed verdicts: `DONE;FAILED;NEEDS_DEBUG;BLOCKED`
+  # verdicts.py only emits a row for an appendix whose body has an
+  # "Allowed verdicts:" line -- an appendix reformatted so that line vanishes
+  # would silently drop out of the drift check below rather than fail it.
+  # Guard against that by
   # requiring the row count to match the real BEGIN-marker count first. The
   # marker regex is anchored at column 0: two lines in the cookbook itself
   # (a Python f-string and a grep -qF pattern) contain the literal text
@@ -327,7 +351,7 @@ EOF
   while IFS=$'\t' read -r a declared; do
     [ -n "$a" ] || continue
     coded="$(_status_verdicts "$a" 2>/dev/null | tr ' ' '\n' | sort | tr '\n' ' ')"
-    want="$(printf '%s' "$declared" | tr '|' '\n' | tr -d ' ' \
+    want="$(printf '%s' "$declared" | tr ';' '\n' | tr -d ' ' \
             | "$GREP_BIN" -v '^$' | sort | tr '\n' ' ')"
     [ "$coded" = "$want" ] || drift="$drift
   $a: appendix declares [$want] but _status_verdicts returns [$coded]"
@@ -473,5 +497,196 @@ if declare -F dispatch_role >/dev/null; then
 else
   _fail "dispatch_role is not defined"
 fi
+
+# --- Task 2 Step 7: eight negative cases, one per failure token -------------
+# Each case tampers a temporary copy of the extracted role-contract registry
+# (or, where the defect is appendix-shaped rather than registry-shaped, a
+# temporary copy of the process document itself) and asserts the exact
+# machine-readable token the plan names. Never mutate the real $BUILD/roles.tsv
+# or $PROCESS_DOC in place -- every case works on its own throwaway copy.
+NEG="$BUILD/negcases"; rm -rf "$NEG"; mkdir -p "$NEG"
+
+# 1. One duplicate role -> ROLE_UNKNOWN_OR_DUPLICATE.
+cp "$BUILD/roles.tsv" "$NEG/dup.tsv"
+"$GREP_BIN" '^spec-fixer	' "$BUILD/roles.tsv" >> "$NEG/dup.tsv"
+err="$(ROLE_CONTRACTS_PATH="$NEG/dup.tsv" role_model spec-fixer 2>&1 >/dev/null)"; rc=$?
+case "$err" in
+  ROLE_UNKNOWN_OR_DUPLICATE:*) [ "$rc" -ne 0 ] && _ok "duplicate role -> ROLE_UNKNOWN_OR_DUPLICATE" \
+                                                || _fail "duplicate role must fail (rc=0): $err" ;;
+  *) _fail "duplicate role did not report ROLE_UNKNOWN_OR_DUPLICATE: [$err]" ;;
+esac
+
+# 2. One unknown role field -> ROLE_FIELD_UNKNOWN.
+err="$(ROLE_CONTRACTS_PATH="$BUILD/roles.tsv" role_field spec-fixer bogus_field 2>&1 >/dev/null)"; rc=$?
+case "$err" in
+  ROLE_FIELD_UNKNOWN:*) [ "$rc" -ne 0 ] && _ok "unknown role field -> ROLE_FIELD_UNKNOWN" \
+                                        || _fail "unknown field must fail (rc=0): $err" ;;
+  *) _fail "unknown role field did not report ROLE_FIELD_UNKNOWN: [$err]" ;;
+esac
+
+# 3. One empty required field -> ROLE_CONTRACT_EMPTY.
+awk -F '\t' 'BEGIN{OFS="\t"} NR==1{print; next} $1=="test-fixer"{$12=""} {print}' \
+  "$BUILD/roles.tsv" > "$NEG/empty.tsv"
+err="$(ROLE_CONTRACTS_PATH="$NEG/empty.tsv" role_outputs test-fixer 2>&1 >/dev/null)"; rc=$?
+case "$err" in
+  ROLE_CONTRACT_EMPTY:*) [ "$rc" -ne 0 ] && _ok "empty required field -> ROLE_CONTRACT_EMPTY" \
+                                         || _fail "empty required field must fail (rc=0): $err" ;;
+  *) _fail "empty required field did not report ROLE_CONTRACT_EMPTY: [$err]" ;;
+esac
+
+# 4. One appendix verdict mismatch -> VERDICT_SCHEMA_DRIFT.
+# Drives the SAME `contract_drift` helper check_02_markers.sh's real,
+# suite-wide (currently-passing) contract check uses -- not a reimplemented
+# comparison that would keep passing if that real detector were deleted.
+cp "$PROCESS_DOC" "$NEG/verdict-drift.md"
+python3 - "$NEG/verdict-drift.md" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+text, n = re.subn(
+    r"(<!-- BEGIN: spec-fixer -->.*?- Allowed verdicts: `)DONE;BLOCKED(`)",
+    r"\1DONE;BLOCKED;BOGUS_VERDICT\2", text, count=1, flags=re.S)
+assert n == 1, "fixture setup: spec-fixer Allowed verdicts line not found"
+open(path, "w").write(text)
+PY
+msg4="$(contract_drift "$NEG/verdict-drift.md" "$BUILD/roles.tsv" spec-fixer "Allowed verdicts" verdicts VERDICT_SCHEMA_DRIFT)"; rc4=$?
+case "$msg4" in
+  VERDICT_SCHEMA_DRIFT:spec-fixer*) [ "$rc4" -ne 0 ] && _ok "tampered appendix verdict -> $msg4" \
+                                                       || _fail "drift must fail (rc=0): $msg4" ;;
+  *) _fail "tampered appendix verdict did not report VERDICT_SCHEMA_DRIFT: [$msg4]" ;;
+esac
+
+# 5. One missing render input -> RENDER_REQUIRED_INPUT_MISSING.
+# The assertion MUST run in the main shell: `_fail`'s $_FAILURES increment
+# made inside a `( ... )` subshell is discarded the instant the subshell
+# exits, so a subshelled assertion can never fail the suite (proven: deleting
+# the RENDER_REQUIRED_INPUT_MISSING branch from render_prompt_check still
+# yielded "-- all assertions passed" with this case run inside `( ... )`).
+# Capture the child's output/rc, restore state, THEN assert.
+_saved_spec_path="$SPEC_PATH"
+unset SPEC_PATH
+err5="$(render_prompt --check spec-reviewer-claude 2>&1 >/dev/null)"
+SPEC_PATH="$_saved_spec_path"
+case "$err5" in
+  *RENDER_REQUIRED_INPUT_MISSING:spec_path*) _ok "missing required input -> RENDER_REQUIRED_INPUT_MISSING" ;;
+  *) _fail "missing required input did not report RENDER_REQUIRED_INPUT_MISSING: [$err5]" ;;
+esac
+
+# 6. One illegal phase -> ROLE_PHASE_UNSUPPORTED.
+awk -F '\t' 'BEGIN{OFS="\t"} NR==1{print; next} $1=="spec-fixer"{$16="99"} {print}' \
+  "$BUILD/roles.tsv" > "$NEG/badphase.tsv"
+err="$(ROLE_CONTRACTS_PATH="$NEG/badphase.tsv" render_prompt --check spec-fixer 2>&1 >/dev/null)"; rc=$?
+case "$err" in
+  *ROLE_PHASE_UNSUPPORTED:99*) [ "$rc" -ne 0 ] && _ok "illegal phase -> ROLE_PHASE_UNSUPPORTED" \
+                                                || _fail "illegal phase must fail (rc=0): $err" ;;
+  *) _fail "illegal phase did not report ROLE_PHASE_UNSUPPORTED: [$err]" ;;
+esac
+
+# 7. One unresolved appendix variable -> RENDER_VARIABLE_UNRESOLVED.
+cp "$PROCESS_DOC" "$NEG/unresolved-var.md"
+python3 - "$NEG/unresolved-var.md" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+text, n = re.subn(
+    r"(<!-- BEGIN: spec-reviewer-claude -->\n# Role: spec-reviewer-claude\n)",
+    r"\1\nReferences an input this appendix never declares: $BOGUS_UNDECLARED_VAR.\n",
+    text, count=1)
+assert n == 1, "fixture setup: spec-reviewer-claude intro not found"
+open(path, "w").write(text)
+PY
+# Same subshell hazard as case 5 -- assert in the main shell.
+_saved_process_path="$PROCESS_PATH"
+PROCESS_PATH="$NEG/unresolved-var.md"
+err7="$(render_prompt --check spec-reviewer-claude 2>&1 >/dev/null)"
+PROCESS_PATH="$_saved_process_path"
+case "$err7" in
+  *RENDER_VARIABLE_UNRESOLVED*BOGUS_UNDECLARED_VAR*) _ok "unresolved appendix variable -> RENDER_VARIABLE_UNRESOLVED" ;;
+  *) _fail "unresolved appendix variable did not report RENDER_VARIABLE_UNRESOLVED: [$err7]" ;;
+esac
+
+# 8. One absent upstream contract during reconstruction -> PRELAUNCH_FAILED.
+# Same subshell hazard as case 5 -- run in a subshell for isolation (its own
+# $REPO_ROOT/$FEATURE_FOLDER/$PROCESS_PATH), but capture output/rc OUT of it
+# and assert in the main shell.
+_neg8_out="$(
+  RF="$BUILD/prelaunch-artifacts"; rm -rf "$RF"
+  REPO_ROOT="$(mktemp -d)"; git -C "$REPO_ROOT" init -q
+  ( cd "$REPO_ROOT" && : > seed && git add seed \
+    && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+  FEATURE_FOLDER="$RF"; mkdir -p "$FEATURE_FOLDER/transcripts"
+  PROCESS_PATH="$PROCESS_DOC"
+  # Phase 6 requires BOTH an accepted spec and an accepted plan. Satisfy the
+  # spec gate so the fixture actually exercises the plan gate it targets --
+  # accepted_plan, not accepted_spec, is the contract under test here.
+  mkdir -p "$FEATURE_FOLDER/3-spec-review"
+  : > "$FEATURE_FOLDER/3-spec-review/spec-review-summary.md"
+  slug="$(basename "$RF" -artifacts)"
+  : > "$(dirname "$RF")/$slug-design.md"
+  # 4-plan-writing/plan-status.md is deliberately never created.
+  init_orchestration_vars 6 2>&1 >/dev/null
+  printf '%s\n' "rc=$?"
+)"
+case "$_neg8_out" in
+  *PRELAUNCH_FAILED:accepted_plan*rc=1*|*rc=1*PRELAUNCH_FAILED:accepted_plan*)
+    _ok "absent upstream contract -> PRELAUNCH_FAILED" ;;
+  *) _fail "absent upstream contract did not report PRELAUNCH_FAILED (rc=1): [$_neg8_out]" ;;
+esac
+
+# --- Reviewer defect 1: reconstruct_durable_inputs must ACTUALLY reconstruct,
+# unconditionally when a phase is given -- not silently skip. Build every
+# upstream artifact Phase 7 needs and assert init_orchestration_vars 7 both
+# succeeds AND leaves the durable variables genuinely populated. (Mutation-
+# tested: reverting reconstruct_durable_inputs to its old dead-code form,
+# which assigned nothing, makes this fail.)
+(
+  RF="$BUILD/recon-happy-artifacts"; rm -rf "$RF"
+  RR="$(mktemp -d)"; git -C "$RR" init -q
+  ( cd "$RR" && : > seed && git add seed \
+    && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+  REPO_ROOT="$RR"; FEATURE_FOLDER="$RF"; mkdir -p "$FEATURE_FOLDER/transcripts"
+  PROCESS_PATH="$PROCESS_DOC"
+
+  mkdir -p "$FEATURE_FOLDER/3-spec-review" "$FEATURE_FOLDER/4-plan-writing" "$FEATURE_FOLDER/6-implementation"
+  : > "$FEATURE_FOLDER/3-spec-review/spec-review-summary.md"
+  slug="$(basename "$RF" -artifacts)"
+  spec_path="$(dirname "$RF")/$slug-design.md"
+  : > "$spec_path"
+  plan_path="$FEATURE_FOLDER/plan.md"; : > "$plan_path"
+  printf 'verdict: DONE\nplan_path: %s\n' "$plan_path" > "$FEATURE_FOLDER/4-plan-writing/plan-status.md"
+  printf 'verdict: DONE\nverification: PASS\n' > "$FEATURE_FOLDER/6-implementation/implementer-status.md"
+  printf 'implementation_base_sha: cafef00d\n\n' > "$FEATURE_FOLDER/RUN_LOG.md"
+
+  init_orchestration_vars 7 >/dev/null 2>&1
+  rc=$?
+  printf '%s\n' "rc=$rc" "SPEC_PATH=$SPEC_PATH" "PLAN_PATH=$PLAN_PATH" \
+    "IMPLEMENTATION_BASE_SHA=$IMPLEMENTATION_BASE_SHA" \
+    "IMPLEMENTATION_FINAL_SHA=$IMPLEMENTATION_FINAL_SHA" \
+    "CONTEXT7_POLICY=$CONTEXT7_POLICY"
+) > "$BUILD/recon-happy.out"
+recon_out="$(cat "$BUILD/recon-happy.out")"
+assert_contains "rc=0" "$BUILD/recon-happy.out" "init_orchestration_vars 7 succeeds once every upstream contract exists"
+case "$recon_out" in
+  *SPEC_PATH=*-design.md*) _ok "reconstruction actually sets SPEC_PATH (not skipped)" ;;
+  *) _fail "SPEC_PATH was not reconstructed: [$recon_out]" ;;
+esac
+case "$recon_out" in
+  *PLAN_PATH=*/plan.md*) _ok "reconstruction actually sets PLAN_PATH (not skipped)" ;;
+  *) _fail "PLAN_PATH was not reconstructed: [$recon_out]" ;;
+esac
+case "$recon_out" in
+  *IMPLEMENTATION_BASE_SHA=cafef00d*) _ok "reconstruction reads IMPLEMENTATION_BASE_SHA from RUN_LOG (not skipped)" ;;
+  *) _fail "IMPLEMENTATION_BASE_SHA was not reconstructed: [$recon_out]" ;;
+esac
+case "$recon_out" in
+  *IMPLEMENTATION_FINAL_SHA=*) [ -n "$(printf '%s' "$recon_out" | "$GREP_BIN" -oE 'IMPLEMENTATION_FINAL_SHA=.+')" ] \
+    && _ok "reconstruction sets IMPLEMENTATION_FINAL_SHA (current HEAD)" \
+    || _fail "IMPLEMENTATION_FINAL_SHA is empty: [$recon_out]" ;;
+  *) _fail "IMPLEMENTATION_FINAL_SHA was not reconstructed: [$recon_out]" ;;
+esac
+case "$recon_out" in
+  *CONTEXT7_POLICY=best-effort*|*CONTEXT7_POLICY=required*) _ok "reconstruction sets CONTEXT7_POLICY (not skipped)" ;;
+  *) _fail "CONTEXT7_POLICY was not reconstructed: [$recon_out]" ;;
+esac
 
 finish

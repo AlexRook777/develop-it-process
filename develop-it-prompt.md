@@ -140,11 +140,37 @@ Reviewer appendices in this file instruct reviewers to use this severity ladder 
 
 A gate that passes in the relaxed tier (final passing iteration ≥ 3) forces the final readiness verdict to `READY_WITH_NOTES` — whether or not any deferred majors remain — never a silent `READY`. Deferred majors, when present, are listed in the readiness report; a clean relaxed pass (`majors=0`) still earns `READY_WITH_NOTES` on the strength of the extended convergence alone.
 
-## Models
+## Role Contract Registry
 
 All non-orchestrator roles run as fresh subprocesses with isolated context. You never produce content a worker or reviewer would produce.
 
-**Pinned models.** The Models table names exact model ids. There is no class
+**One registry, sixteen columns.** Every top-level dispatched role is one row
+below: vendor, pinned model, pinned effort, timeout, whether it mutates the
+target repo, whether it is a long dispatch, whether it may spawn children,
+its required and optional inputs, its attempt-scoped STATUS template, its
+outputs, its complete legal verdict enum, its required STATUS fields beyond
+the common schema-v2 baseline (`common_v2` = `verdict`/`reason`/`cost_hint`),
+its checkpoint kind, and the phase(s) it legally runs in. `impl-worker` is the
+one exception: it is a child-only contract (`phases=child`) spawned solely
+from inside the `implementer`'s own session as a sub-subagent — it never
+receives a top-level dispatch ID, writes no STATUS file of its own
+(`status_template=none`), and has no appendix here; it reports through its
+parent implementer's child-checkpoint protocol.
+
+**`long_running` is materialized, not hand-picked.** A row's `long_running`
+cell MUST equal `yes` exactly when `timeout_minutes` is at or above the
+`long_role_headroom_threshold_minutes` policy value, OR `phases=child`, OR
+`may_spawn_children=yes` — otherwise `no`. `tests/lib/extract.py`'s `cmd_roles`
+recomputes this rule against the Process Policy Registry's threshold on every
+extraction and rejects the whole table if any row's declared value disagrees
+with its own timeout/phases/may_spawn_children inputs. This is a DIFFERENT
+question from the "Long dispatch" section below, which asks whether THIS HOST
+must background a given dispatch — that comparison is host-ceiling-dependent
+and re-evaluated at dispatch time; `long_running` is the static, host-independent
+classification used to decide whether a role needs the policy's just-in-time
+vendor liveness/headroom probe before a long attempt begins.
+
+**Pinned models.** This table names exact model ids. There is no class
 indirection and no fallback: an id that the CLI rejects HALTs the run with a
 remediation message naming the role and the id (see Phase −1). Changing a model
 is an edit to this document, which makes it reviewable.
@@ -174,40 +200,41 @@ omitting `-m` — is what prevents that failure. `gpt-5.6-luna` is available to
 this account and is used for the cheap `preflight-codex` probe;
 `gpt-5.6-terra` is available but deliberately unused.
 
-| Role | Vendor | Model | Effort | Timeout (min) |
-|---|---|---|---|---|
-| `orchestrator` | — | — | — | — |
-| `preflight-claude` | `claude` | `claude-haiku-4-5` | — | 5 |
-| `preflight-codex` | `codex` | `gpt-5.6-luna` | `medium` | 5 |
-| `context-discovery` | `claude` | `claude-sonnet-5` | — | 30 |
-| `spec-reviewer-claude` | `claude` | `claude-opus-5` | — | 60 |
-| `spec-reviewer-codex` | `codex` | `gpt-5.6-sol` | `high` | 60 |
-| `spec-fixer` | `claude` | `claude-opus-5` | — | 60 |
-| `plan-writer` | `claude` | `claude-opus-5` | — | 120 |
-| `plan-reviewer-claude` | `claude` | `claude-opus-5` | — | 60 |
-| `plan-reviewer-codex` | `codex` | `gpt-5.6-sol` | `high` | 60 |
-| `plan-fixer` | `claude` | `claude-opus-5` | — | 60 |
-| `implementer` | `claude` | `claude-opus-5` | — | 300 |
-| `impl-worker` | `claude` | `claude-sonnet-5` | — | 300 |
-| `debugger` | `claude` | `claude-opus-5` | — | 60 |
-| `code-reviewer-claude` | `claude` | `claude-opus-5` | — | 60 |
-| `code-reviewer-codex` | `codex` | `gpt-5.6-sol` | `high` | 60 |
-| `all-tests-runner` | `claude` | `claude-sonnet-5` | — | 60 |
-| `test-fixer` | `claude` | `claude-sonnet-5` | — | 60 |
-| `finishing-branch` | `claude` | `claude-sonnet-5` | — | 30 |
-| `summarizer-spec` | `claude` | `claude-sonnet-5` | — | 20 |
-| `summarizer-plan` | `claude` | `claude-sonnet-5` | — | 20 |
-| `summarizer-implementation` | `claude` | `claude-sonnet-5` | — | 20 |
-| `summarizer-code-review` | `claude` | `claude-sonnet-5` | — | 20 |
-| `summarizer-all-tests` | `claude` | `claude-sonnet-5` | — | 20 |
-| `readiness-writer` | `claude` | `claude-opus-5` | — | 20 |
+| Role | Vendor | Model | Effort | Timeout minutes | Mutates | Long running | May spawn children | Required inputs | Optional inputs | Status template | Outputs | Verdicts | Required status fields | Checkpoint kind | Phases |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| preflight-claude | claude | claude-haiku-4-5 | — | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2;context7 | none | 1 |
+| preflight-codex | codex | gpt-5.6-luna | medium | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2 | none | 1 |
+| context-discovery | claude | claude-sonnet-5 | — | 30 | no | no | no | feature_folder;resolved_models | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | READY;BLOCKED | common_v2 | none | 2 |
+| spec-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
+| spec-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
+| spec-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;spec_path;findings_paths | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 3 |
+| plan-writer | claude | claude-opus-5 | — | 120 | yes | yes | no | feature_folder;spec_path;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;plan_path | DONE;BLOCKED | common_v2 | none | 4 |
+| plan-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
+| plan-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
+| plan-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;plan_path;findings_paths | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 5 |
+| implementer | claude | claude-opus-5 | — | 300 | yes | yes | yes | feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy | findings_paths;debugger_status_path | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | implementation_summary;status | DONE;FAILED;NEEDS_DEBUG;BLOCKED | common_v2;verification | implementation | 6 |
+| impl-worker | claude | claude-sonnet-5 | — | 300 | yes | yes | no | task_brief | context7_policy | none | changed_paths | none | none | implementation | child |
+| debugger | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;plan_path;implementation_summary_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 6 |
+| code-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
+| code-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
+| implementation-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | accepted_plan;reviewed_revision;finding_ids;write_lease | run_log;relevant_artifacts | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | changed_paths;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;finding_dispositions | implementation | 7 |
+| all-tests-runner | claude | claude-sonnet-5 | — | 60 | yes | yes | no | feature_folder;repo_root;round | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;test_report | PASS;FAIL;SKIPPED | common_v2 | none | 8 |
+| test-fixer | claude | claude-sonnet-5 | — | 60 | yes | yes | no | feature_folder;plan_path;round;test_report_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 8 |
+| summarizer-spec | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 3 |
+| summarizer-plan | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 5 |
+| summarizer-implementation | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 6 |
+| summarizer-code-review | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 7 |
+| summarizer-all-tests | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 8 |
+| documentation-writer | claude | claude-sonnet-5 | — | 60 | yes | yes | no | final_diff;accepted_spec;accepted_plan;implementation_summary;test_summary;review_summary;decisions;exclusions;followups;write_lease | docs_inventory;run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | uat.md;planned-vs-realized.md;documentation-validation.md;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;documentation_validation | document | 9 |
+| readiness-writer | claude | claude-opus-5 | — | 20 | no | no | no | feature_folder;spec_path;plan_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | report;status | DONE | common_v2 | none | 10 |
 
-This table is the only place a model, effort, or timeout is stated. The
-`role_model` / `role_effort` / `role_timeout` helpers in the Runtime cookbook
-implement it, and `tests/check_04_table.sh` asserts the two agree for every row —
-they cannot drift. `impl-worker` is the pinned agent type used by the
-implementer's sub-subagents; its timeout matches the implementer's because it
-runs inside that dispatch.
+This table is the ONLY place a model, effort, timeout, contract shape, or
+legal verdict is stated for any role. The `role_*` helpers in the Runtime
+cookbook (backed by `role_contract_field`) implement every column, and
+`tests/check_04_table.sh` asserts they agree with every row — they cannot
+drift. `finishing-branch` is retired: Phase 10 finalization is now an
+orchestrator-owned local operation, not a vendor dispatch. `impl-worker`'s
+timeout matches the implementer's because it runs inside that dispatch.
 
 ## Process Policy Registry
 
@@ -477,6 +504,15 @@ path_in_tree() {
 # definitions with no executable top-level statements; check_01_lint.sh enforces
 # that invariant.
 init_orchestration_vars() {
+  # Usage: init_orchestration_vars [phase]
+  # <phase> is the schema-v2 phase number (2..10; -1/1 for preflight). Every
+  # phase's own bash invocation calls `init_orchestration_vars <phase>` at the
+  # top of its fresh shell. The argument is optional ONLY for pre-phase setup
+  # that has no durable phase context yet -- the Step 1.0 canary, or a test
+  # fixture bootstrapping a throwaway environment -- where there is nothing
+  # yet to reconstruct. Whenever a phase IS given, reconstruction runs
+  # UNCONDITIONALLY: there is no separate opt-in flag on top of the argument.
+  local phase="${1:-}"
   PROCESS_PATH="${PROCESS_PATH:?must be set to the absolute path of this document}"
   REPO_ROOT="${REPO_ROOT:?must be set to the target project repo root}"
   FEATURE_FOLDER="${FEATURE_FOLDER:?must be set before dispatching any phase}"
@@ -496,7 +532,10 @@ init_orchestration_vars() {
   # must still be reported as failure -- a successful process_identity call must
   # never mask it.
   [ "$roots_rc" -eq 0 ] && process_identity
-  return "$roots_rc"
+  [ "$roots_rc" -eq 0 ] || return "$roots_rc"
+
+  [ -z "$phase" ] || reconstruct_durable_inputs "$phase" || return 1
+  return 0
 }
 
 validate_roots() {
@@ -549,81 +588,252 @@ process_identity() {
 
 # ---- Timestamp helper (used by log_dispatch and event-tagged RUN_LOG blocks) -
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# ---- Durable input reconstruction (schema-v2, spec §6.3) --------------------
+# Every phase starts in a fresh shell; nothing a previous phase's shell set
+# survives it. `init_orchestration_vars <phase>` calls this UNCONDITIONALLY
+# whenever a phase is given -- there is no separate opt-in flag -- to
+# re-derive every durable input that phase needs from validated upstream
+# STATUS/events, never from an inherited shell variable. A missing durable
+# input is PRELAUNCH_FAILED:<contract-name>, never reclassified as a
+# dirty-tree or vendor failure.
+
+# SPEC_PATH is never stored anywhere new: the Naming convention already makes
+# it a pure function of $FEATURE_FOLDER (swap the `-artifacts` suffix for
+# `-design.md`). Reconstruction is that reversal plus an existence check --
+# the same derivation summarizer-plan's appendix already documents in prose.
+_spec_path_from_feature_folder() {
+  local dir base
+  dir="$(dirname "$FEATURE_FOLDER")"
+  base="$(basename "$FEATURE_FOLDER")"
+  case "$base" in
+    *-artifacts) printf '%s/%s-design.md\n' "$dir" "${base%-artifacts}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Accepted spec: gated on the spec-review gate having actually completed
+# (its summary file existing), not merely on the derived path existing --
+# a spec file that exists but was never reviewed is not yet "accepted".
+_reconstruct_accepted_spec() {
+  [ -f "$FEATURE_FOLDER/3-spec-review/spec-review-summary.md" ] \
+    || { echo "PRELAUNCH_FAILED:accepted_spec" >&2; return 1; }
+  SPEC_PATH="$(_spec_path_from_feature_folder)" && [ -f "$SPEC_PATH" ] \
+    || { echo "PRELAUNCH_FAILED:accepted_spec" >&2; return 1; }
+  # shellcheck disable=SC2034  # consumed by the calling phase shell (spec §6.3 "spec revision")
+  SPEC_REVISION="$(git -C "$REPO_ROOT" log -1 --format=%H -- "$SPEC_PATH" 2>/dev/null || echo non-git)"
+}
+
+# Accepted plan: PLAN_PATH is not derivable from a naming rule -- plan-writer
+# recorded it directly in plan-status.md's own `plan_path:` field, so read it
+# from there rather than guessing a filename convention.
+_reconstruct_accepted_plan() {
+  local st="$FEATURE_FOLDER/4-plan-writing/plan-status.md"
+  [ -f "$st" ] || { echo "PRELAUNCH_FAILED:accepted_plan" >&2; return 1; }
+  PLAN_PATH="$(status_field "$st" plan_path)"
+  [ -n "$PLAN_PATH" ] && [ -f "$PLAN_PATH" ] \
+    || { echo "PRELAUNCH_FAILED:accepted_plan" >&2; return 1; }
+  # shellcheck disable=SC2034  # consumed by the calling phase shell (spec §6.3 "plan revision")
+  PLAN_REVISION="$(git -C "$REPO_ROOT" log -1 --format=%H -- "$PLAN_PATH" 2>/dev/null || echo non-git)"
+}
+
+# Implementation baseline AND final SHA. The baseline is the SHA captured
+# before Phase 6 started (recorded in RUN_LOG, per "Step 6.0 — Capture
+# implementation baseline"); the final SHA is simply current HEAD, valid the
+# instant a later phase's fresh shell asks for it.
+_reconstruct_implementation_baseline() {
+  local st="$FEATURE_FOLDER/6-implementation/implementer-status.md"
+  [ -f "$st" ] || { echo "PRELAUNCH_FAILED:implementation_baseline" >&2; return 1; }
+  IMPLEMENTATION_BASE_SHA="$(status_field "$FEATURE_FOLDER/RUN_LOG.md" implementation_base_sha)"
+  [ -n "$IMPLEMENTATION_BASE_SHA" ] || IMPLEMENTATION_BASE_SHA=non-git
+  # shellcheck disable=SC2034  # consumed by the calling phase shell / a future task's finalization
+  IMPLEMENTATION_FINAL_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo non-git)"
+}
+
+# Vendor availability / proven state: the documented RUN_LOG-scan rule from
+# "Run-scoped user opt-out: codex_disabled_by_user" above, as one real
+# function instead of five repeated prose paragraphs at each per-phase gate.
+_reconstitute_codex_disabled() {
+  codex_disabled_by_user=false
+  if [ -f "$FEATURE_FOLDER/RUN_LOG.md" ] \
+     && "$GREP_BIN" -q '^event=CODEX_DISABLED_BY_USER_CONSENT$' "$FEATURE_FOLDER/RUN_LOG.md"; then
+    codex_disabled_by_user=true
+  fi
+  # An `if`, not a trailing `&&`: a conditional as the final statement makes the
+  # function return 1 whenever codex is NOT disabled, which is the normal path.
+  if [ "$codex_disabled_by_user" = true ]; then
+    codex_available=false
+  fi
+}
+
+reconstruct_durable_inputs() {
+  # Usage: reconstruct_durable_inputs <phase>
+  local phase="$1"
+
+  # Reconstructed for every phase, via mechanisms that already exist:
+  # context7_policy() (defined below) and the codex opt-out flag's documented
+  # scan rule.
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  CONTEXT7_POLICY="$(context7_policy 2>/dev/null)" || CONTEXT7_POLICY=best-effort
+  _reconstitute_codex_disabled
+
+  # Applicable optional skills: best-effort from Phase 1's own record. Never
+  # gates -- an absent or unreadable record just means "none recorded".
+  # shellcheck disable=SC2034  # consumed by the calling phase shell's skill-loading step
+  OPTIONAL_SKILLS="$(status_field "$FEATURE_FOLDER/1-preflight/phase-1/claude-check-status.md" loaded_skills 2>/dev/null)"
+
+  # Findings / debugger-reverification inputs are optional by nature -- only
+  # set when a prior round left one behind -- so they are reconstructed
+  # opportunistically and never PRELAUNCH_FAILED on absence.
+  DEBUGGER_STATUS_PATH="$FEATURE_FOLDER/6-implementation/debugger-status.md"
+  [ -f "$DEBUGGER_STATUS_PATH" ] || DEBUGGER_STATUS_PATH=""
+
+  # Continuation/checkpoint paths and declared foreign changes/commits: this
+  # revision does not yet define a durable event/artifact for either -- that
+  # lands with the checkpoint/continuation runtime (a later task). Reconstruct
+  # them as empty rather than inventing an undocumented format; neither is a
+  # required_input of any current registry row, so no phase below treats
+  # their absence as PRELAUNCH_FAILED.
+  # shellcheck disable=SC2034  # reserved for the checkpoint/continuation runtime (a later task)
+  CONTINUATION_PATH=""
+  # shellcheck disable=SC2034  # reserved for the checkpoint/continuation runtime (a later task)
+  DECLARED_FOREIGN_CHANGES=""
+
+  case "$phase" in
+    4) _reconstruct_accepted_spec || return 1 ;;
+    6) _reconstruct_accepted_spec || return 1
+       _reconstruct_accepted_plan || return 1 ;;
+    7) _reconstruct_accepted_spec || return 1
+       _reconstruct_accepted_plan || return 1
+       _reconstruct_implementation_baseline || return 1 ;;
+    8) _reconstruct_accepted_plan || return 1
+       _reconstruct_implementation_baseline || return 1 ;;
+    9) _reconstruct_accepted_spec || return 1
+       _reconstruct_accepted_plan || return 1
+       _reconstruct_implementation_baseline || return 1
+       [ -f "$FEATURE_FOLDER/7-code-review/code-review-summary.md" ] \
+         || { echo "PRELAUNCH_FAILED:review_summary" >&2; return 1; }
+       [ -f "$FEATURE_FOLDER/8-all-tests/all-test-summary.md" ] \
+         || { echo "PRELAUNCH_FAILED:test_summary" >&2; return 1; }
+       ;;
+  esac
+  return 0
+}
 ```
 
 All examples below use `python3` (never the bare `python`) and `$PROCESS_PATH` (never the literal `develop-it-prompt.md`).
 
-### Role → model / effort / timeout
+### Role contract registry lookup
 
 <!-- lint: cookbook -->
 ```bash
-# Single source of truth for per-role dispatch parameters. Mirrors the Models
-# table exactly; tests/check_04_table.sh enforces the mirror.
-# Fields: <model> <effort> <timeout_minutes>.  '-' means empty.
-_role_row() {
-  case "$1" in
-    preflight-claude)          echo "claude-haiku-4-5 - 5" ;;
-    preflight-codex)           echo "gpt-5.6-luna medium 5" ;;
-    context-discovery)         echo "claude-sonnet-5 - 30" ;;
-    spec-reviewer-claude)      echo "claude-opus-5 - 60" ;;
-    spec-reviewer-codex)       echo "gpt-5.6-sol high 60" ;;
-    spec-fixer)                echo "claude-opus-5 - 60" ;;
-    plan-writer)               echo "claude-opus-5 - 120" ;;
-    plan-reviewer-claude)      echo "claude-opus-5 - 60" ;;
-    plan-reviewer-codex)       echo "gpt-5.6-sol high 60" ;;
-    plan-fixer)                echo "claude-opus-5 - 60" ;;
-    implementer)               echo "claude-opus-5 - 300" ;;
-    impl-worker)               echo "claude-sonnet-5 - 300" ;;
-    debugger)                  echo "claude-opus-5 - 60" ;;
-    code-reviewer-claude)      echo "claude-opus-5 - 60" ;;
-    code-reviewer-codex)       echo "gpt-5.6-sol high 60" ;;
-    all-tests-runner)          echo "claude-sonnet-5 - 60" ;;
-    test-fixer)                echo "claude-sonnet-5 - 60" ;;
-    finishing-branch)          echo "claude-sonnet-5 - 30" ;;
-    summarizer-spec)           echo "claude-sonnet-5 - 20" ;;
-    summarizer-plan)           echo "claude-sonnet-5 - 20" ;;
-    summarizer-implementation) echo "claude-sonnet-5 - 20" ;;
-    summarizer-code-review)    echo "claude-sonnet-5 - 20" ;;
-    summarizer-all-tests)      echo "claude-sonnet-5 - 20" ;;
-    readiness-writer)          echo "claude-opus-5 - 20" ;;
-    *) echo "unknown role: $1" >&2; return 1 ;;
+# Single source of truth for every per-role dispatch contract: one row in the
+# Role Contract Registry table above, materialized into $ROLE_CONTRACTS_PATH
+# (bootstrap_runtime writes $RUNTIME_DIR/role-contracts.tsv) as 16-column TSV.
+# tests/check_04_table.sh asserts every role_* wrapper below agrees with the
+# table for every row -- they cannot drift.
+#
+# Deliberately does NOT reject a duplicate role at extraction time (see
+# extract.py's cmd_roles): this awk lookup is the one enforcement point for
+# BOTH an unknown field (exit 42) and an unknown-or-duplicate role (exit 43).
+# A role matched zero times and a role matched twice both fail closed the same
+# way -- there is no safe way to guess which of two conflicting rows is right,
+# and a role that does not exist at all must not silently resolve like one
+# that does.
+role_contract_field() {
+  local role=$1 field=$2
+  awk -F '\t' -v role="$role" -v field="$field" '
+    # field_known is captured via the `in` operator (which never auto-vivifies
+    # an array element) at NR==1, before anything reads col[field]. Reading
+    # col[field] directly -- e.g. `value=$col[field]` for an unknown field --
+    # DOES auto-vivify it, which would make a later `field in col` check in
+    # END see it as present and silently mask an unknown field as count!=1
+    # instead of exit-42. Guarding the read with `field_known &&` keeps that
+    # read from ever running for an unknown field, and checking `!field_known`
+    # first in END (before the exit-43 count check) keeps a `NR==1`-time
+    # `exit` from being clobbered -- an `exit` inside a non-END rule still
+    # runs END, and an unconditional exit there would override it.
+    NR==1 {
+      for (i=1; i<=NF; i++) col[$i]=i
+      field_known = (field in col)
+      next
+    }
+    field_known && $1==role { count++; value=$col[field] }
+    END {
+      if (!field_known) exit 42
+      if (count != 1) exit 43
+      print value
+    }
+  ' "$ROLE_CONTRACTS_PATH"
+}
+
+# Columns that may legitimately be empty (normalized from an em-dash in the
+# table): `effort` for a claude role with no reasoning-effort knob, and
+# `optional_inputs` for a role that takes none. Every other column resolving
+# to an empty value is a process-definition bug, not a legal state.
+_role_optional_cell() { case "$1" in effort|optional_inputs) return 0 ;; *) return 1 ;; esac; }
+
+# The one function every role_* wrapper calls. Resolves $ROLE_CONTRACTS_PATH
+# (falling back to $RUNTIME_DIR/role-contracts.tsv, mirroring policy_value's
+# $RUNTIME_DIR fallback), maps role_contract_field's exit codes to the
+# machine-readable tokens the recovery/render layer branches on, and rejects an
+# empty required cell before it can be mistaken for "not set yet".
+role_field() {
+  local role=$1 field=$2 path value rc
+  path="${ROLE_CONTRACTS_PATH:-${RUNTIME_DIR:+$RUNTIME_DIR/role-contracts.tsv}}"
+  if [ -z "$path" ]; then
+    echo "ROLE_REGISTRY_MISSING:unset" >&2; return 1
+  fi
+  if [ ! -r "$path" ]; then
+    echo "ROLE_REGISTRY_MISSING:$path" >&2; return 1
+  fi
+  value="$(ROLE_CONTRACTS_PATH="$path" role_contract_field "$role" "$field")"; rc=$?
+  case "$rc" in
+    0) : ;;
+    42) echo "ROLE_FIELD_UNKNOWN:$field" >&2; return 1 ;;
+    43) echo "ROLE_UNKNOWN_OR_DUPLICATE:$role" >&2; return 1 ;;
+    *)  echo "ROLE_LOOKUP_FAILED:$role.$field" >&2; return 1 ;;
   esac
+  if [ -z "$value" ] && ! _role_optional_cell "$field"; then
+    echo "ROLE_CONTRACT_EMPTY:$role.$field" >&2; return 1
+  fi
+  printf '%s\n' "$value"
 }
 
-_role_field() {
-  local row field
-  row="$(_role_row "$1")" || return 1
-  field="$(printf '%s\n' "$row" | cut -d' ' -f"$2")"
-  [ "$field" = "-" ] && field=""
-  printf '%s\n' "$field"
-}
+# The complete §6.2 wrapper surface -- thin calls onto role_field/role_contract_field.
+role_vendor()                  { role_field "$1" vendor; }
+role_model()                   { role_field "$1" model; }
+role_effort()                  { role_field "$1" effort; }
+role_timeout()                 { role_field "$1" timeout_minutes; }
+role_mutates()                 { role_field "$1" mutates; }
+role_long_running()            { role_field "$1" long_running; }
+role_may_spawn_children()      { role_field "$1" may_spawn_children; }
+role_required_inputs()         { role_field "$1" required_inputs; }
+role_optional_defaults()       { role_field "$1" optional_inputs; }
+role_status_path()             { role_field "$1" status_template; }
+role_outputs()                 { role_field "$1" outputs; }
+role_verdicts()                 { role_field "$1" verdicts; }
+role_required_status_fields()  { role_field "$1" required_status_fields; }
+role_checkpoint_kind()          { role_field "$1" checkpoint_kind; }
+role_phases()                   { role_field "$1" phases; }
 
-role_model()   { _role_field "$1" 1; }
-role_effort()  { _role_field "$1" 2; }
-role_timeout() { _role_field "$1" 3; }
-
-role_vendor() {
-  case "$1" in
-    *-codex) echo codex ;;
-    orchestrator) echo "" ;;
-    *) echo claude ;;
-  esac
-}
+# Every role key present in the registry, in table order. Reads the TSV rather
+# than a hand-maintained list, so this can never drift from the table.
 _role_keys() {
-  printf '%s\n' preflight-claude preflight-codex context-discovery \
-    spec-reviewer-claude spec-reviewer-codex spec-fixer plan-writer \
-    plan-reviewer-claude plan-reviewer-codex plan-fixer implementer \
-    impl-worker debugger code-reviewer-claude code-reviewer-codex \
-    all-tests-runner test-fixer finishing-branch summarizer-spec \
-    summarizer-plan summarizer-implementation summarizer-code-review \
-    summarizer-all-tests readiness-writer
+  local path
+  path="${ROLE_CONTRACTS_PATH:-${RUNTIME_DIR:+$RUNTIME_DIR/role-contracts.tsv}}"
+  [ -n "$path" ] && [ -r "$path" ] || return 1
+  tail -n +2 "$path" | cut -f1
 }
 
 # Render the role->model map for injection into the context-discovery prompt.
 # The dispatched session cannot call role_model, so the orchestrator formats it.
+# Child-only roles (impl-worker) never receive a top-level dispatch and are
+# excluded -- they have no place in a map keyed by dispatched role.
 resolved_models_block() {
   local role
   for role in $(_role_keys); do
+    [ "$(role_phases "$role" 2>/dev/null)" = child ] && continue
     printf '  %s: %s\n' "$role" "$(role_model "$role")"
   done
 }
@@ -691,11 +901,21 @@ misread as a CLI usage error.
 render_keys() {
   printf '%s\n' FEATURE_FOLDER ITERATION SPEC_PATH PLAN_PATH FINDINGS_PATHS \
     IMPLEMENTATION_BASE_SHA IMPLEMENTATION_SUMMARY_PATH DEBUGGER_STATUS_PATH \
-    REPO_ROOT ROUND TEST_REPORT_PATH RESOLVED_MODELS CONTEXT7_POLICY GREP_BIN
+    REPO_ROOT ROUND TEST_REPORT_PATH RESOLVED_MODELS CONTEXT7_POLICY GREP_BIN \
+    ACCEPTED_PLAN REVIEWED_REVISION FINDING_IDS WRITE_LEASE RUN_LOG \
+    RELEVANT_ARTIFACTS FINAL_DIFF ACCEPTED_SPEC IMPLEMENTATION_SUMMARY \
+    TEST_SUMMARY REVIEW_SUMMARY DECISIONS EXCLUSIONS FOLLOWUPS DOCS_INVENTORY \
+    PHASE_DIR DISPATCH_ID
 }
 
 render_prompt() {
   # Usage: render_prompt <appendix-name>
+  #        render_prompt --check <role>   -- see render_prompt_check below.
+  if [ "${1:-}" = "--check" ]; then
+    shift
+    render_prompt_check "$@"
+    return $?
+  fi
   local appendix="$1" k
   local set_keys=() envargs=()
 
@@ -768,6 +988,102 @@ PY
 
 Set each orchestration variable the appendix expects as an ordinary shell assignment — no `export` required, since `render_prompt` reads them through `${!k}` — then call `render_prompt <name>` and check its exit status: it fails loudly and names any variable it could not resolve, so a non-zero exit must halt dispatch rather than pipe a half-rendered prompt forward. `sed` is not an alternative for this substitution: multi-line values like `$FINDINGS_PATHS` break it.
 
+### Pre-launch role check — `render_prompt --check`
+
+Before any attempt is logged as launched, `render_prompt --check <role>` validates the role's contract WITHOUT invoking a vendor: it never shells out to `claude` or `codex`, only to the registry lookups and the existing template-substitution logic above.
+
+<!-- lint: cookbook -->
+```bash
+# A role's `phases` cell is a semicolon-delimited set of legal phase tokens.
+# `child` is legal only for a child-only contract (e.g. impl-worker); every
+# other legal token is -1 (the preflight/canary stage) or 1 through 10.
+_legal_phase_token() {
+  case "$1" in
+    -1|1|2|3|4|5|6|7|8|9|10|child) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# `render_prompt --check <role>` reports, without spending a single token:
+#   - every required input that is not currently set (RENDER_REQUIRED_INPUT_MISSING),
+#   - every populated optional default (KEY=default),
+#   - the resolved output/STATUS paths,
+#   - an unsupported phase token in the registry row (ROLE_PHASE_UNSUPPORTED),
+#   - any appendix variable that still cannot resolve (RENDER_VARIABLE_UNRESOLVED).
+# Returns 0 iff none of the above problems were found. A role lookup failure
+# (unknown role, unknown field) propagates role_field's own token unchanged.
+render_prompt_check() {
+  local role="$1" problems=0 phases p req tok var opt val
+
+  phases="$(role_phases "$role")" || return 1
+  for p in $(printf '%s' "$phases" | tr ';' ' '); do
+    if ! _legal_phase_token "$p"; then
+      echo "ROLE_PHASE_UNSUPPORTED:$p" >&2
+      problems=1
+    fi
+  done
+
+  req="$(role_required_inputs "$role")" || return 1
+  for tok in $(printf '%s' "$req" | tr ';' ' '); do
+    var="$(printf '%s' "$tok" | tr '[:lower:]' '[:upper:]')"
+    if [ -z "${!var+x}" ]; then
+      echo "RENDER_REQUIRED_INPUT_MISSING:$tok" >&2
+      problems=1
+    fi
+  done
+
+  opt="$(role_optional_defaults "$role")" || return 1
+  if [ "$opt" != none ] && [ -n "$opt" ]; then
+    for tok in $(printf '%s' "$opt" | tr ';' ' '); do
+      case "$tok" in *=*) var="${tok%%=*}"; val="${tok#*=}" ;; *) var="$tok"; val="" ;; esac
+      var="$(printf '%s' "$var" | tr '[:lower:]' '[:upper:]')"
+      [ -n "${!var+x}" ] || echo "optional default: $var=$val"
+    done
+  fi
+
+  # Resolve the status_template against the orchestration variables THIS
+  # shell currently has set, and print the RESOLVED path -- spec 6.2 requires
+  # a resolved output/STATUS path, not the literal template text. An attempt
+  # identity variable the template names but this shell has not set yet is
+  # reported as RENDER_VARIABLE_UNRESOLVED, the same token an unresolved
+  # appendix variable gets below, rather than silently echoing "$PHASE_DIR".
+  local template resolved leftover v
+  template="$(role_status_path "$role")"
+  if [ "$template" = none ]; then
+    echo "status_template: none"
+  else
+    resolved="$template"
+    for v in PHASE_DIR ITERATION DISPATCH_ID; do
+      [ -n "${!v+x}" ] && resolved="${resolved//\$$v/${!v}}"
+    done
+    leftover="$("$GREP_BIN" -oE '\$[A-Z][A-Z0-9_]{2,}' <<< "$resolved" | tr -d '$' | sort -u | paste -sd, -)"
+    if [ -n "$leftover" ]; then
+      echo "RENDER_VARIABLE_UNRESOLVED:$leftover" >&2
+      problems=1
+    else
+      echo "status_template: $resolved"
+    fi
+  fi
+  echo "outputs: $(role_outputs "$role")"
+
+  # A child-only role (phases=child, e.g. impl-worker) has no appendix to
+  # render -- appendix_exists correctly returns 1 for it, and there is nothing
+  # further to check here.
+  if [ "$phases" != child ]; then
+    local out
+    out="$(render_prompt "$role" 2>&1 1>/dev/null)"
+    if [ $? -ne 0 ]; then
+      local unresolved
+      unresolved="$("$GREP_BIN" -oE '\$[A-Z][A-Z0-9_]{2,}' <<< "$out" | tr -d '$' | sort -u | paste -sd, -)"
+      echo "RENDER_VARIABLE_UNRESOLVED:${unresolved:-$out}" >&2
+      problems=1
+    fi
+  fi
+
+  [ "$problems" -eq 0 ]
+}
+```
+
 ### CLI invocation forms
 
 The two vendors take different option orders. Memorise both forms — getting them wrong wastes a dispatch attempt and pollutes the failure log.
@@ -833,6 +1149,17 @@ the dispatch as **one Bash tool call with `run_in_background: true`**. The harne
 keeps it running across turns and re-invokes the orchestrator when it exits,
 delivering the exit status.
 
+**Not the same question as the registry's `long_running` column.** That column
+(Role Contract Registry, above) is a STATIC, host-independent classification —
+derived from timeout/child behavior alone — used to gate the just-in-time
+vendor liveness/headroom probe before a long attempt begins. Whether to
+background a dispatch on THIS host is a dynamic, host-ceiling-dependent
+comparison re-evaluated every dispatch, per the rule immediately below. A role
+can be `long_running=yes` in the registry yet still fit inside a generous
+host's foreground budget (foregrounded), or `long_running=no` yet still need
+backgrounding on a tight host (backgrounded) — the two questions are
+independent by design; neither is derived from the other.
+
 **The criterion is the comparison, not a list of roles.** Do not hardcode which
 roles qualify. An earlier revision of this section named exactly three
 (`plan-writer`, `implementer`, `code-reviewer-codex`), which silently encoded one
@@ -873,27 +1200,11 @@ dispatch_id() {
 # edits) if silently re-run. This decides UNFINISHED recovery: a "no" role is
 # safe to redispatch once; a "yes" role must halt for the user to reconcile.
 #
-# Default arm: "yes". An unrecognized role is treated as mutating, so an
-# UNFINISHED dispatch for it HALTS rather than auto-retries. The unsafe default
-# would be "no" — it would silently redispatch a role that turns out to write
-# commits, which is exactly the failure this whole rule exists to prevent. A
-# halt the user can override costs nothing; a silent duplicate commit is not
-# reversible.
-role_mutates() {
-  case "$1" in
-    implementer|impl-worker|debugger|test-fixer|\
-    spec-fixer|plan-fixer|plan-writer|all-tests-runner|finishing-branch)
-      echo yes ;;
-    spec-reviewer-claude|spec-reviewer-codex|\
-    plan-reviewer-claude|plan-reviewer-codex|\
-    code-reviewer-claude|code-reviewer-codex|\
-    summarizer-spec|summarizer-plan|summarizer-implementation|\
-    summarizer-code-review|summarizer-all-tests|\
-    context-discovery|preflight-claude|preflight-codex|readiness-writer)
-      echo no ;;
-    *) echo yes ;;   # fail safe — see comment above
-  esac
-}
+# `role_mutates` (defined in "Role contract registry lookup" above) resolves
+# this from the registry's `mutates` column, not a hand-maintained case
+# statement here — the two could otherwise drift. An unrecognized role is
+# `ROLE_UNKNOWN_OR_DUPLICATE`, not a guessed "yes"/"no": unknown roles default
+# to rejection, never to mutation guessing (registry rule, §6.1).
 
 # Pre-launch validation: a role's appendix must exist as a BEGIN/END marker
 # pair in $PROCESS_PATH before any CLI runs. `impl-worker` is a sub-subagent
@@ -1575,40 +1886,32 @@ status_field() {
 
 # Legal verdicts and required extra fields, keyed by CONCRETE ROLE.
 #
-# Transcribed verbatim from each appendix's own `verdict:` line — the appendix is
-# the contract for what its subagent writes. Generic categories cannot express
-# this: `all-tests-runner` is PASS|FAIL|SKIPPED, `finishing-branch` is
-# DONE|SKIPPED|FAILED, and `implementer` is DONE|FAILED|NEEDS_DEBUG|BLOCKED. An
-# enum that merely looks plausible is worse than none: accepting an invalid
-# verdict lets it fall through every gate `case` arm silently, and rejecting a
-# LEGAL one turns a correct failure report into a bogus malformed-STATUS Mode 4.
+# Both resolve through the Role Contract Registry (`role_verdicts` /
+# `role_required_status_fields`), not a hand-maintained case statement — the
+# registry IS the contract for what a role's subagent writes, and
+# tests/lib/verdicts.py + tests/check_06_cookbook.sh assert every appendix's
+# own "Allowed verdicts" declaration agrees with it. An enum that merely looks
+# plausible is worse than none: accepting an invalid verdict lets it fall
+# through every gate `case` arm silently, and rejecting a LEGAL one turns a
+# correct failure report into a bogus malformed-STATUS Mode 4.
 _status_verdicts() {
-  case "$1" in
-    preflight-claude|preflight-codex)   echo "READY MISSING_SKILLS" ;;
-    context-discovery)                  echo "READY BLOCKED" ;;
-    spec-reviewer-claude|spec-reviewer-codex|\
-    plan-reviewer-claude|plan-reviewer-codex|\
-    code-reviewer-claude|code-reviewer-codex) echo "PASS CHANGES_REQUESTED" ;;
-    spec-fixer|plan-writer|plan-fixer|debugger|test-fixer) echo "DONE BLOCKED" ;;
-    implementer)                        echo "DONE FAILED NEEDS_DEBUG BLOCKED" ;;
-    all-tests-runner)                   echo "PASS FAIL SKIPPED" ;;
-    finishing-branch)                   echo "DONE SKIPPED FAILED" ;;
-    summarizer-spec|summarizer-plan|summarizer-implementation|\
-    summarizer-code-review|summarizer-all-tests|readiness-writer) echo "DONE" ;;
-    *) return 1 ;;
-  esac
+  local v
+  v="$(role_verdicts "$1" 2>/dev/null)" || return 1
+  # Filter the `none` sentinel (impl-worker: a child-only role that writes no
+  # STATUS at all) so it is never returned as if it were a legal verdict --
+  # consistent with _status_required_fields' own common_v2/none filtering.
+  printf '%s\n' "$v" | tr ';' '\n' | "$GREP_BIN" -v -E '^none$' | tr '\n' ' '
 }
 
 # Extra required fields beyond verdict/reason, keyed by concrete role.
+# `common_v2` (verdict/reason/cost_hint) is handled by validate_status's own
+# generic rules below, not repeated here — only the role-specific extras
+# beyond that common baseline are returned. `none` (the impl-worker sentinel —
+# it writes no STATUS at all) likewise contributes no required field.
 _status_required_fields() {
-  case "$1" in
-    spec-reviewer-claude|spec-reviewer-codex|\
-    plan-reviewer-claude|plan-reviewer-codex|\
-    code-reviewer-claude|code-reviewer-codex) echo "blockers majors minors findings" ;;
-    implementer)                              echo "verification" ;;
-    preflight-claude)                         echo "context7" ;;
-    *)                                        echo "" ;;
-  esac
+  local v
+  v="$(role_required_status_fields "$1" 2>/dev/null)" || return 1
+  printf '%s\n' "$v" | tr ';' '\n' | "$GREP_BIN" -v -E '^(common_v2|none)$' | tr '\n' ' '
 }
 
 # Validate a STATUS file's shape before branching on it.
@@ -1715,12 +2018,23 @@ context7_policy() {
 }
 ```
 
-Every phase block then does:
+Every phase block begins by reconstructing its durable inputs. Substitute the
+block's own phase number for the literal below; a phase shell never inherits a
+variable from the phase before it, so this call — not an inherited assignment —
+is what makes `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`,
+`$CONTEXT7_POLICY`, `$codex_available` and the rest defined:
 
 <!-- lint: snippet -->
 ```bash
-CONTEXT7_POLICY="$(context7_policy)" || exit 1
+# Phase 7's block, for example, opens with exactly this line.
+init_orchestration_vars 7 || exit 1
 ```
+
+`init_orchestration_vars <phase>` calls `reconstruct_durable_inputs <phase>`
+unconditionally (spec §6.3). It sets `CONTEXT7_POLICY` itself, so a phase block
+never calls `context7_policy` directly; a missing durable input exits non-zero
+with `PRELAUNCH_FAILED:<contract-name>` rather than letting a later
+`render_prompt` fail as an unset-variable render error.
 
 `CONTEXT7_POLICY` is in `render_keys()`, so every appendix receives it and
 `render_prompt` fails loudly if it is ever left unset.
@@ -2783,9 +3097,10 @@ degraded_roles:           plan-writer implementer debugger test-fixer
 ```
 
 Consumer: the readiness writer lists this as a degradation note. The downgrade
-itself is enforced mechanically, not by this prose: every phase block
-reconstructs `$CONTEXT7_POLICY` via `context7_policy()` (see cookbook) from this
-event (or from Phase 1's STATUS field, if still present), and the affected
+itself is enforced mechanically, not by this prose: every phase block calls
+`init_orchestration_vars <phase>`, which reconstructs `$CONTEXT7_POLICY` via
+`context7_policy()` (see cookbook) from this event (or from Phase 1's STATUS
+field, if still present), and the affected
 appendices receive `$CONTEXT7_POLICY` as a rendered value and branch on it
 explicitly — see the "context7 policy reconstruction" cookbook entry.
 
@@ -3047,6 +3362,16 @@ Each appendix below is delimited by HTML comment markers of the form `BEGIN: <ro
 
 You are a one-shot preflight checker invoked by the develop-it orchestrator. You have no shared context. Your full instructions are below.
 
+## Role contract
+
+- Required inputs: `feature_folder`
+- Optional inputs: `none`
+- Outputs: `check_status`
+- Allowed verdicts: `READY;MISSING_SKILLS`
+- Required status fields: `common_v2;context7`
+- Checkpoint kind: `none`
+- Phases: `1`
+
 ## Inputs (substituted by orchestrator)
 
 - `$FEATURE_FOLDER` — absolute path to the feature artifacts folder (already created)
@@ -3104,6 +3429,16 @@ independent repository discovery.
 
 You are a one-shot preflight checker invoked by the develop-it orchestrator. You have no shared context.
 
+## Role contract
+
+- Required inputs: `feature_folder`
+- Optional inputs: `none`
+- Outputs: `check_status`
+- Allowed verdicts: `READY;MISSING_SKILLS`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `1`
+
 ## Inputs
 
 - `$FEATURE_FOLDER`
@@ -3140,6 +3475,16 @@ Exit 0 on successful write.
 # Role: context-discovery
 
 You are dispatched by the develop-it orchestrator to discover the project's environment, skills, and conventions. You have no shared context.
+
+## Role contract
+
+- Required inputs: `feature_folder;resolved_models`
+- Optional inputs: `none`
+- Outputs: `status`
+- Allowed verdicts: `READY;BLOCKED`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `2`
 
 ## Inputs
 
@@ -3187,6 +3532,16 @@ Exit 0 on successful write.
 # Role: spec-reviewer-claude
 
 You are a spec reviewer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
+
+## Role contract
+
+- Required inputs: `feature_folder;iteration;spec_path`
+- Optional inputs: `none`
+- Outputs: `verdict;findings`
+- Allowed verdicts: `PASS;CHANGES_REQUESTED`
+- Required status fields: `common_v2;blockers;majors;minors;findings`
+- Checkpoint kind: `review`
+- Phases: `3`
 
 ## Inputs
 
@@ -3256,6 +3611,16 @@ Independence means independent judgment over the supplied artifact, not
 independent repository discovery.
 
 You are a cross-vendor spec reviewer (the "second opinion") invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context with the primary reviewer; produce an independent assessment.
+
+## Role contract
+
+- Required inputs: `feature_folder;iteration;spec_path`
+- Optional inputs: `none`
+- Outputs: `verdict;findings`
+- Allowed verdicts: `PASS;CHANGES_REQUESTED`
+- Required status fields: `common_v2;blockers;majors;minors;findings`
+- Checkpoint kind: `review`
+- Phases: `3`
 
 ## Inputs
 
@@ -3332,6 +3697,16 @@ Exit 0 on STATUS write.
 
 You are a spec patcher invoked as a fresh subprocess. You have no shared context.
 
+## Role contract
+
+- Required inputs: `feature_folder;iteration;spec_path;findings_paths`
+- Optional inputs: `none`
+- Outputs: `status`
+- Allowed verdicts: `DONE;BLOCKED`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `3`
+
 ## Inputs
 
 - `$FEATURE_FOLDER`
@@ -3371,6 +3746,16 @@ Exit 0 on successful STATUS write.
 # Role: plan-writer
 
 You are a plan author invoked as a fresh subprocess. You have no shared context.
+
+## Role contract
+
+- Required inputs: `feature_folder;spec_path;context7_policy`
+- Optional inputs: `none`
+- Outputs: `status;plan_path`
+- Allowed verdicts: `DONE;BLOCKED`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `4`
 
 ## Inputs
 
@@ -3422,6 +3807,16 @@ Exit 0 on successful STATUS write.
 # Role: plan-reviewer-claude
 
 You are a plan reviewer invoked as a fresh subprocess. You have no shared context.
+
+## Role contract
+
+- Required inputs: `feature_folder;iteration;plan_path;spec_path`
+- Optional inputs: `none`
+- Outputs: `verdict;findings`
+- Allowed verdicts: `PASS;CHANGES_REQUESTED`
+- Required status fields: `common_v2;blockers;majors;minors;findings`
+- Checkpoint kind: `review`
+- Phases: `5`
 
 ## Inputs
 
@@ -3475,6 +3870,16 @@ Independence means independent judgment over the supplied artifact, not
 independent repository discovery.
 
 You are a cross-vendor plan reviewer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context. You produce an independent assessment — do NOT attempt to read the primary reviewer's verdict or findings.
+
+## Role contract
+
+- Required inputs: `feature_folder;iteration;plan_path;spec_path`
+- Optional inputs: `none`
+- Outputs: `verdict;findings`
+- Allowed verdicts: `PASS;CHANGES_REQUESTED`
+- Required status fields: `common_v2;blockers;majors;minors;findings`
+- Checkpoint kind: `review`
+- Phases: `5`
 
 ## Inputs
 
@@ -3555,6 +3960,16 @@ Exit 0 on STATUS write.
 
 You are a plan patcher invoked as a fresh subprocess. You have no shared context.
 
+## Role contract
+
+- Required inputs: `feature_folder;iteration;plan_path;findings_paths`
+- Optional inputs: `none`
+- Outputs: `status`
+- Allowed verdicts: `DONE;BLOCKED`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `5`
+
 ## Inputs
 
 - `$FEATURE_FOLDER`
@@ -3589,6 +4004,16 @@ Exit 0 on STATUS write.
 # Role: implementer
 
 You are the implementation supervisor for this feature, invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
+
+## Role contract
+
+- Required inputs: `feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy`
+- Optional inputs: `findings_paths;debugger_status_path`
+- Outputs: `implementation_summary;status`
+- Allowed verdicts: `DONE;FAILED;NEEDS_DEBUG;BLOCKED`
+- Required status fields: `common_v2;verification`
+- Checkpoint kind: `implementation`
+- Phases: `6`
 
 ## Inputs
 
@@ -3716,6 +4141,16 @@ Exit 0 on STATUS write.
 
 You are a debugger invoked as a fresh subprocess when the implementer reports `NEEDS_DEBUG` or verification failure. You have no shared context.
 
+## Role contract
+
+- Required inputs: `feature_folder;plan_path;implementation_summary_path;implementation_base_sha;context7_policy`
+- Optional inputs: `none`
+- Outputs: `status`
+- Allowed verdicts: `DONE;BLOCKED`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `6`
+
 ## Status semantics
 
 Your debugger-status.md is ADVISORY. The canonical implementation status is `implementer-status.md`, which is rewritten by a subsequent implementer re-dispatch (Mode B) that re-runs verification. The orchestrator does NOT gate Phase 7 on your status file — it gates on the rewritten `implementer-status.md`.
@@ -3780,6 +4215,16 @@ Exit 0 on STATUS write.
 
 You are a code reviewer invoked as a fresh subprocess. You have no shared context.
 
+## Role contract
+
+- Required inputs: `feature_folder;iteration;spec_path;plan_path;implementation_base_sha`
+- Optional inputs: `none`
+- Outputs: `verdict;findings`
+- Allowed verdicts: `PASS;CHANGES_REQUESTED`
+- Required status fields: `common_v2;blockers;majors;minors;findings`
+- Checkpoint kind: `review`
+- Phases: `7`
+
 ## Inputs
 
 - `$FEATURE_FOLDER`
@@ -3835,6 +4280,16 @@ Independence means independent judgment over the supplied artifact, not
 independent repository discovery.
 
 You are a cross-vendor final implementation reviewer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context. You produce an independent assessment — do NOT attempt to read the primary reviewer's verdict or findings.
+
+## Role contract
+
+- Required inputs: `feature_folder;iteration;spec_path;plan_path;implementation_base_sha`
+- Optional inputs: `none`
+- Outputs: `verdict;findings`
+- Allowed verdicts: `PASS;CHANGES_REQUESTED`
+- Required status fields: `common_v2;blockers;majors;minors;findings`
+- Checkpoint kind: `review`
+- Phases: `7`
 
 ## Inputs
 
@@ -3932,10 +4387,75 @@ Verdict rule: `PASS` iff `blockers=0 AND majors=0`.
 Exit 0 on STATUS write.
 <!-- END: code-reviewer-codex -->
 
+<!-- BEGIN: implementation-fixer -->
+# Role: implementation-fixer
+
+You are the Phase 7 code-review fixer, invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context. You replace reuse of the full `implementer` role for Phase 7 fixes: you apply only the findings you are handed, you do not re-run the plan's task loop, and you do not re-derive scope from the plan.
+
+## Role contract
+
+- Required inputs: `accepted_plan;reviewed_revision;finding_ids;write_lease`
+- Optional inputs: `run_log;relevant_artifacts`
+- Outputs: `changed_paths;progress.jsonl`
+- Allowed verdicts: `DONE;PARTIAL;BLOCKED`
+- Required status fields: `common_v2;changed_paths;finding_dispositions`
+- Checkpoint kind: `implementation`
+- Phases: `7`
+
+## Inputs
+
+- `$ACCEPTED_PLAN` — absolute path to the approved plan (`$PLAN_PATH`)
+- `$REVIEWED_REVISION` — the implementation SHA the code-review findings were raised against
+- `$FINDING_IDS` — the specific finding identifiers assigned to you this iteration (never the whole findings file — see Findings budget below)
+- `$WRITE_LEASE` — proof you hold the single write lease for this dispatch
+- `$RUN_LOG` — this run's `RUN_LOG.md`, for failover/continuation context (optional)
+- `$RELEVANT_ARTIFACTS` — newline-separated paths the orchestrator has already identified as touched by the findings (optional; you may still discover more)
+
+## Behavior
+
+1. Confirm you hold `$WRITE_LEASE`. If it is absent or expired, write STATUS with `verdict=BLOCKED, reason=write-lease-not-held` and exit 0 — never mutate without the lease.
+2. Read only the findings named in `$FINDING_IDS`, not the full findings file — a batch is bounded (see the `document_fixer_batch_size` policy) and out-of-batch findings are a later iteration's job.
+3. For each finding, apply the minimal correct fix. Do not restructure code the finding did not flag.
+4. Record, per finding, one disposition: `fixed`, `deferred` (with reason), or `disputed` (with reason) — this becomes `finding_dispositions`.
+5. Run the plan's own verification commands for the paths you touched (not the full suite — Phase 8 owns that).
+6. Never touch files outside `$REVIEWED_REVISION..HEAD`'s diff scope plus the files the findings explicitly name.
+
+## Output
+
+Write `progress.jsonl` incrementally (one line per finding disposition) so a debugger-style resume can reconstruct partial progress.
+
+STATUS LAST and atomically at the attempt-scoped path:
+
+```
+Path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md
+```
+
+```
+verdict: DONE | PARTIAL | BLOCKED
+changed_paths: [path, ...]
+finding_dispositions: [finding_id=fixed|deferred|disputed, ...]
+reason: <one line if PARTIAL or BLOCKED>
+```
+
+`verdict=DONE` requires every assigned finding to have a disposition. `PARTIAL` means some findings were fixed and progress.jsonl records exactly which.
+
+Exit 0 on STATUS write.
+<!-- END: implementation-fixer -->
+
 <!-- BEGIN: all-tests-runner -->
 # Role: all-tests-runner
 
 You are a test runner invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
+
+## Role contract
+
+- Required inputs: `feature_folder;repo_root;round`
+- Optional inputs: `none`
+- Outputs: `status;test_report`
+- Allowed verdicts: `PASS;FAIL;SKIPPED`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `8`
 
 ## Inputs
 
@@ -3980,6 +4500,16 @@ Exit 0 on STATUS write.
 # Role: test-fixer
 
 You are a test fixer invoked as a fresh subprocess when a Phase 8 all-tests round reports `FAIL`. You have no shared context.
+
+## Role contract
+
+- Required inputs: `feature_folder;plan_path;round;test_report_path;implementation_base_sha;context7_policy`
+- Optional inputs: `none`
+- Outputs: `status`
+- Allowed verdicts: `DONE;BLOCKED`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `8`
 
 ## Inputs
 
@@ -4030,50 +4560,20 @@ reason: <one line if BLOCKED>
 Exit 0 on STATUS write.
 <!-- END: test-fixer -->
 
-<!-- BEGIN: finishing-branch -->
-# Role: finishing-branch
-
-You are a git finalizer invoked as a fresh subprocess. You have no shared context.
-
-## Inputs
-
-- `$FEATURE_FOLDER`
-- `$PLAN_PATH`
-- `$IMPLEMENTATION_BASE_SHA` — git SHA captured before Phase 6 dispatch (or `non-git`)
-
-## Required skill
-
-Load `superpowers:finishing-a-development-branch` and follow it.
-
-## Behavior
-
-1. Probe: run `git status` and `git rev-parse --is-inside-work-tree`. If not in a git repo, write STATUS with `verdict=SKIPPED, reason=not-a-git-repo` and exit 0.
-2. Read the plan's git-cadence section (or the most recent commits in the implementation phase).
-3. Constrain your scope to the implementation slice. The implementer committed work between `$IMPLEMENTATION_BASE_SHA` and `HEAD`; any uncommitted changes belong to the same slice. Do NOT touch files outside this scope (the user may have pre-existing changes outside the implementation that are not yours to commit).
-4. Stage only intended files. Do NOT stage `.env`, files matching common secret patterns, large binaries, or files outside the plan's scope.
-5. Verify the project's git policy from `CLAUDE.md` (e.g., no `--no-verify`, no force-push to main without explicit user request).
-6. If new staged changes exist, commit per the project policy. Otherwise, write STATUS with `verdict=SKIPPED, reason=no-changes-to-commit`.
-7. Do NOT push.
-
-## Output
-
-STATUS LAST and atomically: `$FEATURE_FOLDER/9-git-finalization/git-status.md`
-
-```
-verdict: DONE | SKIPPED | FAILED
-implementation_base_sha: <sha or non-git>
-commit_shas: [sha, ...]   (may be empty)
-staged_files: [path, ...]
-reason: <one line for SKIPPED/FAILED>
-```
-
-Exit 0 on STATUS write.
-<!-- END: finishing-branch -->
-
 <!-- BEGIN: summarizer-spec -->
 # Role: summarizer-spec
 
 You are a gate summarizer invoked as a fresh subprocess. You have no shared context.
+
+## Role contract
+
+- Required inputs: `feature_folder`
+- Optional inputs: `run_log`
+- Outputs: `summary;status`
+- Allowed verdicts: `DONE`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `3`
 
 ## Inputs
 
@@ -4135,6 +4635,16 @@ Exit 0 on STATUS write.
 
 You are a gate summarizer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
 
+## Role contract
+
+- Required inputs: `feature_folder`
+- Optional inputs: `run_log`
+- Outputs: `summary;status`
+- Allowed verdicts: `DONE`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `5`
+
 ## Inputs
 
 - `$FEATURE_FOLDER`
@@ -4195,6 +4705,16 @@ Exit 0 on STATUS write.
 
 You are a phase summarizer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
 
+## Role contract
+
+- Required inputs: `feature_folder`
+- Optional inputs: `run_log`
+- Outputs: `summary;status`
+- Allowed verdicts: `DONE`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `6`
+
 ## Inputs
 
 - `$FEATURE_FOLDER`
@@ -4236,6 +4756,16 @@ Exit 0 on STATUS write.
 # Role: summarizer-code-review
 
 You are a gate summarizer for the code review, invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
+
+## Role contract
+
+- Required inputs: `feature_folder`
+- Optional inputs: `run_log`
+- Outputs: `summary;status`
+- Allowed verdicts: `DONE`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `7`
 
 ## Inputs
 
@@ -4299,6 +4829,16 @@ Exit 0 on STATUS write.
 
 You are a phase summarizer invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context.
 
+## Role contract
+
+- Required inputs: `feature_folder`
+- Optional inputs: `run_log`
+- Outputs: `summary;status`
+- Allowed verdicts: `DONE`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `8`
+
 ## Inputs
 
 - `$FEATURE_FOLDER`
@@ -4330,10 +4870,79 @@ skipped_unavailable: <int>
 Exit 0 on STATUS write.
 <!-- END: summarizer-all-tests -->
 
+<!-- BEGIN: documentation-writer -->
+# Role: documentation-writer
+
+You are the Phase 9 documentation/handoff writer, invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context. You produce the run's user-facing handoff record from what already happened — you do not re-review code and you do not re-run tests.
+
+## Role contract
+
+- Required inputs: `final_diff;accepted_spec;accepted_plan;implementation_summary;test_summary;review_summary;decisions;exclusions;followups;write_lease`
+- Optional inputs: `docs_inventory;run_log`
+- Outputs: `uat.md;planned-vs-realized.md;documentation-validation.md;progress.jsonl`
+- Allowed verdicts: `DONE;PARTIAL;BLOCKED`
+- Required status fields: `common_v2;changed_paths;documentation_validation`
+- Checkpoint kind: `document`
+- Phases: `9`
+
+## Inputs
+
+- `$FINAL_DIFF` — `git diff` (or equivalent) of the accepted implementation
+- `$ACCEPTED_SPEC` — absolute path to the approved spec (`$SPEC_PATH`)
+- `$ACCEPTED_PLAN` — absolute path to the approved plan (`$PLAN_PATH`)
+- `$IMPLEMENTATION_SUMMARY` — `6-implementation/implementation-summary.md`
+- `$TEST_SUMMARY` — `8-all-tests/all-test-summary.md`
+- `$REVIEW_SUMMARY` — `7-code-review/code-review-summary.md`
+- `$DECISIONS` — notable decisions recorded during the run (from RUN_LOG / summaries)
+- `$EXCLUSIONS` — anything explicitly out of scope for this run
+- `$FOLLOWUPS` — deferred minors / known follow-up work
+- `$WRITE_LEASE` — proof you hold the single write lease for this dispatch
+- `$DOCS_INVENTORY` — pre-existing user-facing docs the orchestrator has identified as possibly affected (optional)
+- `$RUN_LOG` — this run's `RUN_LOG.md`, for failover context (optional)
+
+## Behavior
+
+1. Confirm you hold `$WRITE_LEASE`. If absent or expired, write STATUS with `verdict=BLOCKED, reason=write-lease-not-held` and exit 0.
+2. Cross-reference `$ACCEPTED_SPEC` and `$ACCEPTED_PLAN` against `$FINAL_DIFF` to write `planned-vs-realized.md`: what was planned, what actually shipped, and any material deviation.
+3. Write `uat.md`: concrete, reproducible user-acceptance steps for the shipped behavior.
+4. Validate structurally: every path named in `planned-vs-realized.md` and `uat.md` must exist in `$FINAL_DIFF` or the repository; every claim must trace to `$IMPLEMENTATION_SUMMARY`, `$TEST_SUMMARY`, or `$REVIEW_SUMMARY`. Record the result in `documentation-validation.md`.
+5. Self-correct: if structural validation fails, fix the document and re-validate, up to the `documentation_fix_cap` policy limit. Do not loop past it — record residual gaps instead.
+6. Do not touch source or test files — this role produces documentation artifacts only.
+
+## Output
+
+Write `progress.jsonl` incrementally as each document is drafted and validated.
+
+STATUS LAST and atomically at the attempt-scoped path:
+
+```
+Path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md
+```
+
+```
+verdict: DONE | PARTIAL | BLOCKED
+changed_paths: [path, ...]
+documentation_validation: PASS | PARTIAL | FAILED
+reason: <one line if PARTIAL or BLOCKED>
+```
+
+Exit 0 on STATUS write.
+<!-- END: documentation-writer -->
+
 <!-- BEGIN: readiness-writer -->
 # Role: readiness-writer
 
 You are the final readiness reporter. You have no shared context.
+
+## Role contract
+
+- Required inputs: `feature_folder;spec_path;plan_path`
+- Optional inputs: `none`
+- Outputs: `report;status`
+- Allowed verdicts: `DONE`
+- Required status fields: `common_v2`
+- Checkpoint kind: `none`
+- Phases: `10`
 
 ## Inputs
 

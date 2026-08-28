@@ -123,6 +123,13 @@ def cmd_unmarked():
     return rc
 
 
+ROLE_COLUMNS = (
+    "role", "vendor", "model", "effort", "timeout_minutes", "mutates",
+    "long_running", "may_spawn_children", "required_inputs", "optional_inputs",
+    "status_template", "outputs", "verdicts", "required_status_fields",
+    "checkpoint_kind", "phases",
+)
+
 TABLE_SPECS = {
     "policies": ("Process Policy Registry", ("policy", "value", "meaning")),
     "events": ("Event Contract Registry", ("event_type", "required_fields", "proposition_required")),
@@ -130,6 +137,7 @@ TABLE_SPECS = {
         "Recovery Matrix",
         ("matrix_id", "classification", "mutation_state", "action"),
     ),
+    "roles": ("Role Contract Registry", ROLE_COLUMNS),
 }
 
 
@@ -205,40 +213,71 @@ def cmd_recovery():
     return cmd_named_table("recovery")
 
 
-def cmd_roles():
-    """Emit the role table as TSV: role, vendor, model, effort, timeout_min.
+def _long_role_headroom_threshold_minutes(doc_text: str) -> int:
+    """The `long_role_headroom_threshold_minutes` policy value, read straight
+    from the Process Policy Registry table -- never hardcoded here, so the
+    long_running derivation rule below cannot silently drift from Task 1's
+    policy table if that threshold is ever revised."""
+    heading, columns = TABLE_SPECS["policies"]
+    rows = named_markdown_table(doc_text, heading, columns)
+    for row in rows[1:]:
+        if row[0] == "long_role_headroom_threshold_minutes":
+            return int(row[1])
+    raise SystemExit("long_role_headroom_threshold_minutes missing from Process Policy Registry")
 
-    The table is located by its header row, which must contain all five
-    column names. Cells are stripped of backticks and surrounding space.
-    An em-dash or empty cell becomes the empty string.
+
+def cmd_roles():
+    """Emit the full 16-column role-contract registry as TSV.
+
+    Unlike policies/events/recovery, this does NOT use cmd_named_table: role
+    uniqueness is deliberately NOT enforced here. `role_contract_field` (the
+    cookbook awk lookup) is the sole enforcement point for an unknown-or-
+    duplicate role (exit 43) -- pre-deduping here would make that runtime path
+    unreachable and untestable. named_markdown_table is still reused for the
+    header-shape/heading location logic, per extractor convention.
+
+    Also rejects `long_running` DRIFT: the column is a materialized (not
+    hand-picked) value -- spec 6.1 derives it "from timeout/child behavior" --
+    so a row whose declared long_running disagrees with that derivation is a
+    process-definition bug, caught here rather than silently trusted.
     """
     BUILD.mkdir(parents=True, exist_ok=True)
-    rows, in_table = [], False
-    for raw in DOC.read_text().splitlines():
-        if not raw.startswith("|"):
-            if in_table:
-                break
-            continue
-        cells = [c.strip().strip("`").strip() for c in raw.strip().strip("|").split("|")]
-        low = [c.lower() for c in cells]
-        if not in_table:
-            if {"role", "vendor", "model", "effort", "timeout"} <= set(
-                w for c in low for w in c.split()
-            ):
-                in_table = True
-            continue
-        if set("".join(cells)) <= set("-: "):
-            continue  # separator row
-        if len(cells) < 5:
-            continue
-        role, vendor, model, effort, timeout = cells[:5]
-        norm = lambda v: "" if v in {"—", "-", "n/a", ""} else v  # noqa: E731
-        rows.append("\t".join([role, norm(vendor), norm(model),
-                               norm(effort), norm(timeout)]))
-    if not rows:
-        sys.stderr.write("extract.py: role table not found\n")
+    doc_text = DOC.read_text()
+    heading, columns = TABLE_SPECS["roles"]
+    rows = named_markdown_table(doc_text, heading, columns)
+    header, data = rows[0], rows[1:]
+    if not data:
+        sys.stderr.write("extract.py: role table has no rows\n")
         return 1
-    (BUILD / "roles.tsv").write_text("\n".join(rows) + "\n")
+    norm = lambda v: "" if v in {"—", "-", "n/a", ""} else v  # noqa: E731
+
+    threshold = _long_role_headroom_threshold_minutes(doc_text)
+    idx = {name: i for i, name in enumerate(columns)}
+    lines = ["\t".join(header)]
+    for row in data:
+        cells = [norm(cell) for cell in row]
+        role = cells[idx["role"]]
+        timeout_raw = cells[idx["timeout_minutes"]]
+        declared_lr = cells[idx["long_running"]]
+        may_spawn = cells[idx["may_spawn_children"]]
+        phases = cells[idx["phases"]]
+        try:
+            timeout = int(timeout_raw)
+        except ValueError:
+            raise SystemExit(f"{heading}: {role} has a non-integer timeout_minutes: {timeout_raw!r}")
+        # "Derived from timeout/child behavior" (spec 6.1): a long timeout, a
+        # child-only contract, or a role that spawns children all qualify.
+        expected_lr = "yes" if (timeout >= threshold or phases == "child" or may_spawn == "yes") else "no"
+        if declared_lr != expected_lr:
+            raise SystemExit(
+                f"{heading}: {role} declares long_running={declared_lr!r} but "
+                f"timeout_minutes={timeout}/phases={phases!r}/may_spawn_children={may_spawn!r} "
+                f"(threshold={threshold}) derives long_running={expected_lr!r}"
+            )
+        lines.append("\t".join(cells))
+    text_out = "\n".join(lines) + "\n"
+    (BUILD / "roles.tsv").write_text(text_out)
+    sys.stdout.write(text_out)
     return 0
 
 

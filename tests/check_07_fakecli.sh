@@ -29,6 +29,12 @@ PROCESS_PATH="$PROCESS_DOC"
 init_orchestration_vars \
   || { _fail "init_orchestration_vars failed in the fake environment"; finish; }
 
+# Every role_* lookup below (role_model, role_mutates, resolved_models_block, ...)
+# resolves through the extracted role-contract registry, not a hand-maintained
+# case statement -- point it at a freshly extracted copy.
+python3 "$REPO_TOP/tests/lib/extract.py" roles > /dev/null
+export ROLE_CONTRACTS_PATH="$BUILD/roles.tsv"
+
 # --- Fixture values for every key render_keys() lists ------------------------
 # dispatch_reviewers_parallel renders BOTH prompts in the parent before either
 # child launches (Task 13), so every variable an appendix might reference must
@@ -161,7 +167,7 @@ assert_eq UNFINISHED "$(state_of 6 00 implementer "$ST")" \
 # 5. role_mutates decides what UNFINISHED means. This is the rule that keeps a
 #    half-run implementer from being silently re-run over its own commits.
 assert_eq yes "$(role_mutates implementer)"           "the implementer mutates"
-assert_eq yes "$(role_mutates finishing-branch)"      "the git finalizer mutates"
+assert_eq yes "$(role_mutates documentation-writer)"  "the documentation writer mutates"
 assert_eq no  "$(role_mutates summarizer-spec)"       "summarizers are read-only"
 assert_eq no  "$(role_mutates code-reviewer-claude)"  "reviewers are read-only"
 

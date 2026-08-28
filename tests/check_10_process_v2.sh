@@ -57,4 +57,14 @@ rc=0; policy_value review_iteration_cap 2>"$BUILD/policy.err" >/dev/null || rc=$
 assert_rc 1 "$rc" "missing registry fails without killing the shell"
 assert_contains 'POLICY_REGISTRY_MISSING' "$BUILD/policy.err" "missing registry is typed"
 
+# Spec 6.3: reconstruction must run at the start of EVERY phase shell. The
+# helper being correct is worthless if the normative per-phase bootstrap never
+# names it -- that regression already happened once.
+assert_present '^init_orchestration_vars [0-9-]+ \|\| exit 1$' "$PROCESS_DOC" \
+  "the per-phase bootstrap snippet calls init_orchestration_vars <phase>"
+# assert_absent pipes into head; under `set -euo pipefail` a no-match grep would
+# abort this script instead of passing. Count instead.
+stale=$(grep -c '^CONTEXT7_POLICY=' "$PROCESS_DOC" || true)
+assert_eq 0 "$stale" "no phase block reconstructs only the context7 policy"
+
 finish

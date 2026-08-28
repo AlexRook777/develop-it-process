@@ -1,45 +1,73 @@
 #!/usr/bin/env bash
-# Check 6: the role table and the role_* lookups are one source of truth.
-# EXPECTED RED until Task 5 (role_* functions + table rewrite).
+# Check 4: the role contract registry is one complete, non-drifting source of
+# truth -- one 16-column row per role, no duplicates, no empty required cells.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 source lib/assert.sh
 
-python3 lib/extract.py roles 2>/dev/null || { _fail "role table not parseable"; finish; }
-load_cookbook || finish
-# role_* are pure lookups: no orchestration variables needed.
+EXPECTED_HEADER="role	vendor	model	effort	timeout_minutes	mutates	long_running	may_spawn_children	required_inputs	optional_inputs	status_template	outputs	verdicts	required_status_fields	checkpoint_kind	phases"
 
-for fn in role_model role_effort role_timeout; do
+python3 lib/extract.py roles >/dev/null 2>&1 || { _fail "role table not parseable"; finish; }
+
+header="$(head -n1 "$BUILD/roles.tsv")"
+assert_eq "$EXPECTED_HEADER" "$header" "role table header is the complete 16-column contract"
+[ "$_FAILURES" -eq 0 ] || finish
+
+# --- reject duplicate roles ---
+dupes="$(tail -n +2 "$BUILD/roles.tsv" | cut -f1 | sort | uniq -d)"
+assert_eq "" "$dupes" "no duplicate role rows in the registry"
+
+# --- reject empty required fields (every column except effort/optional_inputs) ---
+empty_report="$(awk -F '\t' '
+  NR==1 { for (i=1;i<=NF;i++) name[i]=$i; next }
+  {
+    for (i=1;i<=NF;i++) {
+      if (name[i] == "effort" || name[i] == "optional_inputs") continue
+      if ($i == "") print $1 "." name[i]
+    }
+  }
+' "$BUILD/roles.tsv")"
+assert_eq "" "$empty_report" "no empty required-field cells in the registry"
+
+load_cookbook || finish
+
+for fn in role_vendor role_model role_effort role_timeout role_mutates \
+          role_may_spawn_children role_required_inputs role_optional_defaults \
+          role_status_path role_outputs role_verdicts \
+          role_required_status_fields role_checkpoint_kind role_phases; do
   if declare -F "$fn" >/dev/null; then _ok "$fn is defined"
   else _fail "$fn is not defined in the cookbook"; fi
 done
 [ "$_FAILURES" -eq 0 ] || finish
 
+export ROLE_CONTRACTS_PATH="$BUILD/roles.tsv"
+
+# --- explicit deltas and counts from the plan ---
+assert_tsv_key "$BUILD/roles.tsv" role implementation-fixer
+assert_tsv_key "$BUILD/roles.tsv" role documentation-writer
+assert_tsv_missing_key "$BUILD/roles.tsv" role finishing-branch
+assert_tsv_field "$BUILD/roles.tsv" impl-worker status_template none
+assert_tsv_field "$BUILD/roles.tsv" impl-worker phases child
+assert_eq 25 "$(tail -n +2 "$BUILD/roles.tsv" | wc -l | tr -d ' ')" "25 registry rows including child-only impl-worker"
+assert_eq 24 "$(awk -F '\t' 'NR>1 && $16 != "child" {n++} END {print n+0}' "$BUILD/roles.tsv")" "24 top-level dispatched roles"
+
+# --- role_* wrappers agree with the registry, for every row ---
 rows=0
-# NOTE: `IFS=$'\t' read` collapses consecutive tabs and trims blank fields
-# because tab is an IFS-whitespace character regardless of what IFS is set
-# to -- it is NOT preserved as a plain delimiter the way e.g. ',' would be.
-# Several roles have a genuinely empty `effort` cell, so field-splitting via
-# `read` silently shifts columns. Use `cut` per field instead, which treats
-# tab as a literal delimiter and preserves empty fields.
 while IFS= read -r _row_line; do
   [ -n "$_row_line" ] || continue
   role="$(printf '%s' "$_row_line" | cut -f1)"
-  case "$role" in orchestrator) continue ;; esac
   model="$(printf '%s' "$_row_line" | cut -f3)"
   effort="$(printf '%s' "$_row_line" | cut -f4)"
   timeout="$(printf '%s' "$_row_line" | cut -f5)"
   rows=$((rows + 1))
-  assert_eq "$model"   "$(role_model   "$role")" "role_model $role"
-  assert_eq "$effort"  "$(role_effort  "$role")" "role_effort $role"
-  assert_eq "$timeout" "$(role_timeout "$role")" "role_timeout $role"
-done < "$BUILD/roles.tsv"
+  assert_eq "$model"   "$(role_model   "$role" 2>/dev/null)" "role_model $role"
+  assert_eq "$effort"  "$(role_effort  "$role" 2>/dev/null)" "role_effort $role"
+  assert_eq "$timeout" "$(role_timeout "$role" 2>/dev/null)" "role_timeout $role"
+done < <(tail -n +2 "$BUILD/roles.tsv")
 
-assert_eq 24 "$rows" "role table covers all 24 dispatched roles"
+assert_eq 25 "$rows" "role table covers all 25 registry rows"
 
 # No stale ids, and no model may be named only in the table.
-# `claude-fable-5` was dropped from the table in 19eb57e (spec-fixer, plan-writer
-# and plan-fixer moved to opus); it is intentionally absent from this list.
 for m in claude-haiku-4-5 claude-opus-5 claude-sonnet-5 gpt-5.6-luna gpt-5.6-sol; do
   "$GREP_BIN" -qF "$m" "$BUILD/roles.tsv" || _fail "table never assigns $m"
 done
@@ -50,5 +78,8 @@ if role_model definitely-not-a-role >/dev/null 2>&1; then
 else
   _ok "role_model rejects an unknown role"
 fi
+
+# no extracted contract may name the retired finishing-branch role
+assert_absent 'finishing-branch' "$BUILD/roles.tsv" "no extracted contract contains finishing-branch"
 
 finish
