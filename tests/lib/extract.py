@@ -123,6 +123,88 @@ def cmd_unmarked():
     return rc
 
 
+TABLE_SPECS = {
+    "policies": ("Process Policy Registry", ("policy", "value", "meaning")),
+    "events": ("Event Contract Registry", ("event_type", "required_fields", "proposition_required")),
+    "recovery": (
+        "Recovery Matrix",
+        ("matrix_id", "classification", "mutation_state", "action"),
+    ),
+}
+
+
+def normalized_header(cell: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", cell.strip().lower()).strip("_")
+
+
+def section_after_heading(text: str, heading: str) -> str:
+    pattern = re.compile(rf"^(?P<level>#+)\s+{re.escape(heading)}\s*$", re.MULTILINE)
+    match = pattern.search(text)
+    if match is None:
+        raise SystemExit(f"missing heading: {heading}")
+    level = len(match.group("level"))
+    tail = text[match.end():]
+    next_heading = re.search(rf"^#{{1,{level}}}\s+", tail, re.MULTILINE)
+    return tail if next_heading is None else tail[:next_heading.start()]
+
+
+def markdown_rows(section: str) -> list[list[str]]:
+    rows = []
+    for raw in section.splitlines():
+        if not raw.startswith("|"):
+            if rows:
+                break
+            continue
+        rows.append([cell.strip().strip("`") for cell in raw.strip().strip("|").split("|")])
+    if len(rows) < 3:
+        raise SystemExit("table has no data rows")
+    if any(set(cell) - set("-: ") for cell in rows[1]):
+        raise SystemExit("table separator is malformed")
+    return rows
+
+
+def named_markdown_table(text: str, heading: str, columns: tuple[str, ...]) -> list[list[str]]:
+    section = section_after_heading(text, heading)
+    rows = markdown_rows(section)
+    actual = tuple(normalized_header(cell) for cell in rows[0])
+    if actual != columns:
+        raise SystemExit(f"{heading}: expected columns {columns}, got {actual}")
+    for row in rows[2:]:
+        if len(row) != len(columns) or any("\t" in cell or "\n" in cell for cell in row):
+            raise SystemExit(f"{heading}: invalid row {row}")
+    return [list(columns), *rows[2:]]
+
+
+def cmd_named_table(name):
+    heading, columns = TABLE_SPECS[name]
+    BUILD.mkdir(parents=True, exist_ok=True)
+    rows = named_markdown_table(DOC.read_text(), heading, columns)
+    header, data = rows[0], rows[1:]
+    seen = set()
+    for row in data:
+        key = row[0]
+        if key in seen:
+            raise SystemExit(f"{heading}: duplicate key {key}")
+        seen.add(key)
+    lines = ["\t".join(header)] + ["\t".join(row) for row in data]
+    text = "\n".join(lines) + "\n"
+    (BUILD / f"{name}.tsv").write_text(text)
+    sys.stdout.write(text)
+    return 0
+
+
+def cmd_policies():
+    return cmd_named_table("policies")
+
+
+def cmd_events():
+    return cmd_named_table("events")
+
+
+def cmd_recovery():
+    return cmd_named_table("recovery")
+
+
 def cmd_roles():
     """Emit the role table as TSV: role, vendor, model, effort, timeout_min.
 
@@ -161,7 +243,8 @@ def cmd_roles():
 
 
 CMDS = {"cookbook": cmd_cookbook, "snippets": cmd_snippets,
-        "roles": cmd_roles, "unmarked": cmd_unmarked}
+        "roles": cmd_roles, "unmarked": cmd_unmarked,
+        "policies": cmd_policies, "events": cmd_events, "recovery": cmd_recovery}
 
 if __name__ == "__main__":
     if len(sys.argv) != 2 or sys.argv[1] not in CMDS:

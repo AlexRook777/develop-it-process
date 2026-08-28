@@ -12,6 +12,8 @@ If you find yourself reading an artifact, drafting review feedback, editing the 
 - Both `claude` and `codex` CLIs available on PATH.
 - A git repository (most actions are tolerant of non-git; Phase 9 is skipped when not in a repo).
 
+Process schema `2` (see the Process Policy Registry below) applies to every newly created run's `RUN_LOG.md`, STATUS, checkpoint, and event records. It is not retroactive: historical feature-folder artifacts written by a prior version of this prompt are left exactly as they are, and no compatibility reader or migration path is provided for them.
+
 ## Orchestration contract
 
 You are a strict orchestrator. You sequence subprocess agents. You do not do their work.
@@ -206,6 +208,66 @@ implement it, and `tests/check_04_table.sh` asserts the two agree for every row 
 they cannot drift. `impl-worker` is the pinned agent type used by the
 implementer's sub-subagents; its timeout matches the implementer's because it
 runs inside that dispatch.
+
+## Process Policy Registry
+
+These are the reviewed schema-v2 numeric policy constants. Each is a fixed
+process constant — not a per-run tunable — and every occurrence elsewhere in
+this document (caps, thresholds, retry counts) must agree with this table.
+`tests/lib/extract.py policies` extracts this table verbatim; `tests/check_10_process_v2.sh`
+asserts every row is present with its exact value.
+
+| policy | value | meaning |
+|---|---:|---|
+| process_schema_version | 2 | Schema for new RUN_LOG, STATUS, checkpoint, and event records |
+| prelaunch_correction_cap | 1 | Automatic correction after an input/render/prelaunch defect |
+| publication_retry_cap | 1 | Cheap retry after proven STATUS publication loss |
+| transient_retry_cap | 1 | Fresh redispatch when a transient attempt produced no mutation |
+| continuation_cap | 3 | Continuations after durable partial progress for one logical role invocation |
+| review_iteration_cap | 10 | Hard cap for a review gate |
+| document_fixer_batch_size | 8 | Maximum assigned findings in one document-fixer batch |
+| documentation_fix_cap | 2 | Maximum documentation self-correction rounds |
+| artifact_growth_warning_pct | 10 | Per-fix net growth contributing to divergence detection |
+| divergent_round_cap | 2 | Consecutive divergent rounds before automatic fixing stops |
+| long_role_headroom_threshold_minutes | 60 | Timeout threshold requiring a just-in-time vendor liveness/headroom probe |
+
+Resolve a single policy value with the cookbook helper below — never by
+re-reading this table with ad hoc `grep`/`awk`, which would drift from the
+extractor's own parsing rules.
+
+<!-- lint: cookbook -->
+```bash
+# ---- Process policy registry ------------------------------------------------
+# Reads the generated policy.tsv (materialized under $RUNTIME_DIR by
+# bootstrap_runtime) for a single named value. A policy name absent from the
+# registry, or duplicated in it, is a process-definition bug: fail loudly with
+# a machine-readable token rather than silently defaulting.
+# Never abort the caller: a missing $RUNTIME_DIR or policy.tsv returns a token
+# on stderr and a non-zero status, exactly like an unknown name. A top-level
+# ${VAR:?} here would kill any shell that merely sources the cookbook.
+policy_value() {
+  local name="$1"
+  local path
+  if [ -z "${RUNTIME_DIR:-}" ]; then
+    printf 'POLICY_RUNTIME_UNSET:%s\n' "$name" >&2
+    return 1
+  fi
+  path="$RUNTIME_DIR/policy.tsv"
+  if [ ! -r "$path" ]; then
+    printf 'POLICY_REGISTRY_MISSING:%s\n' "$path" >&2
+    return 1
+  fi
+  awk -F'\t' -v n="$name" '
+    NR == 1 { next }
+    $1 == n { v = $2; c++ }
+    END {
+      if (c == 0) { print "POLICY_UNKNOWN:" n > "/dev/stderr"; exit 1 }
+      if (c > 1)  { print "POLICY_DUPLICATE:" n > "/dev/stderr"; exit 1 }
+      print v
+    }
+  ' "$path"
+}
+```
 
 ## Skill selection rule
 

@@ -42,6 +42,16 @@ assert_absent() {
   else _fail "$msg"; note "pattern should be absent: $pattern"; printf '    %s\n' "$hits"; fi
 }
 
+assert_contains() { local s=$1 f=$2 m=$3; grep -Fq -- "$s" "$f" && _ok "$m" || _fail "$m"; }
+assert_line_count() { local n=$1 f=$2 m=$3; assert_eq "$n" "$(wc -l < "$f" | tr -d ' ')" "$m"; }
+assert_exists() { local p=$1 m=$2; [ -e "$p" ] && _ok "$m" || _fail "$m"; }
+assert_not_exists() { local p=$1 m=$2; [ ! -e "$p" ] && _ok "$m" || _fail "$m"; }
+assert_glob_count() {
+  local expected=$1 pattern=$2 m=$3 actual
+  actual=$(compgen -G "$pattern" | wc -l | tr -d ' ')
+  assert_eq "$expected" "$actual" "$m"
+}
+
 skip() { printf '  SKIP %s\n' "$*"; exit 77; }
 
 finish() {

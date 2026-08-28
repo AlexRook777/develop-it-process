@@ -11,10 +11,15 @@ LIVE=no
 pass=0 fail=0 skipped=0 failed_names=()
 
 for check in check_*.sh; do
+  is_live=0
   case "$check" in
-    check_9*) [ "$LIVE" = yes ] || { printf '\n== %s\n  SKIP tier 2; pass --live to run\n' "$check"
-                                    skipped=$((skipped + 1)); continue; } ;;
+    check_90_*) is_live=1 ;;
+    *)          is_live=0 ;;
   esac
+  if [ "$is_live" -eq 1 ] && [ "$LIVE" != yes ]; then
+    printf '\n== %s\n  SKIP tier 2; pass --live to run\n' "$check"
+    skipped=$((skipped + 1)); continue
+  fi
   printf '\n== %s\n' "$check"
   bash "$check"
   case "$?" in
