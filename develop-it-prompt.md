@@ -1950,6 +1950,233 @@ If you find yourself writing `codex exec ... -a never` (global option after `exe
 
 Pass the role; effort and timeout follow from the Models table.
 
+### Normalized vendor invocation — `invoke_vendor` (spec §12)
+
+`claude_invoke`/`codex_invoke` above remain the dispatch used by the current
+`dispatch_role`/`dispatch_reviewers_parallel` helpers. `invoke_vendor` is the
+new, single registry-driven launch point the schema-v2 dispatch engine
+(`dispatch_attempt`, a later task) will call instead: it takes an
+already-rendered prompt FILE rather than stdin content, always launches
+Claude from `$REPO_ROOT` with an unlimited background-wait ceiling, keeps
+Codex's `-C "$REPO_ROOT"` and global-option ordering, rejects an unknown
+vendor before any subprocess launches, and inserts the long-role headroom
+probe from spec §12.4 before a long launch. Like `claude_invoke`/`codex_invoke`,
+it never classifies the exit code it returns — that is `classify_attempt`'s job
+(a later task).
+
+<!-- lint: cookbook -->
+```bash
+# Reserved invoke_vendor prelaunch exit codes -- never a real vendor exit code
+# (vendor CLIs exit small codes like 0-2 normally; `timeout`'s own reserved
+# codes are 124/137). A future record_event call (Task 6/8) branches on these
+# to classify DISPATCH_NOT_LAUNCHED (95/96) vs a run-scoped VENDOR_UNAVAILABLE
+# (97) before ever reaching classify_attempt's ordinary vendor-exit-code path:
+#   95  unknown vendor, or a role/field lookup failure (INVOKE_VENDOR_ROLE_LOOKUP_FAILED / INVOKE_VENDOR_UNKNOWN_VENDOR)
+#   96  a prelaunch input/registry defect (INVOKE_VENDOR_PROMPT_MISSING /
+#       INVOKE_VENDOR_BAD_TIMEOUT / INVOKE_VENDOR_BAD_REPO_ROOT / a field lookup failure)
+#   97  VENDOR_HEADROOM_REFUSED -- the spend/quota probe below refused (or could not prove liveness)
+# Each return site keeps its own echo token; grep for the token, not the number.
+
+# One minimal, cheap liveness call proving the vendor CLI currently responds
+# and is not mid a spend/quota refusal. This is the ONLY vendor spend before
+# the registry timeout/spend gates below. It proves ONLY current liveness --
+# it MUST NOT be read as proof enough budget remains to finish the role (spec
+# S12.4), and it never runs when the role's timeout is below the policy
+# threshold. Any non-zero probe exit (missing binary, the probe's own 30s
+# timeout, a 5xx) is ALSO refused -- an inconclusive probe proves nothing, so
+# it is treated the same as an explicit spend/quota refusal, never as "OK".
+_vendor_headroom_probe() {
+  # Usage: _vendor_headroom_probe <role> <vendor> <attempt_out> <attempt_err>
+  # <attempt_out>/<attempt_err> are the SUBSTANTIVE attempt's own stdout/stderr
+  # paths (invoke_vendor's $out/$err) -- used only to derive sibling paths to
+  # persist the probe's own transcript. A future run-scoped VENDOR_UNAVAILABLE
+  # event (Task 6/8) needs that transcript as evidence, so it is never deleted
+  # here; the CALLER (invoke_vendor) owns cleanup once that event is recorded.
+  local role="$1" vendor="$2" attempt_out="$3" attempt_err="$4"
+  local probe_out="${attempt_out}.headroom-probe" probe_err="${attempt_err}.headroom-probe"
+  local model effort tpid rc
+  : > "$probe_out"; : > "$probe_err"
+  model="$(role_contract_field "$role" model)" || return 1
+  case "$vendor" in
+    claude)
+      ( cd "$REPO_ROOT" || { echo "INVOKE_VENDOR_BAD_REPO_ROOT:$REPO_ROOT" >&2; exit 96; }
+        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 \
+          timeout --kill-after=10s 30s \
+          claude --model "$model" -p --output-format=json \
+                 --dangerously-skip-permissions - \
+          <<< "ping" 1> "$probe_out" 2> "$probe_err" &
+        tpid=$!
+        wait "$tpid"; trc=$?
+        kill -KILL -- "-$tpid" 2>/dev/null
+        exit "$trc"
+      )
+      rc=$?
+      ;;
+    codex)
+      effort="$(role_contract_field "$role" effort)" || return 1
+      ( timeout --kill-after=10s 30s \
+          codex -a never -m "$model" -c model_reasoning_effort="$effort" \
+            exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json - \
+          <<< "ping" 1> "$probe_out" 2> "$probe_err" &
+        tpid=$!
+        wait "$tpid"; trc=$?
+        kill -KILL -- "-$tpid" 2>/dev/null
+        exit "$trc"
+      )
+      rc=$?
+      ;;
+    *) return 1 ;;
+  esac
+  # A non-zero probe (missing binary, the probe's own timeout, a transport
+  # error) is not proof of liveness -- refuse, same as an explicit signature.
+  [ "$rc" -eq 0 ] || return 1
+  # Same 5b ceiling vocabulary as "Mode 5 has two shapes" in Failure handling
+  # below -- a probe refusal and a substantive-dispatch ceiling are the same
+  # account-level condition, so they must be recognised by the same words.
+  if "$GREP_BIN" -qiE \
+      'spend limit|monthly spend|usage limit reached|credit balance is too low|billing|quota exceeded|contact your organization administrator|insufficient_quota' \
+      "$probe_out" "$probe_err" 2>/dev/null
+  then
+    return 1
+  fi
+  return 0
+}
+
+# The single registry-driven launch point. Rejects an unknown vendor BEFORE
+# any subprocess launches (a PRELAUNCH_FAILED-shaped defect, never a vendor
+# outage). Applies the registry timeout with `timeout --kill-after`.
+#
+# This host's `timeout` (uutils coreutils) leaves a grandchild the monitored
+# process itself forked alive after a --kill-after escalation, even though all
+# three processes share one process group -- confirmed empirically on this
+# host, not assumed from either implementation's docs. GNU coreutils' own
+# `cleanup()` signals the whole group, so this gap may not reproduce there;
+# the sweep below is unconditional defense-in-depth regardless of which
+# `timeout` is on PATH, and is a harmless no-op when nothing survives. Each
+# branch backgrounds `timeout` itself, `wait`s for it, and then sends exactly
+# one SIGKILL to the whole group by negative PID as a post-mortem sweep --
+# never STOP/CONT/TERM, and never while the wrapper is still live: this fires
+# strictly AFTER `wait` returns, so it can never be mistaken for extending a
+# live deadline.
+invoke_vendor() {
+  # Usage: invoke_vendor <role> <prompt_file> <stdout_path> <stderr_path>
+  local role="$1" prompt_file="$2" out="$3" err="$4"
+  local vendor model timeout_minutes threshold long_running grace deadline rc
+
+  vendor="$(role_contract_field "$role" vendor)" \
+    || { echo "INVOKE_VENDOR_ROLE_LOOKUP_FAILED:$role" >&2; return 95; }
+  case "$vendor" in
+    claude|codex) : ;;
+    *) echo "INVOKE_VENDOR_UNKNOWN_VENDOR:$role:$vendor" >&2; return 95 ;;
+  esac
+
+  [ -n "$prompt_file" ] && [ -r "$prompt_file" ] \
+    || { echo "INVOKE_VENDOR_PROMPT_MISSING:$prompt_file" >&2; return 96; }
+
+  model="$(role_contract_field "$role" model)"                     || return 96
+  timeout_minutes="$(role_contract_field "$role" timeout_minutes)" || return 96
+
+  # A non-numeric or non-positive registry cell must fail LOUDLY here, not
+  # coerce to 0 in the awk comparison below and silently skip the paid
+  # headroom gate (the exact "silently defaulting" policy_value's own doc
+  # comment forbids) -- and not reach `timeout` as a garbage "${x}m" deadline.
+  # Checked BEFORE any policy_value lookup: this is a defect in THIS role's
+  # own registry row, and must be diagnosed as such even when $RUNTIME_DIR/
+  # policy.tsv is not yet available (e.g. a unit test with no bootstrap).
+  # Same expression as tests/check_04_table.sh: a bare character-class test
+  # accepts "1.2.3", which awk then reads as 1.2 -- spending a paid probe
+  # before `timeout` rejects the interval.
+  if ! printf '%s' "$timeout_minutes" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+    echo "INVOKE_VENDOR_BAD_TIMEOUT:$role:$timeout_minutes" >&2
+    return 96
+  fi
+  if ! awk -v t="$timeout_minutes" 'BEGIN{exit !(t+0 > 0)}'; then
+    echo "INVOKE_VENDOR_BAD_TIMEOUT:$role:$timeout_minutes" >&2
+    return 96
+  fi
+
+  long_running="$(role_contract_field "$role" long_running)"       || return 96
+  threshold="$(policy_value long_role_headroom_threshold_minutes)" || return 96
+
+  # Gate on the registry's OWN long_running classification (Step 4) in
+  # addition to the direct timeout/threshold comparison: long_running=yes also
+  # covers phases=child and may_spawn_children=yes (spec: "long_running is
+  # materialized, not hand-picked"), two cases a bare timeout>=threshold
+  # compare would miss. This is a pure OR -- it can only make the gate fire in
+  # MORE cases, never fewer, so a role that already qualifies via timeout
+  # keeps qualifying regardless of what a hand-built test registry's
+  # long_running cell says.
+  #
+  # NOTE: this gate is deliberately BROADER than spec 12.4's literal wording
+  # ("a role whose timeout_minutes is at least the threshold"). In the current
+  # registry the two are identical -- every long_running=yes role is >=60 and
+  # no role is yes below it -- so the OR spends nothing extra today. It only
+  # bites a future sub-threshold role that spawns children, and for exactly
+  # that role a paid liveness probe is the right answer, since 12.2's concern
+  # is child-spawning roles. If such a role is added, the 59/60 boundary test
+  # in check_07 must be re-pointed at a role that is still long_running=no.
+  if [ "$long_running" = yes ] \
+     || awk -v t="$timeout_minutes" -v th="$threshold" 'BEGIN{exit !(t+0 >= th+0)}'; then
+    if ! _vendor_headroom_probe "$role" "$vendor" "$out" "$err"; then
+      echo "VENDOR_HEADROOM_REFUSED:$role:$vendor" >&2
+      return 97
+    fi
+  fi
+
+  grace=60s
+  deadline="${timeout_minutes}m"
+
+  # DISPATCH_ID/LOGICAL_DISPATCH_ID/ATTEMPT are ordinary (unexported) shell
+  # variables everywhere else in this document -- render_prompt depends on
+  # exactly that to catch an unresolved $VAR. Exporting them on the line below
+  # is scoped to this ONE command (the vendor subprocess) only, never to this
+  # function's own shell or its caller, so it cannot mask that defect class.
+  case "$vendor" in
+    claude)
+      ( cd "$REPO_ROOT" || { echo "INVOKE_VENDOR_BAD_REPO_ROOT:$REPO_ROOT" >&2; exit 96; }
+        DISPATCH_ID="${DISPATCH_ID:-}" LOGICAL_DISPATCH_ID="${LOGICAL_DISPATCH_ID:-}" \
+        ATTEMPT="${ATTEMPT:-}" STATUS_PATH="${STATUS_PATH:-}" \
+        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 \
+          timeout --kill-after="$grace" "$deadline" \
+          claude --model "$model" -p --output-format=json \
+                 --dangerously-skip-permissions - \
+          < "$prompt_file" 1> "$out" 2> "$err" &
+        tpid=$!
+        wait "$tpid"; trc=$?
+        kill -KILL -- "-$tpid" 2>/dev/null
+        exit "$trc"
+      )
+      rc=$?
+      ;;
+    codex)
+      local effort add_dir=()
+      effort="$(role_contract_field "$role" effort)" || return 96
+      [ -n "${FEATURE_FOLDER_OUTSIDE_REPO:-}" ] && add_dir=(--add-dir "$FEATURE_FOLDER")
+      ( DISPATCH_ID="${DISPATCH_ID:-}" LOGICAL_DISPATCH_ID="${LOGICAL_DISPATCH_ID:-}" \
+        ATTEMPT="${ATTEMPT:-}" STATUS_PATH="${STATUS_PATH:-}" \
+          timeout --kill-after="$grace" "$deadline" \
+          codex -a never -m "$model" -c model_reasoning_effort="$effort" \
+            exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json \
+            ${add_dir[@]+"${add_dir[@]}"} - \
+            < "$prompt_file" 1> "$out" 2> "$err" &
+        tpid=$!
+        wait "$tpid"; trc=$?
+        kill -KILL -- "-$tpid" 2>/dev/null
+        exit "$trc"
+      )
+      rc=$?
+      ;;
+  esac
+  return "$rc"
+}
+```
+
+`invoke_vendor` never inspects `$out`/`$err` content: a stdout stream that merely
+*contains* status-like text (`verdict: DONE`, etc.) establishes nothing. Only a
+validated STATUS file at the attempt's own `STATUS_PATH` — written by the role
+itself, checked by `classify_attempt` (a later task) — can mark an attempt
+complete.
+
 ### Long dispatch
 
 A role is a **long dispatch** when its `role_timeout` exceeds the host harness's

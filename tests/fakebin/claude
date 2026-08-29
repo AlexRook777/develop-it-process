@@ -1,27 +1,148 @@
 #!/usr/bin/env bash
 # Fake `claude` CLI for offline integration tests.
+#
+# Legacy knobs (kept working exactly as before):
 #   FAKE_RC           exit code (default 0)
 #   FAKE_DELAY        seconds to sleep before responding (default 0)
-#   FAKE_IGNORE_TERM  when set, trap and ignore SIGTERM
+#   FAKE_IGNORE_TERM  "1" traps and ignores SIGTERM; anything else (incl. "0") does not.
+#                     (Formalizes the plan's declared FAKE_IGNORE_TERM=0|1 enum -- the
+#                     prior code treated ANY non-empty value, including "0", as truthy
+#                     via `[ -n ... ]`, a latent bug fixed here, not a compat guarantee.)
 #   FAKE_ARGV_LOG     append the full argv to this file
 #   FAKE_ENV_LOG      write the inherited environment to this file
+#
+# Schema-v2 control surface (Task 5, additive):
+#   FAKE_MODE           complete|exit-no-status|malformed-status|publication-lost|
+#                       timeout|transient|permanent|unknown|spend-ceiling|
+#                       orchestration-refusal   (default: complete)
+#   FAKE_EXIT_CODE      exit code; same precedence tier as FAKE_RC, checked second.
+#                       Moot for FAKE_MODE=timeout, which is never allowed to exit on
+#                       its own -- only the wrapping `timeout` can end that attempt.
+#   FAKE_DELAY_SECONDS  alias of FAKE_DELAY, checked second
+#   FAKE_STDOUT         literal text written to stdout instead of the mode default
+#   FAKE_STDERR         literal text written to stderr instead of the mode default
+#   FAKE_STATUS_SOURCE  path whose content is cat'd to stdout when FAKE_STDOUT unset
+#   FAKE_MUTATION       none|clean-checkpointed|dirty-checkpointed|
+#                       dirty-uncheckpointed|unknown -- accepted for call-site
+#                       symmetry with run_fake_attempt; this stub does not act on
+#                       it (mutation-state fixtures are the recovery suite's job).
+#   FAKE_LOG            append one sanitized TSV line: vendor, pid, cwd, argv,
+#                       model, effort, dispatch_id, logical_dispatch_id, attempt,
+#                       mode. EVERY field is sanitized (tabs/newlines -> spaces)
+#                       before being joined, so an adversarial FAKE_MODE/--model/
+#                       argv value can never inject an extra TSV column. Reads
+#                       ONLY the fixed allowlist of env vars named above (plus
+#                       DISPATCH_ID/LOGICAL_DISPATCH_ID/ATTEMPT, which invoke_vendor
+#                       exports command-scoped to this process) -- never a broader
+#                       environment dump. That allowlist is a secret-leak boundary:
+#                       extend it only by naming another specific var, never by
+#                       iterating `env`.
+#
+# STATUS_PATH (when invoke_vendor exports it command-scoped): the attempt's own
+# STATUS file path. Distinct FAKE_MODE values do distinct, observable things to
+# it -- this is what makes exit-no-status/malformed-status/publication-lost
+# actually distinct from `complete` and from each other, not just labels:
+#   complete            writes a valid final STATUS_PATH (temp-then-rename)
+#   exit-no-status      writes NEITHER STATUS_PATH nor any sibling temp
+#   malformed-status    writes STATUS_PATH directly, with an illegal verdict
+#   publication-lost    writes a sibling STATUS_PATH.tmp.* and never renames it
+#   (every other mode)  writes nothing (these fail before publication would occur)
 set -u
-[ -n "${FAKE_IGNORE_TERM:-}" ] && trap '' TERM
-[ -n "${FAKE_ARGV_LOG:-}" ] && printf 'claude %s\n' "$*" >> "$FAKE_ARGV_LOG"
+[ "${FAKE_IGNORE_TERM:-0}" = 1 ] && trap '' TERM
+
+_san() { printf '%s' "$1" | tr '\t\n' '  '; }
+
+argv_sanitized="$(_san "$*")"
+[ -n "${FAKE_ARGV_LOG:-}" ] && printf 'claude %s\n' "$argv_sanitized" >> "$FAKE_ARGV_LOG"
 [ -n "${FAKE_ENV_LOG:-}" ] && env > "$FAKE_ENV_LOG"
+
 case " $* " in
   *" --help "*) printf -- '--output-format --dangerously-skip-permissions --model --agents\n'; exit 0 ;;
 esac
+
+# argv-derived fields for FAKE_LOG. Claude has no reasoning-effort knob.
+model=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--model" ] && model="$a"
+  prev="$a"
+done
+effort=""
+
 # Capture the prompt rather than discarding it: tests assert that what actually
 # reached the CLI is fully substituted (no literal $VARS survived render_prompt).
 # Only when it is piped in, though. The real CLI takes an interactive launch's
 # prompt in argv and never drains the terminal; draining it here would hang the
 # launcher's own pre-launch gate, which runs with the operator's TTY attached.
 if [ -t 0 ]; then prompt=""; else prompt="$(cat || true)"; fi
-[ "${FAKE_DELAY:-0}" != 0 ] && sleep "${FAKE_DELAY}"
-printf '{"type":"result","duration_ms":1234,"total_cost_usd":0.01,'
-printf '"modelUsage":{"claude-opus-5":{"inputTokens":10,"outputTokens":5}},'
-printf '"usage":{"input_tokens":10,"cache_read_input_tokens":0,'
-printf '"cache_creation_input_tokens":0,"output_tokens":5},'
-printf '"prompt_received":%s}\n' "$(printf '%s' "$prompt" | jq -Rs .)"
-exit "${FAKE_RC:-0}"
+
+mode="$(_san "${FAKE_MODE:-complete}")"
+
+if [ -n "${FAKE_LOG:-}" ]; then
+  {
+    printf 'claude\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$$" "$(_san "$(pwd)")" "$argv_sanitized" "$(_san "$model")" "$(_san "$effort")" \
+      "$(_san "${DISPATCH_ID:-}")" "$(_san "${LOGICAL_DISPATCH_ID:-}")" "$(_san "${ATTEMPT:-}")" "$mode"
+  } >> "$FAKE_LOG"
+fi
+
+case "$mode" in
+  timeout)   default_delay=999999 ;;
+  *)         default_delay=0 ;;
+esac
+delay="${FAKE_DELAY:-${FAKE_DELAY_SECONDS:-$default_delay}}"
+[ "$delay" != 0 ] && sleep "$delay"
+
+case "$mode" in
+  transient)  default_rc=1; default_err="please try again later (rate limited): upstream connection reset while streaming" ;;
+  permanent)  default_rc=1; default_err="authentication_error: invalid api key; permission denied" ;;
+  unknown)    default_rc=1; default_err="unexpected internal error (unclassified vendor fault)" ;;
+  spend-ceiling) default_rc=1; default_err="usage limit reached: credit balance is too low. contact your organization administrator for billing." ;;
+  *)          default_rc=0; default_err="" ;;
+esac
+
+# STATUS_PATH side effects -- see the header comment. Runs regardless of
+# FAKE_STDOUT/FAKE_STATUS_SOURCE, which only steer stdout, a separate stream.
+if [ -n "${STATUS_PATH:-}" ]; then
+  mkdir -p "$(dirname "$STATUS_PATH")" 2>/dev/null
+  case "$mode" in
+    complete)
+      tmp="$STATUS_PATH.tmp.$$"
+      printf 'verdict: DONE\nreason: fake attempt complete\n' > "$tmp" && mv "$tmp" "$STATUS_PATH"
+      ;;
+    malformed-status)
+      printf 'verdict: NOT_A_REAL_VERDICT\n' > "$STATUS_PATH"
+      ;;
+    publication-lost)
+      printf 'verdict: DONE\n' > "$STATUS_PATH.tmp.$$"
+      # deliberately never renamed: final STATUS_PATH stays absent
+      ;;
+    *) : ;;  # exit-no-status and every failure mode: no STATUS side effect at all
+  esac
+fi
+
+if [ -n "${FAKE_STDOUT+x}" ]; then
+  printf '%s\n' "$FAKE_STDOUT"
+elif [ -n "${FAKE_STATUS_SOURCE:-}" ] && [ -r "$FAKE_STATUS_SOURCE" ]; then
+  cat "$FAKE_STATUS_SOURCE"
+elif [ "$mode" = orchestration-refusal ]; then
+  printf '{"type":"result","is_error":true,"duration_ms":1234,"total_cost_usd":0.01,'
+  printf '"result":"I cannot complete this task: the requested path is outside the repository.",'
+  printf '"usage":{"input_tokens":10,"cache_read_input_tokens":0,'
+  printf '"cache_creation_input_tokens":0,"output_tokens":5},'
+  printf '"prompt_received":%s}\n' "$(printf '%s' "$prompt" | jq -Rs .)"
+else
+  printf '{"type":"result","duration_ms":1234,"total_cost_usd":0.01,'
+  printf '"modelUsage":{"claude-opus-5":{"inputTokens":10,"outputTokens":5}},'
+  printf '"usage":{"input_tokens":10,"cache_read_input_tokens":0,'
+  printf '"cache_creation_input_tokens":0,"output_tokens":5},'
+  printf '"prompt_received":%s}\n' "$(printf '%s' "$prompt" | jq -Rs .)"
+fi
+
+if [ -n "${FAKE_STDERR+x}" ]; then
+  printf '%s\n' "$FAKE_STDERR" >&2
+elif [ -n "$default_err" ]; then
+  printf '%s\n' "$default_err" >&2
+fi
+
+exit "${FAKE_RC:-${FAKE_EXIT_CODE:-$default_rc}}"

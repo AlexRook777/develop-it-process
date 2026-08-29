@@ -1367,4 +1367,59 @@ rm -f "$_ps_ff/STATUS.md.tmp."*
 
 rm -rf "$_ps_dir"
 
+# --- invoke_vendor: prelaunch validation (Task 5) ----------------------------
+# Pure registry-logic checks -- no PATH/fakebin, no RUNTIME_DIR/policy.tsv --
+# because both cases below must fail BEFORE invoke_vendor ever reaches the
+# policy_value/vendor-launch code that would need either.
+if declare -F invoke_vendor >/dev/null; then
+  python3 "$REPO_TOP/tests/lib/extract.py" roles > "$BUILD/roles-iv.tsv"
+  awk -F'\t' -v OFS='\t' '
+    NR==1 { print; next }
+    { if ($1=="preflight-claude") $2="carrier-pigeon"; print }
+  ' "$BUILD/roles-iv.tsv" > "$BUILD/roles-iv-bad.tsv"
+
+  iv_prompt="$BUILD/iv-prompt.txt"; printf 'hi\n' > "$iv_prompt"
+
+  # invoke_vendor's own prelaunch diagnostics go to ITS caller's stderr (fd 2),
+  # not to the $STDERR_FILE argument -- that argument is only ever wired to
+  # the underlying vendor subprocess once launch actually happens. Capture the
+  # subshell's stderr from the outside, not via the passed-in path.
+  iv_err1="$BUILD/iv-unknown.err"
+  ( ROLE_CONTRACTS_PATH="$BUILD/roles-iv-bad.tsv" \
+      invoke_vendor preflight-claude "$iv_prompt" "$BUILD/iv-unknown.out" "$BUILD/iv-unknown-inner.err" \
+  ) 2>"$iv_err1"
+  rc=$?
+  assert_rc 95 "$rc" "invoke_vendor rejects an unknown vendor"
+  assert_present 'INVOKE_VENDOR_UNKNOWN_VENDOR' "$iv_err1" \
+    "unknown-vendor rejection names itself"
+
+  iv_missing="$BUILD/does-not-exist-prompt.txt"; rm -f "$iv_missing"
+  iv_err2="$BUILD/iv-missing-prompt.err"
+  ( ROLE_CONTRACTS_PATH="$BUILD/roles-iv.tsv" \
+      invoke_vendor preflight-claude "$iv_missing" "$BUILD/iv-missing.out" "$BUILD/iv-missing-inner.err" \
+  ) 2>"$iv_err2"
+  rc=$?
+  assert_rc 96 "$rc" "invoke_vendor fails when the prompt file does not exist"
+  assert_present 'INVOKE_VENDOR_PROMPT_MISSING' "$iv_err2" \
+    "missing-prompt failure names itself"
+
+  # A non-numeric or non-positive timeout_minutes cell must fail loudly
+  # (review finding #1): the gate below coerces via awk, which silently reads
+  # "" or "n/a" as 0 and would skip the paid headroom probe entirely.
+  tcol_bad="$(tsv_column "$BUILD/roles-iv.tsv" timeout_minutes)"
+  awk -F'\t' -v OFS='\t' -v col="$tcol_bad" -v v="n/a" \
+    'NR==1{print;next} { if ($1=="preflight-claude") $col=v; print }' \
+    "$BUILD/roles-iv.tsv" > "$BUILD/roles-iv-badtimeout.tsv"
+  iv_err3="$BUILD/iv-badtimeout.err"
+  ( ROLE_CONTRACTS_PATH="$BUILD/roles-iv-badtimeout.tsv" \
+      invoke_vendor preflight-claude "$iv_prompt" "$BUILD/iv-badtimeout.out" "$BUILD/iv-badtimeout-inner.err" \
+  ) 2>"$iv_err3"
+  rc=$?
+  assert_rc 96 "$rc" "invoke_vendor rejects a non-numeric timeout_minutes"
+  assert_present 'INVOKE_VENDOR_BAD_TIMEOUT' "$iv_err3" \
+    "bad-timeout rejection names itself"
+else
+  _fail "invoke_vendor is not defined"
+fi
+
 finish

@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
-# Fake `codex` CLI for offline integration tests. Same knobs as fakebin/claude.
+# Fake `codex` CLI for offline integration tests. Same knob surface as
+# fakebin/claude -- see that file's header comment for the full list,
+# including the STATUS_PATH per-mode side effects.
 set -u
-[ -n "${FAKE_IGNORE_TERM:-}" ] && trap '' TERM
-[ -n "${FAKE_ARGV_LOG:-}" ] && printf 'codex %s\n' "$*" >> "$FAKE_ARGV_LOG"
+[ "${FAKE_IGNORE_TERM:-0}" = 1 ] && trap '' TERM
+
+_san() { printf '%s' "$1" | tr '\t\n' '  '; }
+
+argv_sanitized="$(_san "$*")"
+[ -n "${FAKE_ARGV_LOG:-}" ] && printf 'codex %s\n' "$argv_sanitized" >> "$FAKE_ARGV_LOG"
+[ -n "${FAKE_ENV_LOG:-}" ] && env > "$FAKE_ENV_LOG"
+
 # Reject the real CLI's ordering bug so the stub cannot mask it: `-a` after
 # `exec` must fail exactly as codex 0.146.0 does.
 seen_exec=no
@@ -13,12 +21,84 @@ for a in "$@"; do
       [ "$seen_exec" = yes ] && { printf "error: unexpected argument '%s' found\n" "$a" >&2; exit 2; } ;;
   esac
 done
+
 case " $* " in
   *" --help "*) printf -- '--json --skip-git-repo-check --add-dir --model\n'; exit 0 ;;
 esac
+
+# argv-derived fields for FAKE_LOG: -m pins the model, -c model_reasoning_effort=X
+# pins the effort. Both are global options and precede `exec` (checked above).
+model=""
+effort=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "-m" ] && model="$a"
+  case "$a" in model_reasoning_effort=*) effort="${a#model_reasoning_effort=}" ;; esac
+  prev="$a"
+done
+
 # Piped prompts only; a terminal on stdin is never drained. See fakebin/claude.
 if [ -t 0 ]; then prompt=""; else prompt="$(cat || true)"; fi
-[ "${FAKE_DELAY:-0}" != 0 ] && sleep "${FAKE_DELAY}"
-printf '%s\n' "{\"type\":\"turn.started\",\"prompt_received\":$(printf '%s' "$prompt" | jq -Rs .)}"
-printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":2100,"cached_input_tokens":1800,"output_tokens":640,"reasoning_output_tokens":2048}}'
-exit "${FAKE_RC:-0}"
+
+mode="$(_san "${FAKE_MODE:-complete}")"
+
+if [ -n "${FAKE_LOG:-}" ]; then
+  {
+    printf 'codex\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$$" "$(_san "$(pwd)")" "$argv_sanitized" "$(_san "$model")" "$(_san "$effort")" \
+      "$(_san "${DISPATCH_ID:-}")" "$(_san "${LOGICAL_DISPATCH_ID:-}")" "$(_san "${ATTEMPT:-}")" "$mode"
+  } >> "$FAKE_LOG"
+fi
+
+case "$mode" in
+  timeout)   default_delay=999999 ;;
+  *)         default_delay=0 ;;
+esac
+delay="${FAKE_DELAY:-${FAKE_DELAY_SECONDS:-$default_delay}}"
+[ "$delay" != 0 ] && sleep "$delay"
+
+case "$mode" in
+  transient)  default_rc=1; default_err="please try again later (rate limited): upstream connection reset while streaming" ;;
+  permanent)  default_rc=1; default_err="authentication_error: invalid api key; permission denied" ;;
+  unknown)    default_rc=1; default_err="unexpected internal error (unclassified vendor fault)" ;;
+  spend-ceiling) default_rc=1; default_err="usage limit reached: credit balance is too low. contact your organization administrator for billing." ;;
+  *)          default_rc=0; default_err="" ;;
+esac
+
+# STATUS_PATH side effects -- see fakebin/claude's header comment.
+if [ -n "${STATUS_PATH:-}" ]; then
+  mkdir -p "$(dirname "$STATUS_PATH")" 2>/dev/null
+  case "$mode" in
+    complete)
+      tmp="$STATUS_PATH.tmp.$$"
+      printf 'verdict: DONE\nreason: fake attempt complete\n' > "$tmp" && mv "$tmp" "$STATUS_PATH"
+      ;;
+    malformed-status)
+      printf 'verdict: NOT_A_REAL_VERDICT\n' > "$STATUS_PATH"
+      ;;
+    publication-lost)
+      printf 'verdict: DONE\n' > "$STATUS_PATH.tmp.$$"
+      ;;
+    *) : ;;
+  esac
+fi
+
+if [ -n "${FAKE_STDOUT+x}" ]; then
+  printf '%s\n' "$FAKE_STDOUT"
+elif [ -n "${FAKE_STATUS_SOURCE:-}" ] && [ -r "$FAKE_STATUS_SOURCE" ]; then
+  cat "$FAKE_STATUS_SOURCE"
+elif [ "$mode" = orchestration-refusal ]; then
+  printf '%s\n' "{\"type\":\"turn.started\",\"prompt_received\":$(printf '%s' "$prompt" | jq -Rs .)}"
+  printf '%s\n' '{"type":"turn.completed","error":"the requested path is outside the repository","usage":{"input_tokens":2100,"cached_input_tokens":1800,"output_tokens":640,"reasoning_output_tokens":2048}}'
+else
+  printf '%s\n' "{\"type\":\"turn.started\",\"prompt_received\":$(printf '%s' "$prompt" | jq -Rs .)}"
+  printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":2100,"cached_input_tokens":1800,"output_tokens":640,"reasoning_output_tokens":2048}}'
+fi
+
+if [ -n "${FAKE_STDERR+x}" ]; then
+  printf '%s\n' "$FAKE_STDERR" >&2
+elif [ -n "$default_err" ]; then
+  printf '%s\n' "$default_err" >&2
+fi
+
+exit "${FAKE_RC:-${FAKE_EXIT_CODE:-$default_rc}}"

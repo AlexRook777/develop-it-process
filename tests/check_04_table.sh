@@ -29,6 +29,18 @@ empty_report="$(awk -F '\t' '
 ' "$BUILD/roles.tsv")"
 assert_eq "" "$empty_report" "no empty required-field cells in the registry"
 
+# --- timeout_minutes must be a positive number (Task 5 review finding #1):
+# invoke_vendor builds "${timeout_minutes}m" for GNU `timeout` and compares it
+# numerically against the headroom threshold via awk. A non-numeric cell
+# (empty, "n/a", ...) would coerce to 0 in that awk comparison and silently
+# skip the paid headroom probe -- exactly the "silently defaulting" policy_value's
+# own doc comment forbids. This is the loud, extraction-time backstop.
+bad_timeout="$(awk -F '\t' '
+  NR==1 { for (i=1;i<=NF;i++) if ($i=="timeout_minutes") col=i; next }
+  { if ($col !~ /^[0-9]+(\.[0-9]+)?$/ || $col+0 <= 0) print $1 ":" $col }
+' "$BUILD/roles.tsv")"
+assert_eq "" "$bad_timeout" "every role's timeout_minutes is a positive number"
+
 load_cookbook || finish
 
 for fn in role_vendor role_model role_effort role_timeout role_mutates \
