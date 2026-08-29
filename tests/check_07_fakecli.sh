@@ -24,6 +24,14 @@ REPO_ROOT="$WORK/target"; mkdir -p "$REPO_ROOT"
 git -C "$REPO_ROOT" init -q
 ( cd "$REPO_ROOT" && : > seed && git add seed \
   && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+# A tracked placeholder under docs/superpowers/specs/ so an otherwise fully
+# untracked "docs/" subtree never collapses into one porcelain line above
+# $FEATURE_FOLDER (see tests/lib/assert.sh's init_fixture_env for why this
+# matters to inspect_mutation_state's dirty_tree_check-based comparison).
+mkdir -p "$REPO_ROOT/docs/superpowers/specs"
+( cd "$REPO_ROOT" && : > docs/superpowers/specs/.gitkeep \
+  && git add docs/superpowers/specs/.gitkeep \
+  && git -c user.email=t@t -c user.name=t commit -qm seed-docs ) >/dev/null
 FEATURE_FOLDER="$REPO_ROOT/docs/superpowers/specs/x-artifacts"
 mkdir -p "$FEATURE_FOLDER/transcripts"
 PROCESS_PATH="$PROCESS_DOC"
@@ -499,6 +507,8 @@ assert_not_exists "${dp_attempt_dir[0]}/result.kv"   "7h: the killed child reall
 _dispatch_ingest_child 3 18 summarizer-spec "${dp_attempt_dir[0]}"
 assert_rc 1 $? "7h: an orphaned attempt ingests as a failure"
 assert_eq ORPHANED_NO_RESULT "${DISPATCH_RESULT_CLASSIFICATION:-}"   "7h: it is classified ORPHANED_NO_RESULT, not PRELAUNCH_FAILED"
+assert_eq INTEGRITY_UNKNOWN "${DISPATCH_RESULT_MUTATION_STATE:-}" \
+  "7h: its mutation_state is INTEGRITY_UNKNOWN (a real spec S14.2 state), never the bare word UNKNOWN"
 assert_eq DISPATCH_PARALLEL_CHILD_DIED_AFTER_START "${DISPATCH_RESULT_REASON:-}"   "7h: the reason names itself"
 assert_eq 0 "$("$GREP_BIN" -c 'event=DISPATCH_NOT_LAUNCHED' "$FEATURE_FOLDER/RUN_LOG.md" || true)"   "7h: the parent never overwrites the durable DISPATCH_STARTED with a contradictory DISPATCH_NOT_LAUNCHED"
 assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md"   "7h: the original DISPATCH_STARTED record is still intact"

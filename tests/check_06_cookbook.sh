@@ -513,7 +513,9 @@ fi
 
 for _fn in dispatch_attempt dispatch_parallel _dispatch_prelaunch _dispatch_launch_attempt \
            _dispatch_write_started _dispatch_ingest_result _dispatch_ingest_child \
-           dispatch_is_running _dispatch_classify _dispatch_lease_try_acquire _dispatch_lease_release; do
+           dispatch_is_running _dispatch_lease_try_acquire _dispatch_lease_release \
+           _dispatch_lease_state classify_attempt inspect_mutation_state recovery_action \
+           recovery_retry_allowed resume_dispatch_state; do
   declare -F "$_fn" >/dev/null && _ok "$_fn is defined" || _fail "$_fn is not defined"
 done
 
@@ -523,9 +525,11 @@ for _fn in _dispatch_run_attempt; do
     || _ok "$_fn is removed (split into _dispatch_prelaunch/_dispatch_launch_attempt)"
 done
 
+# _dispatch_classify (Task 6's four-outcome seam) is retired wholesale by
+# Task 7's classify_attempt -- same pattern as _dispatch_run_attempt above.
 for _fn in dispatch_role dispatch_reviewers_parallel dispatch_id log_dispatch_started log_dispatch dispatch_state \
-           claude_invoke codex_invoke; do
-  declare -F "$_fn" >/dev/null && _fail "$_fn should have been removed in Task 6" \
+           claude_invoke codex_invoke _dispatch_classify; do
+  declare -F "$_fn" >/dev/null && _fail "$_fn should have been removed (Task 6/7)" \
     || _ok "$_fn is removed"
 done
 

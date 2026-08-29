@@ -50,6 +50,29 @@ if [ -n "${FAKE_LOG:-}" ]; then
   } >> "$FAKE_LOG"
 fi
 
+# FAKE_MUTATION real side effects -- see fakebin/claude's header comment.
+# Gated on STATUS_PATH: the headroom probe never sets it. Runs BEFORE the
+# delay/sleep below -- see fakebin/claude's comment for why: a genuinely
+# timed-out attempt is killed mid-sleep and never reaches code placed after it.
+if [ -n "${STATUS_PATH:-}" ] && [ -n "${REPO_ROOT:-}" ] && [ -d "$REPO_ROOT" ]; then
+  case "${FAKE_MUTATION:-none}" in
+    clean-checkpointed)
+      ( cd "$REPO_ROOT" && printf 'x\n' >> fake-mutation.txt && git add fake-mutation.txt \
+        && git -c user.email=fake@fake -c user.name=fake commit -qm "fake checkpoint" \
+      ) >/dev/null 2>&1 ;;
+    dirty-checkpointed)
+      ( cd "$REPO_ROOT" && printf 'x\n' >> fake-mutation.txt && git add fake-mutation.txt \
+        && git -c user.email=fake@fake -c user.name=fake commit -qm "fake checkpoint" \
+        && printf 'y\n' >> fake-mutation.txt \
+      ) >/dev/null 2>&1 ;;
+    dirty-uncheckpointed)
+      ( cd "$REPO_ROOT" && printf 'z\n' >> fake-mutation.txt ) >/dev/null 2>&1 ;;
+    unknown)
+      rm -f "$(dirname "$STATUS_PATH")/pre-head" 2>/dev/null ;;
+    none|*) : ;;
+  esac
+fi
+
 case "$mode" in
   timeout)   default_delay=999999 ;;
   *)         default_delay=0 ;;

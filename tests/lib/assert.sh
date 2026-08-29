@@ -99,6 +99,18 @@ init_fixture_env() {
   if [ "$where" = outside ]; then
     FEATURE_FOLDER="$FIXTURE_ROOT/outside-ff"
   else
+    # A tracked placeholder under docs/superpowers/specs/ BEFORE the feature
+    # folder exists: with nothing else tracked there, git collapses the
+    # ENTIRE untracked "docs/" subtree into one "?? docs/" porcelain line
+    # (dirty_tree_check's own allow-list only matches an offender that is
+    # AT or UNDER an allow-listed path, never an ancestor of one) -- a real
+    # repo always has other tracked content under its own docs tree by the
+    # time a feature folder is created, so this mirrors that, not a special
+    # case invented for the fixture.
+    mkdir -p "$REPO_ROOT/docs/superpowers/specs"
+    ( cd "$REPO_ROOT" && : > docs/superpowers/specs/.gitkeep \
+      && git add docs/superpowers/specs/.gitkeep \
+      && git -c user.email=t@t -c user.name=t commit -qm seed-docs ) >/dev/null
     FEATURE_FOLDER="$REPO_ROOT/docs/superpowers/specs/fixture-artifacts"
   fi
   mkdir -p "$FEATURE_FOLDER/transcripts"

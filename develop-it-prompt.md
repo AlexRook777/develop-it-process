@@ -2138,7 +2138,7 @@ invoke_vendor() {
     claude)
       ( cd "$REPO_ROOT" || { echo "INVOKE_VENDOR_BAD_REPO_ROOT:$REPO_ROOT" >&2; exit 96; }
         DISPATCH_ID="${DISPATCH_ID:-}" LOGICAL_DISPATCH_ID="${LOGICAL_DISPATCH_ID:-}" \
-        ATTEMPT="${ATTEMPT:-}" STATUS_PATH="${STATUS_PATH:-}" \
+        ATTEMPT="${ATTEMPT:-}" STATUS_PATH="${STATUS_PATH:-}" REPO_ROOT="${REPO_ROOT:-}" \
         CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 \
           timeout --kill-after="$grace" "$deadline" \
           claude --model "$model" -p --output-format=json \
@@ -2156,8 +2156,13 @@ invoke_vendor() {
       local effort add_dir=()
       effort="$(role_contract_field "$role" effort)" || return 96
       [ -n "${FEATURE_FOLDER_OUTSIDE_REPO:-}" ] && add_dir=(--add-dir "$FEATURE_FOLDER")
+      # shellcheck disable=SC2097,SC2098  # intentional: REPO_ROOT already
+      # holds this value in the outer shell too, so `-C "$REPO_ROOT"` below
+      # resolves identically either way; the prefix only additionally exports
+      # it into the forked vendor subprocess's own environment (for the fake
+      # CLI's FAKE_MUTATION side effect -- see tests/fakebin/codex).
       ( DISPATCH_ID="${DISPATCH_ID:-}" LOGICAL_DISPATCH_ID="${LOGICAL_DISPATCH_ID:-}" \
-        ATTEMPT="${ATTEMPT:-}" STATUS_PATH="${STATUS_PATH:-}" \
+        ATTEMPT="${ATTEMPT:-}" STATUS_PATH="${STATUS_PATH:-}" REPO_ROOT="${REPO_ROOT:-}" \
           timeout --kill-after="$grace" "$deadline" \
           codex -a never -m "$model" -c model_reasoning_effort="$effort" \
             exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json \
@@ -2361,44 +2366,31 @@ _dispatch_lease_release() {
   fi
 }
 
-# ---- Provisional lifecycle classifier (Task 6 seam) ------------------------
-# Implements only the four outcomes THIS task's own dispatch lifecycle needs
-# to distinguish (COMPLETED, TIMED_OUT, a launched-but-statusless bucket, and
-# a generic non-zero-exit bucket) — never the full ten-row ordered classifier
-# in spec S14.1. Task 7 replaces this wholesale with `classify_attempt`;
-# nothing outside this file may depend on a value this returns beyond
-# COMPLETED vs "not COMPLETED". Sets DISPATCH_CLASSIFY_RESULT/_REASON.
-_dispatch_classify() {
-  # Usage: _dispatch_classify <vendor-rc> <status-path> <role>
-  local rc="$1" status_path="$2" role="$3"
-  DISPATCH_CLASSIFY_RESULT=""
-  DISPATCH_CLASSIFY_REASON=""
-  case "$rc" in
-    95|96|97)
-      DISPATCH_CLASSIFY_RESULT=PRELAUNCH_FAILED
-      DISPATCH_CLASSIFY_REASON="INVOKE_VENDOR_RC_$rc"
-      return 0 ;;
-    124|137)
-      DISPATCH_CLASSIFY_RESULT=TIMED_OUT
-      DISPATCH_CLASSIFY_REASON="TIMEOUT_RC_$rc"
-      return 0 ;;
-  esac
-  if [ "$rc" = 0 ] && [ -f "$status_path" ] && validate_status "$status_path" "$role" >/dev/null 2>&1; then
-    DISPATCH_CLASSIFY_RESULT=COMPLETED
-    return 0
+# ---- Lease-state classifier (Task 7 seam, RM02/RM03 only) ------------------
+# Extends the mkdir-mutex seam above JUST enough to distinguish an actively
+# held lease from a stale/ambiguous one (spec S14.3 RM02 vs RM03), by reusing
+# the SAME durable liveness signal dispatch_is_running already proves (a live
+# DISPATCH_STARTED with no matching completion) rather than inventing a
+# second one. It never reclaims a lease and never guesses: a lease directory
+# whose own owner file is missing, unreadable, or names a dispatch id that
+# is not (or no longer) running is STALE_OR_AMBIGUOUS_LEASE, which RM03
+# routes to a human HALT, never an automatic steal. The real write-lease
+# protocol (owner authority, staleness timeout, snapshot integrity — spec
+# S11) is Task 8's job; it replaces this alongside _dispatch_lease_try_
+# acquire/_release.
+_dispatch_lease_state() {
+  # Usage: _dispatch_lease_state <leasedir>
+  local leasedir="$1" owner_dispatch_id
+  if [ ! -f "$leasedir/owner" ]; then
+    echo STALE_OR_AMBIGUOUS_LEASE; return 0
   fi
-  if [ ! -f "$status_path" ]; then
-    DISPATCH_CLASSIFY_RESULT=EXITED_NO_STATUS
-    DISPATCH_CLASSIFY_REASON="rc=$rc"
-    return 0
+  owner_dispatch_id="$("$GREP_BIN" -m1 '^dispatch_id=' "$leasedir/owner" 2>/dev/null)"
+  owner_dispatch_id="${owner_dispatch_id#dispatch_id=}"
+  if [ -n "$owner_dispatch_id" ] && dispatch_is_running "$owner_dispatch_id"; then
+    echo ACTIVE_LEASE_OWNER
+  else
+    echo STALE_OR_AMBIGUOUS_LEASE
   fi
-  if ! validate_status "$status_path" "$role" >/dev/null 2>&1; then
-    DISPATCH_CLASSIFY_RESULT=MALFORMED_STATUS
-    DISPATCH_CLASSIFY_REASON="rc=$rc"
-    return 0
-  fi
-  DISPATCH_CLASSIFY_RESULT=UNKNOWN_VENDOR_ERROR
-  DISPATCH_CLASSIFY_REASON="rc=$rc"
 }
 
 # ---- Attempt-scoped result record (child -> parent handoff) ----------------
@@ -2521,7 +2513,7 @@ _dispatch_prelaunch() {
       logical_dispatch_id="$logical" attempt="$attempt" status_path="$status_path" \
       classification=PRELAUNCH_FAILED reason="$reject" verdict="" usage_line="" \
       start_ms=0 end_ms=0 wall_ms=0 exit_code="" stdout_path="$stdout_path" \
-      stderr_path="$stderr_path" mutates="${mutates:-no}"
+      stderr_path="$stderr_path" mutates="${mutates:-no}" mutation_state=NO_SIDE_EFFECTS
     return 1
   fi
 
@@ -2595,11 +2587,21 @@ _dispatch_launch_attempt() {
   DISPATCH_ID="$d_id"; LOGICAL_DISPATCH_ID="$logi"; ATTEMPT="$(printf '%02d' "$att")"
   STATUS_PATH="$s_path"
 
+  # inspect_mutation_state's own minimal pre-attempt snapshot (Task 7 seam):
+  # just enough (the pre-attempt HEAD sha, read back from $MUTATION_SNAPSHOT_DIR/
+  # pre-head) to tell HEAD-moved from tree-dirty from comparison-impossible
+  # once the attempt finishes. The real snapshot MANIFEST (owned-artifact
+  # list, checkpoint ledger, cross-owner authority — spec S8/S11) stays
+  # Task 8's job; this captures nothing beyond what RM04-RM08/RM11 need.
+  MUTATION_SNAPSHOT_DIR="$a_dir"
+  git -C "${REPO_ROOT:-}" rev-parse HEAD > "$a_dir/pre-head" 2>/dev/null \
+    || printf 'none\n' > "$a_dir/pre-head"
+
   _dispatch_write_started "$phase" "$phase_name" "$iteration" "$role" "$vend" \
     "$d_id" "$logi" "$s_path" "$lease_ref"
 
   mkdir -p "$(dirname "$out_path")"
-  local start_ms end_ms wall_ms vrc classification reason verdict="" usage_line
+  local start_ms end_ms wall_ms vrc classification reason verdict="" usage_line mutation_state
   start_ms="$(now_ms)"
   run_timed invoke_vendor "$role" "$p_file" "$out_path" "$err_path"
   vrc="$DISPATCH_RC"
@@ -2609,8 +2611,9 @@ _dispatch_launch_attempt() {
   usage_line="$(parse_usage "$vend" "$out_path" "$wall_ms" "$(role_model "$role" 2>/dev/null)")"
   [ -f "$s_path" ] && verdict="$(status_field "$s_path" verdict 2>/dev/null)"
 
-  _dispatch_classify "$vrc" "$s_path" "$role"
-  classification="$DISPATCH_CLASSIFY_RESULT"; reason="$DISPATCH_CLASSIFY_REASON"
+  classify_attempt "$role" "$vrc" "$out_path" "$err_path" "$s_path"
+  classification="$CLASSIFY_ATTEMPT_RESULT"; reason="$CLASSIFY_ATTEMPT_REASON"
+  mutation_state="$(inspect_mutation_state "$role")"
 
   post_dispatch "$vrc" "$s_path" "$err_path" "$out_path" \
     >>"$a_dir/post-dispatch.log" 2>&1 || :
@@ -2623,10 +2626,12 @@ _dispatch_launch_attempt() {
     logical_dispatch_id="$logi" attempt="$att" status_path="$s_path" \
     classification="$classification" reason="$reason" verdict="$verdict" usage_line="$usage_line" \
     start_ms="$start_ms" end_ms="$end_ms" wall_ms="$wall_ms" exit_code="$vrc" \
-    stdout_path="$out_path" stderr_path="$err_path" mutates="$mut"
+    stdout_path="$out_path" stderr_path="$err_path" mutates="$mut" \
+    mutation_state="$mutation_state"
 
-  # Mutation-snapshot capture and authority enforcement is Task 8's job (the
-  # real write-lease protocol). This seam releases only what IT acquired.
+  # Authority enforcement (rejecting a foreign write outside this attempt's
+  # own lease) is Task 8's job (the real write-lease protocol). This seam
+  # releases only what IT acquired.
   [ "$mut" = yes ] && _dispatch_lease_release "$role"
 
   [ "$classification" = COMPLETED ]
@@ -2643,25 +2648,34 @@ _dispatch_ingest_result() {
   local launched="" phase="" phase_name="" iteration="" role="" vendor="" dispatch_id=""
   local logical_dispatch_id="" attempt="" status_path="" classification="" reason=""
   local verdict="" usage_line="" start_ms="" end_ms="" wall_ms="" mutates=""
-  local exit_code="" stdout_path="" stderr_path=""
+  local exit_code="" stdout_path="" stderr_path="" mutation_state=""
   for k in launched phase phase_name iteration role vendor dispatch_id logical_dispatch_id \
            attempt status_path classification reason verdict usage_line start_ms end_ms wall_ms \
-           mutates exit_code stdout_path stderr_path; do
+           mutates exit_code stdout_path stderr_path mutation_state; do
     printf -v "$k" '%s' "$(_dispatch_read_result_field "$rf" "$k" 2>/dev/null)"
   done
 
   # A malformed record (an unrecognized classification, most likely a
   # corrupted or hand-edited result file) still gets exactly ONE ingested
-  # record -- never a crash, never a silently dropped role.
+  # record -- never a crash, never a silently dropped role. The full ten-row
+  # ordered-classifier vocabulary (spec S14.1, `classify_attempt`) is legal
+  # here, not just the four Task 6 originally distinguished.
   case "$classification" in
-    COMPLETED|TIMED_OUT|PRELAUNCH_FAILED|EXITED_NO_STATUS|MALFORMED_STATUS|UNKNOWN_VENDOR_ERROR) : ;;
+    COMPLETED|TIMED_OUT|PRELAUNCH_FAILED|EXITED_NO_STATUS|MALFORMED_STATUS|UNKNOWN_VENDOR_ERROR| \
+    SPEND_CEILING|PERMANENT_VENDOR_ERROR|TRANSIENT_TRANSPORT_ERROR|PUBLICATION_LOST) : ;;
     *)
       reason="DISPATCH_RESULT_MALFORMED:${classification:-empty}"
       classification=UNKNOWN_VENDOR_ERROR ;;
   esac
 
-  local mutation_state checkpoint_kind
-  mutation_state="$([ "$mutates" = yes ] && echo UNKNOWN || echo NO_SIDE_EFFECTS)"
+  # mutation_state is read straight from the child's own result.kv (computed
+  # by _dispatch_launch_attempt via inspect_mutation_state, Task 7) -- a
+  # missing/empty value (an older or synthesized record that predates this
+  # field, e.g. a hand-built result.kv in a test, or _dispatch_ingest_child's
+  # synthesized lost-result record) safely defaults to NO_SIDE_EFFECTS, never
+  # a guessed dirty/checkpointed state.
+  [ -n "$mutation_state" ] || mutation_state=NO_SIDE_EFFECTS
+  local checkpoint_kind
   checkpoint_kind="$(role_checkpoint_kind "$role" 2>/dev/null)"
 
   _run_log_lock_acquire || return 1
@@ -2768,7 +2782,11 @@ _dispatch_ingest_child() {
       # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
       DISPATCH_RESULT_STATUS_PATH=""
       # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
-      DISPATCH_RESULT_MUTATION_STATE=UNKNOWN
+      # INTEGRITY_UNKNOWN, not the bare word UNKNOWN -- that IS one of the
+      # five spec S14.2 mutation states (recovery_action's own vocabulary);
+      # a value outside that vocabulary makes recovery_action return
+      # unmapped for this orphan (Task 7 review finding #10).
+      DISPATCH_RESULT_MUTATION_STATE=INTEGRITY_UNKNOWN
       return 1
     fi
     local synth="$attempt_dir"
@@ -2785,7 +2803,7 @@ _dispatch_ingest_child() {
       vendor=unknown dispatch_id="" logical_dispatch_id="" attempt="" status_path="" \
       classification=PRELAUNCH_FAILED reason=DISPATCH_PARALLEL_MISSING_RESULT \
       verdict="" usage_line="" start_ms=0 end_ms=0 wall_ms=0 exit_code="" stdout_path="" \
-      stderr_path="" mutates=no
+      stderr_path="" mutates=no mutation_state=NO_SIDE_EFFECTS
     attempt_dir="$synth"
   fi
   _dispatch_ingest_result "$attempt_dir/result.kv"
@@ -2859,7 +2877,8 @@ dispatch_parallel() {
           status_path="${dp_status_path[$i]}" classification=PRELAUNCH_FAILED \
           reason="DISPATCH_PARALLEL_PEER_REJECTED:$batch_reject" verdict="" usage_line="" \
           start_ms=0 end_ms=0 wall_ms=0 exit_code="" stdout_path="${dp_stdout_path[$i]}" \
-          stderr_path="${dp_stderr_path[$i]}" mutates="${dp_mutates[$i]}"
+          stderr_path="${dp_stderr_path[$i]}" mutates="${dp_mutates[$i]}" \
+          mutation_state=NO_SIDE_EFFECTS
       fi
     done
     declare -gA DISPATCH_PARALLEL_CLASSIFICATION=()
@@ -2883,14 +2902,19 @@ dispatch_parallel() {
         :
       else
         dp_ok[$i]=0
+        # RM02 vs RM03 (spec S14.3): name WHICH lease-substate this rejection
+        # is, so a later recovery_action call can route it correctly instead
+        # of treating every lease miss the same.
         _dispatch_write_result "${dp_attempt_dir[$i]}" launched=no phase="$phase" \
           phase_name="$phase_name" iteration="$iteration" role="${roles[$i]}" \
           vendor="${dp_vendor[$i]}" dispatch_id="${dp_dispatch_id[$i]}" \
           logical_dispatch_id="${dp_logical[$i]}" attempt="${dp_attempt[$i]}" \
           status_path="${dp_status_path[$i]}" classification=PRELAUNCH_FAILED \
-          reason=DISPATCH_WRITE_LEASE_UNAVAILABLE verdict="" usage_line="" \
+          reason="DISPATCH_WRITE_LEASE_UNAVAILABLE:$(_dispatch_lease_state "$ORCHESTRATION_DIR/write-lease.d")" \
+          verdict="" usage_line="" \
           start_ms=0 end_ms=0 wall_ms=0 exit_code="" stdout_path="${dp_stdout_path[$i]}" \
-          stderr_path="${dp_stderr_path[$i]}" mutates="${dp_mutates[$i]}"
+          stderr_path="${dp_stderr_path[$i]}" mutates="${dp_mutates[$i]}" \
+          mutation_state=NO_SIDE_EFFECTS
       fi
     fi
   done
@@ -2937,6 +2961,743 @@ dispatch_parallel() {
   [ "$DISPATCH_PARALLEL_GROUP_WALL_MS" -ge 0 ] || DISPATCH_PARALLEL_GROUP_WALL_MS=0
 
   return "$all_ok"
+}
+```
+
+### Ordered failure classification, recovery matrix, and resume (spec §14)
+
+`_dispatch_launch_attempt` (above) needs a real answer to two questions every
+launched attempt raises: which of the ten classifications applies, and what a
+failed *mutating* attempt actually did to the target repo. `classify_attempt`
+answers the first; `inspect_mutation_state` the second. `recovery_action`
+then maps the pair onto exactly one of the twelve stable recovery rows below,
+and `resume_dispatch_state` answers the resume question for a logical
+dispatch that may span several attempts across a process restart.
+
+**Ordered classifier (spec §14.1).** Evaluated in this exact order; the first
+matching row wins and no case may select more than one:
+
+```text
+PRELAUNCH_FAILED            invoke_vendor's own reserved prelaunch codes
+                             (95/96/97), OR a success-envelope orchestration
+                             refusal caused by wrong repo/CWD/input
+TIMED_OUT                   the invocation exit code is one `timeout` itself
+                             reserves (124/125/126/127/137)
+SPEND_CEILING                quota/spend-exhaustion signature in the vendor's
+                             own stdout envelope or stderr, any exit code
+PERMANENT_VENDOR_ERROR       auth/permission/invalid-model refusal signature
+TRANSIENT_TRANSPORT_ERROR    connection/stream/overload/throttle signature
+UNKNOWN_VENDOR_ERROR         any remaining non-zero exit with no known signature
+EXITED_NO_STATUS             rc=0, no final STATUS, no sibling temp either
+PUBLICATION_LOST             rc=0, no final STATUS, a sibling temp exists
+MALFORMED_STATUS             a final STATUS exists but fails validate_status
+COMPLETED                    a final STATUS exists, belongs to the attempt,
+                             and validate_status accepts it
+```
+
+<!-- lint: cookbook -->
+```bash
+# Extracts a vendor refusal's own text from BOTH streams and reports it only
+# when it names a wrong-repo/CWD/input shape (spec S14.1's "success-envelope
+# orchestration refusal"). vendor_error_text already tells "no vendor error"
+# from "no transcript" by emptiness; this adds one more filter on top of it
+# and preserves that same convention (prints nothing, still succeeds, when
+# no refusal text is found).
+# Claude's OWN `.result` text, read regardless of `is_error` (unlike
+# vendor_error_text, which only extracts text when is_error==true or
+# .error!=null). A genuine refusal can arrive as a "successful" envelope
+# (is_error:false, rc 0) whose prose declines the task -- spec S14.1's
+# "success-envelope orchestration refusal" is precisely that shape, so the
+# ordinary vendor-error extractor (which treats is_error:false as "nothing
+# to report") must never be the only reader consulted here. Codex has no
+# comparable "successful refusal" shape (its turn.completed record carries
+# no free-text result field at all), so this simply returns empty for it.
+_claude_result_text() {
+  # Usage: _claude_result_text <stdout-transcript-path>
+  local out="$1"
+  [ -s "${out:-}" ] || return 0
+  jq -rs '.[] | select(type=="object") | (.result // empty)' "$out" 2>/dev/null | tail -1
+}
+
+_orchestration_refusal_text() {
+  # Usage: _orchestration_refusal_text <stdout-transcript-path> <status-path> <role>
+  # <status-path>/<role> gate the risky reader below -- see its own comment.
+  local out="$1" status_path="${2:-}" role="${3:-}" txt
+  txt="$(vendor_error_text "$out" 2>/dev/null)"
+  if [ -z "$txt" ]; then
+    # _claude_result_text reads ORDINARY SUCCESS PROSE, which a finished,
+    # legitimately mutating role can easily contain (an implementer's own
+    # summary saying it "fixed invalid input handling" or "the wrong working
+    # directory case"). Consulting it when a VALID STATUS already exists
+    # would misread that prose as a refusal and route a successfully
+    # completed attempt into RM01's ungated correct-and-retry, discarding
+    # finished work -- reproduced and fixed per Task 7 review round 2,
+    # finding #1. A role that published a valid STATUS did not refuse;
+    # only fall back to this reader when no valid STATUS exists at all.
+    if [ ! -f "$status_path" ] || ! validate_status "$status_path" "$role" >/dev/null 2>&1; then
+      txt="$(_claude_result_text "$out" 2>/dev/null)"
+    fi
+  fi
+  [ -n "$txt" ] || return 0
+  if printf '%s\n' "$txt" | "$GREP_BIN" -qiE \
+    'outside (the )?(repo|repository|workspace)|wrong (repo|repository|cwd|working directory)|invalid (input|path|argument)s?([[:space:]]|$)|not inside a trusted directory'
+  then
+    printf '%s\n' "$txt"
+  fi
+}
+
+# The real ten-outcome ordered classifier (spec S14.1), replacing Task 6's
+# four-outcome `_dispatch_classify` wholesale. Sets CLASSIFY_ATTEMPT_RESULT/
+# _REASON; always returns 0 (a classification was reached) -- callers branch
+# on the RESULT value, exactly like the seam it replaces.
+classify_attempt() {
+  # Usage: classify_attempt <role> <exit_code> <stdout_file> <stderr_file> <status_file>
+  local role="$1" rc="$2" out="$3" err="$4" status_path="$5"
+  local refusal combined
+  CLASSIFY_ATTEMPT_RESULT=""
+  CLASSIFY_ATTEMPT_REASON=""
+
+  case "$rc" in
+    95|96|97)
+      CLASSIFY_ATTEMPT_RESULT=PRELAUNCH_FAILED
+      CLASSIFY_ATTEMPT_REASON="INVOKE_VENDOR_RC_$rc"
+      return 0 ;;
+  esac
+
+  # Timeout reserves this whole block, not just 124 -- a `timeout` that
+  # cannot even exec the target (126/127) or fails on its own terms (125) is
+  # just as much "the invocation never produced a vendor result" as a plain
+  # deadline (124) or a post-kill-after SIGKILL (137). This is spec row 2 --
+  # it outranks a refusal signature found in whatever partial transcript a
+  # killed attempt happened to leave behind (a timed-out MUTATING attempt
+  # must route through RM06/RM07/RM08's mutation-state gate, never RM01's
+  # ungated correct-and-retry).
+  case "$rc" in
+    124|125|126|127|137)
+      CLASSIFY_ATTEMPT_RESULT=TIMED_OUT
+      CLASSIFY_ATTEMPT_REASON="TIMEOUT_RC_$rc"
+      return 0 ;;
+  esac
+
+  # A refusal embedded in a success envelope is evaluated BEFORE ordinary
+  # vendor-liveness matching (spec S14.1's own note: rows 3-6, spend/
+  # permanent/transient/unknown) -- it is a process defect (wrong repo/CWD/
+  # input), not a vendor outage, regardless of rc. NOT before TIMED_OUT above.
+  refusal="$(_orchestration_refusal_text "$out" "$status_path" "$role" 2>/dev/null)"
+  if [ -n "$refusal" ]; then
+    CLASSIFY_ATTEMPT_RESULT=PRELAUNCH_FAILED
+    CLASSIFY_ATTEMPT_REASON="ORCHESTRATION_REFUSAL:${refusal:0:200}"
+    return 0
+  fi
+
+  # Signature matching reads BOTH streams (vendor_error_text first, per the
+  # transcript-read policy, then the stderr tail) and is NOT gated on rc: a
+  # real spend ceiling can present as a "successful" rc=0 process wrapping an
+  # is_error envelope just as often as a non-zero exit with a stderr message
+  # -- "zero or non-zero wrapper" must classify identically.
+  combined="$(vendor_error_text "$out" 2>/dev/null)"
+  combined="$combined
+$(tail -n 40 "$err" 2>/dev/null)"
+  if printf '%s' "$combined" | "$GREP_BIN" -qiE \
+    'spend limit|monthly spend|usage limit reached|credit balance is too low|billing|quota exceeded|contact your organization administrator|insufficient_quota'
+  then
+    CLASSIFY_ATTEMPT_RESULT=SPEND_CEILING
+    CLASSIFY_ATTEMPT_REASON="rc=$rc"
+    return 0
+  fi
+  if printf '%s' "$combined" | "$GREP_BIN" -qiE \
+    'authentication_error|invalid api key|permission denied|unauthorized|invalid[_ ]model|model not found|forbidden|http/?[[:space:]]?40[13]'
+  then
+    CLASSIFY_ATTEMPT_RESULT=PERMANENT_VENDOR_ERROR
+    CLASSIFY_ATTEMPT_REASON="rc=$rc"
+    return 0
+  fi
+  if printf '%s' "$combined" | "$GREP_BIN" -qiE \
+    'rate limit|rate_limit_error|429|too many requests|overloaded_error|please try again|retry after|connection reset|stream stall|5[0-9][0-9][^0-9]'
+  then
+    CLASSIFY_ATTEMPT_RESULT=TRANSIENT_TRANSPORT_ERROR
+    CLASSIFY_ATTEMPT_REASON="rc=$rc"
+    return 0
+  fi
+
+  # UNKNOWN_VENDOR_ERROR is the catch-all for a non-zero exit only (spec:
+  # "non-zero result ... not covered above") -- an rc=0 process with no
+  # matched signature falls through to the STATUS-presence ladder instead.
+  if [ "$rc" != 0 ]; then
+    CLASSIFY_ATTEMPT_RESULT=UNKNOWN_VENDOR_ERROR
+    CLASSIFY_ATTEMPT_REASON="rc=$rc"
+    return 0
+  fi
+
+  if [ ! -f "$status_path" ]; then
+    if compgen -G "${status_path}.tmp.*" >/dev/null 2>&1; then
+      CLASSIFY_ATTEMPT_RESULT=PUBLICATION_LOST
+    else
+      CLASSIFY_ATTEMPT_RESULT=EXITED_NO_STATUS
+    fi
+    CLASSIFY_ATTEMPT_REASON="rc=0"
+    return 0
+  fi
+  if ! validate_status "$status_path" "$role" >/dev/null 2>&1; then
+    CLASSIFY_ATTEMPT_RESULT=MALFORMED_STATUS
+    CLASSIFY_ATTEMPT_REASON="rc=0"
+    return 0
+  fi
+  CLASSIFY_ATTEMPT_RESULT=COMPLETED
+  CLASSIFY_ATTEMPT_REASON=""
+  return 0
+}
+
+# Real offenders for MUTATION classification purposes: every changed path
+# EXCEPT the fixed orchestration-bookkeeping locations (RUN_LOG.md,
+# full_log.md, $ORCHESTRATION_DIR, $FEATURE_FOLDER/transcripts/, and any
+# phase's own attempts/ subtree, matched structurally since it recurs under
+# every numbered phase directory). Deliberately NOT dirty_tree_check's own
+# allow-list: that one also exempts $SPEC_PATH/$PLAN_PATH/the WHOLE
+# $FEATURE_FOLDER wholesale, which is right for the Phase-1/6 "did anything
+# unexpected change" gate but wrong here -- plan-writer's only declared
+# output IS $PLAN_PATH, spec-fixer/plan-fixer own $SPEC_PATH, and
+# documentation-writer's outputs live under $FEATURE_FOLDER. Reusing that
+# allow-list silently read every document-writing mutating role as
+# NO_SIDE_EFFECTS regardless of what it actually wrote (Task 7 review
+# finding #4). Real content -- SPEC_PATH, PLAN_PATH, source under $REPO_ROOT,
+# any other $FEATURE_FOLDER output -- is never exempted here.
+#
+# Uses `--untracked-files=all` (its own git status call, not porcelain_
+# offenders, which is shared with the production Phase-1/6 dirty-tree gate
+# and deliberately stays on the cheaper default grouping there): $FEATURE_
+# FOLDER is NEVER git-added by design, so with the default grouping git
+# collapses its entire untracked subtree into ONE line the moment nothing
+# under it is tracked -- exactly the case on every fresh dispatch -- which
+# would make every one of the per-subpath exclusions below unmatchable.
+# ponytail: recursive untracked-file listing is O(untracked files in the
+# whole repo), a real cost on a repo with large ungitignored scratch trees;
+# revisit if that ever measurably matters for this one per-attempt check.
+_mutation_dirty() {
+  local ff_rel orch_rel status path old entry
+  ff_rel="${FEATURE_FOLDER#"${REPO_ROOT:-}"/}"
+  orch_rel="${ORCHESTRATION_DIR#"${REPO_ROOT:-}"/}"
+  _mutation_excluded() {
+    local p="$1"
+    case "$p" in
+      "$ff_rel/RUN_LOG.md"|"$ff_rel/full_log.md") return 0 ;;
+      "$orch_rel"|"$orch_rel"/*) return 0 ;;
+      "$ff_rel/transcripts"|"$ff_rel/transcripts"/*) return 0 ;;
+      "$ff_rel"/*/attempts/*) return 0 ;;
+    esac
+    return 1
+  }
+  local rc=1   # 1 = clean (no offender found), 0 = dirty (an offender found)
+  while IFS= read -r -d '' entry; do
+    status="${entry:0:2}"; path="${entry:3}"
+    case "$status" in
+      R*|C*)
+        IFS= read -r -d '' old || old=""
+        if ! _mutation_excluded "$path" || { [ -n "$old" ] && ! _mutation_excluded "$old"; }; then
+          rc=0; break
+        fi
+        ;;
+      *)
+        _mutation_excluded "$path" || { rc=0; break; } ;;
+    esac
+  done < <(git -C "${REPO_ROOT:-}" status --porcelain=v1 --untracked-files=all -z 2>/dev/null)
+  unset -f _mutation_excluded
+  return "$rc"
+}
+
+# Compares the target repo's git HEAD/tree now against the pre-attempt
+# snapshot _dispatch_launch_attempt captured at $MUTATION_SNAPSHOT_DIR/
+# pre-head, and reports one of the five spec S14.2 mutation states. A
+# read-only role (role_mutates != yes) is always NO_SIDE_EFFECTS UNLESS it
+# somehow left evidence of a change, which is a contract violation, not a
+# mutation state to route retries by -- INTEGRITY_UNKNOWN, per spec.
+inspect_mutation_state() {
+  # Usage: inspect_mutation_state <role>
+  local role="$1" mutates pre_head cur_head dirty
+  mutates="$(role_mutates "$role" 2>/dev/null)" || mutates=""
+
+  pre_head=""
+  if [ -n "${MUTATION_SNAPSHOT_DIR:-}" ] && [ -f "$MUTATION_SNAPSHOT_DIR/pre-head" ]; then
+    pre_head="$(cat "$MUTATION_SNAPSHOT_DIR/pre-head" 2>/dev/null)"
+  fi
+  if [ -z "$pre_head" ]; then
+    echo INTEGRITY_UNKNOWN
+    return 0
+  fi
+
+  cur_head="$(git -C "${REPO_ROOT:-}" rev-parse HEAD 2>/dev/null || echo none)"
+  if _mutation_dirty; then dirty=yes; else dirty=no; fi
+
+  if [ "$mutates" != yes ]; then
+    if [ "$cur_head" = "$pre_head" ] && [ "$dirty" = no ]; then
+      echo NO_SIDE_EFFECTS
+    else
+      echo INTEGRITY_UNKNOWN
+    fi
+    return 0
+  fi
+
+  if [ "$cur_head" = "$pre_head" ] && [ "$dirty" = no ]; then
+    echo NO_SIDE_EFFECTS
+  elif [ "$cur_head" != "$pre_head" ] && [ "$dirty" = no ]; then
+    echo CLEAN_CHECKPOINTED
+  elif [ "$cur_head" != "$pre_head" ] && [ "$dirty" = yes ]; then
+    echo DIRTY_CHECKPOINTED
+  else
+    echo DIRTY_UNCHECKPOINTED
+  fi
+}
+```
+
+**Recovery matrix (spec §14.3).** The table below is the normative row list
+`tests/lib/extract.py recovery` reads (`tests/check_09_recovery.sh` asserts
+all twelve IDs execute). `classification`/`mutation_state` cells use a
+comma-separated set where one action covers several inputs; `recovery_action`
+below implements the same routing directly, including RM08's override
+("any failure" with a dirty/unknown tree wins over every other failure row).
+
+#### Recovery Matrix
+
+| Matrix ID | Classification | Mutation State | Action |
+|---|---|---|---|
+| RM01 | PRELAUNCH_FAILED | CORRECTABLE | Emit ORCHESTRATION_CORRECTION; correct once up to prelaunch_correction_cap; never emit a vendor-failure event; allocate a new attempt |
+| RM02 | PRELAUNCH_FAILED | ACTIVE_LEASE_OWNER | Wait for/classify the lease owner; do not spend the correction budget; do not launch another writer |
+| RM03 | PRELAUNCH_FAILED | STALE_OR_AMBIGUOUS_LEASE | HALT for integrity reconciliation; no automatic correction |
+| RM04 | PUBLICATION_LOST | NO_SIDE_EFFECTS | Retry once up to publication_retry_cap; never promote .tmp; allocate a new attempt |
+| RM05 | TIMED_OUT,TRANSIENT_TRANSPORT_ERROR,EXITED_NO_STATUS | NO_SIDE_EFFECTS | Fresh retry once up to transient_retry_cap; allocate a new attempt |
+| RM06 | TIMED_OUT,TRANSIENT_TRANSPORT_ERROR,EXITED_NO_STATUS,PUBLICATION_LOST | CLEAN_CHECKPOINTED | Dispatch continuation up to continuation_cap; allocate a new attempt |
+| RM07 | TIMED_OUT,TRANSIENT_TRANSPORT_ERROR,EXITED_NO_STATUS,PUBLICATION_LOST | DIRTY_CHECKPOINTED | Run integrity reconciliation, then continuation up to continuation_cap only if the partial unit is isolated |
+| RM08 | ANY_FAILURE | DIRTY_UNCHECKPOINTED,INTEGRITY_UNKNOWN | HALT with exact paths/state; no second writer launches |
+| RM09 | SPEND_CEILING | NO_SIDE_EFFECTS,CLEAN_CHECKPOINTED,DIRTY_CHECKPOINTED | Emit one run-scoped vendor-unavailable event; suppress later calls to that vendor; halt or use an explicitly accepted degraded path |
+| RM10 | PERMANENT_VENDOR_ERROR,UNKNOWN_VENDOR_ERROR | NO_SIDE_EFFECTS,CLEAN_CHECKPOINTED,DIRTY_CHECKPOINTED | No automatic retry; halt or use the documented vendor-degradation decision |
+| RM11 | MALFORMED_STATUS | NO_SIDE_EFFECTS,CLEAN_CHECKPOINTED,DIRTY_CHECKPOINTED | Non-mutating (NO_SIDE_EFFECTS): one correction retry; mutating (CLEAN/DIRTY_CHECKPOINTED): reconcile mutation first, then continue/retry only if safe |
+| RM12 | COMPLETED | ANY | Branch only on validated role verdict; release lease after final state is recorded |
+
+**Two cells fill gaps the spec leaves unmapped, not restate it.** Spec S14.3's
+own RM05 text is "TRANSIENT_TRANSPORT_ERROR or EXITED_NO_STATUS" only, and its
+RM06 text is "TIMED_OUT/transient/no-STATUS" only -- neither one actually
+assigns an outcome to `(TIMED_OUT, NO_SIDE_EFFECTS)` or `(PUBLICATION_LOST,
+CLEAN_CHECKPOINTED)`. Both are real, reachable combinations (a timed-out
+attempt that mutated nothing yet; a cleanly checkpointed commit whose own
+STATUS publish then got lost), so this table assigns them the row with the
+matching semantic (RM05's "nothing happened, retry fresh" / RM06's "already
+clean, just continue") rather than leaving them unmapped. Treat RM05's
+`TIMED_OUT` and RM06's `PUBLICATION_LOST` as this table's own judgment call,
+not spec text a future task should expect to find restated elsewhere.
+
+<!-- lint: cookbook -->
+```bash
+# Maps (classification, mutation/lease state) onto exactly one of the twelve
+# rows above. For classification=PRELAUNCH_FAILED, <state> is a LEASE
+# substate (CORRECTABLE / ACTIVE_LEASE_OWNER / STALE_OR_AMBIGUOUS_LEASE,
+# from _dispatch_lease_state or "correctable" by default) -- never one of
+# the five repo mutation states, since a prelaunch failure never invoked the
+# vendor and has nothing yet to compare against a snapshot. Every other
+# classification takes a real inspect_mutation_state value. Sets
+# RECOVERY_MATRIX_ID/RECOVERY_ACTION; returns 1 only for a combination no
+# row covers (a process-definition bug, never silently swallowed).
+# Task 7 seam (not full record_event -- Task 8's job): appends ONE durable
+# event through the same direct-tag convention Task 6 already used for
+# RECOVERY_CAP_REACHED, below. Named so a future record_event can replace
+# the call site without touching recovery_action's own logic.
+_recovery_emit_orchestration_correction() {
+  # Usage: _recovery_emit_orchestration_correction <logical_dispatch_id>
+  local logical="$1"
+  _run_log_lock_acquire || return 1
+  {
+    printf -- '--- %s  event=ORCHESTRATION_CORRECTION\n' "$(iso_now)"
+    printf 'logical_dispatch_id:      %s\n' "$logical"
+    printf 'reason:                   correctable prelaunch defect (RM01)\n'
+    printf '\n'
+  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+  _run_log_lock_release
+}
+
+# Same convention, for RM09. This records that the vendor was found
+# unavailable -- ACTUALLY suppressing later dispatches to it (a run-scoped
+# flag every subsequent invoke_vendor call consults) is Task 8's
+# record_event/proposition-ledger job; this seam only makes the incident
+# durable, per spec S14.3's "emit one run-scoped vendor-unavailable event".
+_recovery_emit_vendor_unavailable() {
+  # Usage: _recovery_emit_vendor_unavailable <logical_dispatch_id> <vendor>
+  local logical="$1" vendor="${2:-unknown}"
+  _run_log_lock_acquire || return 1
+  {
+    printf -- '--- %s  event=VENDOR_UNAVAILABLE\n' "$(iso_now)"
+    printf 'logical_dispatch_id:      %s\n' "$logical"
+    printf 'vendor:                   %s\n' "$vendor"
+    printf 'reason:                   spend ceiling (RM09)\n'
+    printf '\n'
+  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+  _run_log_lock_release
+}
+
+recovery_action() {
+  # Usage: recovery_action <classification> <state> [logical_dispatch_id] [vendor]
+  # <logical_dispatch_id>/<vendor> are optional and used ONLY to name the
+  # RM01/RM09 events above -- every other row ignores them.
+  local classification="$1" state="$2" logical="${3:-}" vendor="${4:-}"
+  RECOVERY_MATRIX_ID=""; RECOVERY_ACTION=""
+
+  if [ "$classification" = COMPLETED ]; then
+    RECOVERY_MATRIX_ID=RM12; RECOVERY_ACTION=BRANCH_ON_VERDICT
+    return 0
+  fi
+  if [ "$classification" = PRELAUNCH_FAILED ]; then
+    case "$state" in
+      ACTIVE_LEASE_OWNER)       RECOVERY_MATRIX_ID=RM02; RECOVERY_ACTION=WAIT_FOR_OWNER ;;
+      STALE_OR_AMBIGUOUS_LEASE) RECOVERY_MATRIX_ID=RM03; RECOVERY_ACTION=HALT_INTEGRITY ;;
+      *)
+        RECOVERY_MATRIX_ID=RM01; RECOVERY_ACTION=CORRECT_AND_RETRY
+        [ -n "$logical" ] && _recovery_emit_orchestration_correction "$logical"
+        ;;
+    esac
+    return 0
+  fi
+
+  # RM08 overrides every other failure row once the repo is irrecoverable or
+  # uncertain (spec: "any failure, DIRTY_UNCHECKPOINTED or INTEGRITY_UNKNOWN").
+  case "$state" in
+    DIRTY_UNCHECKPOINTED|INTEGRITY_UNKNOWN)
+      RECOVERY_MATRIX_ID=RM08; RECOVERY_ACTION=HALT_EXACT_STATE
+      return 0 ;;
+  esac
+
+  case "$classification" in
+    TIMED_OUT|TRANSIENT_TRANSPORT_ERROR|EXITED_NO_STATUS|PUBLICATION_LOST)
+      # PUBLICATION_LOST shares this state-keyed routing with the other
+      # three "no confirmed completion" classifications (spec's Recovery
+      # Matrix table lists it alongside them in RM06/RM07) -- ONLY its
+      # NO_SIDE_EFFECTS case gets its OWN row/cap (RM04, publication_retry_
+      # cap) instead of RM05/transient_retry_cap, since "nothing mutated
+      # yet, just retry the report" is a cheaper class of retry than a
+      # genuine transient/timeout/no-status redispatch.
+      case "$state" in
+        NO_SIDE_EFFECTS)
+          if [ "$classification" = PUBLICATION_LOST ]; then
+            RECOVERY_MATRIX_ID=RM04; RECOVERY_ACTION=RETRY_PUBLICATION
+          else
+            RECOVERY_MATRIX_ID=RM05; RECOVERY_ACTION=TRANSIENT_RETRY
+          fi ;;
+        CLEAN_CHECKPOINTED)
+          RECOVERY_MATRIX_ID=RM06; RECOVERY_ACTION=CONTINUE_WITHIN_CAP ;;
+        DIRTY_CHECKPOINTED)
+          # RM07's own "isolated" test (spec: "continuation ... only if the
+          # partial unit is isolated") is NOT evaluated here -- there is no
+          # owned-artifact/checkpoint-boundary ledger yet to ask (spec S8/
+          # S11, Task 8/9). This seam always answers CONTINUE_IF_ISOLATED
+          # optimistically; the orchestrator narrative is what actually
+          # gates the continuation dispatch until that ledger exists.
+          RECOVERY_MATRIX_ID=RM07
+          RECOVERY_ACTION=RECONCILE_THEN_CONTINUE_IF_ISOLATED
+          ;;
+        *)
+          echo "RECOVERY_ACTION_UNMAPPED_STATE:$classification:$state" >&2
+          return 1 ;;
+      esac ;;
+    SPEND_CEILING)
+      RECOVERY_MATRIX_ID=RM09; RECOVERY_ACTION=SUPPRESS_VENDOR_HALT_OR_DEGRADE
+      [ -n "$logical" ] && _recovery_emit_vendor_unavailable "$logical" "$vendor"
+      ;;
+    PERMANENT_VENDOR_ERROR|UNKNOWN_VENDOR_ERROR)
+      RECOVERY_MATRIX_ID=RM10; RECOVERY_ACTION=HALT_OR_DEGRADE ;;
+    MALFORMED_STATUS)
+      if [ "$state" = NO_SIDE_EFFECTS ]; then
+        RECOVERY_MATRIX_ID=RM11; RECOVERY_ACTION=CORRECT_AND_RETRY
+      else
+        # shellcheck disable=SC2034  # consumed by the caller after recovery_action returns
+        RECOVERY_MATRIX_ID=RM11
+        # shellcheck disable=SC2034  # consumed by the caller after recovery_action returns
+        RECOVERY_ACTION=RECONCILE_THEN_CONTINUE_IF_SAFE
+      fi ;;
+    *)
+      echo "RECOVERY_ACTION_UNMAPPED_CLASSIFICATION:$classification:$state" >&2
+      return 1 ;;
+  esac
+  return 0
+}
+
+# Counts CLASSIFIED FAILED attempts for one logical dispatch id -- an
+# ATTEMPT_FAILED record (a launched attempt that finished but was not
+# COMPLETED), or a DISPATCH_NOT_LAUNCHED record whose OWN prelaunch defect
+# was the cause. A DISPATCH_NOT_LAUNCHED caused by a SIBLING's batch reject
+# (reason starts with DISPATCH_PARALLEL_PEER_REJECTED, see dispatch_
+# parallel's own comment on this exact carry-over) is explicitly excluded:
+# that role never got a chance to fail on its own merits, so it must not
+# spend its own retry/correction budget. Counting `next_unused_attempt`
+# (every allocated attempt id, launched or not) was the Task 7 review's
+# finding #3 -- an innocent peer-rejected role would otherwise lose its
+# budget to a batch it wasn't even the cause of.
+_recovery_failed_attempts_used() {
+  # Usage: _recovery_failed_attempts_used <logical_dispatch_id>
+  local logical="$1" log="${FEATURE_FOLDER:-}/RUN_LOG.md"
+  [ -f "$log" ] || { echo 0; return 0; }
+  awk -v RS="" -v logical="$logical" '
+    function has_id(text,    n, lines, i) {
+      n = split(text, lines, "\n")
+      for (i=1;i<=n;i++) if (lines[i] ~ ("^dispatch_id:[ \t]+" logical "-a[0-9][0-9]$")) return 1
+      return 0
+    }
+    function field(text, name,    n, lines, i, v) {
+      n = split(text, lines, "\n")
+      for (i=1;i<=n;i++) {
+        if (index(lines[i], name ":") == 1) {
+          v = substr(lines[i], length(name) + 2)
+          gsub(/^[ \t]+|[ \t]+$/, "", v)
+          return v
+        }
+      }
+      return ""
+    }
+    /event=ATTEMPT_FAILED/ { if (has_id($0)) count++ }
+    /event=DISPATCH_NOT_LAUNCHED/ {
+      if (has_id($0) && field($0, "reason") !~ /^DISPATCH_PARALLEL_PEER_REJECTED:/) count++
+    }
+    END { print count + 0 }
+  ' "$log"
+}
+
+# Enforces a recovery action's retry cap via policy_value -- never a numeric
+# literal. Every actual retry still allocates its OWN new attempt id through
+# the normal allocate_attempt/dispatch_attempt path; this only answers
+# "is the cap for THIS action already spent" and, when it is, records
+# RECOVERY_CAP_REACHED once. An action with no cap (WAIT_FOR_OWNER, every
+# HALT_*, SUPPRESS_VENDOR_HALT_OR_DEGRADE, HALT_OR_DEGRADE, BRANCH_ON_VERDICT)
+# always returns 0 -- recovery_action never routes those here.
+#
+# used_count (from _recovery_failed_attempts_used) is the number of times
+# this logical dispatch has ALREADY failed for real -- the ORIGINAL attempt
+# counts as failure #1, not as a retry. A cap of 1 ("retry once") must still
+# permit the retry that follows failure #1 (0 retries spent so far) and only
+# deny after failure #2 (the one retry already happened and also failed) --
+# i.e. deny when (used_count - 1) >= cap_value, never used_count >= cap_value
+# (that off-by-one denied every cap-1 row's very first retry -- Task 7
+# review finding #1).
+#
+# Budgets are keyed by logical_dispatch_id only, not yet by cause (spec:
+# "keyed by logical dispatch and cause") -- every classified failure
+# recorded so far for one logical id is counted as one shared budget. This
+# is exact for how these caps are exercised today (one cause per logical
+# dispatch's retry history); a future mixed-cause history is Task 8/9's
+# per-cause ledger to refine, not a gap this task's own tests can observe.
+recovery_retry_allowed() {
+  # Usage: recovery_retry_allowed <logical_dispatch_id> <recovery_action>
+  local logical="$1" action="$2" cap_name cap_value used_count retries_used
+  case "$action" in
+    CORRECT_AND_RETRY)                     cap_name=prelaunch_correction_cap ;;
+    RETRY_PUBLICATION)                      cap_name=publication_retry_cap ;;
+    TRANSIENT_RETRY)                        cap_name=transient_retry_cap ;;
+    CONTINUE_WITHIN_CAP| \
+    RECONCILE_THEN_CONTINUE_IF_ISOLATED| \
+    RECONCILE_THEN_CONTINUE_IF_SAFE)        cap_name=continuation_cap ;;
+    *) return 0 ;;
+  esac
+  cap_value="$(policy_value "$cap_name")" \
+    || { echo "RECOVERY_CAP_LOOKUP_FAILED:$cap_name" >&2; return 1; }
+  used_count="$(_recovery_failed_attempts_used "$logical")"
+  retries_used=$(( used_count > 0 ? used_count - 1 : 0 ))
+  if [ "$retries_used" -ge "$cap_value" ]; then
+    _run_log_lock_acquire || return 1
+    {
+      printf -- '--- %s  event=RECOVERY_CAP_REACHED\n' "$(iso_now)"
+      printf 'logical_dispatch_id:      %s\n' "$logical"
+      printf 'cap:                      %s\n' "$cap_name"
+      printf 'cap_value:                %s\n' "$cap_value"
+      printf 'attempts_used:            %s\n' "$used_count"
+      printf '\n'
+    } >> "$FEATURE_FOLDER/RUN_LOG.md"
+    _run_log_lock_release
+    return 1
+  fi
+  return 0
+}
+```
+
+**Resume states (spec §14.4).** `resume_dispatch_state` reports exactly one
+of `NOT_STARTED`, `PRELAUNCH_FAILED`, `RUNNING_OBSERVED`,
+`ORPHANED_UNOBSERVED`, `FAILED_OBSERVED`, `COMPLETED_VALID`, or
+`COMPLETED_UNACCEPTED` for one logical dispatch id, from durable RUN_LOG
+evidence plus a fresh re-check of the STATUS file itself — never from
+stdout, a temp STATUS, or a success exit code alone. It never itself
+allocates an attempt: resume first processes an existing lease and the
+ordered recovery matrix above, then a caller decides whether to allocate a
+new one. `COMPLETED_UNACCEPTED` uses the existing PASS/READY/DONE terminal-
+verdict convention (`STATUS.md contract`, above) as its "accepted" test: a
+COMPLETED attempt whose own verdict is not one of those three legal terminal
+values (e.g. a reviewer's `CHANGES_REQUESTED`) genuinely completed, but the
+phase still has to act on it -- it is not yet the phase's own accepted
+outcome.
+
+<!-- lint: cookbook -->
+```bash
+# Last event tag (DISPATCH_STARTED/DISPATCH_COMPLETED/DISPATCH_NOT_LAUNCHED)
+# recorded for ONE exact dispatch id, or nothing. Same append-only "last
+# match wins" scan shape as dispatch_is_running.
+_dispatch_last_event_for_id() {
+  # Usage: _dispatch_last_event_for_id <dispatch_id>
+  local id="$1" log="${FEATURE_FOLDER:-}/RUN_LOG.md" tag="" last="" line
+  [ -f "$log" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      "--- "*"  event=DISPATCH_STARTED")      tag=DISPATCH_STARTED ;;
+      "--- "*"  event=DISPATCH_COMPLETED")    tag=DISPATCH_COMPLETED ;;
+      "--- "*"  event=DISPATCH_NOT_LAUNCHED") tag=DISPATCH_NOT_LAUNCHED ;;
+      "--- "*)                                tag="" ;;
+      "dispatch_id:"*)
+        [ -n "$tag" ] || continue
+        case "$line" in *"$id") last="$tag" ;; esac ;;
+    esac
+  done < "$log"
+  if [ -n "$last" ]; then
+    printf '%s\n' "$last"
+  fi
+}
+
+# One field from the SPECIFIC DISPATCH_COMPLETED block naming this exact
+# dispatch id (paragraph-mode awk: RUN_LOG blocks are blank-line separated).
+_dispatch_completed_field() {
+  # Usage: _dispatch_completed_field <dispatch_id> <field>
+  local id="$1" field="$2" log="${FEATURE_FOLDER:-}/RUN_LOG.md"
+  [ -f "$log" ] || return 1
+  awk -v RS="" -v id="$id" -v field="$field:" '
+    /event=DISPATCH_COMPLETED/ {
+      n = split($0, lines, "\n")
+      match_id = 0
+      for (i=1;i<=n;i++) if (lines[i] ~ ("^dispatch_id:[ \t]+" id "$")) match_id = 1
+      if (!match_id) next
+      for (i=1;i<=n;i++) {
+        if (index(lines[i], field) == 1) {
+          v = substr(lines[i], length(field)+1)
+          gsub(/^[ \t]+|[ \t]+$/, "", v)
+          print v
+          exit
+        }
+      }
+    }
+  ' "$log"
+}
+
+# One-shot liveness probe for spec S14.4's RUNNING_OBSERVED vs
+# ORPHANED_UNOBSERVED split ("the child is known live" / "no child is
+# live"). Never a supervision loop and never a hand-rolled PID file (both
+# explicitly retired -- see "Long dispatch" above): a single point-in-time
+# /proc scan for a live process whose OWN environment carries this exact
+# DISPATCH_ID, which invoke_vendor already exports command-scoped into
+# every vendor subprocess it launches.
+#
+# Fails SAFE, not merely "no false positive": the harmful direction here is
+# a false NEGATIVE (reporting "not live" for a genuinely running writer),
+# because ORPHANED_UNOBSERVED is exactly the state that authorises
+# allocating a REPLACEMENT attempt -- a false negative means two writers.
+# So this returns 0 ("treat as live") both when a match is found AND when
+# liveness cannot be determined at all (no /proc on this host, or a read
+# race/permission failure on some candidate file); it returns 1 ("confirmed
+# not live") ONLY once every candidate file was actually read and none
+# matched. A single `grep` call across every candidate file (rather than one
+# per file) makes this one fork total instead of two forks per process
+# (measured 0.44s at 426 processes with the old per-file tr|grep pipeline),
+# and keeps the whole command's stderr under ONE redirect -- a per-file
+# `< "$f" 2>/dev/null` leaks "Permission denied" because bash's own
+# redirect-setup failure happens before that trailing `2>` takes effect;
+# a single `cmd ... 2>/dev/null` has no such ordering hazard.
+_dispatch_child_live() {
+  # Usage: _dispatch_child_live <dispatch_id>
+  local id="$1" f hit
+  [ -d /proc ] || return 0
+  # Pre-filter to READABLE files with the `[ -r ]` builtin (no fork) before
+  # the one grep call below -- both to shrink the argument list and because
+  # a file this EUID cannot even stat as readable is never a process this
+  # shell could have spawned. Uses `-l` (list matching filenames) rather
+  # than `-q`/an exit-code check: on a real host running under Yama's
+  # default ptrace_scope, `/proc/<pid>/environ` can still refuse an actual
+  # read for a same-UID process that is not a ptrace-visible descendant of
+  # THIS shell (unrelated terminals, daemons under the same account), which
+  # makes grep exit 2 (a read error) on nearly every real invocation
+  # regardless of whether the target dispatch is alive -- an exit-code rule
+  # of "2 means inconclusive" would make ORPHANED_UNOBSERVED practically
+  # unreachable on such a host. Reading grep's OWN reported match list
+  # sidesteps that ambiguity entirely: a name in the output is an
+  # unambiguous live match; nothing in the output, across every file this
+  # EUID could actually open, is treated as a confirmed non-match. (A
+  # residual gap remains for the specific, unusual case of a live target
+  # process this shell is not a ptrace-visible ancestor of -- a known
+  # ceiling of the /proc-environ approach itself, not of this exit-code
+  # handling; Task 8/9's real snapshot/lease bookkeeping is the eventual
+  # fix, not a shell-only liveness probe.)
+  local -a files=()
+  for f in /proc/[0-9]*/environ; do
+    [ -r "$f" ] && files+=("$f")
+  done
+  [ "${#files[@]}" -gt 0 ] || return 0   # nothing readable at all -- cannot determine, fail safe
+  # -x (whole NUL-record match) is required, not optional: without it,
+  # "DISPATCH_ID=p06-i40-debugger" is a SUBSTRING of a sibling
+  # "LOGICAL_DISPATCH_ID=p06-i40-debugger" environ entry, which would make a
+  # logical-id lookup a guaranteed false "live" match (Task 7 review round 2,
+  # finding #3). Latent today (only full -aNN attempt ids are ever passed in),
+  # but -x costs nothing and removes the trap entirely.
+  hit="$("$GREP_BIN" -zlxF "DISPATCH_ID=$id" "${files[@]}" 2>/dev/null)"
+  [ -n "$hit" ] && return 0
+  return 1
+}
+
+# The spec S14.4 seven-state resume classifier for one LOGICAL dispatch id
+# (spanning every attempt allocated for it so far).
+resume_dispatch_state() {
+  # Usage: resume_dispatch_state <logical_dispatch_id>
+  local logical="$1" max_raw max latest_id last_event
+  local classification status_path role verdict
+  if [ ! -f "${FEATURE_FOLDER:-}/RUN_LOG.md" ]; then
+    echo NOT_STARTED; return 0
+  fi
+  max_raw="$(next_unused_attempt "$logical" 2>/dev/null)"
+  if [ -z "$max_raw" ]; then
+    # ATTEMPT_OVERFLOW or a lookup defect -- at least one attempt clearly
+    # exists already (next_unused_attempt only fails once 99 already do);
+    # never misreport that as NOT_STARTED.
+    max=99
+  else
+    max=$((max_raw - 1))
+  fi
+  if [ "$max" -le 0 ]; then
+    echo NOT_STARTED; return 0
+  fi
+  latest_id="${logical}-a$(printf '%02d' "$max")"
+
+  if dispatch_is_running "$latest_id"; then
+    # A durable start with no completion yet: RUNNING_OBSERVED only when a
+    # live child is ACTUALLY confirmed; otherwise it is an unobserved
+    # orphan (spec S14.4 splits these two, never inferred from stdout or
+    # exit code, only from this durable gap plus the liveness probe).
+    if _dispatch_child_live "$latest_id"; then
+      echo RUNNING_OBSERVED
+    else
+      echo ORPHANED_UNOBSERVED
+    fi
+    return 0
+  fi
+
+  last_event="$(_dispatch_last_event_for_id "$latest_id")"
+  case "$last_event" in
+    DISPATCH_NOT_LAUNCHED)
+      echo PRELAUNCH_FAILED ;;
+    DISPATCH_COMPLETED)
+      classification="$(_dispatch_completed_field "$latest_id" classification)"
+      status_path="$(_dispatch_completed_field "$latest_id" status_path)"
+      role="$(_dispatch_completed_field "$latest_id" role)"
+      if [ "$classification" != COMPLETED ] || [ -z "$status_path" ] \
+         || [ ! -f "$status_path" ] || ! validate_status "$status_path" "$role" >/dev/null 2>&1; then
+        echo FAILED_OBSERVED
+      else
+        verdict="$(_dispatch_completed_field "$latest_id" verdict)"
+        case "$verdict" in
+          PASS|READY|DONE) echo COMPLETED_VALID ;;
+          *)               echo COMPLETED_UNACCEPTED ;;
+        esac
+      fi
+      ;;
+    *)
+      echo NOT_STARTED ;;
+  esac
 }
 ```
 
@@ -4438,7 +5199,8 @@ Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 10 fix→re-revie
 `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE`, `MODEL_REJECTED`,
 `ATTEMPT_ALLOCATED`, `DISPATCH_STARTED`, `DISPATCH_COMPLETED`,
 `DISPATCH_NOT_LAUNCHED`, `ATTEMPT_FAILED`, `DISPATCH_ORPHANED`,
-`CONTEXT7_UNAVAILABLE`, `PROCESS_DEVIATION` (plus the reserved
+`CONTEXT7_UNAVAILABLE`, `PROCESS_DEVIATION`, `ORCHESTRATION_CORRECTION`,
+`RECOVERY_CAP_REACHED`, `VENDOR_UNAVAILABLE` (plus the reserved
 `CODEX_RE_ENABLED_BY_USER`). An event entry NEVER substitutes for the
 `DISPATCH_COMPLETED` entry of an attempt that actually ran.
 

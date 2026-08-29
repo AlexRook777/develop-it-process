@@ -23,9 +23,17 @@
 #   FAKE_STDERR         literal text written to stderr instead of the mode default
 #   FAKE_STATUS_SOURCE  path whose content is cat'd to stdout when FAKE_STDOUT unset
 #   FAKE_MUTATION       none|clean-checkpointed|dirty-checkpointed|
-#                       dirty-uncheckpointed|unknown -- accepted for call-site
-#                       symmetry with run_fake_attempt; this stub does not act on
-#                       it (mutation-state fixtures are the recovery suite's job).
+#                       dirty-uncheckpointed|unknown -- when STATUS_PATH is also
+#                       set (a real substantive launch, never the headroom
+#                       probe, which never sets it), performs the matching git
+#                       operation in $REPO_ROOT so inspect_mutation_state's
+#                       pre/post comparison has something real to observe:
+#                       clean-checkpointed commits a change; dirty-checkpointed
+#                       commits one change and leaves a second uncommitted;
+#                       dirty-uncheckpointed leaves an uncommitted change with
+#                       no commit; unknown deletes the pre-attempt snapshot
+#                       (dirname "$STATUS_PATH")/pre-head so the comparison
+#                       itself becomes impossible; none (default) does nothing.
 #   FAKE_LOG            append one sanitized TSV line: vendor, pid, cwd, argv,
 #                       model, effort, dispatch_id, logical_dispatch_id, attempt,
 #                       mode. EVERY field is sanitized (tabs/newlines -> spaces)
@@ -86,6 +94,34 @@ if [ -n "${FAKE_LOG:-}" ]; then
   } >> "$FAKE_LOG"
 fi
 
+# FAKE_MUTATION real side effects -- see the header comment. Gated on
+# STATUS_PATH being set: the headroom probe never sets it, so a paid
+# liveness ping can never mutate the target repo. Runs BEFORE the delay/sleep
+# below (not after): a genuinely timed-out attempt is killed mid-sleep and
+# never reaches code placed after it, but real work -- and whatever it
+# checkpoints -- happens FIRST, with the delay simulating the remainder
+# still in flight when the deadline hits. Placing this after the sleep would
+# make FAKE_MODE=timeout unable to ever exercise a checkpointed mutation
+# state at all.
+if [ -n "${STATUS_PATH:-}" ] && [ -n "${REPO_ROOT:-}" ] && [ -d "$REPO_ROOT" ]; then
+  case "${FAKE_MUTATION:-none}" in
+    clean-checkpointed)
+      ( cd "$REPO_ROOT" && printf 'x\n' >> fake-mutation.txt && git add fake-mutation.txt \
+        && git -c user.email=fake@fake -c user.name=fake commit -qm "fake checkpoint" \
+      ) >/dev/null 2>&1 ;;
+    dirty-checkpointed)
+      ( cd "$REPO_ROOT" && printf 'x\n' >> fake-mutation.txt && git add fake-mutation.txt \
+        && git -c user.email=fake@fake -c user.name=fake commit -qm "fake checkpoint" \
+        && printf 'y\n' >> fake-mutation.txt \
+      ) >/dev/null 2>&1 ;;
+    dirty-uncheckpointed)
+      ( cd "$REPO_ROOT" && printf 'z\n' >> fake-mutation.txt ) >/dev/null 2>&1 ;;
+    unknown)
+      rm -f "$(dirname "$STATUS_PATH")/pre-head" 2>/dev/null ;;
+    none|*) : ;;
+  esac
+fi
+
 case "$mode" in
   timeout)   default_delay=999999 ;;
   *)         default_delay=0 ;;
@@ -126,7 +162,12 @@ if [ -n "${FAKE_STDOUT+x}" ]; then
 elif [ -n "${FAKE_STATUS_SOURCE:-}" ] && [ -r "$FAKE_STATUS_SOURCE" ]; then
   cat "$FAKE_STATUS_SOURCE"
 elif [ "$mode" = orchestration-refusal ]; then
-  printf '{"type":"result","is_error":true,"duration_ms":1234,"total_cost_usd":0.01,'
+  # A genuine SUCCESS envelope (is_error:false, rc 0 by this mode's own
+  # default_rc) carrying a refusal in .result -- spec S14.1's "success-
+  # envelope orchestration refusal" shape, distinct from an is_error:true
+  # vendor-side error envelope (which every OTHER failure mode above already
+  # covers). _orchestration_refusal_text must detect this via .result alone.
+  printf '{"type":"result","is_error":false,"duration_ms":1234,"total_cost_usd":0.01,'
   printf '"result":"I cannot complete this task: the requested path is outside the repository.",'
   printf '"usage":{"input_tokens":10,"cache_read_input_tokens":0,'
   printf '"cache_creation_input_tokens":0,"output_tokens":5},'
