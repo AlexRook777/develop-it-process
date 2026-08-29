@@ -197,4 +197,53 @@ appendix_content_missing="$(python3 "$REPO_TOP/tests/lib/check_appendix_content.
 assert_eq "" "$appendix_content_missing" \
   "every restored appendix still carries its non-STATUS role contract (verdict rules / findings format / progress.jsonl notes)"
 
+# --- Task 6: dispatch_attempt/dispatch_parallel end to end, inside the real
+# schema-v2 fixture layout (ORCHESTRATION_DIR/RUNTIME_DIR/RUN_LOG as
+# init_v2_fixture provisions them, not check_07's own hand-rolled paths).
+# check_07_fakecli.sh already exhaustively covers classification and fan-out
+# edge cases against a synthetic registry; this only proves the same engine
+# also works end to end against the REAL runtime bootstrap_runtime just
+# produced above (role-contracts.tsv/policy.tsv extracted from THIS process
+# document, not a hand-built fixture copy). `set -euo pipefail` is active in
+# this file, so every call that may legitimately return non-zero is guarded.
+# unset FAKE_ARGV_LOG/FAKE_MODE/FAKE_DELAY*: when this whole suite runs NESTED
+# inside develop-it.sh's own launcher pre-check gate (check_08_launcher.sh),
+# those vars may already be exported from the OUTER (unrelated) launcher
+# test -- inheriting FAKE_ARGV_LOG here would leak this file's own fakebin
+# invocations into that outer test's argv log and produce a false failure.
+unset FAKE_ARGV_LOG FAKE_MODE FAKE_DELAY FAKE_DELAY_SECONDS FAKE_RC FAKE_EXIT_CODE
+export PATH="$REPO_TOP/tests/fakebin:$PATH"
+FEATURE_FOLDER_OUTSIDE_REPO=""
+RESOLVED_MODELS="$(resolved_models_block)"
+CONTEXT7_POLICY="disabled"
+ROLE_CONTRACTS_PATH="$RUNTIME_DIR/role-contracts.tsv"
+STATUS_PUBLISHER_PATH="$RUNTIME_DIR/publish-status"
+
+: > "$RUN_LOG"
+rc=0
+FAKE_MODE=complete dispatch_attempt 3 01 summarizer-spec || rc=$?
+assert_rc 0 "$rc" "dispatch_attempt succeeds end to end inside the v2 fixture layout"
+assert_present 'event=DISPATCH_STARTED' "$RUN_LOG" \
+  "the v2 fixture's own \$RUN_LOG (not a hand-built path) gained a DISPATCH_STARTED block"
+assert_present 'event=DISPATCH_COMPLETED' "$RUN_LOG" \
+  "the v2 fixture's own \$RUN_LOG gained a DISPATCH_COMPLETED block"
+completed_id="$("$GREP_BIN" -oE 'p03-i01-summarizer-spec-a[0-9]{2}' "$RUN_LOG" | head -1)"
+[ -n "$completed_id" ] || _fail "could not recover the completed attempt's dispatch_id"
+rc=0
+dispatch_is_running "$completed_id" || rc=$?
+assert_rc 1 "$rc" "turn-start reconciliation: a completed attempt is no longer 'running' in the real fixture"
+
+# A prelaunch failure (unknown role) still leaves the real $RUN_LOG in a
+# recoverable state: exactly one DISPATCH_NOT_LAUNCHED, nothing else added.
+before_lines=$(wc -l < "$RUN_LOG")
+rc=0
+dispatch_attempt 3 02 no-such-role 2>/dev/null || rc=$?
+assert_rc 1 "$rc" "dispatch_attempt fails closed for an unknown role"
+assert_eq PRELAUNCH_FAILED "${DISPATCH_RESULT_CLASSIFICATION:-}" \
+  "an unknown role is a typed PRELAUNCH_FAILED, not a shell crash under set -euo pipefail"
+after_lines=$(wc -l < "$RUN_LOG")
+[ "$after_lines" -gt "$before_lines" ] \
+  && _ok "the prelaunch failure still appended durable evidence to \$RUN_LOG" \
+  || _fail "the prelaunch failure left no durable RUN_LOG evidence"
+
 finish

@@ -79,59 +79,510 @@ else
   _fail "sanity: render_prompt spec-reviewer-claude produced non-empty output"
 fi
 
-# --- 1. claude_invoke passes the resolved model and timeout ---
-: > "$FAKE_ARGV_LOG"
-printf 'prompt\n' | claude_invoke spec-reviewer-claude "$WORK/o.json" "$WORK/o.err"
-assert_rc 0 $? "claude_invoke succeeds with a healthy stub"
-assert_present "--model claude-opus-5" "$FAKE_ARGV_LOG" \
-  "claude_invoke passes the role's resolved model"
+# --- helpers local to this file --------------------------------------------
+# Extracts the ordered sequence of event tags in RUN_LOG.md that name a given
+# dispatch_id in their very next `dispatch_id:` field -- used to assert the
+# DISPATCH_STARTED -> DISPATCH_COMPLETED -> ATTEMPT_FAILED durable order for
+# ONE dispatch id (Task 6 Step 1).
+_events_for_dispatch_id() {
+  local id="$1" log="$2" tag=""
+  while IFS= read -r line; do
+    case "$line" in
+      "--- "*"  event=DISPATCH_STARTED"|"--- "*"  event=DISPATCH_COMPLETED"| \
+      "--- "*"  event=DISPATCH_NOT_LAUNCHED"|"--- "*"  event=ATTEMPT_FAILED")
+        tag="${line##*event=}" ;;
+      "--- "*) tag="" ;;
+      "dispatch_id:"*)
+        [ -n "$tag" ] || continue
+        case "$line" in *"$id") printf '%s\n' "$tag"; tag="" ;; esac ;;
+    esac
+  done < "$log"
+}
 
-# --- 2. codex_invoke pins the model, effort, and --json ---
-: > "$FAKE_ARGV_LOG"
-printf 'prompt\n' | codex_invoke spec-reviewer-codex "$WORK/c.json" "$WORK/c.err"
-assert_present "-m gpt-5.6-sol" "$FAKE_ARGV_LOG" "codex_invoke pins the model"
-assert_present "model_reasoning_effort=high" "$FAKE_ARGV_LOG" "codex_invoke sets high effort"
-assert_present "--json" "$FAKE_ARGV_LOG" "codex_invoke always passes --json"
+# --- 0. role_mutates / appendix_exists still hold (unaffected by Task 6) ----
+assert_eq yes "$(role_mutates implementer)"           "the implementer mutates"
+assert_eq yes "$(role_mutates documentation-writer)"  "the documentation writer mutates"
+assert_eq no  "$(role_mutates summarizer-spec)"       "summarizers are read-only"
+assert_eq no  "$(role_mutates code-reviewer-claude)"  "reviewers are read-only"
 
-# --- 2b. The codex stub rejects global options placed after `exec` ---
-# This reproduces the real CLI's ordering bug (codex 0.146.0): -a/-m/-c MUST
-# precede `exec`. If the stub silently accepted the wrong order, it would mask
-# that defect class entirely.
+appendix_exists implementer     && _ok "appendix_exists finds a real appendix" \
+                                || _fail "appendix_exists missed a real appendix"
+appendix_exists no-such-role    && _fail "appendix_exists accepted a missing appendix" \
+                                || _ok "appendix_exists rejects a missing appendix"
+
+# A mutated registry copy for every test below that needs the fakebin's
+# generic FAKE_MODE=complete STATUS body (`verdict: DONE`, no extra fields) to
+# validate cleanly: only a role whose legal verdicts include DONE and whose
+# required_status_fields is exactly `common_v2` accepts it as-is. Among the
+# real registry rows that satisfy both, `summarizer-spec` (read-only, phase 3)
+# is the cheapest -- it needs only $FEATURE_FOLDER. `summarizer-plan` (also
+# common_v2/DONE, but phase 5) is remapped onto phase 3 too, purely so two
+# such roles can be dispatched together in the SAME dispatch_parallel call --
+# a throwaway registry mutation, same pattern as roles-59.tsv/roles-badvendor.tsv
+# above, never the real $BUILD/roles.tsv.
+pcol="$(tsv_column "$BUILD/roles.tsv" phases)"
+awk -F'\t' -v OFS='\t' -v col="$pcol" \
+  'NR==1{print;next} { if ($1=="summarizer-plan") $col=3; print }' \
+  "$BUILD/roles.tsv" > "$BUILD/roles-clean-status.tsv"
+
+# --- 1. dispatch_attempt end to end against a healthy stub -------------------
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+: > "$FAKE_ARGV_LOG"
+FAKE_MODE=complete dispatch_attempt 3 01 summarizer-spec
+assert_rc 0 $? "dispatch_attempt returns 0 end to end with a healthy stub"
+assert_eq COMPLETED "${DISPATCH_RESULT_CLASSIFICATION:-}" \
+  "dispatch_attempt exports DISPATCH_RESULT_CLASSIFICATION=COMPLETED"
+assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "RUN_LOG gained an event=DISPATCH_STARTED block"
+assert_present 'event=DISPATCH_COMPLETED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "RUN_LOG gained an event=DISPATCH_COMPLETED block"
+
+# Task 6 review fix #2: Step 3's mandated fields must actually be emitted --
+# not just computed into result.kv and then silently dropped at ingest. And
+# (follow-up review fix #2) not just PRESENT -- each carries the real value,
+# never an empty one that a presence-only check would accept.
+for _f in lease snapshot; do
+  assert_present "^${_f}:" "$FEATURE_FOLDER/RUN_LOG.md" "DISPATCH_STARTED carries field: $_f"
+done
+for _f in exit_code start_ms end_ms stdout_path stderr_path mutation_state checkpoint_kind; do
+  assert_present "^${_f}:" "$FEATURE_FOLDER/RUN_LOG.md" "DISPATCH_COMPLETED carries field: $_f"
+done
+assert_eq 0 "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" exit_code)" \
+  "DISPATCH_COMPLETED's exit_code is the real vendor rc (0 for a healthy stub)"
+assert_eq NO_SIDE_EFFECTS "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" mutation_state)" \
+  "DISPATCH_COMPLETED's mutation_state reflects a non-mutating role"
+assert_eq "none" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" lease)" \
+  "DISPATCH_STARTED's lease is 'none' for a non-mutating role"
+assert_eq "none" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" snapshot)" \
+  "DISPATCH_STARTED's snapshot carries the Task 8 seam value"
+assert_eq "$(role_checkpoint_kind summarizer-spec)" \
+  "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" checkpoint_kind)" \
+  "DISPATCH_COMPLETED's checkpoint_kind matches the registry lookup for this role"
+
+id1_val="$("$GREP_BIN" -oE 'p03-i01-summarizer-spec-a[0-9]{2}' "$FEATURE_FOLDER/RUN_LOG.md" | head -1)"
+[ -n "$id1_val" ] || _fail "could not recover dispatch #1's own dispatch_id from RUN_LOG"
+assert_eq "$FEATURE_FOLDER/transcripts/$id1_val.stdout" \
+  "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" stdout_path)" \
+  "DISPATCH_COMPLETED's stdout_path is the attempt's REAL transcript path"
+assert_eq "$FEATURE_FOLDER/transcripts/$id1_val.stderr" \
+  "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" stderr_path)" \
+  "DISPATCH_COMPLETED's stderr_path is the attempt's REAL transcript path"
+
+sm_val="$(status_field "$FEATURE_FOLDER/RUN_LOG.md" start_ms)"
+em_val="$(status_field "$FEATURE_FOLDER/RUN_LOG.md" end_ms)"
+case "$sm_val" in
+  ''|*[!0-9]*) _fail "start_ms is not a positive integer: [$sm_val]" ;;
+  *) [ "$sm_val" -gt 0 ] && _ok "start_ms is a positive integer" || _fail "start_ms is not > 0: [$sm_val]" ;;
+esac
+case "$em_val" in
+  ''|*[!0-9]*) _fail "end_ms is not a positive integer: [$em_val]" ;;
+  *) [ "$em_val" -gt 0 ] && _ok "end_ms is a positive integer" || _fail "end_ms is not > 0: [$em_val]" ;;
+esac
+if [ "$sm_val" -gt 0 ] 2>/dev/null && [ "$em_val" -gt 0 ] 2>/dev/null && [ "$em_val" -ge "$sm_val" ]; then
+  _ok "end_ms >= start_ms"
+else
+  _fail "end_ms < start_ms (or non-numeric): start=$sm_val end=$em_val"
+fi
+
+# Regression for FIX 1 (Task 4): provenance fields must be REAL, not empty.
+git_sha="$(status_field "$FEATURE_FOLDER/RUN_LOG.md" develop_it_git_sha)"
+file_sha256="$(status_field "$FEATURE_FOLDER/RUN_LOG.md" develop_it_file_sha256)"
+if [ -n "$git_sha" ] && [ "$git_sha" != non-git ]; then
+  _ok "DISPATCH_COMPLETED's develop_it_git_sha is populated"
+else
+  _fail "DISPATCH_COMPLETED's develop_it_git_sha is empty or non-git: [$git_sha]"
+fi
+if [ -n "$file_sha256" ]; then
+  _ok "DISPATCH_COMPLETED's develop_it_file_sha256 is populated"
+else
+  _fail "DISPATCH_COMPLETED's develop_it_file_sha256 is empty"
+fi
+assert_eq "spec-review" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" phase_name)" \
+  "DISPATCH_COMPLETED's phase_name is canonical, not 'unknown'"
+
+# lease carries the real seam value (not "none") for a MUTATING role.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+rm -rf "$ORCHESTRATION_DIR/write-lease.d"
+FAKE_MODE=complete dispatch_attempt 6 19 debugger >/dev/null 2>&1
+assert_eq "$ORCHESTRATION_DIR/write-lease.d" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" lease)" \
+  "DISPATCH_STARTED's lease names the real seam path for a mutating role"
+
+# --- 2. dispatch_parallel with codex_available=true --------------------------
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+: > "$FAKE_ARGV_LOG"
+declare -gA DISPATCH_PARALLEL_CLASSIFICATION=()
+ROLE_CONTRACTS_PATH="$BUILD/roles-clean-status.tsv" \
+  FAKE_MODE=complete dispatch_parallel 3 02 summarizer-spec summarizer-plan
+assert_rc 0 $? "dispatch_parallel returns 0 when every role completes"
+assert_eq COMPLETED "${DISPATCH_PARALLEL_CLASSIFICATION[summarizer-spec]:-}" \
+  "dispatch_parallel records the first role's classification"
+assert_eq COMPLETED "${DISPATCH_PARALLEL_CLASSIFICATION[summarizer-plan]:-}" \
+  "dispatch_parallel records the second role's classification"
+assert_eq 2 "$("$GREP_BIN" -c 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "both roles got a DISPATCH_STARTED record"
+assert_present 'role:                     summarizer-spec' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "the first role's DISPATCH_STARTED record is present"
+assert_present 'role:                     summarizer-plan' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "the second role's DISPATCH_STARTED record is present"
+
+# --- 3. Lifecycle-order test (Task 6 Step 1) ---------------------------------
+# 3a. A launched, SUCCESSFUL attempt: DISPATCH_STARTED then DISPATCH_COMPLETED,
+#     no ATTEMPT_FAILED.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+FAKE_MODE=complete dispatch_attempt 3 03 summarizer-spec
+did_ok="$DISPATCH_RESULT_STATUS_PATH"
+id_ok="$("$GREP_BIN" -oE 'p03-i03-summarizer-spec-a[0-9]{2}' "$FEATURE_FOLDER/RUN_LOG.md" | head -1)"
+[ -n "$id_ok" ] || _fail "could not recover the successful attempt's dispatch_id from RUN_LOG"
+seq_ok="$(_events_for_dispatch_id "$id_ok" "$FEATURE_FOLDER/RUN_LOG.md" | tr '\n' ' ')"
+assert_eq "DISPATCH_STARTED DISPATCH_COMPLETED " "$seq_ok" \
+  "a successful launched attempt records STARTED then COMPLETED, and nothing else"
+
+# 3b. A launched, CLASSIFIED-FAILED attempt (permanent vendor error): STARTED,
+#     COMPLETED, THEN exactly one ATTEMPT_FAILED referencing the same id.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+FAKE_MODE=permanent dispatch_attempt 3 04 summarizer-spec
+id_fail="$("$GREP_BIN" -oE 'p03-i04-summarizer-spec-a[0-9]{2}' "$FEATURE_FOLDER/RUN_LOG.md" | head -1)"
+[ -n "$id_fail" ] || _fail "could not recover the failed attempt's dispatch_id from RUN_LOG"
+seq_fail="$(_events_for_dispatch_id "$id_fail" "$FEATURE_FOLDER/RUN_LOG.md" | tr '\n' ' ')"
+assert_eq "DISPATCH_STARTED DISPATCH_COMPLETED ATTEMPT_FAILED " "$seq_fail" \
+  "a classified-failed launched attempt records STARTED, COMPLETED, then exactly one ATTEMPT_FAILED"
+
+# 3c. A prelaunch failure: exactly one DISPATCH_NOT_LAUNCHED, no start/completion.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+_saved_context7="${CONTEXT7_POLICY:-}"
+unset CONTEXT7_POLICY
+dispatch_attempt 1 05 preflight-claude
+prelaunch_rc=$?
+CONTEXT7_POLICY="$_saved_context7"
+assert_rc 1 "$prelaunch_rc" "a prelaunch-rejected attempt returns non-zero"
+assert_eq PRELAUNCH_FAILED "${DISPATCH_RESULT_CLASSIFICATION:-}" \
+  "a prelaunch-rejected attempt is classified PRELAUNCH_FAILED"
+assert_eq 1 "$("$GREP_BIN" -c 'event=DISPATCH_NOT_LAUNCHED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "exactly one DISPATCH_NOT_LAUNCHED is recorded"
+assert_eq 0 "$("$GREP_BIN" -c 'event=DISPATCH_STARTED\|event=DISPATCH_COMPLETED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "a prelaunch failure records no DISPATCH_STARTED and no DISPATCH_COMPLETED"
+
+# --- 4. Two read-only roles dispatched concurrently: disjoint attempt dirs,
+#        complete parent-ingested RUN_LOG records (Task 6 Step 1) ------------
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+declare -gA DISPATCH_PARALLEL_CLASSIFICATION=()
+# Both roles launch and their vendor call succeeds (rc=0) -- their eventual
+# STATUS-shape classification is irrelevant to what THIS test checks (attempt
+# isolation and RUN_LOG completeness), so no rc/classification is asserted
+# here; sections 1-3 above already prove a fully COMPLETED lifecycle.
+FAKE_MODE=complete dispatch_parallel 1 06 preflight-claude preflight-codex >/dev/null 2>&1
+id_a="$("$GREP_BIN" -oE 'p01-i06-preflight-claude-a[0-9]{2}' "$FEATURE_FOLDER/RUN_LOG.md" | head -1)"
+id_b="$("$GREP_BIN" -oE 'p01-i06-preflight-codex-a[0-9]{2}' "$FEATURE_FOLDER/RUN_LOG.md" | head -1)"
+dir_a="$(role_attempt_dir preflight-claude "$id_a" 2>/dev/null)"
+dir_b="$(role_attempt_dir preflight-codex "$id_b" 2>/dev/null)"
+if [ -n "$dir_a" ] && [ -n "$dir_b" ] && [ "$dir_a" != "$dir_b" ] \
+   && [ -d "$dir_a" ] && [ -d "$dir_b" ]; then
+  _ok "the two concurrently-dispatched roles have disjoint, real attempt directories"
+else
+  _fail "attempt directories are not disjoint or do not exist: [$dir_a] vs [$dir_b]"
+fi
+# "Complete blocks" -- every DISPATCH_COMPLETED block in this RUN_LOG carries
+# the full identity/telemetry field set, not a truncated fragment.
+complete_blocks="$("$GREP_BIN" -c 'event=DISPATCH_COMPLETED' "$FEATURE_FOLDER/RUN_LOG.md" || true)"
+usage_status_lines="$("$GREP_BIN" -c '^usage_status:' "$FEATURE_FOLDER/RUN_LOG.md" || true)"
+assert_eq 2 "$complete_blocks" "two DISPATCH_COMPLETED blocks were ingested by the parent"
+assert_eq "$complete_blocks" "$usage_status_lines" \
+  "every DISPATCH_COMPLETED block reaches its final usage_status field (no truncated block)"
+
+# --- 5. group_wall_ms is max(end)-min(start), never a sum (Task 6 Step 4) ---
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+FAKE_MODE=complete FAKE_DELAY_SECONDS=1 dispatch_parallel 1 07 preflight-claude preflight-codex \
+  >/dev/null 2>&1
+gw="${DISPATCH_PARALLEL_GROUP_WALL_MS:-0}"
+# Two ~1s children run concurrently: a correct max(end)-min(start) computation
+# stays near 1000ms; a (buggy) sum would land near 2000ms. 1700ms is a
+# generous mid-point that tolerates real scheduling jitter without accepting
+# a sum.
+if [ "$gw" -ge 700 ] && [ "$gw" -lt 1700 ]; then
+  _ok "DISPATCH_PARALLEL_GROUP_WALL_MS ($gw ms) reflects concurrent execution, not a sum of two ~1s children"
+else
+  _fail "DISPATCH_PARALLEL_GROUP_WALL_MS is implausible for two concurrent ~1s children: $gw ms"
+fi
+
+# --- 6. Duplicate roles are rejected before anything is dispatched ----------
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+dispatch_parallel 1 08 preflight-claude preflight-claude 2>"$WORK/dup.err"
+assert_rc 1 $? "dispatch_parallel rejects a duplicate role"
+assert_contains "DISPATCH_PARALLEL_DUPLICATE_ROLE" "$WORK/dup.err" "the rejection names itself"
+assert_eq 0 "$(wc -l < "$FEATURE_FOLDER/RUN_LOG.md" | tr -d ' ')" \
+  "a duplicate-role rejection writes nothing to RUN_LOG.md"
+
+# --- 7. Partial fan-out failures (Task 6 Step 7) -----------------------------
+# 7a. one completed child plus one timed-out child, dispatched together.
+tcol="$(tsv_column "$BUILD/roles-clean-status.tsv" timeout_minutes)"
+awk -F'\t' -v OFS='\t' -v col="$tcol" -v v=0.02 \
+  'NR==1{print;next} { if ($1=="summarizer-spec") $col=v; print }' \
+  "$BUILD/roles-clean-status.tsv" > "$BUILD/roles-fanout-timeout.tsv"
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+declare -gA DISPATCH_PARALLEL_CLASSIFICATION=()
+ROLE_CONTRACTS_PATH="$BUILD/roles-fanout-timeout.tsv" \
+  FAKE_MODE=complete FAKE_DELAY_SECONDS=2 \
+  dispatch_parallel 3 09 summarizer-spec summarizer-plan >/dev/null 2>&1
+case "${DISPATCH_PARALLEL_CLASSIFICATION[summarizer-spec]:-}" in
+  TIMED_OUT) _ok "7a: the short-timeout role is classified TIMED_OUT" ;;
+  *) _fail "7a: expected TIMED_OUT, got [${DISPATCH_PARALLEL_CLASSIFICATION[summarizer-spec]:-}]" ;;
+esac
+assert_eq COMPLETED "${DISPATCH_PARALLEL_CLASSIFICATION[summarizer-plan]:-}" \
+  "7a: its sibling still completes normally despite the other role timing out"
+assert_eq 2 "$("$GREP_BIN" -cE 'event=(DISPATCH_STARTED|DISPATCH_NOT_LAUNCHED)' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "7a: one result record per requested role (both PIDs were awaited and ingested)"
+
+# 7b. one missing result file (child produced no attempt directory at all).
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+_dispatch_ingest_child 1 10 preflight-claude ""
+assert_rc 1 $? "7b: a missing result file ingests as a failure"
+assert_eq PRELAUNCH_FAILED "${DISPATCH_RESULT_CLASSIFICATION:-}" \
+  "7b: a missing result file is classified PRELAUNCH_FAILED"
+assert_present 'event=DISPATCH_NOT_LAUNCHED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "7b: exactly one synthesized DISPATCH_NOT_LAUNCHED is still recorded"
+assert_present 'DISPATCH_PARALLEL_MISSING_RESULT' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "7b: the synthesized record names the missing-result reason"
+
+# 7c. one malformed result file (unrecognized classification value).
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+malformed_dir="$(mktemp -d)"
+_dispatch_write_result "$malformed_dir" launched=yes phase=1 phase_name=preflight \
+  iteration=11 role=preflight-claude vendor=claude dispatch_id=p01-i11-preflight-claude-a01 \
+  logical_dispatch_id=p01-i11-preflight-claude attempt=01 status_path=/dev/null \
+  classification=NOT_A_REAL_CLASSIFICATION reason="" verdict="" usage_line="" \
+  start_ms=1 end_ms=2 wall_ms=1 mutates=no
+_dispatch_ingest_result "$malformed_dir/result.kv"
+assert_rc 1 $? "7c: a malformed result record ingests as a failure, never a crash"
+assert_present 'event=ATTEMPT_FAILED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "7c: a malformed classification still yields exactly one ingested failure record"
+assert_present 'DISPATCH_RESULT_MALFORMED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "7c: the malformed-record reason names itself"
+# One ingest call must yield exactly one of EACH block _dispatch_ingest_result
+# itself owns (DISPATCH_COMPLETED, ATTEMPT_FAILED) -- never duplicated by a
+# second call. DISPATCH_STARTED is NOT one of them any more (the review fix):
+# it is written earlier, by _dispatch_write_started inside
+# _dispatch_launch_attempt, immediately before the vendor launches -- calling
+# _dispatch_ingest_result directly, as this test does, must never manufacture
+# one out of thin air.
+assert_eq 0 "$("$GREP_BIN" -c 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "7c: _dispatch_ingest_result never writes DISPATCH_STARTED itself"
+assert_eq 1 "$("$GREP_BIN" -c 'event=DISPATCH_COMPLETED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "7c: exactly one DISPATCH_COMPLETED for the malformed record"
+assert_eq 1 "$("$GREP_BIN" -c 'event=ATTEMPT_FAILED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "7c: exactly one ATTEMPT_FAILED for the malformed record -- not silently dropped or duplicated"
+
+# 7d. two mutating attempts competing for the (Task 6 seam) write lease.
+# Whether the winner's OWN STATUS shape then classifies as COMPLETED or
+# MALFORMED_STATUS is irrelevant here (implementer additionally requires a
+# `verification:` STATUS field the generic fake envelope omits) -- what this
+# case proves is the LEASE property: exactly one of the two ever reaches
+# DISPATCH_STARTED (it was actually launched); the other is rejected before
+# launch (DISPATCH_NOT_LAUNCHED), never left to overlap in mutation.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+rm -rf "$ORCHESTRATION_DIR/write-lease.d"
+declare -gA DISPATCH_PARALLEL_CLASSIFICATION=()
+FAKE_MODE=complete dispatch_parallel 6 12 implementer debugger >/dev/null 2>&1
+assert_eq 1 "$("$GREP_BIN" -c 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "7d: exactly one of the two mutating roles was actually launched"
+assert_eq 1 "$("$GREP_BIN" -c 'event=DISPATCH_NOT_LAUNCHED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "7d: the other is rejected as a typed prelaunch failure, never left to overlap"
+assert_present 'DISPATCH_WRITE_LEASE_UNAVAILABLE' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "7d: the loser's rejection names the write-lease seam"
+assert_not_exists "$ORCHESTRATION_DIR/write-lease.d" \
+  "7d: the winner released the lease after finishing (nothing left held)"
+
+# 7e. render failure in one role yields ZERO invocations for its peer (Task 6
+# review fix #4 -- restores v1 dispatch_reviewers_parallel's invariant:
+# "rendering up front means a codex render failure cannot leave a claude
+# child already spending", generalized to the whole batch).
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+: > "$FAKE_ARGV_LOG"
+declare -gA DISPATCH_PARALLEL_CLASSIFICATION=()
+_saved_spec_path="$SPEC_PATH"
+unset SPEC_PATH
+dispatch_parallel 3 15 spec-reviewer-claude summarizer-spec >/dev/null 2>&1
+rc_batch=$?
+SPEC_PATH="$_saved_spec_path"
+assert_rc 1 "$rc_batch" "7e: dispatch_parallel fails when one role's render fails"
+assert_eq 0 "$("$GREP_BIN" -c '^claude \|^codex ' "$FAKE_ARGV_LOG" || true)" \
+  "7e: the peer role (summarizer-spec, whose own render would have succeeded) got ZERO invocations"
+assert_eq PRELAUNCH_FAILED "${DISPATCH_PARALLEL_CLASSIFICATION[spec-reviewer-claude]:-}" \
+  "7e: the role that actually failed render is PRELAUNCH_FAILED"
+assert_eq PRELAUNCH_FAILED "${DISPATCH_PARALLEL_CLASSIFICATION[summarizer-spec]:-}" \
+  "7e: its peer is ALSO PRELAUNCH_FAILED -- never silently launched anyway"
+assert_present 'DISPATCH_PARALLEL_PEER_REJECTED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "7e: the peer's rejection names the batch-abort reason, distinct from its own (nonexistent) render failure"
+
+# 7f. orphan-process check for dispatch_parallel's fan-out (Task 6 review fix
+# #10): mutating the wait loop to "wait \${pids[0]}" only must be caught by
+# observing a REAL leftover process, the same discipline section 9.10 already
+# applies to invoke_vendor -- not just by a RUN_LOG-shaped assertion.
+orphan_marker="2.$$"
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+declare -gA DISPATCH_PARALLEL_CLASSIFICATION=()
+ROLE_CONTRACTS_PATH="$BUILD/roles-fanout-timeout.tsv" \
+  FAKE_MODE=timeout FAKE_DELAY_SECONDS="$orphan_marker" \
+  dispatch_parallel 3 16 summarizer-spec summarizer-plan >/dev/null 2>&1 &
+orphan_pid=$!
+seen_orphan=0
+for _ in $(seq 1 50); do
+  pgrep -f "sleep $orphan_marker" >/dev/null 2>&1 && { seen_orphan=1; break; }
+  sleep 0.1
+done
+[ "$seen_orphan" -eq 1 ] \
+  && _ok "7f: the fan-out's slower child was actually observed running before dispatch_parallel returned" \
+  || _fail "7f: never observed the slower child running (test would not be meaningful)"
+wait "$orphan_pid"
+if pgrep -f "sleep $orphan_marker" >/dev/null 2>&1; then
+  _fail "7f: dispatch_parallel returned while a forked child's process was still running (an unawaited PID)"
+  pkill -9 -f "sleep $orphan_marker" 2>/dev/null
+else
+  _ok "7f: no forked child's process remains after dispatch_parallel returns (every PID was truly awaited)"
+fi
+
+# 7g. a corrupt/empty `mutates` registry cell fails CLOSED (Task 6 review fix
+# #7): never silently coerced to "no", which would skip the write lease for a
+# role that actually mutates.
+mcol_mut="$(tsv_column "$BUILD/roles.tsv" mutates)"
+awk -F'\t' -v OFS='\t' -v col="$mcol_mut" -v v="maybe" \
+  'NR==1{print;next} { if ($1=="implementer") $col=v; print }' \
+  "$BUILD/roles.tsv" > "$BUILD/roles-corrupt-mutates.tsv"
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+ROLE_CONTRACTS_PATH="$BUILD/roles-corrupt-mutates.tsv" \
+  FAKE_MODE=complete dispatch_attempt 6 17 implementer >/dev/null 2>&1
+rc_corrupt=$?
+assert_rc 1 "$rc_corrupt" "7g: a corrupt mutates cell fails the dispatch, not a silent 'no' guess"
+assert_eq PRELAUNCH_FAILED "${DISPATCH_RESULT_CLASSIFICATION:-}" \
+  "7g: a corrupt mutates cell is a typed PRELAUNCH_FAILED"
+assert_present 'DISPATCH_MUTATES_LOOKUP_FAILED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "7g: the rejection names the mutates-lookup failure specifically"
+
+# 7h. orphan branch (Task 6 review fix #1 follow-up): a child that already
+# wrote a durable DISPATCH_STARTED, then died before writing its result, must
+# be recorded as an orphan by the parent's ingestion -- NEVER overwritten
+# with a contradictory DISPATCH_NOT_LAUNCHED. That contradiction is the exact
+# log corruption blocker-1's fix exists to prevent, and _dispatch_ingest_child
+# is the ONLY code standing between a real crash and that corruption, so it
+# is driven here with a REAL killed process, not a hand-injected RUN_LOG line.
+#
+# _dispatch_launch_attempt is called directly (bypassing dispatch_parallel's
+# own forking loop) so the test can grab its PID and kill it mid-flight; it
+# reads the roles/dp_*/phase/iteration/phase_name arrays via bash's dynamic
+# scoping for `local`, which works identically for plain globals -- this
+# script runs at top level, so every array/scalar set below IS a global.
+orphan_kill_marker="9.$$"
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+_dispatch_prelaunch 3 18 summarizer-spec   || _fail "7h: prelaunch for the orphan-branch fixture failed (test setup broken)"
+phase=3; iteration=18; phase_name=spec-review
+roles=(summarizer-spec)
+dp_attempt_dir=("$PREP_ATTEMPT_DIR"); dp_dispatch_id=("$PREP_DISPATCH_ID")
+dp_logical=("$PREP_LOGICAL"); dp_attempt=("$PREP_ATTEMPT")
+dp_status_path=("$PREP_STATUS_PATH"); dp_stdout_path=("$PREP_STDOUT_PATH")
+dp_stderr_path=("$PREP_STDERR_PATH"); dp_vendor=("$PREP_VENDOR")
+dp_mutates=("$PREP_MUTATES"); dp_prompt_file=("$PREP_PROMPT_FILE")
+
+FAKE_MODE=timeout FAKE_DELAY_SECONDS="$orphan_kill_marker" _dispatch_launch_attempt 0 &
+orphan_child_pid=$!
+orphan_seen=0
+for _ in $(seq 1 50); do
+  dispatch_is_running "${dp_dispatch_id[0]}" && { orphan_seen=1; break; }
+  sleep 0.1
+done
+[ "$orphan_seen" -eq 1 ]   && _ok "7h: the child's own DISPATCH_STARTED became durable before it was killed"   || _fail "7h: never observed a durable DISPATCH_STARTED (test would not be meaningful)"
+
+kill -9 "$orphan_child_pid" 2>/dev/null
+wait "$orphan_child_pid" 2>/dev/null
+pkill -9 -f "sleep $orphan_kill_marker" 2>/dev/null   # reap the orphaned vendor stub too
+
+assert_not_exists "${dp_attempt_dir[0]}/result.kv"   "7h: the killed child really did die before writing its result (the crash landed where intended)"
+
+_dispatch_ingest_child 3 18 summarizer-spec "${dp_attempt_dir[0]}"
+assert_rc 1 $? "7h: an orphaned attempt ingests as a failure"
+assert_eq ORPHANED_NO_RESULT "${DISPATCH_RESULT_CLASSIFICATION:-}"   "7h: it is classified ORPHANED_NO_RESULT, not PRELAUNCH_FAILED"
+assert_eq DISPATCH_PARALLEL_CHILD_DIED_AFTER_START "${DISPATCH_RESULT_REASON:-}"   "7h: the reason names itself"
+assert_eq 0 "$("$GREP_BIN" -c 'event=DISPATCH_NOT_LAUNCHED' "$FEATURE_FOLDER/RUN_LOG.md" || true)"   "7h: the parent never overwrites the durable DISPATCH_STARTED with a contradictory DISPATCH_NOT_LAUNCHED"
+assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md"   "7h: the original DISPATCH_STARTED record is still intact"
+
+# --- 8. Turn-start reconciliation: dispatch_is_running (spec S13.3) ---------
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+FAKE_MODE=complete dispatch_attempt 1 13 preflight-claude >/dev/null 2>&1
+completed_id="$("$GREP_BIN" -oE 'p01-i13-preflight-claude-a[0-9]{2}' "$FEATURE_FOLDER/RUN_LOG.md" | head -1)"
+dispatch_is_running "$completed_id"
+assert_rc 1 $? "a completed dispatch id is no longer 'running'"
+
+# A REAL backgrounded dispatch, not a hand-injected RUN_LOG block: proves the
+# ENGINE itself (not just dispatch_is_running's own parser) makes
+# DISPATCH_STARTED durable before the vendor launches (Task 6 review fix #1 --
+# a state the pre-fix engine could never produce, since it wrote
+# DISPATCH_STARTED only after the child had already finished).
+real_live_marker="3.$$"
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+FAKE_MODE=complete FAKE_DELAY_SECONDS="$real_live_marker"   dispatch_attempt 1 14 preflight-claude >/dev/null 2>&1 &
+real_live_pid=$!
+seen_real_live=0
+real_live_id=""
+for _ in $(seq 1 50); do
+  pgrep -f "sleep $real_live_marker" >/dev/null 2>&1 && seen_real_live=1
+  real_live_id="$("$GREP_BIN" -oE 'p01-i14-preflight-claude-a[0-9]{2}' "$FEATURE_FOLDER/RUN_LOG.md" 2>/dev/null | head -1)"
+  [ "$seen_real_live" -eq 1 ] && [ -n "$real_live_id" ] && break
+  sleep 0.1
+done
+[ "$seen_real_live" -eq 1 ]   && _ok "the real dispatch's own vendor process was actually observed running"   || _fail "never observed the real dispatch's vendor process running (test would not be meaningful)"
+if [ -n "$real_live_id" ]; then
+  dispatch_is_running "$real_live_id"
+  assert_rc 0 $? "dispatch_is_running is TRUE for a real attempt while its vendor process is genuinely still running"
+else
+  _fail "never recovered the real attempt's dispatch_id from RUN_LOG while it was running"
+fi
+wait "$real_live_pid"
+[ -n "$real_live_id" ] && { dispatch_is_running "$real_live_id"; assert_rc 1 $? "and FALSE again once that same attempt has completed"; }
+
+live_id="p09-i99-liveness-probe-a01"
+{
+  printf -- '--- %s  event=DISPATCH_STARTED\n' "$(iso_now)"
+  printf 'phase:                    9\n'
+  printf 'phase_name:               git-finalization\n'
+  printf 'iteration:                99\n'
+  printf 'role:                     liveness-probe\n'
+  printf 'dispatch_id:              %s\n' "$live_id"
+  printf '\n'
+} >> "$FEATURE_FOLDER/RUN_LOG.md"
+dispatch_is_running "$live_id"
+assert_rc 0 $? "a DISPATCH_STARTED with no matching completion IS 'running'"
+
+# A narration matching durable evidence: no correction needed.
+pre_count="$("$GREP_BIN" -c 'event=PROCESS_DEVIATION' "$FEATURE_FOLDER/RUN_LOG.md" || true)"
+assert_dispatch_running_claim "$live_id" "liveness-probe is running"
+assert_rc 0 $? "a narration backed by DISPATCH_STARTED needs no correction"
+post_count="$("$GREP_BIN" -c 'event=PROCESS_DEVIATION' "$FEATURE_FOLDER/RUN_LOG.md" || true)"
+assert_eq "$pre_count" "$post_count" "no PROCESS_DEVIATION is appended for a truthful claim"
+
+# A narration NOT backed by durable evidence: corrected.
+assert_dispatch_running_claim "p09-i99-nonexistent-a01" "a role that was never dispatched is running"
+assert_rc 1 $? "a false 'is running' narration is rejected"
+assert_present 'event=PROCESS_DEVIATION' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "a false narration is recorded as a durable process deviation"
+
+# --- 9. A render failure must produce ZERO CLI invocations ------------------
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+: > "$FAKE_ARGV_LOG"
+unset SPEC_PATH
+dispatch_attempt 7 01 code-reviewer-claude \
+  && _fail "dispatch must fail when a render key is unset" \
+  || _ok "dispatch fails when a render key is unset"
+assert_eq 0 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
+  "a render failure invokes the CLI zero times"
+SPEC_PATH="$WORK/spec.md"
+
+# --- 10. the fake CLI's own argument-order guard (unrelated to dispatch,
+#     regression coverage for the stub itself) -------------------------------
 codex exec -a never -m gpt-5.6-sol - < /dev/null \
   > "$WORK/codex_bad_order.out" 2> "$WORK/codex_bad_order.err"
 assert_rc 2 $? "codex stub rejects a global option placed after exec"
 assert_present "unexpected argument" "$WORK/codex_bad_order.err" \
   "codex stub's rejection message names the offending argument"
 
-# --- 3. --add-dir appears only when the feature folder is outside REPO_ROOT ---
-case "$(cat "$FAKE_ARGV_LOG")" in
-  *--add-dir*) _fail "--add-dir must be absent when FEATURE_FOLDER is inside REPO_ROOT" ;;
-  *) _ok "--add-dir absent for an in-repo feature folder" ;;
-esac
-: > "$FAKE_ARGV_LOG"
-(
-  # Plain assignment, no export: validate_roots and codex_invoke run as bash
-  # functions in this SAME forked subshell process, so they see this variable
-  # without needing it in the environment. Only the actual `codex` stub
-  # (a separate process) needs anything exported, and it reads FAKE_ARGV_LOG
-  # and PATH, not FEATURE_FOLDER.
-  FEATURE_FOLDER="$WORK/outside"; mkdir -p "$FEATURE_FOLDER"
-  validate_roots >/dev/null 2>&1
-  printf '%s' "${FEATURE_FOLDER_OUTSIDE_REPO:-<unset>}" > "$WORK/outside_flag.txt"
-  printf 'p\n' | codex_invoke plan-reviewer-codex "$WORK/c2.json" "$WORK/c2.err"
-)
-assert_eq "yes" "$(cat "$WORK/outside_flag.txt")" \
-  "validate_roots sets FEATURE_FOLDER_OUTSIDE_REPO=yes for an out-of-repo feature folder"
-assert_present "--add-dir" "$FAKE_ARGV_LOG" \
-  "--add-dir present for an out-of-repo feature folder"
-
-# --- 4. A failing stub is reported as failed ---
-: > "$FAKE_ARGV_LOG"
-FAKE_RC=3 dispatch_reviewers_parallel spec-reviewer-claude spec-reviewer-codex 3 01
-assert_eq 3 "${CLAUDE_RC}" "a failing claude stub is detected (was always 0 before)"
-assert_eq -1 "${CODEX_RC}" "CODEX_RC is -1 when codex is not dispatched"
-
-# --- 5. timeout escalates to --kill-after for a stub that ignores SIGTERM ---
+# --- 11. timeout escalates to --kill-after for a stub that ignores SIGTERM --
 FAKE_IGNORE_TERM=1 FAKE_DELAY=30 \
   timeout --kill-after=1s 1s claude --model x -p - </dev/null >/dev/null 2>&1
 rc=$?
@@ -140,138 +591,7 @@ case "$rc" in
   *) _fail "expected 124 or 137 from timeout escalation, got $rc" ;;
 esac
 
-# --- long dispatch: recording and resume classification ---
-for fn in dispatch_id role_mutates appendix_exists log_dispatch_started dispatch_state; do
-  declare -F "$fn" >/dev/null || _fail "$fn is not defined"
-done
-[ "$_FAILURES" -eq 0 ] || finish
-
-assert_eq "6-iter00-implementer" "$(dispatch_id 6 00 implementer)" \
-  "dispatch_id is deterministic"
-
-# dispatch_state sets a GLOBAL and must be called directly: "$(dispatch_state ...)"
-# would run it in a subshell and discard it.
-state_of() { dispatch_state "$1" "$2" "$3" "$4"; printf '%s' "$DISPATCH_STATE"; }
-
-SD="$FEATURE_FOLDER/6-implementation"; mkdir -p "$SD"
-ST="$SD/implementer-status.md"
-: > "$FEATURE_FOLDER/RUN_LOG.md"
-
-# 1. Nothing recorded, no STATUS -> never launched.
-assert_eq NEVER_LAUNCHED "$(state_of 6 00 implementer "$ST")" \
-  "no DISPATCH_STARTED record means NEVER_LAUNCHED"
-
-# 2. Recorded, but no STATUS -> unfinished. This is the session-crash case.
-log_dispatch_started 6 implementation 00 implementer
-assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" \
-  "the dispatch is recorded BEFORE it runs"
-assert_eq UNFINISHED "$(state_of 6 00 implementer "$ST")" \
-  "a recorded dispatch with no STATUS is UNFINISHED"
-
-# 3. Recorded and a valid STATUS -> completed.
-printf 'verdict: DONE\nverification: PASS\n' > "$ST"
-assert_eq COMPLETED "$(state_of 6 00 implementer "$ST")" \
-  "a recorded dispatch with a valid STATUS is COMPLETED"
-
-# 4. A STATUS that fails validation is NOT completion. A half-written artifact
-#    must never be mistaken for a finished dispatch.
-printf 'verdict: DONE\nverification: MAYBE\n' > "$ST"
-assert_eq UNFINISHED "$(state_of 6 00 implementer "$ST")" \
-  "an invalid STATUS is UNFINISHED, not COMPLETED"
-
-# 5. role_mutates decides what UNFINISHED means. This is the rule that keeps a
-#    half-run implementer from being silently re-run over its own commits.
-assert_eq yes "$(role_mutates implementer)"           "the implementer mutates"
-assert_eq yes "$(role_mutates documentation-writer)"  "the documentation writer mutates"
-assert_eq no  "$(role_mutates summarizer-spec)"       "summarizers are read-only"
-assert_eq no  "$(role_mutates code-reviewer-claude)"  "reviewers are read-only"
-
-# 6. Pre-launch validation: a missing appendix must fail before any CLI runs.
-appendix_exists implementer     && _ok "appendix_exists finds a real appendix" \
-                                || _fail "appendix_exists missed a real appendix"
-appendix_exists no-such-role    && _fail "appendix_exists accepted a missing appendix" \
-                                || _ok "appendix_exists rejects a missing appendix"
-
-# 7. dispatch_role run TO COMPLETION against the fakebin stubs. Every prior
-#    assertion in this file either called a helper directly or deliberately
-#    failed at render -- nothing exercised the success path all the way through
-#    log_dispatch, which is exactly where the Critical finding lived:
-#    process_identity had zero call sites, so PROCESS_GIT_HEAD was an unbound
-#    variable and log_dispatch died mid-`{ }` group under `set -uo pipefail`,
-#    AFTER the CLI had already been invoked, appending a TRUNCATED block to the
-#    append-only RUN_LOG. Isolate RUN_LOG first so the field-order and
-#    provenance checks below see exactly one dispatch block.
-: > "$FEATURE_FOLDER/RUN_LOG.md"
-: > "$FAKE_ARGV_LOG"
-dispatch_role 3 01 spec-reviewer-claude "$SD/dr7-status.md"
-assert_rc 0 $? "dispatch_role returns 0 end to end with a healthy stub"
-
-assert_present 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" \
-  "RUN_LOG gained an event=DISPATCH_STARTED block"
-assert_present '^--- .*  dispatch$' "$FEATURE_FOLDER/RUN_LOG.md" \
-  "RUN_LOG gained a full dispatch block"
-
-# Regression test for FIX 1: provenance fields must be REAL, not empty/unbound.
-git_sha="$(status_field "$FEATURE_FOLDER/RUN_LOG.md" develop_it_git_sha)"
-file_sha256="$(status_field "$FEATURE_FOLDER/RUN_LOG.md" develop_it_file_sha256)"
-if [ -n "$git_sha" ] && [ "$git_sha" != non-git ]; then
-  _ok "dispatch block's develop_it_git_sha is populated (FIX1 regression)"
-else
-  _fail "dispatch block's develop_it_git_sha is empty or non-git: [$git_sha]"
-fi
-if [ -n "$file_sha256" ]; then
-  _ok "dispatch block's develop_it_file_sha256 is populated (FIX1 regression)"
-else
-  _fail "dispatch block's develop_it_file_sha256 is empty"
-fi
-
-# Regression test for FIX 2: phase_name must be the canonical name, not 'unknown'.
-assert_eq "spec-review" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" phase_name)" \
-  "dispatch block's phase_name is canonical, not 'unknown' (FIX2 regression)"
-
-# Regression test for FIX 7: emitted key order must match the declared grammar
-# field-for-field. Walk the dispatch block's own lines rather than trusting any
-# single-key lookup, which cannot see ordering.
-dr_keys=""
-in_dispatch_block=0
-while IFS= read -r line; do
-  case "$line" in
-    "--- "*"  dispatch")
-      in_dispatch_block=1
-      continue
-      ;;
-  esac
-  if [ "$in_dispatch_block" -eq 1 ]; then
-    [ -z "$line" ] && break
-    dr_keys="$dr_keys ${line%%:*}"
-  fi
-done < "$FEATURE_FOLDER/RUN_LOG.md"
-dr_keys="${dr_keys# }"
-assert_eq \
-  "phase phase_name iteration role vendor appendix develop_it_git_sha develop_it_file_sha256 develop_it_dirty status_path verdict model duration_ms tokens_input_new tokens_input_cached tokens_cache_write tokens_output tokens_reasoning cost_usd usage_status" \
-  "$dr_keys" \
-  "log_dispatch emits keys in the declared grammar order (FIX7 regression)"
-
-# 7b. dispatch_reviewers_parallel with codex_available=true: exercises the
-# codex render path, the second subshell, the second `wait`, and CODEX_RC
-# coming from that wait -- none of which any existing assertion touched.
-# Also the regression test for FIX 3: BOTH roles must get a DISPATCH_STARTED
-# record before either subshell launches, or dispatch_state can never see them
-# on resume.
-: > "$FEATURE_FOLDER/RUN_LOG.md"
-: > "$FAKE_ARGV_LOG"
-codex_available=true dispatch_reviewers_parallel spec-reviewer-claude spec-reviewer-codex 3 02
-assert_rc 0 $? "dispatch_reviewers_parallel returns 0 with codex_available=true"
-assert_eq 0 "${CLAUDE_RC}" "codex path: claude subprocess succeeds (rc from wait)"
-assert_eq 0 "${CODEX_RC}" "codex path: codex subprocess succeeds (rc from the second wait)"
-assert_eq 2 "$("$GREP_BIN" -c 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
-  "both claude and codex roles got a DISPATCH_STARTED record (FIX3 regression)"
-assert_present 'role:                     spec-reviewer-claude' "$FEATURE_FOLDER/RUN_LOG.md" \
-  "the claude role's DISPATCH_STARTED record is present"
-assert_present 'role:                     spec-reviewer-codex' "$FEATURE_FOLDER/RUN_LOG.md" \
-  "the codex role's DISPATCH_STARTED record is present"
-
-# 7c. post_dispatch must treat an empty rc, a non-numeric rc, and rc=124
+# --- 12. post_dispatch must treat an empty rc, a non-numeric rc, and rc=124
 # (timeout's own exit code) as failure -- not a syntax error, not success.
 : > "$WORK/pd-status.md"; : > "$WORK/pd.err"
 post_dispatch "" "$WORK/pd-status.md" "$WORK/pd.err" >/dev/null 2>&1
@@ -280,18 +600,6 @@ post_dispatch "abc" "$WORK/pd-status.md" "$WORK/pd.err" >/dev/null 2>&1
 assert_rc 1 $? "post_dispatch treats a non-numeric rc as failure"
 post_dispatch 124 "$WORK/pd-status.md" "$WORK/pd.err" >/dev/null 2>&1
 assert_rc 1 $? "post_dispatch treats rc=124 (timeout) as failure"
-
-# 8. A render failure must produce ZERO CLI invocations. Asserting only that the
-#    delivered prompt has no $VARS is insufficient: an empty prompt also passes
-#    that test.
-: > "$FAKE_ARGV_LOG"
-unset SPEC_PATH
-dispatch_role 7 01 code-reviewer-claude "$SD/x-status.md" \
-  && _fail "dispatch must fail when a render key is unset" \
-  || _ok "dispatch fails when a render key is unset"
-assert_eq 0 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
-  "a render failure invokes the CLI zero times"
-SPEC_PATH="$WORK/spec.md"
 
 # =============================================================================
 # 9. invoke_vendor (Task 5) -- normalized registry-driven vendor invocation.
@@ -479,6 +787,30 @@ assert_present 'verdict: DONE' "$WORK/status-like.out" \
 assert_not_exists "$neg_status" \
   "invoke_vendor (mode=exit-no-status) never materializes the attempt's REAL \$STATUS_PATH from stdout content -- only a real STATUS file, validated by classify_attempt (a later task), can establish completion"
 unset STATUS_PATH  # do not leak into the launches that follow
+
+# --- 9.9b EXTRA_VENDOR_ARGS (Phase 6 --agents sub-subagent model pin) reaches
+# the real argv, with the model GENERATED from role_model -- never a literal,
+# so the sub-subagent model cannot silently drift from the single source of
+# truth (Task 6 review fix #10: previously untested).
+: > "$FAKE_ARGV_LOG"
+agents_json="$(jq -nc --arg m "$(role_model impl-worker)" \
+  '{"impl-worker":{description:"d",prompt:"p",model:$m}}')"
+EXTRA_VENDOR_ARGS=(--agents "$agents_json")
+invoke_vendor context-discovery "$iv_prompt" "$WORK/agents.out" "$WORK/agents.err"
+rc_agents=$?
+assert_rc 0 "$rc_agents" "invoke_vendor succeeds with EXTRA_VENDOR_ARGS set"
+assert_contains "--agents" "$FAKE_ARGV_LOG" \
+  "invoke_vendor forwards EXTRA_VENDOR_ARGS (--agents) to claude"
+assert_contains "$(role_model impl-worker)" "$FAKE_ARGV_LOG" \
+  "the --agents payload carries the REGISTRY's impl-worker model, proven via role_model, not a literal"
+# EXTRA_VENDOR_ARGS is left SET (not unset) across this next call -- the
+# claim under test is that codex ignores it (claude-only), which the array
+# being empty/unset would prove nothing about.
+: > "$FAKE_ARGV_LOG"
+invoke_vendor preflight-codex "$iv_prompt" "$WORK/agents-codex.out" "$WORK/agents-codex.err"
+unset EXTRA_VENDOR_ARGS
+assert_eq 0 "$("$GREP_BIN" -c -- '--agents' "$FAKE_ARGV_LOG" || true)" \
+  "EXTRA_VENDOR_ARGS is claude-only and never reaches a codex launch, even when set"
 
 # --- 9.10 TERM-respecting and TERM-ignoring timeouts, with a real process check
 # Markers are scoped with $$ (this script's own PID) so a leftover from any

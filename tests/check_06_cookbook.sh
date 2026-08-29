@@ -481,25 +481,53 @@ if declare -F post_dispatch >/dev/null; then
   rm -f "$_pd_err"
 fi
 
-# --- dispatch_role actually CALLS post_dispatch, with the stdout transcript ---
+# --- _dispatch_launch_attempt actually CALLS post_dispatch, with the stdout transcript ---
 # post_dispatch spent a revision as an orphan: defined, documented as "the"
 # implementation of the transcript-read policy, and invoked from nowhere. That
 # is why a spend-ceiling failure reached the user with no diagnostic. Pin both
-# the call and the 4th argument.
-if declare -F dispatch_role >/dev/null; then
-  _dr_body="$(declare -f dispatch_role)"
+# the call and the stdout-transcript argument. dispatch_role is gone (Task 6);
+# _dispatch_launch_attempt is the part of dispatch_attempt/dispatch_parallel's
+# lifecycle that actually invokes the vendor and classifies the result.
+if declare -F _dispatch_launch_attempt >/dev/null; then
+  _dr_body="$(declare -f _dispatch_launch_attempt)"
   case "$_dr_body" in
-    *post_dispatch*) _ok "dispatch_role calls post_dispatch" ;;
-    *) _fail "dispatch_role no longer calls post_dispatch — the policy is unenforced again" ;;
+    *post_dispatch*) _ok "_dispatch_launch_attempt calls post_dispatch" ;;
+    *) _fail "_dispatch_launch_attempt no longer calls post_dispatch — the policy is unenforced again" ;;
   esac
   case "$_dr_body" in
-    *'post_dispatch "$DISPATCH_RC" "$status_path" "$base.err" "$base.json"'*)
-      _ok "dispatch_role passes the stdout transcript to post_dispatch" ;;
-    *) _fail "dispatch_role's post_dispatch call is missing the stdout transcript argument" ;;
+    *'post_dispatch "$vrc" "$s_path" "$err_path" "$out_path"'*)
+      _ok "_dispatch_launch_attempt passes the stdout transcript to post_dispatch" ;;
+    *) _fail "_dispatch_launch_attempt's post_dispatch call is missing the stdout transcript argument" ;;
+  esac
+  # Step 3 order (review fix #9): write the attempt result BEFORE releasing
+  # the lease -- a single ordered-substring match on the function's own body,
+  # same style as the post_dispatch pin two cases above.
+  case "$_dr_body" in
+    *'_dispatch_write_result "$a_dir" launched=yes'*'_dispatch_lease_release "$role"'*)
+      _ok "_dispatch_launch_attempt writes the attempt result BEFORE releasing the lease" ;;
+    *) _fail "_dispatch_launch_attempt releases the lease before (or without) writing the attempt result" ;;
   esac
 else
-  _fail "dispatch_role is not defined"
+  _fail "_dispatch_launch_attempt is not defined"
 fi
+
+for _fn in dispatch_attempt dispatch_parallel _dispatch_prelaunch _dispatch_launch_attempt \
+           _dispatch_write_started _dispatch_ingest_result _dispatch_ingest_child \
+           dispatch_is_running _dispatch_classify _dispatch_lease_try_acquire _dispatch_lease_release; do
+  declare -F "$_fn" >/dev/null && _ok "$_fn is defined" || _fail "$_fn is not defined"
+done
+
+for _fn in _dispatch_run_attempt; do
+  declare -F "$_fn" >/dev/null \
+    && _fail "$_fn should have been split into _dispatch_prelaunch/_dispatch_launch_attempt in the review fix" \
+    || _ok "$_fn is removed (split into _dispatch_prelaunch/_dispatch_launch_attempt)"
+done
+
+for _fn in dispatch_role dispatch_reviewers_parallel dispatch_id log_dispatch_started log_dispatch dispatch_state \
+           claude_invoke codex_invoke; do
+  declare -F "$_fn" >/dev/null && _fail "$_fn should have been removed in Task 6" \
+    || _ok "$_fn is removed"
+done
 
 # --- Task 2 Step 7: eight negative cases, one per failure token -------------
 # Each case tampers a temporary copy of the extracted role-contract registry

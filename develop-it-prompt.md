@@ -40,9 +40,10 @@ You work independently and solo. You do not ask the user for help. You have full
   `preflight/` subfolder) prescribe. This permits moving a file the subagent
   already wrote; it does not permit writing new content, and it does not extend
   to any path outside `$FEATURE_FOLDER`.
-- **Appendix content is never written to disk.** There is no `.prompt` file:
-  prompts are rendered into a shell variable and delivered to the CLI by
-  herestring.
+- **Appendix content is written to exactly one disk location: the attempt's
+  own immutable prompt file.** `dispatch_attempt` renders the appendix fully
+  in memory, persists it once as `<attempt-dir>/prompt.txt`, and only then
+  invokes the vendor against that file. It is never written anywhere else.
 
 ### Forbidden actions
 
@@ -57,15 +58,19 @@ You work independently and solo. You do not ask the user for help. You have full
 For every step that produces or modifies an artifact:
 
 1. Pick the role: which CLI (`claude` or `codex`), which model (Opus / Sonnet / GPT-5.6), which appendix in this file defines its prompt, and which Superpowers skill it must load.
-2. Render the appendix with `render_prompt <appendix-name>` and pipe it into
-   `claude_invoke <role> …` or `codex_invoke <role> …`. Never use `sed` for
-   substitution: multi-line values break it, and the model/effort/timeout must
-   come from the role helpers rather than being written into the command.
+2. Dispatch it with `dispatch_attempt <phase> <iteration> <role>` — or, when it
+   runs alongside its Claude/Codex counterpart at the same gate,
+   `dispatch_parallel <phase> <iteration> <role>...`. Either helper resolves
+   the CLI, model, effort, timeout, and appendix from the role's own registry
+   row, renders the appendix (never with `sed`: multi-line values break it),
+   validates it, invokes the vendor, classifies the result, and records it —
+   there is no separate render/invoke/log call sequence to hand-assemble at a
+   phase step any more.
 
 3. The subagent writes its artifact and a short `STATUS.md` to a pre-agreed path inside the feature folder. STATUS.md is written LAST and atomically (the subagent writes `STATUS.md.tmp` and renames).
 4. You read ONLY `STATUS.md` (and, for the final readiness writer, the per-phase summary files referenced by STATUS.md). You do not open the artifact, the findings file, or the transcripts. The only exception is surfacing a transcript path to the user when a failure halts the run.
 5. Branch on the verdict. For review gates this follows the **iteration-dependent gate** (see "Review-gate severity policy"): through iteration 2, any `blockers + majors > 0` re-dispatches the relevant fixer subagent with the reviewer findings paths as input; from iteration 3 onward, only `blockers > 0` re-dispatches the fix→re-review loop (a `CHANGES_REQUESTED` carrying majors-only at iteration ≥ 3 triggers one **final fix pass** — the fixer runs once with that iteration's findings, reviewers are NOT re-dispatched — then the gate passes, with the majors recorded as deferred (fixed, not re-reviewed)). If `BLOCKED`, halt and surface to the user.
-6. Append one multi-line block to `RUN_LOG.md` for every dispatch **using the `log_dispatch` cookbook helper** (see **Resumability** below for the full grammar — blocks are separated by blank lines and start with `--- <ISO-timestamp>  dispatch` or `--- <ISO-timestamp>  event=<NAME>`; the grammar's block shapes are exhaustive — never hand-compose abbreviated entries). Every dispatch block MUST include the nine usage-telemetry fields produced by `parse_usage` (see "Parsing usage from JSON output" in the cookbook). Call `parse_usage` immediately after the subprocess returns and pass its output line to `log_dispatch`. On parse failure the helper returns `usage_status=unavailable` with zeros; write those into the block unchanged — telemetry parsing failure NEVER blocks dispatch logging.
+6. `dispatch_attempt`/`dispatch_parallel` append the `RUN_LOG.md` block for you — one `DISPATCH_STARTED` plus `DISPATCH_COMPLETED` pair per attempt (see **Resumability** below for the full grammar — blocks are separated by blank lines and start with `--- <ISO-timestamp>  event=<NAME>`; the grammar's block shapes are exhaustive — never hand-compose abbreviated entries). Every completion block includes the nine usage-telemetry fields produced by `parse_usage`, which the dispatch helper calls internally immediately after the subprocess returns. On parse failure it returns `usage_status=unavailable` with zeros; those are written into the block unchanged — telemetry parsing failure NEVER blocks dispatch logging. Do not call `parse_usage` or append a RUN_LOG block by hand at a phase step.
 
    ```
    --- <ISO-timestamp>  dispatch
@@ -433,8 +438,10 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     <phase>-iter<NN>-<role>.err
 ```
 
-Transcripts are named `<phase>-iter<NN>-<role>.<ext>`, exactly
-what `dispatch_id` returns. The role is required, not the vendor: several roles of
+Transcripts are named `<dispatch_id>.stdout` / `<dispatch_id>.stderr`, where
+`dispatch_id` is the attempt identity `allocate_attempt` mints
+(`p<phase-token>-i<NN>-<role>-a<NN>`) — never a hand-built
+`<phase>-iter<NN>-<role>` string. The role is required, not the vendor: several roles of
 the same vendor run within one phase and iteration (e.g. Phase 3 iteration 1 can
 dispatch `spec-reviewer-claude` and, on a re-review round, `spec-fixer` and
 `summarizer-spec` — all vendor `claude`, all in the same phase and iteration), so a
@@ -562,7 +569,7 @@ validate_roots() {
 
   # Codex's workspace-write sandbox is rooted at $REPO_ROOT. When the feature
   # folder lies outside it, reviewers cannot write their own STATUS and the
-  # failure looks like a vendor outage. codex_invoke adds --add-dir in that case.
+  # failure looks like a vendor outage. invoke_vendor adds --add-dir in that case.
   if path_in_tree "$(canon "$FEATURE_FOLDER" 2>/dev/null || echo "$FEATURE_FOLDER")" "$REPO_ROOT"; then
     FEATURE_FOLDER_OUTSIDE_REPO=""
   else
@@ -586,7 +593,8 @@ process_identity() {
   fi
 }
 
-# ---- Timestamp helper (used by log_dispatch and event-tagged RUN_LOG blocks) -
+# ---- Timestamp helper (used by _dispatch_ingest_result and every event-tagged
+# RUN_LOG block) ---------------------------------------------------------
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ---- Durable input reconstruction (schema-v2, spec §6.3) --------------------
@@ -1591,8 +1599,9 @@ role_attempt_dir() {
 # these nine; nothing else, including $ITERATION itself, is touched. A
 # prelaunch failure still consumes its allocated attempt: this function
 # always appends an event=ATTEMPT_ALLOCATED record with `launched: false`
-# BEFORE returning, and only a later real dispatch's own log_dispatch entry
-# is evidence the attempt actually launched -- so an attempt that never gets
+# BEFORE returning, and only a later DISPATCH_STARTED/DISPATCH_COMPLETED pair
+# (written by _dispatch_ingest_result) is evidence the attempt actually
+# launched -- so an attempt that never gets
 # that far stays correctly recorded as `launched: false` forever.
 allocate_attempt() {
   # Usage: allocate_attempt PHASE ITERATION ROLE
@@ -1897,48 +1906,37 @@ render_prompt_check() {
 
 The two vendors take different option orders. Memorise both forms — getting them wrong wastes a dispatch attempt and pollutes the failure log.
 
-<!-- lint: cookbook -->
-```bash
-# Claude — prompt on stdin, model and timeout resolved from the role.
-# --dangerously-skip-permissions is REQUIRED: claude subprocesses run
-# non-interactively and cannot receive approval for Write/Bash calls. Without
-# it the subprocess exits rc=0 but never writes its STATUS file.
-claude_invoke() {
-  # Usage: claude_invoke <role> <out_path> <err_path> [extra args...]
-  local role="$1" out="$2" err="$3"; shift 3
-  local model timeout
-  model="$(role_model "$role")"     || return 1
-  timeout="$(role_timeout "$role")" || return 1
+Both forms below are what `invoke_vendor` (see "Normalized vendor invocation"
+further down) actually assembles — there is no separate `claude_invoke`/
+`codex_invoke` pair any more; vendor-specific argument assembly lives ONLY
+inside `invoke_vendor`, for both the substantive launch and its own headroom
+probe.
+
+- **Claude** — prompt on stdin, model and timeout resolved from the role.
+  `--dangerously-skip-permissions` is REQUIRED: claude subprocesses run
+  non-interactively and cannot receive approval for Write/Bash calls. Without
+  it the subprocess exits rc=0 but never writes its STATUS file.
+
+  ```text
   timeout --kill-after=60s "${timeout}m" \
     claude --model "$model" -p --output-format=json \
-           --dangerously-skip-permissions "$@" - \
-    1> "$out" 2> "$err"
-}
+           --dangerously-skip-permissions - < "$prompt_file"
+  ```
 
-# Codex — global options (-a, -c, -m) MUST precede `exec`.
-#   -a never              : non-interactive, never pause for approval.
-#   -m                    : pins the model; never rely on ~/.codex/config.toml.
-#   --skip-git-repo-check : required when $REPO_ROOT is not a Codex trusted dir.
-#   --json                : REQUIRED — parse_usage reads JSONL from stdout.
-#   -s workspace-write    : read-only blocks the reviewer's own STATUS write.
-#   --add-dir             : only when $FEATURE_FOLDER is outside $REPO_ROOT.
-codex_invoke() {
-  # Usage: codex_invoke <role> <out_path> <err_path> [extra args...]
-  # Extra args are accepted for call-site symmetry with claude_invoke; note
-  # that --agents is claude-only and never reaches a codex role.
-  local role="$1" out="$2" err="$3"; shift 3
-  local model effort timeout add_dir=()
-  model="$(role_model "$role")"     || return 1
-  effort="$(role_effort "$role")"   || return 1
-  timeout="$(role_timeout "$role")" || return 1
-  [ -n "${FEATURE_FOLDER_OUTSIDE_REPO:-}" ] && add_dir=(--add-dir "$FEATURE_FOLDER")
+- **Codex** — global options (`-a`, `-c`, `-m`) MUST precede `exec`.
+  - `-a never` : non-interactive, never pause for approval.
+  - `-m` : pins the model; never rely on `~/.codex/config.toml`.
+  - `--skip-git-repo-check` : required when `$REPO_ROOT` is not a Codex trusted dir.
+  - `--json` : REQUIRED — `parse_usage` reads JSONL from stdout.
+  - `-s workspace-write` : read-only blocks the reviewer's own STATUS write.
+  - `--add-dir` : only when `$FEATURE_FOLDER` is outside `$REPO_ROOT`.
+
+  ```text
   timeout --kill-after=60s "${timeout}m" \
     codex -a never -m "$model" -c model_reasoning_effort="$effort" \
       exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json \
-      ${add_dir[@]+"${add_dir[@]}"} "$@" - \
-    1> "$out" 2> "$err"
-}
-```
+      [--add-dir "$FEATURE_FOLDER"] - < "$prompt_file"
+  ```
 
 If you find yourself writing `codex exec ... -a never` (global option after `exec`), STOP — that is the orchestrator-bug shape, not a Codex outage. See the "Distinguish orchestration bugs from vendor failures" rule in Failure handling.
 
@@ -1952,23 +1950,23 @@ Pass the role; effort and timeout follow from the Models table.
 
 ### Normalized vendor invocation — `invoke_vendor` (spec §12)
 
-`claude_invoke`/`codex_invoke` above remain the dispatch used by the current
-`dispatch_role`/`dispatch_reviewers_parallel` helpers. `invoke_vendor` is the
-new, single registry-driven launch point the schema-v2 dispatch engine
-(`dispatch_attempt`, a later task) will call instead: it takes an
-already-rendered prompt FILE rather than stdin content, always launches
-Claude from `$REPO_ROOT` with an unlimited background-wait ceiling, keeps
-Codex's `-C "$REPO_ROOT"` and global-option ordering, rejects an unknown
-vendor before any subprocess launches, and inserts the long-role headroom
-probe from spec §12.4 before a long launch. Like `claude_invoke`/`codex_invoke`,
-it never classifies the exit code it returns — that is `classify_attempt`'s job
-(a later task).
+`invoke_vendor` is the single, registry-driven launch point every dispatch
+goes through — `dispatch_attempt`/`dispatch_parallel` (see "Unified attempt
+dispatch" below) call it and nothing else. It takes an already-rendered
+prompt FILE rather than stdin content, always launches Claude from
+`$REPO_ROOT` with an unlimited background-wait ceiling, keeps Codex's
+`-C "$REPO_ROOT"` and global-option ordering, rejects an unknown vendor
+before any subprocess launches, and inserts the long-role headroom probe
+from spec §12.4 before a long launch. It never classifies the exit code it
+returns — that is `classify_attempt`'s job (Task 7); Task 6's dispatch
+lifecycle uses a narrower provisional classifier (`_dispatch_classify`) that
+only distinguishes what its own tests need.
 
 <!-- lint: cookbook -->
 ```bash
 # Reserved invoke_vendor prelaunch exit codes -- never a real vendor exit code
 # (vendor CLIs exit small codes like 0-2 normally; `timeout`'s own reserved
-# codes are 124/137). A future record_event call (Task 6/8) branches on these
+# codes are 124/137). A future record_event call (Task 8) branches on these
 # to classify DISPATCH_NOT_LAUNCHED (95/96) vs a run-scoped VENDOR_UNAVAILABLE
 # (97) before ever reaching classify_attempt's ordinary vendor-exit-code path:
 #   95  unknown vendor, or a role/field lookup failure (INVOKE_VENDOR_ROLE_LOOKUP_FAILED / INVOKE_VENDOR_UNKNOWN_VENDOR)
@@ -2060,6 +2058,11 @@ _vendor_headroom_probe() {
 # live deadline.
 invoke_vendor() {
   # Usage: invoke_vendor <role> <prompt_file> <stdout_path> <stderr_path>
+  # EXTRA_VENDOR_ARGS (optional, ambient, claude-only): a bash array the
+  # caller may set before invoking, same pattern as DISPATCH_ID/STATUS_PATH
+  # above -- not a 5th positional argument, because this signature is fixed
+  # across the whole implementation (Interfaces Used Across Tasks). Its one
+  # consumer is Phase 6's --agents sub-subagent model pin.
   local role="$1" prompt_file="$2" out="$3" err="$4"
   local vendor model timeout_minutes threshold long_running grace deadline rc
 
@@ -2139,7 +2142,8 @@ invoke_vendor() {
         CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 \
           timeout --kill-after="$grace" "$deadline" \
           claude --model "$model" -p --output-format=json \
-                 --dangerously-skip-permissions - \
+                 --dangerously-skip-permissions \
+                 ${EXTRA_VENDOR_ARGS[@]+"${EXTRA_VENDOR_ARGS[@]}"} - \
           < "$prompt_file" 1> "$out" 2> "$err" &
         tpid=$!
         wait "$tpid"; trc=$?
@@ -2221,32 +2225,14 @@ reduce the affected roles' timeouts instead; do not reintroduce the protocol.
 **One dispatch per phase still holds.** A background dispatch is one Bash call, and
 the orchestrator's next turn begins when it finishes. Nothing about it bundles phases.
 
-Three small helpers back the recording and resume logic below:
+Pre-launch validation: a role's appendix must exist as a BEGIN/END marker
+pair in $PROCESS_PATH before any CLI runs. `impl-worker` is a sub-subagent
+type spawned only from inside the implementer's own session, not a
+top-level dispatched role with a prompt appendix here — appendix_exists
+correctly returns 1 for it, and no appendix is ever added for it.
 
 <!-- lint: cookbook -->
 ```bash
-# Deterministic dispatch identifier. Depends only on (phase, iter, role), never
-# on time or PID, so it is stable across a session and across resume.
-dispatch_id() {
-  # Usage: dispatch_id <phase> <iter> <role>
-  printf '%s-iter%s-%s\n' "$1" "$2" "$3"
-}
-
-# Whether a role's dispatch can leave irreversible side effects (commits, file
-# edits) if silently re-run. This decides UNFINISHED recovery: a "no" role is
-# safe to redispatch once; a "yes" role must halt for the user to reconcile.
-#
-# `role_mutates` (defined in "Role contract registry lookup" above) resolves
-# this from the registry's `mutates` column, not a hand-maintained case
-# statement here — the two could otherwise drift. An unrecognized role is
-# `ROLE_UNKNOWN_OR_DUPLICATE`, not a guessed "yes"/"no": unknown roles default
-# to rejection, never to mutation guessing (registry rule, §6.1).
-
-# Pre-launch validation: a role's appendix must exist as a BEGIN/END marker
-# pair in $PROCESS_PATH before any CLI runs. `impl-worker` is a sub-subagent
-# type spawned only from inside the implementer's own session, not a
-# top-level dispatched role with a prompt appendix here — appendix_exists
-# correctly returns 1 for it, and no appendix is ever added for it.
 appendix_exists() {
   # Usage: appendix_exists <role>
   local role="$1"
@@ -2254,12 +2240,7 @@ appendix_exists() {
   "$GREP_BIN" -qF -- "<!-- END: ${role} -->" "$PROCESS_PATH" 2>/dev/null || return 1
   return 0
 }
-```
 
-Every dispatch, foreground or background, goes through the same helper:
-
-<!-- lint: cookbook -->
-```bash
 # Canonical phase_name lookup, mirroring the phase_name table in the
 # Resumability section exactly (tests/check_04_table.sh does not enforce this
 # one; keep the two in sync by hand if the table ever changes). -1 is the
@@ -2282,118 +2263,750 @@ _phase_name() {
     *)    echo "unknown phase: $1" >&2; return 1 ;;
   esac
 }
+```
 
-# Record a dispatch BEFORE it runs. This is the only durable evidence that a
-# dispatch was attempted, and it is what a resume reads to tell "never started"
-# apart from "started and did not finish".
-log_dispatch_started() {
-  # Usage: log_dispatch_started <phase> <phase_name> <iter> <role>
-  {
-    printf -- '--- %s  event=DISPATCH_STARTED\n' "$(iso_now)"
-    printf 'phase:                    %s\n' "$1"
-    printf 'phase_name:               %s\n' "$2"
-    printf 'iteration:                %s\n' "$3"
-    printf 'role:                     %s\n' "$4"
-    printf 'dispatch_id:              %s\n' "$(dispatch_id "$1" "$3" "$4")"
-    printf 'model:                    %s\n' "$(role_model "$4")"
-    printf '\n'
-  } >> "$FEATURE_FOLDER/RUN_LOG.md"
-}
+### Unified attempt dispatch — `dispatch_attempt` and `dispatch_parallel`
 
-# Render, validate, record, dispatch. Used for every role; the ONLY difference for a
-# long-running role is that the orchestrator makes the Bash tool call with
-# run_in_background: true.
-dispatch_role() {
-  # Usage: dispatch_role <phase> <iter> <role> <status_path> [extra CLI args...]
-  local phase="$1" iter="$2" role="$3" status_path="$4"; shift 4
-  local id tdir base vendor prompt
-  id="$(dispatch_id "$phase" "$iter" "$role")"
-  tdir="$FEATURE_FOLDER/transcripts"; mkdir -p "$tdir"
-  base="$tdir/$id"
-  vendor="$(role_vendor "$role")"
+Every top-level role, whether dispatched alone or alongside its Claude/Codex
+counterpart, goes through exactly one lifecycle. `dispatch_attempt` runs it
+for one role; `dispatch_parallel` fans it out to several roles at once and is
+the ONLY code path that runs more than one attempt concurrently. Internally
+`dispatch_attempt` is `dispatch_parallel` given a single role — there are not
+two implementations of the lifecycle to keep in sync, only two call shapes
+onto the same one.
 
-  appendix_exists "$role" \
-    || { echo "halt: no appendix markers for role $role" >&2; return 1; }
+The lifecycle runs in three phases, and only the last one forks:
 
-  # Render FIRST, into memory, and check it. Process substitution must not be used:
-  # `cmd < <(render_prompt ...)` discards the renderer's exit status entirely --
-  # verified, a renderer returning 42 still ran the consumer with zero bytes and
-  # yielded rc 0. That would send an EMPTY prompt to a real model and bill for it.
-  prompt="$(render_prompt "$role")" \
-    || { echo "halt: render failed for role $role" >&2; return 1; }
-  [ -n "$prompt" ] \
-    || { echo "halt: empty prompt for role $role" >&2; return 1; }
+1. **Prelaunch** (`_dispatch_prelaunch`) — allocate the attempt, validate
+   every non-lease precondition, and render + persist the prompt. This runs
+   for **every requested role, sequentially, in the calling shell, before any
+   role's lease is taken or any child is forked** — restoring v1's
+   `dispatch_reviewers_parallel` invariant ("rendering up front means a codex
+   render failure cannot leave a claude child already spending"), generalized
+   to the whole batch: if ANY role fails prelaunch, `dispatch_parallel`
+   aborts the entire batch before forking anyone, and every role in it
+   (including ones whose own render succeeded) is recorded
+   `DISPATCH_NOT_LAUNCHED` — never just the one that actually failed.
+2. **Lease** — for roles that passed prelaunch, acquire the write lease for
+   any that mutate, **sequentially, in the caller's request order**. This is
+   a per-role outcome, not a batch-wide one: contention here rejects only the
+   losing role (the second mutating role in the list — the ordering is
+   deterministic, not a race, because acquisition happens one at a time
+   before anything is forked) and never its siblings.
+3. **Launch** (`_dispatch_launch_attempt`) — fork one subshell per role that
+   survived both gates. Each child writes `DISPATCH_STARTED` itself,
+   **immediately before invoking the vendor** — this is the only accurate
+   place for that timestamp, since it is the actual moment the attempt is
+   about to spend, not a timestamp invented after the fact. It then invokes,
+   times, and classifies the attempt, and writes ONE small result record to
+   a file inside its own attempt directory. `dispatch_parallel` waits for
+   every forked PID unconditionally, and only afterward — from the parent,
+   never from inside a child — ingests each result and appends its
+   `DISPATCH_COMPLETED` (and, on failure, `ATTEMPT_FAILED`) block.
 
-  log_dispatch_started "$phase" "$(_phase_name "$phase")" "$iter" "$role"
+`DISPATCH_STARTED`'s own append (from inside a forked child, phase 3) and
+`DISPATCH_COMPLETED`'s append (from the parent, after `wait`, phases combined
+in `_dispatch_ingest_result`) both go through the very same mkdir-based
+`run-log.lock.d` mutex `allocate_attempt` already uses for its own
+`ATTEMPT_ALLOCATED` write — one lock guards every writer of `RUN_LOG.md`,
+whether that writer is the parent orchestrator shell or one of its own
+forked children. This is why a forked child writing to `RUN_LOG.md` does not
+violate the Global Constraint "the parent orchestrator is the sole writer of
+`RUN_LOG.md`": that constraint is about the **dispatched vendor subprocess**
+(the `claude`/`codex` CLI `invoke_vendor` launches) never touching
+`RUN_LOG.md` directly — which still holds, unconditionally — not about a
+bash-level fork the orchestrator uses purely for its own internal fan-out
+concurrency. A forked child of `dispatch_parallel` is still the orchestrator,
+running briefly in a second copy of the same shell.
 
-  # A herestring, not a pipe: a pipe would run the invoker in a subshell and
-  # discard the globals run_timed sets.
-  if [ "$vendor" = codex ]; then
-    run_timed codex_invoke "$role" "$base.json" "$base.err" "$@" <<< "$prompt"
-  else
-    run_timed claude_invoke "$role" "$base.json" "$base.err" "$@" <<< "$prompt"
-  fi
+A background child dying mid-flight, after its own `DISPATCH_STARTED` is
+already durable, leaves exactly that: a `DISPATCH_STARTED` with no matching
+`DISPATCH_COMPLETED`. Task 7's `classify_attempt`/resume work is what turns
+that into a proper `UNFINISHED`/`DISPATCH_ORPHANED` classification. What
+Task 6 guarantees is narrower and unconditional: every `DISPATCH_STARTED`
+this engine writes is real (the vendor was actually about to be invoked when
+it was written), and `RUN_LOG.md` never records both a
+`DISPATCH_STARTED`/`DISPATCH_COMPLETED` pair AND a `DISPATCH_NOT_LAUNCHED`
+for the same dispatch id.
 
-  local usage_line verdict
-  usage_line="$(parse_usage "$vendor" "$base.json" "$DISPATCH_WALL_MS" "$(role_model "$role")")"
-  verdict=""
-  [ -f "$status_path" ] && verdict="$(status_field "$status_path" verdict)"
-  log_dispatch "$role" "$phase" "$(_phase_name "$phase")" "$iter" \
-               "$status_path" "$verdict" "$usage_line"
-
-  # Classify AFTER logging, so RUN_LOG keeps its evidence even for a failed
-  # dispatch, and BEFORE returning, so the caller never has to re-derive the
-  # diagnosis. This is the call that makes post_dispatch the actual
-  # implementation of the transcript-read policy rather than a helper the
-  # phases were each expected to remember. Its exit status is deliberately
-  # discarded: `$DISPATCH_RC` remains dispatch_role's contract, and the
-  # missing-STATUS case is owned by `dispatch_state`/`validate_status`, which
-  # every gate already consults. post_dispatch runs here for its diagnostic
-  # output — notably the stdout-JSON vendor error a zero-byte stderr hides.
-  post_dispatch "$DISPATCH_RC" "$status_path" "$base.err" "$base.json" || :
-
-  return "$DISPATCH_RC"
-}
-
-# Classify a dispatch for resume. Sets the global DISPATCH_STATE; echoes nothing,
-# because "$(dispatch_state ...)" would run it in a subshell.
-#
-# Three states, not thirteen. The harness owns process lifecycle, so the only
-# question a resume must answer is whether the dispatch finished — and the STATUS
-# file, written last and atomically, is the authoritative answer.
-dispatch_state() {
-  # Usage: dispatch_state <phase> <iter> <role> <status_path>
-  local phase="$1" iter="$2" role="$3" status_path="$4" id
-  id="$(dispatch_id "$phase" "$iter" "$role")"
-  # shellcheck disable=SC2034  # consumed by the caller after dispatch_state returns
-  DISPATCH_STATE=""
-
-  if ! "$GREP_BIN" -q "^dispatch_id: *${id}\$" "$FEATURE_FOLDER/RUN_LOG.md" 2>/dev/null; then
-    # shellcheck disable=SC2034  # consumed by the caller after dispatch_state returns
-    DISPATCH_STATE=NEVER_LAUNCHED
+<!-- lint: cookbook -->
+```bash
+# ---- Provisional exclusive write lease (Task 6 seam) -----------------------
+# A single global mkdir-based mutex standing in for the full write-lease
+# protocol (write-lease.json, snapshot manifest, staleness/ambiguous-owner
+# reconciliation, cross-owner authority checks — spec S13, Task 8 Step 5).
+# This seam proves exactly the one property Task 6's own tests need: two
+# mutating attempts can never invoke their vendor concurrently. It does NOT
+# wait for a busy lease — an active lease here is always an IMMEDIATE typed
+# prelaunch failure, never a queued retry — and it carries no snapshot or
+# staleness reconciliation at all. Task 8 replaces both functions below
+# wholesale with the real `acquire_write_lease`/`release_write_lease`
+# (deliberately different names, so nothing here collides with that task's
+# own definitions).
+_dispatch_lease_try_acquire() {
+  # Usage: _dispatch_lease_try_acquire <role> <dispatch_id>
+  local role="$1" dispatch_id="$2" leasedir="$ORCHESTRATION_DIR/write-lease.d"
+  mkdir -p "$ORCHESTRATION_DIR"
+  if mkdir "$leasedir" 2>/dev/null; then
+    printf 'role=%s\ndispatch_id=%s\n' "$role" "$dispatch_id" > "$leasedir/owner"
     return 0
   fi
-  # A STATUS file only counts when it VALIDATES. A truncated or malformed one means
-  # the subagent died mid-write, which is not completion.
-  if [ -f "$status_path" ] && validate_status "$status_path" "$role" >/dev/null 2>&1; then
-    # shellcheck disable=SC2034  # consumed by the caller after dispatch_state returns
-    DISPATCH_STATE=COMPLETED
-  else
-    # shellcheck disable=SC2034  # consumed by the caller after dispatch_state returns
-    DISPATCH_STATE=UNFINISHED
+  return 1
+}
+_dispatch_lease_release() {
+  # Usage: _dispatch_lease_release <role>
+  local role="$1" leasedir="$ORCHESTRATION_DIR/write-lease.d"
+  if [ -f "$leasedir/owner" ] && "$GREP_BIN" -qF "role=$role" "$leasedir/owner" 2>/dev/null; then
+    rm -rf "$leasedir"
   fi
+}
+
+# ---- Provisional lifecycle classifier (Task 6 seam) ------------------------
+# Implements only the four outcomes THIS task's own dispatch lifecycle needs
+# to distinguish (COMPLETED, TIMED_OUT, a launched-but-statusless bucket, and
+# a generic non-zero-exit bucket) — never the full ten-row ordered classifier
+# in spec S14.1. Task 7 replaces this wholesale with `classify_attempt`;
+# nothing outside this file may depend on a value this returns beyond
+# COMPLETED vs "not COMPLETED". Sets DISPATCH_CLASSIFY_RESULT/_REASON.
+_dispatch_classify() {
+  # Usage: _dispatch_classify <vendor-rc> <status-path> <role>
+  local rc="$1" status_path="$2" role="$3"
+  DISPATCH_CLASSIFY_RESULT=""
+  DISPATCH_CLASSIFY_REASON=""
+  case "$rc" in
+    95|96|97)
+      DISPATCH_CLASSIFY_RESULT=PRELAUNCH_FAILED
+      DISPATCH_CLASSIFY_REASON="INVOKE_VENDOR_RC_$rc"
+      return 0 ;;
+    124|137)
+      DISPATCH_CLASSIFY_RESULT=TIMED_OUT
+      DISPATCH_CLASSIFY_REASON="TIMEOUT_RC_$rc"
+      return 0 ;;
+  esac
+  if [ "$rc" = 0 ] && [ -f "$status_path" ] && validate_status "$status_path" "$role" >/dev/null 2>&1; then
+    DISPATCH_CLASSIFY_RESULT=COMPLETED
+    return 0
+  fi
+  if [ ! -f "$status_path" ]; then
+    DISPATCH_CLASSIFY_RESULT=EXITED_NO_STATUS
+    DISPATCH_CLASSIFY_REASON="rc=$rc"
+    return 0
+  fi
+  if ! validate_status "$status_path" "$role" >/dev/null 2>&1; then
+    DISPATCH_CLASSIFY_RESULT=MALFORMED_STATUS
+    DISPATCH_CLASSIFY_REASON="rc=$rc"
+    return 0
+  fi
+  DISPATCH_CLASSIFY_RESULT=UNKNOWN_VENDOR_ERROR
+  DISPATCH_CLASSIFY_REASON="rc=$rc"
+}
+
+# ---- Attempt-scoped result record (child -> parent handoff) ----------------
+# A plain sanitized key=value file, one line per field (never RUN_LOG.md
+# grammar — this is a private handoff file under the attempt's own directory,
+# read by nobody but _dispatch_ingest_result/_dispatch_ingest_child).
+_dispatch_write_result() {
+  # Usage: _dispatch_write_result <dir> key=value [key=value ...]
+  local dir="$1"; shift
+  local kv
+  mkdir -p "$dir"
+  {
+    for kv in "$@"; do
+      printf '%s=%s\n' "${kv%%=*}" "$(printf '%s' "${kv#*=}" | tr '\t\n' '  ')"
+    done
+  } > "$dir/result.kv"
+}
+_dispatch_read_result_field() {
+  # Usage: _dispatch_read_result_field <result.kv path> <key>
+  local file="$1" key="$2" line
+  line="$("$GREP_BIN" -m1 "^${key}=" "$file" 2>/dev/null)" || return 1
+  printf '%s\n' "${line#*=}"
+}
+
+# Phase 1: allocate the attempt, validate every non-lease precondition, and
+# render + persist the prompt. Called once per role, sequentially, from
+# dispatch_parallel's own shell — BEFORE any lease is taken or any child
+# forked (see the section intro above for why). Sets (caller-visible):
+# PREP_OK (1 ready to launch, 0 rejected — result.kv is already written on
+# rejection), PREP_PHASE_NAME, PREP_VENDOR, PREP_MUTATES, PREP_DISPATCH_ID,
+# PREP_LOGICAL, PREP_ATTEMPT, PREP_ATTEMPT_DIR, PREP_STATUS_PATH,
+# PREP_STDOUT_PATH, PREP_STDERR_PATH, PREP_PROMPT_FILE.
+_dispatch_prelaunch() {
+  # Usage: _dispatch_prelaunch <phase> <iteration> <role>
+  local phase="$1" iteration="$2" role="$3"
+  local phase_name reject="" vendor="" mutates=""
+  local dispatch_id logical attempt attempt_dir status_path stdout_path stderr_path
+  # Reset EVERY PREP_* field up front, unconditionally: a caller (dispatch_
+  # parallel) reads PREP_ATTEMPT_DIR regardless of this call's return value,
+  # to know where to find (or synthesize) this role's result -- an early
+  # return below (bad phase, allocate_attempt failure) must never leave a
+  # STALE value here from some earlier role's successful call, or ingestion
+  # would read and misreport THAT role's already-written result instead.
+  PREP_OK=0
+  PREP_PHASE_NAME=""; PREP_VENDOR=""; PREP_MUTATES=""
+  PREP_DISPATCH_ID=""; PREP_LOGICAL=""; PREP_ATTEMPT=""; PREP_ATTEMPT_DIR=""
+  PREP_STATUS_PATH=""; PREP_STDOUT_PATH=""; PREP_STDERR_PATH=""; PREP_PROMPT_FILE=""
+
+  phase_name="$(_phase_name "$phase")" || { echo "DISPATCH_ATTEMPT_BAD_PHASE:$phase" >&2; return 1; }
+  # shellcheck disable=SC2034  # consumed by dispatch_parallel after this call returns
+  PREP_PHASE_NAME="$phase_name"
+
+  allocate_attempt "$phase" "$iteration" "$role" \
+    || { echo "DISPATCH_ATTEMPT_ALLOCATE_FAILED:$role" >&2; return 1; }
+  dispatch_id="$DISPATCH_ID"; logical="$LOGICAL_DISPATCH_ID"; attempt="$ATTEMPT"
+  attempt_dir="$ATTEMPT_DIR"; status_path="$STATUS_PATH"
+  stdout_path="$STDOUT_PATH"; stderr_path="$STDERR_PATH"
+  PREP_DISPATCH_ID="$dispatch_id"; PREP_LOGICAL="$logical"; PREP_ATTEMPT="$attempt"
+  PREP_ATTEMPT_DIR="$attempt_dir"; PREP_STATUS_PATH="$status_path"
+  PREP_STDOUT_PATH="$stdout_path"; PREP_STDERR_PATH="$stderr_path"
+
+  # Render-time identity every appendix/status-template resolution needs,
+  # derived entirely from what this call just minted — callers no longer
+  # hand-set $PHASE_DIR/$ITERATION/$DISPATCH_ID themselves.
+  # shellcheck disable=SC2034  # consumed by render_prompt via render_keys()
+  PHASE_DIR="$FEATURE_FOLDER/$phase-$phase_name"
+  # shellcheck disable=SC2034  # consumed by render_prompt via render_keys()
+  ITERATION="$(printf '%02d' "$iteration")"
+  DISPATCH_ID="$dispatch_id"; LOGICAL_DISPATCH_ID="$logical"; ATTEMPT="$(printf '%02d' "$attempt")"
+
+  # ---- "validate inputs and budget" (the control-flow line in the plan):
+  # budget has two existing enforcement points, not a third redundant check
+  # invented here -- the attempt-number ceiling is allocate_attempt's own
+  # ATTEMPT_OVERFLOW guard (next_unused_attempt, above), and the timeout/spend
+  # budget is invoke_vendor's registry timeout validation plus its headroom
+  # probe (spec S12.4), both already run on every launch.
+  # ---- validate vendor invocation, CWD, context7 policy, phase applicability
+  vendor="$(role_vendor "$role" 2>/dev/null)" || reject="DISPATCH_ROLE_LOOKUP_FAILED"
+  case "$vendor" in claude|codex) : ;; *) reject="${reject:-DISPATCH_UNKNOWN_VENDOR}" ;; esac
+  [ -d "${REPO_ROOT:-}" ] || reject="${reject:-DISPATCH_BAD_REPO_ROOT}"
+  [ -n "${CONTEXT7_POLICY+x}" ] || reject="${reject:-DISPATCH_CONTEXT7_POLICY_UNSET}"
+  case ";$(role_phases "$role" 2>/dev/null);" in
+    *";$phase;"*) : ;;
+    *) reject="${reject:-DISPATCH_PHASE_NOT_APPLICABLE}" ;;
+  esac
+  render_prompt --check "$role" >/dev/null 2>"$attempt_dir/render-check.err" \
+    || reject="${reject:-DISPATCH_RENDER_CHECK_FAILED}"
+
+  # `role_mutates` resolves this from the registry's `mutates` column. An
+  # unrecognized role or a corrupt/empty cell is a registry defect, not a
+  # guessed "yes"/"no": unknown or unresolved mutation state defaults to
+  # REJECTION, never to mutation guessing (registry rule, §6.1) — silently
+  # coercing it to "no" would skip the write lease for a role that actually
+  # mutates.
+  mutates="$(role_mutates "$role" 2>/dev/null)" || reject="${reject:-DISPATCH_MUTATES_LOOKUP_FAILED}"
+  case "$mutates" in yes|no) : ;; *) reject="${reject:-DISPATCH_MUTATES_LOOKUP_FAILED}" ;; esac
+  PREP_VENDOR="${vendor:-unknown}"
+  PREP_MUTATES="$mutates"
+
+  # ---- render fully in memory; write the immutable prompt file. Process
+  # substitution must not be used here: `cmd < <(render_prompt ...)` discards
+  # the renderer's exit status entirely — verified, a renderer returning 42
+  # still ran the consumer with zero bytes and yielded rc 0. That would send
+  # an EMPTY prompt to a real model and bill for it. Render into a variable,
+  # check it, THEN write it.
+  if [ -z "$reject" ]; then
+    local prompt
+    prompt="$(render_prompt "$role")" || reject=DISPATCH_RENDER_FAILED
+    if [ -z "$reject" ] && [ -z "$prompt" ]; then reject=DISPATCH_RENDER_EMPTY; fi
+    if [ -z "$reject" ]; then
+      printf '%s' "$prompt" > "$attempt_dir/prompt.txt"
+      chmod 400 "$attempt_dir/prompt.txt" 2>/dev/null || true
+    fi
+  fi
+  PREP_PROMPT_FILE="$attempt_dir/prompt.txt"
+
+  if [ -n "$reject" ]; then
+    _dispatch_write_result "$attempt_dir" launched=no phase="$phase" phase_name="$phase_name" \
+      iteration="$iteration" role="$role" vendor="${vendor:-unknown}" dispatch_id="$dispatch_id" \
+      logical_dispatch_id="$logical" attempt="$attempt" status_path="$status_path" \
+      classification=PRELAUNCH_FAILED reason="$reject" verdict="" usage_line="" \
+      start_ms=0 end_ms=0 wall_ms=0 exit_code="" stdout_path="$stdout_path" \
+      stderr_path="$stderr_path" mutates="${mutates:-no}"
+    return 1
+  fi
+
+  # shellcheck disable=SC2034  # consumed by dispatch_parallel after this call returns
+  PREP_OK=1
   return 0
+}
+
+# Writes the DISPATCH_STARTED record. Called ONLY from _dispatch_launch_attempt,
+# immediately before invoke_vendor — this is what makes the timestamp real: it
+# is the actual moment the attempt is about to spend, not a timestamp invented
+# later once some other code happens to get around to it. May run inside a
+# forked child (dispatch_parallel's fan-out); serialized against every
+# sibling, and against allocate_attempt's own ATTEMPT_ALLOCATED write, through
+# the same run-log.lock.d mutex — see the section intro above for why this
+# does not violate "the parent orchestrator is the sole writer of RUN_LOG.md".
+_dispatch_write_started() {
+  # Usage: _dispatch_write_started <phase> <phase_name> <iteration> <role> \
+  #        <vendor> <dispatch_id> <logical_dispatch_id> <status_path> <lease_ref>
+  local phase="$1" phase_name="$2" iteration="$3" role="$4" vendor="$5"
+  local dispatch_id="$6" logical="$7" status_path="$8" lease_ref="$9"
+  _run_log_lock_acquire || return 1
+  {
+    printf -- '--- %s  event=DISPATCH_STARTED\n' "$(iso_now)"
+    printf 'phase:                    %s\n' "$phase"
+    printf 'phase_name:               %s\n' "$phase_name"
+    printf 'iteration:                %s\n' "$(printf '%02d' "$iteration")"
+    printf 'role:                     %s\n' "$role"
+    printf 'vendor:                   %s\n' "$vendor"
+    printf 'dispatch_id:              %s\n' "$dispatch_id"
+    printf 'logical_dispatch_id:      %s\n' "$logical"
+    printf 'model:                    %s\n' "$(role_model "$role" 2>/dev/null)"
+    printf 'status_path:              %s\n' "$status_path"
+    printf 'cwd:                      %s\n' "${REPO_ROOT:-}"
+    printf 'lease:                    %s\n' "${lease_ref:-none}"
+    # Task 8 seam: real before/after mutation snapshots (spec S8, write-lease
+    # protocol Step 6) do not exist yet — "none" is an honest placeholder,
+    # never a guessed reference.
+    printf 'snapshot:                 none\n'
+    printf '\n'
+  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+  _run_log_lock_release
+}
+
+# Phase 3: invoke, time, classify, and record ONE role that already passed
+# _dispatch_prelaunch (and, for a mutating role, already holds the lease).
+# Usage: _dispatch_launch_attempt <index> — reads the per-role arrays
+# dispatch_parallel just populated (roles/dp_attempt_dir/dp_dispatch_id/dp_logical/
+# dp_attempt/dp_status_path/dp_stdout_path/dp_stderr_path/dp_vendor/dp_mutates/dp_prompt_file),
+# plus its phase/iteration/phase_name. This is always invoked as
+# "( _dispatch_launch_attempt "$i" ) &" from INSIDE dispatch_parallel's own
+# body, so bash's dynamic scoping for `local` makes every one of those
+# arrays visible here with no extra plumbing — the fork is a copy of the
+# same shell, arrays included.
+_dispatch_launch_attempt() {
+  local i="$1"
+  local role="${roles[$i]}" a_dir="${dp_attempt_dir[$i]}" d_id="${dp_dispatch_id[$i]}"
+  local logi="${dp_logical[$i]}" att="${dp_attempt[$i]}" s_path="${dp_status_path[$i]}"
+  local out_path="${dp_stdout_path[$i]}" err_path="${dp_stderr_path[$i]}"
+  local vend="${dp_vendor[$i]}" mut="${dp_mutates[$i]}" p_file="${dp_prompt_file[$i]}"
+  local lease_ref=none
+  [ "$mut" = yes ] && lease_ref="$ORCHESTRATION_DIR/write-lease.d"
+
+  # invoke_vendor forwards these AMBIENT (unexported) globals into the
+  # vendor subprocess's environment -- it does not take them as arguments.
+  # Each forked _dispatch_launch_attempt call sets its own copy fresh; the
+  # per-role prelaunch loop in dispatch_parallel runs sequentially and
+  # overwrites these same globals for every role in turn, so by the time
+  # THIS fork actually runs, they must be (re)set from this role's own
+  # dp_* arrays, never trusted to still hold what prelaunch last left there.
+  DISPATCH_ID="$d_id"; LOGICAL_DISPATCH_ID="$logi"; ATTEMPT="$(printf '%02d' "$att")"
+  STATUS_PATH="$s_path"
+
+  _dispatch_write_started "$phase" "$phase_name" "$iteration" "$role" "$vend" \
+    "$d_id" "$logi" "$s_path" "$lease_ref"
+
+  mkdir -p "$(dirname "$out_path")"
+  local start_ms end_ms wall_ms vrc classification reason verdict="" usage_line
+  start_ms="$(now_ms)"
+  run_timed invoke_vendor "$role" "$p_file" "$out_path" "$err_path"
+  vrc="$DISPATCH_RC"
+  wall_ms="$DISPATCH_WALL_MS"
+  end_ms="$(now_ms)"
+
+  usage_line="$(parse_usage "$vend" "$out_path" "$wall_ms" "$(role_model "$role" 2>/dev/null)")"
+  [ -f "$s_path" ] && verdict="$(status_field "$s_path" verdict 2>/dev/null)"
+
+  _dispatch_classify "$vrc" "$s_path" "$role"
+  classification="$DISPATCH_CLASSIFY_RESULT"; reason="$DISPATCH_CLASSIFY_REASON"
+
+  post_dispatch "$vrc" "$s_path" "$err_path" "$out_path" \
+    >>"$a_dir/post-dispatch.log" 2>&1 || :
+
+  # Step 3 order: write the attempt result BEFORE releasing the lease --
+  # release is the very last thing an attempt does, once its outcome is
+  # already durable.
+  _dispatch_write_result "$a_dir" launched=yes phase="$phase" phase_name="$phase_name" \
+    iteration="$iteration" role="$role" vendor="$vend" dispatch_id="$d_id" \
+    logical_dispatch_id="$logi" attempt="$att" status_path="$s_path" \
+    classification="$classification" reason="$reason" verdict="$verdict" usage_line="$usage_line" \
+    start_ms="$start_ms" end_ms="$end_ms" wall_ms="$wall_ms" exit_code="$vrc" \
+    stdout_path="$out_path" stderr_path="$err_path" mutates="$mut"
+
+  # Mutation-snapshot capture and authority enforcement is Task 8's job (the
+  # real write-lease protocol). This seam releases only what IT acquired.
+  [ "$mut" = yes ] && _dispatch_lease_release "$role"
+
+  [ "$classification" = COMPLETED ]
+}
+
+# The ONLY code that appends DISPATCH_COMPLETED / DISPATCH_NOT_LAUNCHED /
+# ATTEMPT_FAILED to RUN_LOG.md (DISPATCH_STARTED is _dispatch_write_started's
+# job, above, run earlier by whichever process actually launches the
+# attempt). Always runs in the parent, strictly after every forked PID has
+# been `wait`ed — never from inside a child.
+_dispatch_ingest_result() {
+  # Usage: _dispatch_ingest_result <result.kv path>
+  local rf="$1" k
+  local launched="" phase="" phase_name="" iteration="" role="" vendor="" dispatch_id=""
+  local logical_dispatch_id="" attempt="" status_path="" classification="" reason=""
+  local verdict="" usage_line="" start_ms="" end_ms="" wall_ms="" mutates=""
+  local exit_code="" stdout_path="" stderr_path=""
+  for k in launched phase phase_name iteration role vendor dispatch_id logical_dispatch_id \
+           attempt status_path classification reason verdict usage_line start_ms end_ms wall_ms \
+           mutates exit_code stdout_path stderr_path; do
+    printf -v "$k" '%s' "$(_dispatch_read_result_field "$rf" "$k" 2>/dev/null)"
+  done
+
+  # A malformed record (an unrecognized classification, most likely a
+  # corrupted or hand-edited result file) still gets exactly ONE ingested
+  # record -- never a crash, never a silently dropped role.
+  case "$classification" in
+    COMPLETED|TIMED_OUT|PRELAUNCH_FAILED|EXITED_NO_STATUS|MALFORMED_STATUS|UNKNOWN_VENDOR_ERROR) : ;;
+    *)
+      reason="DISPATCH_RESULT_MALFORMED:${classification:-empty}"
+      classification=UNKNOWN_VENDOR_ERROR ;;
+  esac
+
+  local mutation_state checkpoint_kind
+  mutation_state="$([ "$mutates" = yes ] && echo UNKNOWN || echo NO_SIDE_EFFECTS)"
+  checkpoint_kind="$(role_checkpoint_kind "$role" 2>/dev/null)"
+
+  _run_log_lock_acquire || return 1
+  if [ "$launched" != yes ]; then
+    {
+      printf -- '--- %s  event=DISPATCH_NOT_LAUNCHED\n' "$(iso_now)"
+      printf 'phase:                    %s\n' "$phase"
+      printf 'phase_name:               %s\n' "$phase_name"
+      printf 'iteration:                %s\n' "$(printf '%02d' "${iteration:-0}" 2>/dev/null || echo "$iteration")"
+      printf 'role:                     %s\n' "$role"
+      printf 'dispatch_id:              %s\n' "$dispatch_id"
+      printf 'logical_dispatch_id:      %s\n' "$logical_dispatch_id"
+      printf 'reason:                   %s\n' "$reason"
+      printf '\n'
+    } >> "$FEATURE_FOLDER/RUN_LOG.md"
+    _run_log_lock_release
+    DISPATCH_RESULT_CLASSIFICATION=PRELAUNCH_FAILED
+    DISPATCH_RESULT_VERDICT=""
+    DISPATCH_RESULT_REASON="$reason"
+    DISPATCH_RESULT_STATUS_PATH="$status_path"
+    DISPATCH_RESULT_MUTATION_STATE=NO_SIDE_EFFECTS
+    return 1
+  fi
+
+  {
+    printf -- '--- %s  event=DISPATCH_COMPLETED\n' "$(iso_now)"
+    printf 'phase:                    %s\n' "$phase"
+    printf 'phase_name:               %s\n' "$phase_name"
+    printf 'iteration:                %s\n' "$(printf '%02d' "$iteration")"
+    printf 'role:                     %s\n' "$role"
+    printf 'vendor:                   %s\n' "$vendor"
+    printf 'appendix:                 %s\n' "$role"
+    printf 'dispatch_id:              %s\n' "$dispatch_id"
+    printf 'logical_dispatch_id:      %s\n' "$logical_dispatch_id"
+    printf 'develop_it_git_sha:       %s\n' "${PROCESS_GIT_HEAD:-non-git}"
+    printf 'develop_it_file_sha256:   %s\n' "${PROCESS_FILE_SHA256:-}"
+    printf 'develop_it_dirty:         %s\n' "${PROCESS_DIRTY:-unknown}"
+    printf 'status_path:              %s\n' "$status_path"
+    printf 'verdict:                  %s\n' "$verdict"
+    printf 'classification:           %s\n' "$classification"
+    printf 'exit_code:                %s\n' "$exit_code"
+    printf 'model:                    %s\n' "$(role_model "$role" 2>/dev/null)"
+    printf 'start_ms:                 %s\n' "$start_ms"
+    printf 'end_ms:                   %s\n' "$end_ms"
+    printf 'duration_ms:              %s\n' "$wall_ms"
+    printf 'stdout_path:              %s\n' "$stdout_path"
+    printf 'stderr_path:              %s\n' "$stderr_path"
+    printf 'mutation_state:           %s\n' "$mutation_state"
+    printf 'checkpoint_kind:          %s\n' "$checkpoint_kind"
+    local kv
+    for kv in $usage_line; do
+      case "$kv" in model=*|duration_ms=*) continue ;; esac
+      printf '%-25s %s\n' "${kv%%=*}:" "${kv#*=}"
+    done
+    printf '\n'
+  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+
+  if [ "$classification" != COMPLETED ]; then
+    {
+      printf -- '--- %s  event=ATTEMPT_FAILED\n' "$(iso_now)"
+      printf 'phase:                    %s\n' "$phase"
+      printf 'phase_name:               %s\n' "$phase_name"
+      printf 'iteration:                %s\n' "$(printf '%02d' "$iteration")"
+      printf 'role:                     %s\n' "$role"
+      printf 'dispatch_id:              %s\n' "$dispatch_id"
+      printf 'classification:           %s\n' "$classification"
+      printf 'reason:                   %s\n' "$reason"
+      printf '\n'
+    } >> "$FEATURE_FOLDER/RUN_LOG.md"
+  fi
+  _run_log_lock_release
+
+  DISPATCH_RESULT_CLASSIFICATION="$classification"
+  DISPATCH_RESULT_VERDICT="$verdict"
+  DISPATCH_RESULT_REASON="$reason"
+  DISPATCH_RESULT_STATUS_PATH="$status_path"
+  DISPATCH_RESULT_MUTATION_STATE="$mutation_state"
+  [ "$classification" = COMPLETED ]
+}
+
+# Ingest one child's outcome, synthesizing a PRELAUNCH_FAILED record ONLY
+# when the child never even reached a durable DISPATCH_STARTED -- dispatch_
+# parallel calls this once per requested role, so the parent ALWAYS emits
+# exactly one ingested record per role, never a silently missing one.
+_dispatch_ingest_child() {
+  # Usage: _dispatch_ingest_child <phase> <iteration> <role> <attempt-dir-or-empty>
+  local phase="$1" iteration="$2" role="$3" attempt_dir="$4"
+  if [ -z "$attempt_dir" ] || [ ! -f "$attempt_dir/result.kv" ]; then
+    # A child whose DISPATCH_STARTED is already durable (its attempt dir's
+    # basename IS its dispatch_id) and then produced no result was genuinely
+    # launched and then lost -- an orphan, not a prelaunch failure. Writing a
+    # synthetic DISPATCH_NOT_LAUNCHED here would directly contradict the
+    # DISPATCH_STARTED already on disk. Leave it alone for Task 7's
+    # classify_attempt/resume to turn into DISPATCH_ORPHANED.
+    local maybe_id=""
+    [ -n "$attempt_dir" ] && maybe_id="$(basename "$attempt_dir" 2>/dev/null)"
+    if [ -n "$maybe_id" ] && dispatch_is_running "$maybe_id"; then
+      # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
+      DISPATCH_RESULT_CLASSIFICATION=ORPHANED_NO_RESULT
+      # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
+      DISPATCH_RESULT_VERDICT=""
+      # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
+      DISPATCH_RESULT_REASON=DISPATCH_PARALLEL_CHILD_DIED_AFTER_START
+      # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
+      DISPATCH_RESULT_STATUS_PATH=""
+      # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
+      DISPATCH_RESULT_MUTATION_STATE=UNKNOWN
+      return 1
+    fi
+    local synth="$attempt_dir"
+    if [ -n "$synth" ]; then
+      mkdir -p "$synth" 2>/dev/null
+    else
+      # Contained under $ORCHESTRATION_DIR, never system /tmp -- this is a
+      # rare defensive fallback (a real attempt_dir is always known by the
+      # time ingestion runs), not a per-call leak into shared temp space.
+      synth="$(mktemp -d "${ORCHESTRATION_DIR:-${TMPDIR:-/tmp}}/lost-result.XXXXXX")"
+    fi
+    _dispatch_write_result "$synth" launched=no phase="$phase" \
+      phase_name="$(_phase_name "$phase" 2>/dev/null)" iteration="$iteration" role="$role" \
+      vendor=unknown dispatch_id="" logical_dispatch_id="" attempt="" status_path="" \
+      classification=PRELAUNCH_FAILED reason=DISPATCH_PARALLEL_MISSING_RESULT \
+      verdict="" usage_line="" start_ms=0 end_ms=0 wall_ms=0 exit_code="" stdout_path="" \
+      stderr_path="" mutates=no
+    attempt_dir="$synth"
+  fi
+  _dispatch_ingest_result "$attempt_dir/result.kv"
+}
+
+# The only launcher. Renders, validates, dispatches, classifies, and records
+# exactly one role. Internally this is dispatch_parallel with one role -- see
+# the section intro above for why that is not a redundant second lifecycle.
+dispatch_attempt() {
+  # Usage: dispatch_attempt <phase> <iteration> <role>
+  dispatch_parallel "$1" "$2" "$3"
+}
+
+# Fan-out. See the section intro above for the three phases (prelaunch / lease
+# / launch) and why each is scoped the way it is. group_wall_ms is
+# max(end) - min(start) across the roles that actually launched, never a
+# sum; a role that never launched contributes no start/end and is excluded
+# from that computation entirely.
+dispatch_parallel() {
+  # Usage: dispatch_parallel <phase> <iteration> <role> [<role> ...]
+  local phase="$1" iteration="$2"; shift 2
+  local -a roles=("$@")
+  local role seen=""
+  [ "${#roles[@]}" -ge 1 ] || { echo "DISPATCH_PARALLEL_NO_ROLES" >&2; return 1; }
+  for role in "${roles[@]}"; do
+    case " $seen " in
+      *" $role "*) echo "DISPATCH_PARALLEL_DUPLICATE_ROLE:$role" >&2; return 1 ;;
+    esac
+    seen="$seen $role"
+  done
+
+  local phase_name
+  phase_name="$(_phase_name "$phase")" || { echo "DISPATCH_PARALLEL_BAD_PHASE:$phase" >&2; return 1; }
+
+  # ---- Phase 1 (prelaunch): every role, sequentially, before any lease or
+  # fork. Restores the v1 render-up-front invariant for the whole batch.
+  local -a dp_ok=() dp_attempt_dir=() dp_dispatch_id=() dp_logical=() dp_attempt=()
+  local -a dp_status_path=() dp_stdout_path=() dp_stderr_path=() dp_vendor=() dp_mutates=() dp_prompt_file=()
+  local i batch_reject=""
+  for i in "${!roles[@]}"; do
+    if _dispatch_prelaunch "$phase" "$iteration" "${roles[$i]}"; then
+      dp_ok[$i]=1
+    else
+      dp_ok[$i]=0
+      batch_reject="${batch_reject:-${roles[$i]}}"
+    fi
+    dp_attempt_dir[$i]="$PREP_ATTEMPT_DIR"; dp_dispatch_id[$i]="$PREP_DISPATCH_ID"
+    dp_logical[$i]="$PREP_LOGICAL"; dp_attempt[$i]="$PREP_ATTEMPT"
+    dp_status_path[$i]="$PREP_STATUS_PATH"; dp_stdout_path[$i]="$PREP_STDOUT_PATH"
+    dp_stderr_path[$i]="$PREP_STDERR_PATH"; dp_vendor[$i]="$PREP_VENDOR"
+    dp_mutates[$i]="$PREP_MUTATES"; dp_prompt_file[$i]="$PREP_PROMPT_FILE"
+  done
+
+  if [ -n "$batch_reject" ]; then
+    # A sibling failed prelaunch validation/render: every role that itself
+    # passed gets its result OVERWRITTEN as not-launched too -- its own
+    # render succeeding is irrelevant, nothing in this batch may spend.
+    #
+    # Note for Task 7 (recovery/resume): allocate_attempt already minted a
+    # real attempt number for an innocent peer rejected here, purely as a
+    # side effect of validating it before the batch decision was known. A
+    # DISPATCH_PARALLEL_PEER_REJECTED record must NOT count against that
+    # role's own retry/correction budget -- it never had a chance to run,
+    # let alone fail on its own merits.
+    for i in "${!roles[@]}"; do
+      if [ "${dp_ok[$i]}" = 1 ]; then
+        _dispatch_write_result "${dp_attempt_dir[$i]}" launched=no phase="$phase" \
+          phase_name="$phase_name" iteration="$iteration" role="${roles[$i]}" \
+          vendor="${dp_vendor[$i]}" dispatch_id="${dp_dispatch_id[$i]}" \
+          logical_dispatch_id="${dp_logical[$i]}" attempt="${dp_attempt[$i]}" \
+          status_path="${dp_status_path[$i]}" classification=PRELAUNCH_FAILED \
+          reason="DISPATCH_PARALLEL_PEER_REJECTED:$batch_reject" verdict="" usage_line="" \
+          start_ms=0 end_ms=0 wall_ms=0 exit_code="" stdout_path="${dp_stdout_path[$i]}" \
+          stderr_path="${dp_stderr_path[$i]}" mutates="${dp_mutates[$i]}"
+      fi
+    done
+    declare -gA DISPATCH_PARALLEL_CLASSIFICATION=()
+    for i in "${!roles[@]}"; do
+      _dispatch_ingest_result "${dp_attempt_dir[$i]}/result.kv"
+      # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
+      DISPATCH_PARALLEL_CLASSIFICATION["${roles[$i]}"]="$DISPATCH_RESULT_CLASSIFICATION"
+    done
+    # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
+    DISPATCH_PARALLEL_GROUP_WALL_MS=0
+    return 1
+  fi
+
+  # ---- Phase 2 (lease): sequential, in REQUEST ORDER -- deterministic, not
+  # a race: the first mutating role in the caller's argument list always
+  # wins. A miss here rejects only THAT role, never its siblings (unlike
+  # phase 1, lease contention is an expected per-attempt outcome).
+  for i in "${!roles[@]}"; do
+    if [ "${dp_mutates[$i]}" = yes ]; then
+      if _dispatch_lease_try_acquire "${roles[$i]}" "${dp_dispatch_id[$i]}"; then
+        :
+      else
+        dp_ok[$i]=0
+        _dispatch_write_result "${dp_attempt_dir[$i]}" launched=no phase="$phase" \
+          phase_name="$phase_name" iteration="$iteration" role="${roles[$i]}" \
+          vendor="${dp_vendor[$i]}" dispatch_id="${dp_dispatch_id[$i]}" \
+          logical_dispatch_id="${dp_logical[$i]}" attempt="${dp_attempt[$i]}" \
+          status_path="${dp_status_path[$i]}" classification=PRELAUNCH_FAILED \
+          reason=DISPATCH_WRITE_LEASE_UNAVAILABLE verdict="" usage_line="" \
+          start_ms=0 end_ms=0 wall_ms=0 exit_code="" stdout_path="${dp_stdout_path[$i]}" \
+          stderr_path="${dp_stderr_path[$i]}" mutates="${dp_mutates[$i]}"
+      fi
+    fi
+  done
+
+  # ---- Phase 3 (launch): fork only the roles that survived both gates.
+  # Every started PID is awaited unconditionally below -- a non-zero exit
+  # from one child's subshell must never short-circuit the loop and skip a
+  # sibling's wait.
+  local -a pids=()
+  for i in "${!roles[@]}"; do
+    [ "${dp_ok[$i]}" = 1 ] || continue
+    ( _dispatch_launch_attempt "$i" ) &
+    pids+=("$!")
+  done
+  for i in "${!pids[@]}"; do
+    wait "${pids[$i]}" || :
+  done
+
+  # ---- Ingest every role's result -- launched or not -- strictly after
+  # every fork has been waited on, never from inside a child.
+  declare -gA DISPATCH_PARALLEL_CLASSIFICATION=()
+  local all_ok=0 started=0 s e min_start=0 max_end=0
+  for i in "${!roles[@]}"; do
+    # See dispatch_parallel's own -e note: never a bare call.
+    _dispatch_ingest_child "$phase" "$iteration" "${roles[$i]}" "${dp_attempt_dir[$i]}" || all_ok=1
+    # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
+    DISPATCH_PARALLEL_CLASSIFICATION["${roles[$i]}"]="$DISPATCH_RESULT_CLASSIFICATION"
+    if [ -f "${dp_attempt_dir[$i]}/result.kv" ]; then
+      s="$(_dispatch_read_result_field "${dp_attempt_dir[$i]}/result.kv" start_ms 2>/dev/null)"
+      e="$(_dispatch_read_result_field "${dp_attempt_dir[$i]}/result.kv" end_ms 2>/dev/null)"
+      case "$s" in *[!0-9]*|'') s=0 ;; esac
+      case "$e" in *[!0-9]*|'') e=0 ;; esac
+      if [ "$s" -gt 0 ]; then
+        if [ "$started" -eq 0 ]; then min_start="$s"; max_end="$e"; started=1
+        else
+          [ "$s" -lt "$min_start" ] && min_start="$s"
+          [ "$e" -gt "$max_end" ] && max_end="$e"
+        fi
+      fi
+    fi
+  done
+  # shellcheck disable=SC2034  # consumed by the caller after dispatch_parallel returns
+  DISPATCH_PARALLEL_GROUP_WALL_MS=$((max_end - min_start))
+  [ "$DISPATCH_PARALLEL_GROUP_WALL_MS" -ge 0 ] || DISPATCH_PARALLEL_GROUP_WALL_MS=0
+
+  return "$all_ok"
 }
 ```
 
-**Resume.** Call `dispatch_state` directly (never in `$(…)`) and branch on
-`$DISPATCH_STATE`:
+### Turn-start reconciliation (spec §13.3)
+
+At the beginning of every orchestrator turn, before narrating what happens
+next, reconstruct whether the dispatch the narration is about to describe is
+actually backed by durable evidence. `dispatch_is_running` answers exactly
+one question — is there a `DISPATCH_STARTED` for this dispatch id with no
+matching `DISPATCH_COMPLETED` or `DISPATCH_NOT_LAUNCHED` yet — by scanning
+`RUN_LOG.md`, never by trusting the orchestrator's own prior turn narration.
+
+<!-- lint: cookbook -->
+```bash
+# Usage: dispatch_is_running <dispatch_id>
+# 0 (true) iff RUN_LOG.md has a DISPATCH_STARTED for this id with no later
+# DISPATCH_COMPLETED or DISPATCH_NOT_LAUNCHED for the same id.
+dispatch_is_running() {
+  local id="$1" log="$FEATURE_FOLDER/RUN_LOG.md" started=no
+  [ -f "$log" ] || return 1
+  local tag line
+  while IFS= read -r line; do
+    case "$line" in
+      "--- "*"  event=DISPATCH_STARTED") tag=DISPATCH_STARTED ;;
+      "--- "*"  event=DISPATCH_COMPLETED") tag=DISPATCH_COMPLETED ;;
+      "--- "*"  event=DISPATCH_NOT_LAUNCHED") tag=DISPATCH_NOT_LAUNCHED ;;
+      "--- "*) tag="" ;;
+      "dispatch_id:"*)
+        [ -n "$tag" ] || continue
+        case "$line" in
+          *"$id") case "$tag" in
+                    DISPATCH_STARTED) started=yes ;;
+                    DISPATCH_COMPLETED|DISPATCH_NOT_LAUNCHED) started=no ;;
+                  esac ;;
+        esac ;;
+    esac
+  done < "$log"
+  [ "$started" = yes ]
+}
+
+# A user-facing "role X is running" claim is only ever correct when
+# dispatch_is_running agrees. When it does not, this appends a durable
+# correction (the full typed proposition ledger is Task 8/15's job; this is
+# the minimal durable evidence Task 6 owes) and returns non-zero so the
+# caller corrects its own narration instead of repeating the false claim.
+assert_dispatch_running_claim() {
+  # Usage: assert_dispatch_running_claim <dispatch_id> <narrated-claim>
+  local id="$1" claim="$2"
+  if dispatch_is_running "$id"; then
+    return 0
+  fi
+  {
+    printf -- '--- %s  event=PROCESS_DEVIATION\n' "$(iso_now)"
+    printf 'dispatch_id:              %s\n' "$id"
+    printf 'reason:                   %s\n' "narrated as running with no matching DISPATCH_STARTED: $claim"
+    printf '\n'
+  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+  return 1
+}
+```
+
+**Resume.** Call `dispatch_is_running <dispatch_id>` — never `dispatch_state`,
+which this task removes — to distinguish the three states a resume must tell
+apart:
 
 | State | Meaning | Action |
 |---|---|---|
-| `NEVER_LAUNCHED` | no `DISPATCH_STARTED` record for this id | dispatch fresh |
-| `COMPLETED` | recorded, and STATUS present **and valid** | read STATUS, proceed |
-| `UNFINISHED` | recorded, STATUS absent or invalid | **depends on `role_mutates`** — below |
+| `NEVER_LAUNCHED` | no `DISPATCH_STARTED` record for this id anywhere in `RUN_LOG.md` | dispatch fresh |
+| `COMPLETED` | a `DISPATCH_COMPLETED` (or `DISPATCH_NOT_LAUNCHED`) record exists for this id, and its classification is `COMPLETED` with STATUS present **and valid** | read STATUS, proceed |
+| `UNFINISHED` | `dispatch_is_running` reports the id still running, or a completed record's classification is anything other than `COMPLETED` | **depends on `role_mutates`** — below |
 
 `UNFINISHED` recovery is role-dependent, and this is the one place the process
 deliberately stops rather than recovering:
@@ -2403,11 +3016,21 @@ deliberately stops rather than recovering:
 | `no` — reviewers, summarizers, `context-discovery`, preflight, `readiness-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: no`, `action: redispatched`, and re-dispatch once. These roles only read and write their own STATUS and findings, so a repeat is idempotent. **Exception:** if the run-scoped `claude_spend_exhausted` / `codex_spend_exhausted` flag is set for this role's vendor (Mode 5b), do NOT re-dispatch — log `action: halted` with `reason: vendor spend ceiling`, and halt. Idempotence makes a repeat *safe*, not *useful*; under a ceiling it cannot succeed, and it buries the real cause under a second identical failure. |
 | `yes` — `implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `finishing-branch` | log `event=DISPATCH_ORPHANED` with `role_mutates: yes`, `action: halted`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, the `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch or keep the partial work. **Never auto-retry.** After the fact nothing can distinguish "the task ran once" from "the task ran twice", and a re-run implementer duplicates commits and re-applies edits. |
 
-**Write contract.** Long dispatch adds no control files. The orchestrator writes
-only the paths in the canonical write list under **Allowed actions** — nothing
-else. Appendix content is never written to disk: prompts are rendered into a
-shell variable and delivered by herestring.
+The ordered classifier that fully replaces this hand-rolled three-state read
+(ambiguity between "never launched" and "launched, crashed, no evidence at
+all" included) is Task 7's `classify_attempt`; this task's job is only to make
+sure every launched attempt leaves the durable evidence that classifier will
+read.
 
+**Write contract.** The orchestrator writes only the paths in the canonical
+write list under **Allowed actions**, plus the one new artifact this task
+introduces: `_dispatch_prelaunch` persists the fully-rendered prompt at
+`<attempt-dir>/prompt.txt` before invoking the vendor — the immutable render
+`dispatch_attempt`'s lifecycle requires (spec S13.1 step 5) and the file
+`invoke_vendor`'s `PROMPT_FILE` argument actually reads. This replaces the
+v1 herestring delivery; appendix content still never reaches any OTHER path
+on disk, and no `.tmp` companion is written for it — the file is written
+once, by the process that will read it, before it is ever read.
 Removing the hand-rolled protocol also removed every atomic-publication site the
 orchestrator had, so no `.tmp` companion is written any more either.
 
@@ -2596,7 +3219,7 @@ now_ms() { local t="${EPOCHREALTIME}"; local us="${t/[.,]/}"; printf '%s\n' "$((
 # It must NOT be called via `wall_ms="$(run_timed ...)"` or as the last element
 # of a pipe: both run it in a subshell, so any global the function sets is
 # discarded and the caller sees nothing. Call it directly and read the globals.
-#   run_timed claude_invoke "$role" "$out" "$err" < prompt
+#   run_timed invoke_vendor "$role" "$prompt_file" "$out" "$err"
 #   echo "$DISPATCH_WALL_MS $DISPATCH_RC"
 #
 # `local` is also only legal inside a function — the previous snippet used it at
@@ -2621,96 +3244,18 @@ Pass `$DISPATCH_WALL_MS` (set by `run_timed`) to `parse_usage` as the third argu
 
 **Failure handling.** The function ALWAYS exits 0 and ALWAYS prints a complete nine-field record. On any parse error or missing file, it prints `usage_status=unavailable` with zeros. The orchestrator never branches on `parse_usage` exit code — it always uses the output.
 
-### Writing RUN_LOG dispatch entries — `log_dispatch`
+### Writing RUN_LOG dispatch entries — superseded by `dispatch_attempt`
 
-This is **the standard helper** every phase step refers to. One call per subprocess invocation, immediately after `parse_usage`. It is the ONLY sanctioned way to record phase progress in `RUN_LOG.md` — do NOT hand-compose abbreviated entries (see the exhaustive-shapes rule in Resumability). It emits the full dispatch block from the Resumability grammar: identity fields, process-file content identity, and the nine telemetry fields.
-
-<!-- lint: cookbook -->
-```bash
-# log_dispatch <role> <phase> <phase_name> <iteration> <status_path> <verdict> "<usage_line>"
-#   <usage_line> is the single-line nine-pair output of parse_usage, quoted as ONE argument.
-# Requires: $PROCESS_PATH, $FEATURE_FOLDER. Process-file identity
-# (PROCESS_GIT_HEAD/PROCESS_FILE_SHA256/PROCESS_DIRTY) runs as part of
-# init_orchestration_vars, before any dispatch.
-# vendor/model/appendix are DERIVED from <role> — never pass them separately.
-log_dispatch() {
-  # Usage: log_dispatch <role> <phase> <phase_name> <iteration> <status_path> \
-  #                     <verdict> "<usage_line>"
-  # Appends exactly one block plus a trailing blank line. Process-file
-  # identity runs as part of init_orchestration_vars.
-  local role="$1" phase="$2" phase_name="$3" iter="$4" status_path="$5"
-  local verdict="$6" usage_line="$7"
-  local vendor model
-  vendor="$(role_vendor "$role")"
-  model="$(role_model "$role")"
-  # Key order below matches the Resumability grammar's dispatch block
-  # field-for-field: phase, phase_name, iteration, role, vendor, appendix,
-  # develop_it_git_sha, develop_it_file_sha256, develop_it_dirty, status_path,
-  # verdict, model, then the telemetry fields from $usage_line.
-  {
-    printf -- '--- %s  dispatch\n' "$(iso_now)"
-    printf 'phase:                    %s\n' "$phase"
-    printf 'phase_name:               %s\n' "$phase_name"
-    printf 'iteration:                %s\n' "$iter"
-    printf 'role:                     %s\n' "$role"
-    printf 'vendor:                   %s\n' "$vendor"
-    printf 'appendix:                 %s\n' "$role"
-    printf 'develop_it_git_sha:       %s\n' "$PROCESS_GIT_HEAD"
-    printf 'develop_it_file_sha256:   %s\n' "$PROCESS_FILE_SHA256"
-    printf 'develop_it_dirty:         %s\n' "$PROCESS_DIRTY"
-    printf 'status_path:              %s\n' "$status_path"
-    printf 'verdict:                  %s\n' "$verdict"
-    printf 'model:                    %s\n' "$model"
-    # parse_usage's line ALSO begins with model=, so skip that pair here or the
-    # block would carry two `model:` keys and break the fixed-key-order grammar.
-    local kv
-    for kv in $usage_line; do
-      case "$kv" in model=*) continue ;; esac
-      printf '%-25s %s\n' "${kv%%=*}:" "${kv#*=}"
-    done
-    printf '\n'
-  } >> "$FEATURE_FOLDER/RUN_LOG.md"
-}
-```
-
-Usage at a dispatch site:
-
-<!-- lint: snippet -->
-```bash
-role=spec-reviewer-claude
-out_json="$FEATURE_FOLDER/transcripts/$(dispatch_id 3 01 "$role").json"
-err_txt="${out_json%.json}.err"
-status="$FEATURE_FOLDER/3-spec-review/iteration-01/claude-verdict.md"
-
-# Validate the appendix BEFORE dispatching: a failed render must not reach the
-# CLI as an empty prompt.
-appendix_exists "$role" || { echo "halt: no appendix for role $role" >&2; return 1; }
-
-# Process substitution, NOT a pipe and NOT "$(...)":
-#   render_prompt … | run_timed …   -> run_timed is the last pipeline element,
-#                                      which bash runs in a SUBSHELL, so both
-#                                      globals are discarded.
-#   wall="$(run_timed …)"           -> same problem, plus it captures nothing.
-#   run_timed … <<< "$prompt"        -> run_timed stays in THIS shell. Correct.
-# A herestring, not process substitution: `< <(render_prompt …)` would also keep
-# run_timed in this shell, but it DISCARDS the renderer's exit status, so a failed
-# render silently becomes a zero-byte prompt with rc 0 (verified). Render into a
-# variable, check it, then feed it. The prompt still never touches a file we
-# manage, satisfying "appendix content is NEVER written to disk".
-prompt="$(render_prompt "$role")" || { echo "halt: render failed for $role" >&2; return 1; }
-[ -n "$prompt" ] || { echo "halt: empty prompt for $role" >&2; return 1; }
-run_timed claude_invoke "$role" "$out_json" "$err_txt" <<< "$prompt"
-
-usage_line="$(parse_usage claude "$out_json" "$DISPATCH_WALL_MS" "$(role_model "$role")")"
-verdict="$(status_field "$status" verdict)"
-
-log_dispatch "$role" 3 spec-review 01 "$status" "$verdict" "$usage_line"
-
-# Classify last. Pass BOTH transcripts: the stderr tail carries local CLI usage
-# errors, the stdout JSON carries the vendor's own refusal text, and a
-# quota/spend failure appears ONLY in the latter.
-post_dispatch "$DISPATCH_RC" "$status" "$err_txt" "$out_json" || :
-```
+The v1 `log_dispatch` helper and its hand-assembled dispatch-site snippet are
+retired. `dispatch_attempt`/`dispatch_parallel` (see "Unified attempt
+dispatch" above) now own every RUN_LOG write for a top-level role: they
+allocate the attempt, render and persist the prompt, invoke the vendor via
+`invoke_vendor`, classify the result, and append the `DISPATCH_STARTED` /
+`DISPATCH_COMPLETED` (and, on failure, `ATTEMPT_FAILED`) block themselves — in
+the fixed key order the Resumability grammar declares. A phase step never
+calls `log_dispatch`, `claude_invoke`, or `codex_invoke` directly any more;
+every dispatch, sequential or parallel, is `dispatch_attempt <phase>
+<iteration> <role>` or `dispatch_parallel <phase> <iteration> <role>...`.
 
 ### Dirty-tree gate (early — runs at the very top of Phase 1, before any folder creation)
 
@@ -3095,94 +3640,28 @@ missing, interrupted, or its manifest fails to verify against the current
 
 The two reviewers at each gate (Claude + Codex) read the same inputs and produce independent STATUS files. They have no inter-dependency. Dispatch them in parallel — sequential dispatch wastes wall-clock and adds nothing.
 
-<!-- lint: cookbook -->
+`dispatch_reviewers_parallel` is retired: `dispatch_parallel` (see "Unified
+attempt dispatch" above) is the general fan-out primitive every gate now
+calls directly, with the role list decided by the caller rather than baked
+into a two-role-only signature:
+
+<!-- lint: snippet -->
 ```bash
-# Dispatch both reviewers concurrently for one gate iteration.
-#
-# Roles are passed EXPLICITLY. The previous version built appendix names as
-# "${phase}-reviewer-claude", which cannot produce `code-reviewer-claude` for
-# any value of $phase — Phase 7 rendered an empty prompt and render_prompt
-# raised ValueError.
-#
-# Each subshell ends with `exit "$rc"` so `wait` reports the truth. Previously
-# the last command was an `echo`, so `wait` returned 0 unconditionally and no
-# reviewer failure was ever detected.
-#
-# Prompts are rendered in the PARENT, before either subshell is launched, and
-# checked for failure/emptiness here. A pipeline's exit status is that of its
-# LAST command, so `render_prompt ... | claude_invoke ...` inside a subshell
-# would mask a render failure and still invoke the CLI with an empty prompt —
-# real spend on a prompt that says nothing. Rendering up front means a codex
-# render failure cannot leave a claude child already spending.
-dispatch_reviewers_parallel() {
-  # Usage: dispatch_reviewers_parallel <claude_role> <codex_role> <phase> <iter>
-  local claude_role="$1" codex_role="$2" phase="$3" iter="$4"
-  local tdir="$FEATURE_FOLDER/transcripts"
-  mkdir -p "$tdir"   # bash fails the redirect below if this is absent
-
-  local base_c base_x
-  base_c="$tdir/$(dispatch_id "$phase" "$iter" "$claude_role")"
-  base_x="$tdir/$(dispatch_id "$phase" "$iter" "$codex_role")"
-  local claude_pid="" codex_pid=""
-
-  local claude_prompt codex_prompt
-  claude_prompt="$(render_prompt "$claude_role")" \
-    || { echo "halt: render failed for role $claude_role" >&2; return 1; }
-  [ -n "$claude_prompt" ] \
-    || { echo "halt: empty prompt for role $claude_role" >&2; return 1; }
-
-  if [ "${codex_available:-false}" = true ]; then
-    codex_prompt="$(render_prompt "$codex_role")" \
-      || { echo "halt: render failed for role $codex_role" >&2; return 1; }
-    [ -n "$codex_prompt" ] \
-      || { echo "halt: empty prompt for role $codex_role" >&2; return 1; }
-  fi
-
-  # Record BOTH dispatches now that both prompts have rendered and validated,
-  # and BEFORE either subshell launches -- this is what makes dispatch_state's
-  # `^dispatch_id: *<id>$` scan find these roles on resume. Without it every
-  # reviewer role dispatched through this function looked NEVER_LAUNCHED on
-  # resume and was silently re-run over a completed result.
-  local phase_name
-  phase_name="$(_phase_name "$phase")"
-  log_dispatch_started "$phase" "$phase_name" "$iter" "$claude_role"
-  [ "${codex_available:-false}" = true ] \
-    && log_dispatch_started "$phase" "$phase_name" "$iter" "$codex_role"
-
-  (
-    claude_invoke "$claude_role" "${base_c}.json" "${base_c}.err" <<< "$claude_prompt"
-    rc=$?
-    exit "$rc"
-  ) &
-  claude_pid=$!
-
-  if [ "${codex_available:-false}" = true ]; then
-    (
-      codex_invoke "$codex_role" "${base_x}.json" "${base_x}.err" <<< "$codex_prompt"
-      rc=$?
-      exit "$rc"
-    ) &
-    codex_pid=$!
-  fi
-
-  wait "$claude_pid"
-  # shellcheck disable=SC2034  # consumed by the caller after this function returns
-  CLAUDE_RC=$?
-  if [ -n "$codex_pid" ]; then
-    wait "$codex_pid"
-    # shellcheck disable=SC2034  # consumed by the caller after this function returns
-    CODEX_RC=$?
-  else
-    # shellcheck disable=SC2034  # consumed by the caller after this function returns
-    CODEX_RC=-1   # not dispatched; distinct from rc=0
-  fi
-  # RUN_LOG appends are serialised here, after both children have exited, so
-  # concurrent writes cannot interleave and corrupt the block grammar.
-  return 0
-}
+if [ "${codex_available:-false}" = true ]; then
+  dispatch_parallel "$phase" "$iter" "$claude_role" "$codex_role"
+else
+  dispatch_attempt "$phase" "$iter" "$claude_role"
+fi
 ```
 
-Validation, RUN_LOG appends, and failover decisions still run sequentially after the parallel wait — they touch shared state. Only the dispatch and the wait are parallel.
+`dispatch_parallel` renders and validates every role's prompt, takes the
+write lease for any that mutate, launches every child concurrently, waits
+for every PID unconditionally, and only then appends each child's
+`DISPATCH_STARTED`/`DISPATCH_COMPLETED` pair to `RUN_LOG.md` — one full
+result record per requested role, whether or not its peer succeeded. There is
+nothing left for a phase step to hand-assemble: no `dispatch_id` to build, no
+`log_dispatch_started` call to remember before the fork, no per-child `wait`
+to write out by hand.
 
 Same pattern applies to Phase 1 preflight: dispatch `preflight-claude` and `preflight-codex` in parallel, then validate both STATUS files.
 
@@ -3232,8 +3711,8 @@ where the folder name is not yet known because a subagent must propose it: there
 HALT without the RUN_LOG write rather than inventing a folder to log into.
 
 This is resume-safe: a `RUN_LOG.md` containing only pre-dispatch event entries
-has no `DISPATCH_STARTED` records, so `dispatch_state` reports `NEVER_LAUNCHED`
-for every role and the retry is a genuine fresh Phase 1, not a resume. The cost
+has no `DISPATCH_STARTED` records, so `dispatch_is_running` is false and every
+role is `NEVER_LAUNCHED` — the retry is a genuine fresh Phase 1, not a resume. The cost
 is one empty folder after a failed gate; the benefit is that no HALT in this
 process is silent.
 
@@ -3290,10 +3769,10 @@ previous behaviour — hid the degradation from the final report.
 
 ### Step 1.1 — Skill probe flow
 
-1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `1-preflight/` subfolder with `mkdir -p`. Then call `bootstrap_runtime` (see "Runtime extraction contract" in the cookbook) to materialize `$FEATURE_FOLDER/.orchestration/runtime/` — this is the run's first bootstrap, so it always extracts fresh (`BOOTSTRAP_OK`). On any non-zero return, HALT: create `$FEATURE_FOLDER` (already done by this step) and append an `event=HALT` entry naming the token printed on stderr (`RUNTIME_MANIFEST_INVALID:...`, `BOOTSTRAP_RACE_LOST_INVALID:...`, or `BOOTSTRAP_IO_ERROR:...`), then STOP before any subprocess dispatch. Immediately `source "$RUNTIME_DIR/develop-it-runtime.sh"` — every helper referenced below (`dispatch_reviewers_parallel`, `validate_status`, `context7_policy`, ...) comes from that sourced file, not from re-pasting this cookbook.
-2. **Dispatch both preflight subprocesses in parallel using `dispatch_reviewers_parallel preflight-claude preflight-codex 1 00`** (see "Reviewer parallelization" cookbook; preflight has no shared state between vendors, so this is safe as the very first dispatch of the run). This is the ONLY dispatch mechanism for Step 1.1 — there is no separate `dispatch_role` call for either preflight role.
-   - **Claude subprocess (always dispatched):** role `preflight-claude`. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Transcript: `<feature-folder>/transcripts/1-iter00-preflight-claude.json` (stdout) and `1-iter00-preflight-claude.err` (stderr) — the `dispatch_id` naming form. This role's timeout comes from the Models table via `role_timeout`.
-3. **Codex subprocess (dispatched if and only if `codex_available = true`):** role `preflight-codex`, dispatched by the SAME `dispatch_reviewers_parallel` call named in step 2 — not a second, separate dispatch. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Transcript: `<feature-folder>/transcripts/1-iter00-preflight-codex.json` (stdout) and `1-iter00-preflight-codex.err` (stderr). Model and effort are resolved per-role from the Models table, which is what puts preflight in `micro` mode per the "Codex reviewer modes" table.
+1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `1-preflight/` subfolder with `mkdir -p`. Then call `bootstrap_runtime` (see "Runtime extraction contract" in the cookbook) to materialize `$FEATURE_FOLDER/.orchestration/runtime/` — this is the run's first bootstrap, so it always extracts fresh (`BOOTSTRAP_OK`). On any non-zero return, HALT: create `$FEATURE_FOLDER` (already done by this step) and append an `event=HALT` entry naming the token printed on stderr (`RUNTIME_MANIFEST_INVALID:...`, `BOOTSTRAP_RACE_LOST_INVALID:...`, or `BOOTSTRAP_IO_ERROR:...`), then STOP before any subprocess dispatch. Immediately `source "$RUNTIME_DIR/develop-it-runtime.sh"` — every helper referenced below (`dispatch_parallel`, `validate_status`, `context7_policy`, ...) comes from that sourced file, not from re-pasting this cookbook.
+2. **Dispatch both preflight subprocesses in parallel using `dispatch_parallel 1 00 preflight-claude preflight-codex`** (see "Reviewer parallelization" cookbook; preflight has no shared state between vendors, so this is safe as the very first dispatch of the run). This is the ONLY dispatch mechanism for Step 1.1 — there is no separate `dispatch_attempt` call for either preflight role.
+   - **Claude subprocess (always dispatched):** role `preflight-claude`. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Transcript: `<feature-folder>/transcripts/<dispatch_id>.stdout` (stdout) and `<dispatch_id>.stderr` (stderr) — `allocate_attempt`'s naming form. This role's timeout comes from the Models table via `role_timeout`.
+3. **Codex subprocess (dispatched if and only if `codex_available = true`):** role `preflight-codex`, dispatched by the SAME `dispatch_parallel` call named in step 2 — not a second, separate dispatch. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Transcript: `<feature-folder>/transcripts/<dispatch_id>.stdout` (stdout) and `<dispatch_id>.stderr` (stderr). Model and effort are resolved per-role from the Models table, which is what puts preflight in `micro` mode per the "Codex reviewer modes" table.
 4. Read only the two STATUS files. Validate each with `validate_status` (see cookbook).
 4a. Read the `context7` field from `claude-check-status.md`. If it is `unreachable`, append one `event=CONTEXT7_UNAVAILABLE` entry to `RUN_LOG.md` (phase 1). Do NOT halt — this only affects `context7_policy()` (see cookbook) for the rest of the run. If it is `reachable`, no RUN_LOG entry is needed; `context7_policy()` reads the STATUS field directly.
 5. If either reports `verdict=MISSING_SKILLS`, print to the user: which CLI is missing which skills, plus an install hint ("Install the Superpowers plugin (e.g. `claude plugin install superpowers`) and re-run this prompt against the same feature folder"). HALT.
@@ -3434,9 +3913,9 @@ Per the design's "File policy for non-READY paths" section, the orchestrator's c
 For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/3-spec-review/iteration-NN`.
-2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=3, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 3.0) have completed.
+2. **Dispatch both reviewers in parallel using `dispatch_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=3, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 3.0) have completed.
    - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `spec-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `3-spec-review/iteration-NN/claude-verdict.md` (STATUS) and `claude-findings.md` (findings). This role's timeout comes from the Models table via `role_timeout`.
-   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `spec-reviewer-codex`. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_reviewers_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 3.0 — do not dispatch and do not log a new event here.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `spec-reviewer-codex`. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 3.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only the verdict files.
 4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
@@ -3456,12 +3935,12 @@ appendix. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`. The subagent loads
 `superpowers:writing-plans` and produces the plan at the skill's default
 location (`docs/superpowers/plans/<YYYY-MM-DD>-<slug>-plan.md`). This role's timeout
 (from the Models table via `role_timeout`) exceeds a single Bash tool call, so issue
-the `dispatch_role 4 00 plan-writer <feature-folder>/4-plan-writing/plan-status.md`
-call **with `run_in_background: true`**; your next turn begins when it finishes.
+the `dispatch_attempt 4 00 plan-writer` call **with `run_in_background: true`**;
+your next turn begins when it finishes.
 
 Output: `<feature-folder>/4-plan-writing/plan-status.md` with `verdict=DONE` and `plan_path=<absolute-path>`.
 
-After the subprocess completes, **append one RUN_LOG dispatch entry** with `phase: 4`, `phase_name: plan-writing`, `iteration: 00`, `role: plan-writer`, `vendor: claude`, `appendix: plan-writer`, `status_path: 4-plan-writing/plan-status.md`, and `verdict:` read from the STATUS file. Use the standard `log_dispatch` helper.
+`dispatch_attempt` appends the RUN_LOG record itself — `phase: 4`, `phase_name: plan-writing`, `iteration: 00`, `role: plan-writer`, `vendor: claude`, `status_path:` the attempt's own STATUS path, and `verdict:` read from it. There is nothing further to append by hand.
 
 You read only `plan-status.md`. On `DONE`, proceed to Phase 5.
 
@@ -3510,9 +3989,9 @@ The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this 
 For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/5-plan-review/iteration-NN`.
-2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=5, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 5.0) have completed.
+2. **Dispatch both reviewers in parallel using `dispatch_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=5, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 5.0) have completed.
    - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `plan-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Outputs: `5-plan-review/iteration-NN/claude-verdict.md` and `claude-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
-   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `plan-reviewer-codex`. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_reviewers_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `plan-reviewer-codex`. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
 4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
@@ -3636,12 +4115,14 @@ agents_json="$(jq -nc --arg m "$(role_model impl-worker)" \
                    prompt:"Follow the task instructions you are given.",
                    model:$m}}')"
 
-# dispatch_role renders internally and takes no stdin. Issue this call with
+# dispatch_attempt renders internally and takes no stdin. Issue this call with
 # run_in_background: true -- the implementer's timeout (see the Models table,
-# via role_timeout) cannot fit in a foreground Bash call.
-dispatch_role 6 00 implementer \
-  "$FEATURE_FOLDER/6-implementation/implementer-status.md" \
-  --agents "$agents_json"
+# via role_timeout) cannot fit in a foreground Bash call. EXTRA_VENDOR_ARGS is
+# the ambient hook invoke_vendor reads for this one claude-only case -- unset
+# it again afterward so it never leaks into an unrelated later dispatch.
+EXTRA_VENDOR_ARGS=(--agents "$agents_json")
+dispatch_attempt 6 00 implementer
+unset EXTRA_VENDOR_ARGS
 ```
 
 Outputs (written by the implementer at the end):
@@ -3714,11 +4195,11 @@ The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this 
 For each iteration N (start at 1, hard cap at 10):
 
 1. `mkdir -p <feature-folder>/7-code-review/iteration-NN`.
-2. **Dispatch both reviewers in parallel using `dispatch_reviewers_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=7, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 7.0) have completed.
+2. **Dispatch both reviewers in parallel using `dispatch_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=7, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 7.0) have completed.
    - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `code-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-verdict.md` and `claude-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
-   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `code-reviewer-codex`. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_reviewers_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `code-reviewer-codex`. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
    `code-reviewer-codex`'s timeout (see the Models table, via `role_timeout`) exceeds
-   a single Bash tool call, so this step's `dispatch_reviewers_parallel` call must
+   a single Bash tool call, so this step's `dispatch_parallel` call must
    itself be issued as **one Bash tool call with `run_in_background: true`** — the
    whole call waits on both children, so it inherits the longer of the two roles'
    timeouts.
@@ -3880,7 +4361,7 @@ Concretely for Codex: the most common orchestration bug is `codex exec ... -a ne
 
 The orchestrator must NOT inspect transcript stdout/stderr after a successful subprocess (`rc=0` AND STATUS.md exists AND `validate_status` returns clean). The verdict is whatever STATUS.md says. Tailing transcripts "out of curiosity" or "to confirm" leaks the orchestrator into the subagent's reasoning and routinely creates the temptation to override a STATUS.
 
-Transcript tails are read ONLY when classifying a failure (`rc != 0`, missing STATUS, or malformed STATUS — Modes 1–5). The `post_dispatch` helper from the cookbook implements this rule, and `dispatch_role` calls it on every dispatch — do not hand-roll a tail at a phase step. "Transcript" here means BOTH streams: the stderr tail and the stdout JSON envelope that `vendor_error_text` parses. Reading the stdout envelope on failure is not a widening of this policy — it is the same one-look-on-failure rule applied to the stream the vendor actually writes its refusals to. Surface both only when halting the run or logging a vendor-failover event.
+Transcript tails are read ONLY when classifying a failure (`rc != 0`, missing STATUS, or malformed STATUS — Modes 1–5). The `post_dispatch` helper from the cookbook implements this rule, and `_dispatch_launch_attempt` (inside `dispatch_attempt`/`dispatch_parallel`) calls it on every attempt — do not hand-roll a tail at a phase step. "Transcript" here means BOTH streams: the stderr tail and the stdout JSON envelope that `vendor_error_text` parses. Reading the stdout envelope on failure is not a widening of this policy — it is the same one-look-on-failure rule applied to the stream the vendor actually writes its refusals to. Surface both only when halting the run or logging a vendor-failover event.
 
 ### STATUS.md contract
 
@@ -3949,32 +4430,64 @@ Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 10 fix→re-revie
 
 ### Resumability
 
-`RUN_LOG.md` is append-only and is the source of truth for where the run stopped. **Each entry is a multi-line YAML-ish block separated from the next by a blank line.** Entries are read top-to-bottom; key order within an entry is fixed (as shown below) so humans can scan it. The first line of every entry is `--- <ISO-timestamp>  <event-or-dispatch-tag>` so blocks are visually distinct. There are four block shapes, distinguishable by their tag:
+`RUN_LOG.md` is append-only and is the source of truth for where the run stopped. **Each entry is a multi-line YAML-ish block separated from the next by a blank line.** Entries are read top-to-bottom; key order within an entry is fixed (as shown below) so humans can scan it. The first line of every entry is `--- <ISO-timestamp>  <event-tag>` so blocks are visually distinct.
 
-**The block shapes below are EXHAUSTIVE — do not invent entry kinds.** Phase progress is recorded ONLY as one full `dispatch` entry per subprocess invocation, written via the `log_dispatch` cookbook helper — there are no phase-completion marker events and no free-form progress notes. A RUN_LOG made of blocks like `--- <ts>  event=PHASE3_SPEC_SUMMARY` / `verdict: DONE` (no `role`, no `vendor`, no `appendix`, no process-file identity, no telemetry) is the canonical degenerate failure mode this grammar exists to prevent: it destroys resumability, the per-phase Usage tables, the completion-criteria count checks, and the readiness rollup. The ONLY legal `event=` tags are: `CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `HALT`,
+**The block shapes below are EXHAUSTIVE — do not invent entry kinds.** Phase progress is recorded ONLY as one `event=DISPATCH_STARTED` / `event=DISPATCH_COMPLETED` pair per attempt (or one `event=DISPATCH_NOT_LAUNCHED` for a prelaunch failure), written by `_dispatch_ingest_result` (the sole helper `dispatch_attempt`/`dispatch_parallel` call for this) — there are no phase-completion marker events and no free-form progress notes. The bare `--- <ts>  dispatch` tag is retired: schema v1 used it for what schema v2 now always splits into a `DISPATCH_STARTED`/`DISPATCH_COMPLETED` pair. A RUN_LOG made of blocks like `--- <ts>  event=PHASE3_SPEC_SUMMARY` / `verdict: DONE` (no `role`, no `vendor`, no `appendix`, no process-file identity, no telemetry) is the canonical degenerate failure mode this grammar exists to prevent: it destroys resumability, the per-phase Usage tables, the completion-criteria count checks, and the readiness rollup. The ONLY legal `event=` tags are: `CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `HALT`,
 `IMPLEMENTATION_BASELINE`, `IMPLEMENTATION_BASELINE_BLOCKED`,
 `CODEX_DISABLED_BY_USER_CONSENT`, `CODEX_SKIPPED_BY_USER_CONSENT`,
 `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE`, `MODEL_REJECTED`,
-`DISPATCH_STARTED`, `DISPATCH_ORPHANED`, `CONTEXT7_UNAVAILABLE` (plus the reserved
-`CODEX_RE_ENABLED_BY_USER`). An event entry NEVER substitutes for the dispatch entry of a subprocess that actually ran.
+`ATTEMPT_ALLOCATED`, `DISPATCH_STARTED`, `DISPATCH_COMPLETED`,
+`DISPATCH_NOT_LAUNCHED`, `ATTEMPT_FAILED`, `DISPATCH_ORPHANED`,
+`CONTEXT7_UNAVAILABLE`, `PROCESS_DEVIATION` (plus the reserved
+`CODEX_RE_ENABLED_BY_USER`). An event entry NEVER substitutes for the
+`DISPATCH_COMPLETED` entry of an attempt that actually ran.
 
-**Dispatch entries** (one per subprocess invocation):
+**Dispatch entries.** `DISPATCH_STARTED` is written FIRST, by the process
+actually about to invoke the vendor (see "Unified attempt dispatch" above),
+in the instant before that invocation — its timestamp is genuinely the start.
+`DISPATCH_COMPLETED` is appended later, by the parent, once the attempt has
+been classified. The two are never the same append and never share a
+timestamp:
 
 ```
---- 2026-05-28T17:48:45Z  dispatch
+--- 2026-05-28T17:48:44Z  event=DISPATCH_STARTED
+phase:                    3
+phase_name:               spec-review
+iteration:                01
+role:                     spec-reviewer-claude
+vendor:                   claude
+dispatch_id:              p03-i01-spec-reviewer-claude-a01
+logical_dispatch_id:      p03-i01-spec-reviewer-claude
+model:                    claude-opus-5
+status_path:              3-spec-review/01/attempts/p03-i01-spec-reviewer-claude-a01/STATUS.md
+cwd:                      /repo
+lease:                    none
+snapshot:                 none
+
+--- 2026-05-28T17:52:45Z  event=DISPATCH_COMPLETED
 phase:                    3
 phase_name:               spec-review
 iteration:                01
 role:                     spec-reviewer-claude
 vendor:                   claude
 appendix:                 spec-reviewer-claude
+dispatch_id:              p03-i01-spec-reviewer-claude-a01
+logical_dispatch_id:      p03-i01-spec-reviewer-claude
 develop_it_git_sha:       fd705aef83efe207cf12f668980544576b8849bc
 develop_it_file_sha256:   8c2f6bf5e9d3a4b1f5c7d8e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9
 develop_it_dirty:         no
-status_path:              3-spec-review/iteration-01/claude-verdict.md
+status_path:              3-spec-review/01/attempts/p03-i01-spec-reviewer-claude-a01/STATUS.md
 verdict:                  CHANGES_REQUESTED
+classification:           COMPLETED
+exit_code:                0
 model:                    claude-opus-5
+start_ms:                 1780000124000
+end_ms:                   1780000365830
 duration_ms:              241830
+stdout_path:              transcripts/p03-i01-spec-reviewer-claude-a01.stdout
+stderr_path:              transcripts/p03-i01-spec-reviewer-claude-a01.stderr
+mutation_state:           NO_SIDE_EFFECTS
+checkpoint_kind:          review
 tokens_input_new:         18430
 tokens_input_cached:      0
 tokens_cache_write:       54200
@@ -3984,6 +4497,21 @@ cost_usd:                 0.4823
 usage_status:             ok
 ```
 
+`lease` names the write-lease reference the attempt held while running
+(`none` for a non-mutating role); `snapshot` is a Task 8 seam — real
+before/after mutation snapshots (write-lease protocol Step 6) do not exist
+yet, so it is always `none` until that task lands. `mutation_state` and
+`checkpoint_kind` are likewise provisional/registry-derived placeholders
+pending Task 8's real snapshot classification (`NO_SIDE_EFFECTS`/`UNKNOWN`
+only — never `CLEAN_CHECKPOINTED`/`DIRTY_CHECKPOINTED`/etc., which require
+the real snapshot machinery).
+
+A failed launched attempt additionally gets exactly one `event=ATTEMPT_FAILED`
+block, immediately after its `DISPATCH_COMPLETED`, naming the same
+`dispatch_id` plus `classification:` and `reason:`. A prelaunch failure
+(vendor never invoked) gets exactly one `event=DISPATCH_NOT_LAUNCHED` instead
+of the whole pair — no `DISPATCH_STARTED`, no `DISPATCH_COMPLETED`.
+
 (Relative `status_path` is encouraged; absolute is allowed when ambiguous.
 `develop_it_git_sha` is `git -C "$PROCESS_REPO_ROOT" rev-parse HEAD`;
 `develop_it_file_sha256` is `sha256sum "$PROCESS_PATH" | cut -d' ' -f1`;
@@ -3992,12 +4520,12 @@ usage_status:             ok
 matches, and `unknown` outside a git repo. All three describe THIS document, not
 the project under development — a bare `git` call would report the wrong repo.)
 
-**Usage telemetry fields.** Every dispatch entry MUST carry the nine telemetry fields shown above (`model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`, `usage_status`). Values come from `parse_usage` (see cookbook). Field semantics:
+**Usage telemetry fields.** Every `DISPATCH_COMPLETED` entry MUST carry the nine telemetry fields shown above (`model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`, `usage_status`). Values come from `parse_usage` (see cookbook). Field semantics:
 
 - All token counts are integers; `0` when not applicable to the vendor (`tokens_reasoning` is `0` for Claude; `tokens_cache_write` is `0` for Codex).
 - `cost_usd` is numeric for Claude; the literal string `n/a` for Codex (subscription-priced, no per-call cost).
-- `usage_status` is `ok` or `unavailable`. When `unavailable`, all token fields are `0` and `cost_usd` is `n/a` — but the dispatch entry itself is still written normally. Telemetry parsing failure NEVER blocks logging.
-- `model` is the resolved concrete model id (e.g. `claude-opus-5`) of the dispatch's MAIN model. Claude sessions may additionally consume tokens on Claude Code's internal small-model helper (haiku); that auxiliary usage is included in `cost_usd` (which is the whole-subprocess `total_cost_usd`) but never changes `model` — `parse_usage` selects the `modelUsage` key matching the dispatched id. `log_dispatch` writes this field itself from `role_model <role>` — the single source of truth for per-role model ids — rather than from `parse_usage`'s output, so it is correct for both vendors and for pre-Phase-0 dispatches (canary, preflight) alike.
+- `usage_status` is `ok` or `unavailable`. When `unavailable`, all token fields are `0` and `cost_usd` is `n/a` — but the `DISPATCH_COMPLETED` entry itself is still written normally. Telemetry parsing failure NEVER blocks logging.
+- `model` is the resolved concrete model id (e.g. `claude-opus-5`) of the dispatch's MAIN model. Claude sessions may additionally consume tokens on Claude Code's internal small-model helper (haiku); that auxiliary usage is included in `cost_usd` (which is the whole-subprocess `total_cost_usd`) but never changes `model` — `parse_usage` selects the `modelUsage` key matching the dispatched id. `_dispatch_ingest_result` writes this field itself from `role_model <role>` — the single source of truth for per-role model ids — rather than from `parse_usage`'s output, so it is correct for both vendors and for pre-Phase-0 dispatches (canary, preflight) alike.
 - `duration_ms` is the CLI-reported wall time for Claude (`duration_ms` field in the JSON), and the orchestrator-measured wall time for Codex (Codex JSON omits a duration field).
 
 Existing entries written by prior versions of this process file MAY lack the nine fields. Readers (summarizers, readiness writer) MUST tolerate missing fields by treating them as `usage_status=unavailable` with zero values.
@@ -4017,7 +4545,7 @@ Existing entries written by prior versions of this process file MAY lack the nin
 | 9 | `git-finalization` |
 | 10 | `readiness-report` |
 
-`phase_name` applies to every dispatch entry and to every event entry that carries `phase:` (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE`). Events that do not carry `phase:` (`IMPLEMENTATION_BASELINE`, `IMPLEMENTATION_BASELINE_BLOCKED`) do not need `phase_name`. Existing entries in already-written RUN_LOGs are not back-filled — readers MUST tolerate entries that lack `phase_name`.
+`phase_name` applies to every `DISPATCH_STARTED`/`DISPATCH_COMPLETED`/`DISPATCH_NOT_LAUNCHED`/`ATTEMPT_FAILED` entry and to every other event entry that carries `phase:` (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE`). Events that do not carry `phase:` (`IMPLEMENTATION_BASELINE`, `IMPLEMENTATION_BASELINE_BLOCKED`) do not need `phase_name`. Existing entries in already-written RUN_LOGs are not back-filled — readers MUST tolerate entries that lack `phase_name`.
 
 **Failure events** (CODEX_UNAVAILABLE, CLAUDE_FAILED) — dispatch shape plus `failure_mode` and `event`:
 
@@ -4107,7 +4635,10 @@ reason:                   <one line from the CLI>
 Consumer: the readiness writer reports this as a HALT cause. The run does not
 continue; there is no substitute for a rejected id.
 
-**`DISPATCH_STARTED` event** (written immediately before a subprocess is launched):
+**`DISPATCH_STARTED` event** (written by `_dispatch_write_started`,
+immediately before the vendor is invoked — see "Unified attempt dispatch"
+above for who calls it and why that timestamp is genuinely the start, not a
+timestamp invented later):
 
 ```
 --- <ISO-timestamp>  event=DISPATCH_STARTED
@@ -4115,23 +4646,31 @@ phase:                    <n>
 phase_name:               <name>
 iteration:                <NN>
 role:                     <role>
-dispatch_id:              <phase>-iter<NN>-<role>
+vendor:                   claude | codex
+dispatch_id:              p<phase-token>-i<NN>-<role>-a<NN>
+logical_dispatch_id:      p<phase-token>-i<NN>-<role>
 model:                    <resolved id>
+status_path:              <attempt's own STATUS.md path>
+cwd:                      <REPO_ROOT>
+lease:                    <lease reference, or none>
+snapshot:                 none
 ```
 
-Consumer: resume. Its presence without a matching `dispatch` block means the
-dispatch was launched but never completed; `dispatch_state` then classifies it.
-This event NEVER substitutes for the `dispatch` block of a subprocess that ran to
-completion — both appear for a normal dispatch.
+Consumer: resume, via `dispatch_is_running`. Its presence without a matching
+`DISPATCH_COMPLETED` (or `DISPATCH_NOT_LAUNCHED`) for the same `dispatch_id`
+means the attempt is still live or died mid-flight; Task 7's `classify_attempt`
+turns that into a full recovery classification. This event NEVER substitutes
+for the `DISPATCH_COMPLETED` block of an attempt that ran to completion — both
+appear for a normal dispatch.
 
-**`DISPATCH_ORPHANED` event** (written by resume when a prior `DISPATCH_STARTED` has no matching `dispatch` block):
+**`DISPATCH_ORPHANED` event** (written by resume when a prior `DISPATCH_STARTED` has no matching `DISPATCH_COMPLETED`/`DISPATCH_NOT_LAUNCHED`):
 
 ```
 --- <ISO-timestamp>  event=DISPATCH_ORPHANED
 phase:                    <n>
 iteration:                <NN>
 role:                     <role>
-dispatch_id:              <phase>-iter<NN>-<role>
+dispatch_id:              p<phase-token>-i<NN>-<role>-a<NN>
 role_mutates:             yes | no
 action:                   redispatched | halted
 ```
@@ -4156,21 +4695,33 @@ field, if still present), and the affected
 appendices receive `$CONTEXT7_POLICY` as a rendered value and branch on it
 explicitly — see the "context7 policy reconstruction" cookbook entry.
 
-**Per-phase preflight dispatch entries** use the standard dispatch shape with `iteration: 00` to mark them as pre-iteration-loop work. Example:
+**Per-phase preflight dispatch entries** use the standard `DISPATCH_STARTED`/`DISPATCH_COMPLETED` pair with `iteration: 00` to mark them as pre-iteration-loop work. Example (the `DISPATCH_COMPLETED` half):
 
 ```
---- 2026-05-28T20:31:00Z  dispatch
+--- 2026-05-28T20:31:01Z  event=DISPATCH_COMPLETED
 phase:                    5
 phase_name:               plan-review
 iteration:                00
 role:                     preflight-claude
 vendor:                   claude
 appendix:                 preflight-claude
+dispatch_id:              p05-i00-preflight-claude-a01
+logical_dispatch_id:      p05-i00-preflight-claude
 develop_it_git_sha:       <sha>
 develop_it_file_sha256:   <hash>
 develop_it_dirty:         no
 status_path:              5-plan-review/preflight/claude-check-status.md
 verdict:                  READY
+classification:           COMPLETED
+model:                    claude-opus-5
+duration_ms:              <n>
+tokens_input_new:         <n>
+tokens_input_cached:      <n>
+tokens_cache_write:       <n>
+tokens_output:            <n>
+tokens_reasoning:         <n>
+cost_usd:                 <n|n/a>
+usage_status:             ok
 ```
 
 Summarizer appendices already filter by `phase=<n>`, so per-phase preflight events appear in each phase's existing summary scope automatically — no summarizer changes are required. Phase 1 verdicts continue to be read by summarizers from RUN_LOG dispatch entries for Phase 1 (the same source they use today), not from the relocated `1-preflight/phase-1/` STATUS files. The relocated STATUS files are consumed only by the readiness writer and by ad-hoc human inspection.
@@ -4188,11 +4739,13 @@ On re-run of this prompt against the same feature folder:
    - **Resuming into a non-gated phase** (Phase 2, 4, 8, 9, 10, or any future phase not in {3, 5, 6, 7}): no preflight runs on resume. The orchestrator picks up where it left off using the most recent applicable preflight verdict from RUN_LOG (Phase 1 for Phases 2 and 4, or the most recent per-phase preflight for Phase 8, 9, or 10 (and analogously for any future non-gated phase)) and any in-scope flags such as `codex_disabled_by_user`. This is a direct consequence of the "gated set is exactly {3, 5, 6, 7}" rule, not a violation of it.
 6. Resume from the next un-completed step.
 
-Resume reads `RUN_LOG.md` for the last completed step **and** calls `dispatch_state`
-for the current phase's dispatch. `RUN_LOG.md` alone is insufficient: a session that
-died mid-dispatch leaves an `event=DISPATCH_STARTED` block with no matching `dispatch`
-block, and only the STATUS file distinguishes a finished subagent from one killed
-mid-write. A STATUS file that does not pass `validate_status` counts as unfinished.
+Resume reads `RUN_LOG.md` for the last completed step **and** calls
+`dispatch_is_running` for the current phase's dispatch id. `RUN_LOG.md` alone
+is insufficient: a session that died mid-dispatch leaves an
+`event=DISPATCH_STARTED` block with no matching `DISPATCH_COMPLETED`, and only
+the STATUS file distinguishes a finished subagent from one killed mid-write. A
+STATUS file that does not pass `validate_status` counts as unfinished. The
+full ordered classification this implies is Task 7's `classify_attempt`.
 
 **Terminology gloss** (used in this section and in acceptance criteria):
 - *first work dispatch* = the very first dispatch of a gate's iteration loop across the entire run as a whole (e.g., for Phase 3, the iter 01 spec-reviewer-claude dispatch). The per-phase preflight (Step 3.0 / 5.0 / 6.−1 / 7.0) is the dispatch immediately preceding the first work dispatch.
