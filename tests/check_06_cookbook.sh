@@ -503,7 +503,7 @@ if declare -F _dispatch_launch_attempt >/dev/null; then
   # the lease -- a single ordered-substring match on the function's own body,
   # same style as the post_dispatch pin two cases above.
   case "$_dr_body" in
-    *'_dispatch_write_result "$a_dir" launched=yes'*'_dispatch_lease_release "$role"'*)
+    *'_dispatch_write_result "$a_dir" launched=yes'*'release_write_lease "$role"'*)
       _ok "_dispatch_launch_attempt writes the attempt result BEFORE releasing the lease" ;;
     *) _fail "_dispatch_launch_attempt releases the lease before (or without) writing the attempt result" ;;
   esac
@@ -513,10 +513,18 @@ fi
 
 for _fn in dispatch_attempt dispatch_parallel _dispatch_prelaunch _dispatch_launch_attempt \
            _dispatch_write_started _dispatch_ingest_result _dispatch_ingest_child \
-           dispatch_is_running _dispatch_lease_try_acquire _dispatch_lease_release \
-           _dispatch_lease_state classify_attempt inspect_mutation_state recovery_action \
-           recovery_retry_allowed resume_dispatch_state; do
+           dispatch_is_running acquire_write_lease release_write_lease _write_lease_state \
+           record_event event_required_fields classify_attempt inspect_mutation_state \
+           recovery_action recovery_retry_allowed resume_dispatch_state; do
   declare -F "$_fn" >/dev/null && _ok "$_fn is defined" || _fail "$_fn is not defined"
+done
+
+# Task 8: the provisional Task 6/7 lease seam is retired wholesale, not left
+# defined-but-uncalled -- see check_06's "retired" pattern two blocks below.
+for _fn in _dispatch_lease_try_acquire _dispatch_lease_release _dispatch_lease_state; do
+  declare -F "$_fn" >/dev/null \
+    && _fail "$_fn should have been retired by Task 8's real write-lease protocol" \
+    || _ok "$_fn is removed (replaced by acquire_write_lease/release_write_lease)"
 done
 
 for _fn in _dispatch_run_attempt; do
@@ -1147,7 +1155,7 @@ assert_contains "ATTEMPT_DIR_COLLISION" "$BUILD/aa-collision.err" "collision fai
 
 # Lock serialization: allocate_attempt must actually WAIT for the run-log
 # lock, not merely define lock helpers nobody calls.
-mkdir -p "$ORCHESTRATION_DIR/run-log.lock.d"   # simulate a lock held by someone else
+: > "$ORCHESTRATION_DIR/log.lock"   # simulate a lock held by someone else (a plain file now, ln-based)
 rm -f "$BUILD/aa-lock-done"
 ( allocate_attempt 5 4 plan-fixer >/dev/null 2>&1; : > "$BUILD/aa-lock-done" ) &
 _aa_bg_pid=$!
@@ -1157,7 +1165,7 @@ if [ -f "$BUILD/aa-lock-done" ]; then
 else
   _ok "allocate_attempt blocks while the run-log lock is held by someone else"
 fi
-rmdir "$ORCHESTRATION_DIR/run-log.lock.d"
+rm -f "$ORCHESTRATION_DIR/log.lock"
 wait "$_aa_bg_pid"
 assert_exists "$BUILD/aa-lock-done" "allocate_attempt proceeds once the lock is released"
 rm -f "$BUILD/aa-lock-done"
@@ -1453,5 +1461,327 @@ if declare -F invoke_vendor >/dev/null; then
 else
   _fail "invoke_vendor is not defined"
 fi
+
+# ============================================================================
+# Task 8: record_event, the Event Contract Registry, write leases, and
+# mutation snapshots.
+# ============================================================================
+init_v2_fixture
+mkdir -p "$RUNTIME_DIR"
+python3 "$REPO_TOP/tests/lib/extract.py" policies > "$RUNTIME_DIR/policy.tsv"
+
+# --- context7_policy: full spec S15.5 latest-event-wins precedence (code
+# review fix #6 -- out of Task 8's own steps, but a genuine behaviour
+# change with previously zero coverage).
+mkdir -p "$FEATURE_FOLDER/1-preflight/phase-1"
+_t8_c7_status="$FEATURE_FOLDER/1-preflight/phase-1/claude-check-status.md"
+printf 'verdict: READY\ncontext7: reachable\n' > "$_t8_c7_status"
+: > "$RUN_LOG"
+assert_eq required "$(context7_policy)" \
+  "context7_policy: STATUS reachable, no RUN_LOG event, is required (baseline unchanged)"
+
+# The behaviour CHANGE this fix delivers: a LATER CONTEXT7_UNAVAILABLE event
+# overrides an already-reachable Phase 1 STATUS -- the old implementation
+# checked STATUS first and could never downgrade it.
+record_event CONTEXT7_UNAVAILABLE phase=3 iteration=00 reason="probe failed mid-run" >/dev/null
+assert_eq best-effort "$(context7_policy)" \
+  "context7_policy: a later CONTEXT7_UNAVAILABLE downgrades an already-reachable Phase 1 STATUS"
+
+# CONTEXT7_RESTORED requires a successful deterministic probe citation to
+# re-promote back to required; anything else (or a missing probe field)
+# stays best-effort.
+: > "$RUN_LOG"
+record_event CONTEXT7_UNAVAILABLE phase=3 iteration=00 reason="probe failed" >/dev/null
+record_event CONTEXT7_RESTORED phase=5 iteration=00 probe=success reason="probe succeeded" >/dev/null
+assert_eq required "$(context7_policy)" \
+  "context7_policy: CONTEXT7_RESTORED with probe=success re-promotes to required"
+
+: > "$RUN_LOG"
+record_event CONTEXT7_UNAVAILABLE phase=3 iteration=00 reason="probe failed" >/dev/null
+record_event CONTEXT7_RESTORED phase=5 iteration=00 probe=unconfirmed reason="no deterministic probe" >/dev/null
+assert_eq best-effort "$(context7_policy)" \
+  "context7_policy: CONTEXT7_RESTORED without a successful probe citation stays best-effort"
+
+# No STATUS, no RUN_LOG event at all: refuse to guess.
+rm -f "$_t8_c7_status"
+: > "$RUN_LOG"
+rc=0; context7_policy >/dev/null 2>"$BUILD/t8-c7.err" || rc=$?
+assert_rc 1 "$rc" "context7_policy halts (never guesses) with no STATUS and no RUN_LOG evidence"
+assert_contains "halt:" "$BUILD/t8-c7.err" "the halt names itself"
+
+# --- Event Contract Registry: event_required_fields (the runtime mirror)
+# agrees with extract.py events (the markdown table) for EVERY row, in BOTH
+# directions -- a row in one but not the other is a real drift, not a subset.
+python3 "$REPO_TOP/tests/lib/extract.py" events > "$BUILD/events.tsv"
+_t8_registry_types="$(tail -n +2 "$BUILD/events.tsv" | cut -f1 | sort)"
+_t8_code_types="$(printf '%s\n' \
+  DISPATCH_NOT_LAUNCHED DISPATCH_STARTED DISPATCH_COMPLETED ATTEMPT_FAILED \
+  RECOVERY_AUTHORIZED RECOVERY_CAP_REACHED ORCHESTRATION_CORRECTION HALT \
+  OWNER_DECISION RISK_ACCEPTED PHASE_ACCEPTED EVENT_CORRECTED VENDOR_UNAVAILABLE \
+  DEGRADED_REVIEW_ACCEPTED CONTEXT7_UNAVAILABLE CONTEXT7_RESTORED \
+  WRITE_LEASE_ACQUIRED WRITE_LEASE_RELEASED ARTIFACT_INTEGRITY_BLOCKED \
+  GIT_FINALIZATION_RESULT ITERATION_CAP_REACHED ITERATION_CAP_OVERRIDE \
+  PROCESS_DEVIATION ATTEMPT_ALLOCATED \
+  CODEX_UNAVAILABLE CLAUDE_FAILED IMPLEMENTATION_BASELINE IMPLEMENTATION_BASELINE_BLOCKED \
+  CODEX_DISABLED_BY_USER_CONSENT CODEX_SKIPPED_BY_USER_CONSENT MODEL_REJECTED DISPATCH_ORPHANED \
+  | sort)"
+assert_eq "$_t8_code_types" "$_t8_registry_types" \
+  "event_required_fields' own type list matches the Event Contract Registry exactly"
+_t8_mismatch=""
+# NOTE: bash `read` collapses consecutive tab delimiters (tab is IFS
+# "whitespace" regardless of what IFS is set to), which would silently
+# misalign an empty required_fields cell -- use awk -F '\t' per column, the
+# same discipline Task 4's own tests already apply to this exact TSV shape.
+_t8_fields_col="$(tsv_column "$BUILD/events.tsv" required_fields)"
+while IFS= read -r _t8_type; do
+  _t8_fields="$(awk -F'\t' -v k="$_t8_type" -v c="$_t8_fields_col" \
+    '$1==k{print $c}' "$BUILD/events.tsv")"
+  _t8_code_fields="$(event_required_fields "$_t8_type" 2>/dev/null)"
+  [ "$_t8_code_fields" = "$_t8_fields" ] || _t8_mismatch="$_t8_mismatch $_t8_type"
+done < <(printf '%s\n' "$_t8_registry_types")
+assert_eq "" "$_t8_mismatch" \
+  "event_required_fields agrees with the registry's required_fields column for every type"
+_t8_yes_count="$(tail -n +2 "$BUILD/events.tsv" | awk -F'\t' '$3=="yes"' | wc -l | tr -d ' ')"
+assert_eq 12 "$_t8_yes_count" "exactly twelve event types are proposition_required=yes"
+
+# --- record_event flushes/fsyncs its append (Step 3, code review fix #5) ---
+if declare -F record_event >/dev/null; then
+  case "$(declare -f record_event)" in
+    *'_bootstrap_fsync_path "$FEATURE_FOLDER/RUN_LOG.md"'*)
+      _ok "record_event fsyncs RUN_LOG.md after appending" ;;
+    *) _fail "record_event no longer fsyncs its append" ;;
+  esac
+fi
+
+# --- record_event: envelope validation ---
+: > "$RUN_LOG"
+record_event ATTEMPT_ALLOCATED dispatch_id=p01-i01-x-a01 logical_dispatch_id=p01-i01-x \
+  phase=1 iteration=01 role=x attempt=1 launched=false reason="t8 fixture"
+assert_rc 0 $? "record_event succeeds for a well-formed known event type"
+for _f in event_id process_schema_version phase iteration dispatch_id \
+          caused_by_event_id authority reason; do
+  assert_present "^${_f}:" "$RUN_LOG" "record_event's block carries common field: $_f"
+done
+assert_present '^event_id:[[:space:]]*1$' "$RUN_LOG" "the first event_id assigned is 1"
+record_event ATTEMPT_ALLOCATED dispatch_id=p01-i02-x-a01 logical_dispatch_id=p01-i02-x \
+  phase=1 iteration=02 role=x attempt=1 launched=false reason="t8 fixture 2" >/dev/null
+assert_present '^event_id:[[:space:]]*2$' "$RUN_LOG" "event_id is monotonically increasing across calls"
+
+rc=0; record_event NO_SUCH_TYPE foo=bar 2>"$BUILD/t8-err1.log" || rc=$?
+assert_rc 1 "$rc" "record_event rejects an unregistered event type"
+assert_contains "EVENT_TYPE_UNKNOWN" "$BUILD/t8-err1.log" "unknown type names itself"
+
+rc=0; record_event ATTEMPT_ALLOCATED dispatch_id=x logical_dispatch_id=y phase=1 iteration=1 \
+  role=r attempt=1 launched=false 2>"$BUILD/t8-err2.log" || rc=$?
+assert_rc 1 "$rc" "record_event rejects a missing reason (the one common field required non-empty)"
+assert_contains "RECORD_EVENT_MISSING_REASON" "$BUILD/t8-err2.log" "missing-reason failure names itself"
+
+rc=0; record_event ATTEMPT_ALLOCATED dispatch_id=x logical_dispatch_id=y phase=1 iteration=1 \
+  role=r attempt=1 reason=ok 2>"$BUILD/t8-err3.log" || rc=$?
+assert_rc 1 "$rc" "record_event rejects a missing event-specific required field (launched)"
+assert_contains "RECORD_EVENT_MISSING_FIELD:ATTEMPT_ALLOCATED:launched" "$BUILD/t8-err3.log" \
+  "missing-field failure names the type and field"
+
+rc=0; record_event ATTEMPT_ALLOCATED dispatch_id=x logical_dispatch_id=y phase=1 iteration=1 \
+  role=r attempt=1 launched=false reason=ok bogus=1 2>"$BUILD/t8-err4.log" || rc=$?
+assert_rc 1 "$rc" "record_event rejects an undeclared field, never silently accepting it"
+assert_contains "RECORD_EVENT_UNKNOWN_FIELD:ATTEMPT_ALLOCATED:bogus" "$BUILD/t8-err4.log" \
+  "unknown-field failure names the type and field"
+
+rc=0; record_event ATTEMPT_ALLOCATED dispatch_id=x logical_dispatch_id=y phase=1 iteration=1 \
+  role=r attempt=1 launched=false reason=ok authority=bogus 2>"$BUILD/t8-err5.log" || rc=$?
+assert_rc 1 "$rc" "record_event rejects an authority value outside process|owner|role|system"
+assert_contains "RECORD_EVENT_BAD_AUTHORITY:bogus" "$BUILD/t8-err5.log" \
+  "bad-authority failure names the value"
+
+# --- Concurrency: record_event's monotonic event_id under REAL concurrent
+# writers, not just sequential calls (Task 8 code review fix #0). The
+# mkdir-based lock this replaced was invisible to every prior test because
+# none of them raced concurrent writers -- an 8-way race is the same shape
+# the review reproduced duplicates with.
+: > "$RUN_LOG"
+rm -f "$ORCHESTRATION_DIR/log.lock"
+_t8c_n=8
+_t8c_pids=()
+for _t8c_i in $(seq 1 "$_t8c_n"); do
+  ( record_event ATTEMPT_ALLOCATED dispatch_id="p01-i01-c${_t8c_i}-a01"       logical_dispatch_id="p01-i01-c${_t8c_i}" phase=1 iteration=01 role="c${_t8c_i}"       attempt=1 launched=false reason="concurrency probe ${_t8c_i}" ) &
+  _t8c_pids+=("$!")
+done
+for _t8c_pid in "${_t8c_pids[@]}"; do wait "$_t8c_pid"; done
+_t8c_ids="$("$GREP_BIN" -oE '^event_id:[[:space:]]+[0-9]+$' "$RUN_LOG" | "$GREP_BIN" -oE '[0-9]+$' | sort -n)"
+_t8c_count="$(printf '%s\n' "$_t8c_ids" | sed '/^$/d' | wc -l | tr -d ' ')"
+assert_eq "$_t8c_n" "$_t8c_count"   "record_event under ${_t8c_n}-way concurrency produced exactly ${_t8c_n} events (no lost writes)"
+assert_eq "$(seq 1 "$_t8c_n")" "$_t8c_ids"   "record_event's event_id sequence is contiguous 1..N with no duplicates under real concurrency"
+
+# --- Append-only: RUN_LOG's prior content is always a byte-exact PREFIX of
+# its content after another record_event call -- never rewritten in place.
+_t8_before_sha="$(sha256sum "$RUN_LOG" | cut -d' ' -f1)"
+_t8_before_bytes="$(wc -c < "$RUN_LOG" | tr -d ' ')"
+record_event ATTEMPT_ALLOCATED dispatch_id=p01-i03-x-a01 logical_dispatch_id=p01-i03-x \
+  phase=1 iteration=03 role=x attempt=1 launched=false reason="append-only probe" >/dev/null
+head -c "$_t8_before_bytes" "$RUN_LOG" | sha256sum | cut -d' ' -f1 > "$BUILD/t8-prefix.sha"
+assert_contains "$_t8_before_sha" "$BUILD/t8-prefix.sha" \
+  "RUN_LOG's prior bytes remain an exact prefix after another event is appended"
+
+# --- Decision records and corrections (spec S15.3/S15.4): OWNER_DECISION's
+# full field list, then a correcting EVENT_CORRECTED referencing it by ID.
+: > "$RUN_LOG"
+record_event OWNER_DECISION decision_id=d1 authority=owner authority_identity=operator \
+  scope="finding-7" artifact_path="src/x.py" artifact_revision=abc123 evidence="reviewed by hand" \
+  alternatives_rejected="revert instead" residual_risk="low" expiry="this phase" \
+  independent_rereview=no follow_up_id="" reason="owner accepted the residual risk"
+assert_rc 0 $? "record_event accepts a full OWNER_DECISION (spec S15.3's whole field list)"
+decision_event_id="$(status_field "$RUN_LOG" event_id)"
+record_event EVENT_CORRECTED corrected_event_id="$decision_event_id" \
+  replacement_classification="RISK_ACCEPTED" evidence="follow-up review changed the finding" \
+  downstream_effect="none" reason="correcting event $decision_event_id"
+assert_rc 0 $? "record_event accepts EVENT_CORRECTED naming the original decision's event_id"
+assert_present "corrected_event_id:[[:space:]]*${decision_event_id}\$" "$RUN_LOG" \
+  "EVENT_CORRECTED names the exact original event_id"
+_t8_owner_decision_still_present="$(grep -c 'event=OWNER_DECISION' "$RUN_LOG")"
+assert_eq 1 "$_t8_owner_decision_still_present" \
+  "the original OWNER_DECISION block is retained verbatim, never edited or removed"
+
+# --- Write leases: the remaining substates check_09_recovery.sh's RM02/RM03
+# fixtures do not already cover directly (ACTIVE_LEASE_OWNER and
+# AMBIGUOUS_LEASE/MALFORMED_LEASE are proven there against a real dispatch).
+: > "$RUN_LOG"
+rm -f "$LEASE_FILE"
+
+record_event DISPATCH_STARTED phase=6 iteration=01 dispatch_id=p06-i01-implementer-a01 \
+  reason=x phase_name=implementation role=implementer vendor=claude \
+  logical_dispatch_id=p06-i01-implementer model=m status_path=/dev/null cwd=/tmp \
+  lease=none snapshot=none >/dev/null
+record_event DISPATCH_COMPLETED phase=6 iteration=01 dispatch_id=p06-i01-implementer-a01 \
+  reason=x phase_name=implementation role=implementer vendor=claude appendix=implementer \
+  logical_dispatch_id=p06-i01-implementer develop_it_git_sha=x develop_it_file_sha256=x \
+  develop_it_dirty=no status_path=/dev/null verdict="" classification=TIMED_OUT exit_code=1 \
+  model=m start_ms=1 end_ms=2 duration_ms=1 stdout_path=/dev/null stderr_path=/dev/null \
+  mutation_state=NO_SIDE_EFFECTS checkpoint_kind=none tokens_input_new=0 tokens_input_cached=0 \
+  tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 cost_usd=0 usage_status=ok >/dev/null
+write_fake_lease "$LEASE_FILE" p06-i01-implementer-a01 implementer
+assert_eq OBSERVED_FAILED_OWNER "$(_write_lease_state "$LEASE_FILE")" \
+  "a launched-then-classified-failed owner (no release recorded) is OBSERVED_FAILED_OWNER"
+assert_eq STALE_OR_AMBIGUOUS_LEASE "$(_write_lease_recovery_state OBSERVED_FAILED_OWNER)" \
+  "OBSERVED_FAILED_OWNER folds into RM03's STALE_OR_AMBIGUOUS_LEASE -- never auto-reclaimed"
+
+: > "$RUN_LOG"
+record_event DISPATCH_STARTED phase=6 iteration=02 dispatch_id=p06-i02-implementer-a01 \
+  reason=x phase_name=implementation role=implementer vendor=claude \
+  logical_dispatch_id=p06-i02-implementer model=m status_path=/dev/null cwd=/tmp \
+  lease=none snapshot=none >/dev/null
+record_event DISPATCH_COMPLETED phase=6 iteration=02 dispatch_id=p06-i02-implementer-a01 \
+  reason=x phase_name=implementation role=implementer vendor=claude appendix=implementer \
+  logical_dispatch_id=p06-i02-implementer develop_it_git_sha=x develop_it_file_sha256=x \
+  develop_it_dirty=no status_path=/dev/null verdict=DONE classification=COMPLETED exit_code=0 \
+  model=m start_ms=1 end_ms=2 duration_ms=1 stdout_path=/dev/null stderr_path=/dev/null \
+  mutation_state=CLEAN_CHECKPOINTED checkpoint_kind=none tokens_input_new=0 tokens_input_cached=0 \
+  tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 cost_usd=0 usage_status=ok >/dev/null
+printf '{"dispatch_id":"p06-i02-implementer-a01","lease_owner":"implementer","authority":"role"}\n' \
+  > "$LEASE_FILE"
+assert_eq COMPLETED_LOST_RELEASE "$(_write_lease_state "$LEASE_FILE")" \
+  "a COMPLETED owner whose release record is lost (lease file still present) is COMPLETED_LOST_RELEASE"
+
+: > "$RUN_LOG"
+record_event DISPATCH_STARTED phase=6 iteration=03 dispatch_id=p06-i03-implementer-a01 \
+  reason=x phase_name=implementation role=implementer vendor=claude \
+  logical_dispatch_id=p06-i03-implementer model=m status_path=/dev/null cwd=/tmp \
+  lease=none snapshot=none >/dev/null
+printf '{"dispatch_id":"p06-i03-implementer-a01","lease_owner":"implementer","authority":"role"}\n' \
+  > "$LEASE_FILE"
+assert_eq ORPHANED_UNOBSERVED_OWNER "$(_write_lease_state "$LEASE_FILE")" \
+  "a durable DISPATCH_STARTED with no live process behind it is ORPHANED_UNOBSERVED_OWNER"
+
+rm -f "$LEASE_FILE"
+assert_eq NO_LEASE "$(_write_lease_state "$LEASE_FILE")" "an absent lease file is NO_LEASE"
+
+# --- acquire_write_lease: repository containment and exclusive creation ---
+rc=0; acquire_write_lease implementer role p06-i04-implementer-a01 6 /etc/passwd \
+  2>"$BUILD/t8-lease-abs.err" || rc=$?
+assert_rc 1 "$rc" "acquire_write_lease rejects an absolute declared path"
+assert_contains "WRITE_LEASE_PATH_NOT_CONTAINED" "$BUILD/t8-lease-abs.err" \
+  "absolute-path rejection names itself"
+assert_not_exists "$LEASE_FILE" "the rejected acquisition never created a lease file"
+
+# Code review fix #8: without this, a fully-broken _write_lease_path_ok
+# would still make THIS case's own rc=1 check pass (for the wrong reason --
+# the PRECEDING case's own acquisition, if also unrejected, would leave a
+# real lease file behind, and `ln` fails on that collision regardless of
+# whether containment itself works). Start from a guaranteed-clean lease
+# state so this case's rc/reason are meaningful on their own.
+rm -f "$LEASE_FILE"
+rc=0; acquire_write_lease implementer role p06-i05-implementer-a01 6 "../outside" \
+  2>"$BUILD/t8-lease-esc.err" || rc=$?
+assert_rc 1 "$rc" "acquire_write_lease rejects a path that escapes \$REPO_ROOT via .."
+assert_contains "WRITE_LEASE_PATH_NOT_CONTAINED" "$BUILD/t8-lease-esc.err" \
+  "path-escape rejection names itself"
+
+# --- release_write_lease: non-owner and malformed refusals never remove the
+# lease file (spec S11.3: "removes only an exact, valid owner match"). ---
+acquire_write_lease implementer role p06-i06-implementer-a01 6 "." >/dev/null
+assert_eq 6 "$(jq -r '.phase' "$LEASE_FILE")" \
+  "acquire_write_lease records the EXPLICIT phase parameter (code review fix #2), never an ambient guess"
+rc=0; release_write_lease debugger 2>"$BUILD/t8-rel1.err" || rc=$?
+assert_rc 1 "$rc" "release_write_lease refuses a non-owner caller"
+assert_contains "WRITE_LEASE_NOT_OWNER" "$BUILD/t8-rel1.err" "non-owner refusal names itself"
+assert_exists "$LEASE_FILE" "a non-owner release call never removes the lease file"
+printf 'not json\n' > "$LEASE_FILE"
+rc=0; release_write_lease implementer 2>"$BUILD/t8-rel2.err" || rc=$?
+assert_rc 1 "$rc" "release_write_lease refuses a malformed lease file"
+assert_contains "WRITE_LEASE_MALFORMED" "$BUILD/t8-rel2.err" "malformed-lease refusal names itself"
+assert_exists "$LEASE_FILE" "a malformed lease file is left in place, never force-removed"
+rm -f "$LEASE_FILE"
+rc=0; release_write_lease implementer 2>"$BUILD/t8-rel3.err" || rc=$?
+assert_rc 1 "$rc" "release_write_lease refuses when no lease is held at all"
+assert_contains "WRITE_LEASE_NOT_HELD" "$BUILD/t8-rel3.err" "not-held refusal names itself"
+
+# --- Snapshot capture: a real declared artifact gets hashed and copied into
+# the manifest's before/after tree, never just the whole-repo "." shortcut.
+( cd "$REPO_ROOT" && printf 'hello\n' > tracked.txt && git add tracked.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "seed tracked.txt" ) >/dev/null
+rm -f "$LEASE_FILE"
+# A pre-existing, untracked "foreign" change -- present BEFORE this lease is
+# even acquired, standing in for another writer's already-dirty tree state
+# (spec S11.2's "known foreign changes").
+( cd "$REPO_ROOT" && printf 'not mine\n' > foreign.txt )
+acquire_write_lease implementer role p06-i07-implementer-a01 6 tracked.txt >/dev/null
+_t8_manifest="$ORCHESTRATION_DIR/snapshots/p06-i07-implementer-a01/manifest.json"
+assert_exists "$_t8_manifest" "acquiring the lease captured a before-manifest"
+assert_present '"path": *"tracked.txt"' "$_t8_manifest" \
+  "the before-manifest names the declared artifact by path"
+assert_exists "$ORCHESTRATION_DIR/snapshots/p06-i07-implementer-a01/before/tracked.txt" \
+  "the before-manifest's own artifact copy was actually written to disk"
+_t8_allow_list_len="$(jq '.before.allow_list | length' "$_t8_manifest")"
+[ "$_t8_allow_list_len" -gt 0 ] && _ok "the before-manifest records a non-empty allow-list" \
+  || _fail "the before-manifest's allow_list is empty"
+( cd "$REPO_ROOT" && printf 'changed\n' >> tracked.txt )
+release_write_lease implementer >/dev/null
+assert_present '"before":' "$_t8_manifest" "the manifest keeps the before snapshot after release"
+assert_present '"after":' "$_t8_manifest" "release_write_lease added the after snapshot"
+_t8_foreign="$(jq -r '.after.foreign_changes' "$_t8_manifest")"
+case "$_t8_foreign" in
+  *foreign.txt*) _ok "the after-snapshot's foreign_changes names the pre-existing untracked file" ;;
+  *) _fail "foreign_changes did not carry the pre-existing foreign dirt: [$_t8_foreign]" ;;
+esac
+rm -f "$REPO_ROOT/foreign.txt"
+_t8_before_blob="$(python3 -c "import json;print(json.load(open('$_t8_manifest'))['before']['artifacts'][0]['blob'])")"
+_t8_after_status="$(python3 -c "import json;print(json.load(open('$_t8_manifest'))['after']['status'])")"
+case "$_t8_after_status" in
+  *tracked.txt*) _ok "the after-snapshot's porcelain status shows the real uncommitted change" ;;
+  *) _fail "the after-snapshot did not observe the change made while the lease was held: [$_t8_after_status]" ;;
+esac
+[ -n "$_t8_before_blob" ] && _ok "the before-manifest recorded a real git blob hash for the declared artifact" \
+  || _fail "the before-manifest's blob hash is empty"
+
+# --- Phase 10 direct-finalization shape (spec Step 5's own JSON example):
+# dispatch_id null, authority orchestrator, phase "10" -- not just a role
+# dispatch's phase read off an ambient variable.
+rm -f "$LEASE_FILE"
+acquire_write_lease orchestrator-finalization orchestrator "" 10 "." >/dev/null
+assert_eq 10 "$(jq -r '.phase' "$LEASE_FILE")" \
+  "acquire_write_lease's Phase 10 finalization shape records phase:\"10\" exactly as spec Step 5 shows"
+assert_eq null "$(jq -r '.dispatch_id' "$LEASE_FILE")" \
+  "Phase 10's lease has a JSON null dispatch_id, never an empty string"
+release_write_lease orchestrator-finalization >/dev/null
 
 finish

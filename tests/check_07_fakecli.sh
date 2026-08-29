@@ -162,7 +162,7 @@ assert_eq NO_SIDE_EFFECTS "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" mutation_
 assert_eq "none" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" lease)" \
   "DISPATCH_STARTED's lease is 'none' for a non-mutating role"
 assert_eq "none" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" snapshot)" \
-  "DISPATCH_STARTED's snapshot carries the Task 8 seam value"
+  "DISPATCH_STARTED's snapshot is 'none' for a non-mutating role (no lease, no manifest)"
 assert_eq "$(role_checkpoint_kind summarizer-spec)" \
   "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" checkpoint_kind)" \
   "DISPATCH_COMPLETED's checkpoint_kind matches the registry lookup for this role"
@@ -208,12 +208,24 @@ fi
 assert_eq "spec-review" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" phase_name)" \
   "DISPATCH_COMPLETED's phase_name is canonical, not 'unknown'"
 
-# lease carries the real seam value (not "none") for a MUTATING role.
+# lease/snapshot carry real values (not "none") for a MUTATING role.
 : > "$FEATURE_FOLDER/RUN_LOG.md"
-rm -rf "$ORCHESTRATION_DIR/write-lease.d"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
 FAKE_MODE=complete dispatch_attempt 6 19 debugger >/dev/null 2>&1
-assert_eq "$ORCHESTRATION_DIR/write-lease.d" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" lease)" \
-  "DISPATCH_STARTED's lease names the real seam path for a mutating role"
+assert_eq "$ORCHESTRATION_DIR/write-lease.json" "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" lease)" \
+  "DISPATCH_STARTED's lease names the real write-lease.json path for a mutating role"
+debugger_id19="$("$GREP_BIN" -oE 'p06-i19-debugger-a[0-9]{2}' "$FEATURE_FOLDER/RUN_LOG.md" | head -1)"
+assert_eq "$ORCHESTRATION_DIR/snapshots/$debugger_id19/manifest.json" \
+  "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" snapshot)" \
+  "DISPATCH_STARTED's snapshot names the real manifest path for a mutating role"
+assert_exists "$ORCHESTRATION_DIR/snapshots/$debugger_id19/manifest.json" \
+  "the snapshot manifest was actually captured, not just named"
+assert_present '"before":' "$ORCHESTRATION_DIR/snapshots/$debugger_id19/manifest.json" \
+  "the manifest carries a before-mutation snapshot"
+assert_present '"after":' "$ORCHESTRATION_DIR/snapshots/$debugger_id19/manifest.json" \
+  "the manifest carries an after-mutation snapshot (release_write_lease captured it)"
+assert_not_exists "$ORCHESTRATION_DIR/write-lease.json" \
+  "the winner released the lease after finishing"
 
 # --- 2. dispatch_parallel with codex_available=true --------------------------
 : > "$FEATURE_FOLDER/RUN_LOG.md"
@@ -387,16 +399,18 @@ assert_eq 1 "$("$GREP_BIN" -c 'event=ATTEMPT_FAILED' "$FEATURE_FOLDER/RUN_LOG.md
 # DISPATCH_STARTED (it was actually launched); the other is rejected before
 # launch (DISPATCH_NOT_LAUNCHED), never left to overlap in mutation.
 : > "$FEATURE_FOLDER/RUN_LOG.md"
-rm -rf "$ORCHESTRATION_DIR/write-lease.d"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
 declare -gA DISPATCH_PARALLEL_CLASSIFICATION=()
 FAKE_MODE=complete dispatch_parallel 6 12 implementer debugger >/dev/null 2>&1
 assert_eq 1 "$("$GREP_BIN" -c 'event=DISPATCH_STARTED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
   "7d: exactly one of the two mutating roles was actually launched"
 assert_eq 1 "$("$GREP_BIN" -c 'event=DISPATCH_NOT_LAUNCHED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
   "7d: the other is rejected as a typed prelaunch failure, never left to overlap"
-assert_present 'DISPATCH_WRITE_LEASE_UNAVAILABLE' "$FEATURE_FOLDER/RUN_LOG.md" \
-  "7d: the loser's rejection names the write-lease seam"
-assert_not_exists "$ORCHESTRATION_DIR/write-lease.d" \
+assert_present 'DISPATCH_WRITE_LEASE_UNAVAILABLE:ACTIVE_LEASE_OWNER' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "7d: the loser's rejection names ACTIVE_LEASE_OWNER -- ordinary same-batch contention (RM02 wait), never RM03's ambiguous/stale alarm (code review fix #1)"
+assert_eq 0 "$("$GREP_BIN" -c 'event=ARTIFACT_INTEGRITY_BLOCKED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "7d: ordinary same-batch lease contention never emits an integrity alarm"
+assert_not_exists "$ORCHESTRATION_DIR/write-lease.json" \
   "7d: the winner released the lease after finishing (nothing left held)"
 
 # 7e. render failure in one role yields ZERO invocations for its peer (Task 6
@@ -966,5 +980,25 @@ san_rows=$(wc -l < "$san_log" | tr -d ' ')
 assert_eq 3 "$san_rows" "a hostile FAKE_MODE/model/dispatch id still yields one log row per call"
 san_bad=$(awk -F'\t' 'NF != 10 { n++ } END { print n+0 }' "$san_log")
 assert_eq 0 "$san_bad" "every FAKE_LOG row has exactly 10 tab-separated fields"
+
+# --- Task 8 Step 6: unauthorized mutation with NO lease held at all --------
+# A read-only role (mutates=no) never calls acquire_write_lease. If it still
+# leaves evidence of a repo change (FAKE_MUTATION's real-git side effect),
+# inspect_mutation_state's own contract (above) makes that INTEGRITY_UNKNOWN,
+# never a guessed clean/dirty state -- and Task 8 wires that straight into a
+# durable ARTIFACT_INTEGRITY_BLOCKED event. Run LAST in this file: it leaves
+# $REPO_ROOT genuinely dirty on purpose, which would otherwise pollute every
+# later dirty-tree comparison in this same fixture.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+FAKE_MODE=complete FAKE_MUTATION=dirty-uncheckpointed \
+  dispatch_attempt 3 22 summarizer-spec >/dev/null 2>&1
+assert_eq INTEGRITY_UNKNOWN "$(status_field "$FEATURE_FOLDER/RUN_LOG.md" mutation_state)" \
+  "a read-only role that left a real repo change (no lease ever held) is INTEGRITY_UNKNOWN"
+assert_present 'event=ARTIFACT_INTEGRITY_BLOCKED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "the unauthorized mutation with no lease held emits a durable ARTIFACT_INTEGRITY_BLOCKED"
+assert_present 'lease_owner:[[:space:]]*summarizer-spec' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "ARTIFACT_INTEGRITY_BLOCKED names the offending role"
+git -C "$REPO_ROOT" checkout -q -- . 2>/dev/null
+git -C "$REPO_ROOT" clean -q -fd -- fake-mutation.txt 2>/dev/null || true
 
 finish

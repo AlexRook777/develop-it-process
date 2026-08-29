@@ -246,4 +246,66 @@ after_lines=$(wc -l < "$RUN_LOG")
   && _ok "the prelaunch failure still appended durable evidence to \$RUN_LOG" \
   || _fail "the prelaunch failure left no durable RUN_LOG evidence"
 
+# --- Task 8 Step 7: every RUN_LOG.md block written above (ATTEMPT_ALLOCATED,
+# DISPATCH_STARTED, DISPATCH_COMPLETED, DISPATCH_NOT_LAUNCHED) carries the
+# full common envelope, and event_id is strictly increasing across the whole
+# file -- checked end to end against the REAL runtime this file already
+# bootstrapped above, not a hand-built fixture. ---
+rc=0
+python3 - "$RUN_LOG" <<'PY' || rc=$?
+import sys
+text = open(sys.argv[1]).read()
+blocks = [b for b in text.split("\n\n") if b.strip()]
+required = ("event_id", "process_schema_version", "phase", "iteration",
+            "dispatch_id", "caused_by_event_id", "authority", "reason")
+ids = []
+bad = []
+for b in blocks:
+    header = b.splitlines()[0]
+    fields = {}
+    for line in b.splitlines()[1:]:
+        if ":" not in line:
+            bad.append(f"non key:value line in block {header!r}: {line!r}")
+            continue
+        k, v = line.split(":", 1)
+        fields[k.strip()] = v.strip()
+    for req in required:
+        if req not in fields:
+            bad.append(f"block {header!r} missing common field {req!r}")
+    if not fields.get("reason"):
+        bad.append(f"block {header!r} has an empty reason")
+    if "event_id" in fields:
+        try:
+            ids.append(int(fields["event_id"]))
+        except ValueError:
+            bad.append(f"block {header!r} has a non-integer event_id: {fields['event_id']!r}")
+if bad:
+    print("\n".join(bad))
+    sys.exit(1)
+if len(ids) != len(set(ids)) or ids != sorted(ids):
+    print(f"event_id sequence is not strictly increasing/unique: {ids}")
+    sys.exit(1)
+PY
+assert_rc 0 "$rc" "every RUN_LOG.md block carries the full common envelope, and event_id is strictly monotonic"
+
+# --- Task 8 Step 7: non-owner mutation/release stops safely, no rollback. --
+# acquire_write_lease/release_write_lease live in the SAME runtime just
+# bootstrapped above -- exercised directly here (rather than through a full
+# mutating dispatch, which this file's minimal fixture does not set up
+# render_keys() for) because the property under test is the lease API's own
+# ownership check, not the dispatch lifecycle around it.
+rc=0
+acquire_write_lease debugger role p06-i50-debugger-a01 6 "." || rc=$?
+assert_rc 0 "$rc" "acquire_write_lease succeeds for a fresh lease against the real runtime"
+_pre_release_lease_sha="$(sha256sum "$LEASE_FILE" | cut -d' ' -f1)"
+rc=0
+release_write_lease not-the-owner 2>/dev/null || rc=$?
+assert_rc 1 "$rc" "a non-owner release attempt is refused, never silently accepted"
+assert_eq "$_pre_release_lease_sha" "$(sha256sum "$LEASE_FILE" | cut -d' ' -f1)" \
+  "the lease file is byte-identical after a refused non-owner release -- no rollback, no partial write"
+rc=0
+release_write_lease debugger || rc=$?
+assert_rc 0 "$rc" "the real owner's release succeeds once the non-owner attempt is safely refused"
+assert_not_exists "$LEASE_FILE" "the real owner's release actually removed the lease"
+
 finish

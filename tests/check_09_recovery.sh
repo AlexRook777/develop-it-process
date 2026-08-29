@@ -142,7 +142,7 @@ assert_present 'logical_dispatch_id: *p03-i21-spec-reviewer-claude' "$FEATURE_FO
   "the ORCHESTRATION_CORRECTION event names the actual logical dispatch"
 
 # --- RM02: a lease actively held by a genuinely running attempt.
-rm -rf "$ORCHESTRATION_DIR/write-lease.d"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
 : > "$FEATURE_FOLDER/RUN_LOG.md"
 rm02_marker="20.$$"
 ROLE_CONTRACTS_PATH="$BUILD/roles-debugger-tiny.tsv" \
@@ -157,30 +157,43 @@ done
 [ "$rm02_seen" -eq 1 ] \
   && _ok "RM02 fixture: the lease-holding attempt was actually observed running" \
   || _fail "RM02 fixture: never observed the lease holder running (test would not be meaningful)"
-rm02_state="$(_dispatch_lease_state "$ORCHESTRATION_DIR/write-lease.d")"
+rm02_state="$(_write_lease_state "$ORCHESTRATION_DIR/write-lease.json")"
 assert_eq ACTIVE_LEASE_OWNER "$rm02_state" \
   "RM02 fixture: a lease held by a live DISPATCH_STARTED is ACTIVE_LEASE_OWNER"
 _check_rm RM02 PRELAUNCH_FAILED ACTIVE_LEASE_OWNER \
   "RM02: active lease owner -> wait/observe, never steal"
+# Active collision: a second acquire against the SAME still-live lease is
+# refused quietly (wait/observe, spec RM02) -- never an integrity alarm,
+# which is reserved for stale/ambiguous/malformed ownership (RM03).
+rm02_owner_sha="$(sha256sum "$ORCHESTRATION_DIR/write-lease.json" | cut -d' ' -f1)"
+rc=0
+acquire_write_lease debugger-second role p06-i98-debugger-second-a01 6 "." 2>/dev/null || rc=$?
+assert_rc 1 "$rc" "RM02: a second acquire against an ACTIVE lease is refused"
+assert_eq "$rm02_owner_sha" "$(sha256sum "$ORCHESTRATION_DIR/write-lease.json" | cut -d' ' -f1)" \
+  "RM02: the active owner's lease file is untouched by the refused collision"
+assert_eq 0 "$("$GREP_BIN" -c 'event=ARTIFACT_INTEGRITY_BLOCKED' "$FEATURE_FOLDER/RUN_LOG.md" || true)" \
+  "RM02: an active collision is a quiet refusal, never an integrity alarm"
 wait "$rm02_pid" 2>/dev/null
 pkill -9 -f "sleep $rm02_marker" 2>/dev/null || true
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
 
 # --- RM03: a stale/ambiguous lease (owner names a dispatch id that was never
 # started -- no automatic reclaiming, ever).
-rm -rf "$ORCHESTRATION_DIR/write-lease.d"
-mkdir -p "$ORCHESTRATION_DIR/write-lease.d"
-printf 'role=debugger\ndispatch_id=p06-i99-debugger-a01\n' > "$ORCHESTRATION_DIR/write-lease.d/owner"
-rm03_state="$(_dispatch_lease_state "$ORCHESTRATION_DIR/write-lease.d")"
-assert_eq STALE_OR_AMBIGUOUS_LEASE "$rm03_state" \
-  "RM03 fixture: a lease naming a never-started dispatch id is stale/ambiguous"
-_check_rm RM03 PRELAUNCH_FAILED STALE_OR_AMBIGUOUS_LEASE \
+write_fake_lease "$ORCHESTRATION_DIR/write-lease.json" p06-i99-debugger-a01 debugger
+rm03_state="$(_write_lease_state "$ORCHESTRATION_DIR/write-lease.json")"
+assert_eq AMBIGUOUS_LEASE "$rm03_state" \
+  "RM03 fixture: a lease naming a never-started dispatch id is ambiguous"
+_check_rm RM03 PRELAUNCH_FAILED "$(_write_lease_recovery_state "$rm03_state")" \
   "RM03: stale/ambiguous lease -> HALT for integrity reconciliation"
-# Bonus (not separately counted): an owner file that is simply missing is
-# ALSO stale/ambiguous, never treated as "no lease at all".
-rm -f "$ORCHESTRATION_DIR/write-lease.d/owner"
-assert_eq STALE_OR_AMBIGUOUS_LEASE "$(_dispatch_lease_state "$ORCHESTRATION_DIR/write-lease.d")" \
-  "a lease directory with no owner file at all is also stale/ambiguous"
-rm -rf "$ORCHESTRATION_DIR/write-lease.d"
+# Bonus (not separately counted): a malformed (non-JSON) lease file is ALSO
+# stale/ambiguous, never treated as "no lease at all".
+printf 'not json\n' > "$ORCHESTRATION_DIR/write-lease.json"
+assert_eq MALFORMED_LEASE "$(_write_lease_state "$ORCHESTRATION_DIR/write-lease.json")" \
+  "a malformed lease file is also classified, never treated as absent"
+assert_eq STALE_OR_AMBIGUOUS_LEASE \
+  "$(_write_lease_recovery_state "$(_write_lease_state "$ORCHESTRATION_DIR/write-lease.json")")" \
+  "a malformed lease also routes to RM03, never RM02"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
 
 # Drives one dispatch_attempt of the `debugger` role (mutating, tiny timeout)
 # under the given FAKE_MODE/FAKE_MUTATION, asserts the REAL observed
@@ -528,6 +541,10 @@ assert_eq TRANSIENT_TRANSPORT_ERROR "${DISPATCH_RESULT_CLASSIFICATION:-}" \
   "cap fixture: first attempt (a01) really did fail transient"
 recovery_retry_allowed "$cap_logical" TRANSIENT_RETRY
 assert_rc 0 $? "cap fixture: after failure #1 (0 retries spent), transient_retry_cap=1 still permits a retry"
+assert_present 'event=RECOVERY_AUTHORIZED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "code review fix #9: an authorized retry emits a durable RECOVERY_AUTHORIZED event"
+assert_present "logical_dispatch_id: *${cap_logical}\$" "$FEATURE_FOLDER/RUN_LOG.md" \
+  "RECOVERY_AUTHORIZED names the actual logical dispatch"
 # finding #2 (Step 4's "every retry allocates a new attempt id"): the retry
 # itself goes through the normal allocate_attempt/dispatch_attempt path, so
 # it lands in a genuinely NEW, distinct attempt directory (a02), never
@@ -617,7 +634,7 @@ assert_eq PRELAUNCH_FAILED "$(resume_dispatch_state p03-i39-spec-reviewer-claude
 
 # 3. RUNNING_OBSERVED: start exists, the child is genuinely still live.
 : > "$FEATURE_FOLDER/RUN_LOG.md"
-rm -rf "$ORCHESTRATION_DIR/write-lease.d"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
 resume_marker="2.$$"
 ROLE_CONTRACTS_PATH="$BUILD/roles-debugger-medium.tsv" \
   FAKE_MODE=complete FAKE_DELAY_SECONDS="$resume_marker" \

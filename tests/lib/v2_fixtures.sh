@@ -98,3 +98,24 @@ run_fake_attempt() {
 
   return "$rc"
 }
+
+# ---- write_fake_lease (Task 8) ----------------------------------------------
+# Writes a well-formed write-lease.json by hand -- the fixture-side
+# counterpart to acquire_write_lease's own JSON shape, for tests that need an
+# EXISTING lease on disk without going through a real dispatch (RM02/RM03 in
+# tests/check_09_recovery.sh, the OBSERVED_FAILED_OWNER case in
+# tests/check_06_cookbook.sh). Every field acquire_write_lease itself writes
+# is present, so a caller testing "does _write_lease_state read field X"
+# starts from a genuinely complete record, not one that happens to omit it.
+#
+# Usage: write_fake_lease LEASE_FILE DISPATCH_ID [OWNER] [AUTHORITY]
+write_fake_lease() {
+  local file="$1" dispatch_id="$2" owner="${3:-debugger}" authority="${4:-role}"
+  printf '{"schema_version":2,"dispatch_id":"%s","lease_owner":"%s","authority":"%s",' \
+    "$dispatch_id" "$owner" "$authority" > "$file"
+  printf '"phase":"6","acquired_at":"1970-01-01T00:00:00Z","baseline_head":"0000000000000000000000000000000000000000",' \
+    >> "$file"
+  printf '"declared_write_paths":["."],"declared_foreign_paths":[],"declared_foreign_commits":[],' \
+    >> "$file"
+  printf '"snapshot_manifest_path":"%s"}\n' "$(dirname "$file")/fake-lease-manifest.json" >> "$file"
+}

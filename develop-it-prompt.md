@@ -1526,21 +1526,43 @@ document is permitted to construct a `dispatch_id` for a top-level role.
 <!-- lint: cookbook -->
 ```bash
 # Serializes the ATTEMPT-NUMBER-DERIVATION critical section below across
-# concurrent orchestrator shells (e.g. two roles dispatched in parallel).
-# A plain `mkdir` is the lock primitive -- it is atomic on every POSIX
-# filesystem and needs no dependency beyond GNU coreutils (no `flock`, which
-# is util-linux, not guaranteed by the supported-environment list).
+# concurrent orchestrator shells (e.g. two roles dispatched in parallel), AND
+# (Task 8) every record_event append -- one mutex, every RUN_LOG.md writer.
+#
+# `ln TARGET LINKNAME` (hardlink creation), not `mkdir`, is the exclusive-
+# creation primitive: `link(2)` is atomically all-or-nothing on POSIX by
+# definition, whereas an actual concurrency measurement on this host's
+# coreutils (uutils 0.8.0) showed `mkdir` losing that guarantee under real
+# contention (8-way x 20 rounds: 71 total "winners", 15 rounds with more than
+# one) -- silently breaking record_event's own monotonic-event_id promise,
+# since two shells could both see their `mkdir` succeed for the same
+# critical section. `ln` needs no dependency beyond GNU coreutils either (no
+# `flock`, which is util-linux, not guaranteed by the supported-environment
+# list) and is the SAME primitive acquire_write_lease already uses for its
+# own exclusive creation, below.
 _run_log_lock_acquire() {
-  local lockdir="$ORCHESTRATION_DIR/run-log.lock.d" tries=0
+  local lockfile="$ORCHESTRATION_DIR/log.lock" tries=0 tmp
   mkdir -p "$ORCHESTRATION_DIR"
-  until mkdir "$lockdir" 2>/dev/null; do
+  # $BASHPID, not $$: a `( ... ) &` subshell fork (dispatch_parallel's own
+  # fan-out, or this file's own 8-way concurrency test) keeps $$ pointing at
+  # the ORIGINAL shell, so every forked sibling would otherwise build the
+  # SAME tmp name -- a real collision this exact concurrency test caught.
+  # $BASHPID is the actual PID of the running shell and differs per fork.
+  tmp="$ORCHESTRATION_DIR/.log.lock.owner.$BASHPID.$RANDOM"
+  printf '%s\n' "$$" > "$tmp" || { echo "RUN_LOG_LOCK_TMP_FAILED" >&2; return 1; }
+  until ln "$tmp" "$lockfile" 2>/dev/null; do
     tries=$((tries + 1))
-    [ "$tries" -lt 200 ] || { echo "RUN_LOG_LOCK_TIMEOUT" >&2; return 1; }
+    if [ "$tries" -ge 200 ]; then
+      rm -f "$tmp"
+      echo "RUN_LOG_LOCK_TIMEOUT" >&2
+      return 1
+    fi
     sleep 0.05
   done
+  rm -f "$tmp"
 }
 _run_log_lock_release() {
-  rmdir "$ORCHESTRATION_DIR/run-log.lock.d" 2>/dev/null || true
+  rm -f "$ORCHESTRATION_DIR/log.lock" 2>/dev/null || true
 }
 
 # Derives the next two-digit attempt monotonically from EVERY prior
@@ -1630,20 +1652,35 @@ allocate_attempt() {
     _run_log_lock_release
     return 1
   fi
-
-  {
-    printf -- '--- %s  event=ATTEMPT_ALLOCATED\n' "$(iso_now)"
-    printf 'dispatch_id:              %s\n' "$DISPATCH_ID"
-    printf 'logical_dispatch_id:      %s\n' "$LOGICAL_DISPATCH_ID"
-    printf 'phase:                    %s\n' "$phase"
-    printf 'iteration:                %s\n' "$iter2"
-    printf 'role:                     %s\n' "$role"
-    printf 'attempt:                  %s\n' "$ATTEMPT"
-    printf 'launched:                 false\n'
-    printf '\n'
-  } >> "$FEATURE_FOLDER/RUN_LOG.md"
-
+  # Release BEFORE record_event: record_event takes the SAME log.lock
+  # itself (it is the canonical writer now, see "RUN_LOG events, decisions,
+  # write leases, and snapshots" below) -- holding it here too would
+  # deadlock a single-threaded shell against its own already-held lock
+  # (non-reentrant). The attempt-number/attempt-directory critical section
+  # above is what actually needed this lock; the RUN_LOG append below gets
+  # its own fresh, independently-serialized acquisition.
+  #
+  # Code review note (fix #9, accepted as a latent gap, not fixed): this
+  # DOES shrink the critical section. next_unused_attempt (above) derives
+  # the next attempt number by scanning RUN_LOG.md for this logical
+  # dispatch's OWN prior entries -- but with the lock released here, before
+  # record_event durably writes THIS attempt's own ATTEMPT_ALLOCATED entry,
+  # a second concurrent allocate_attempt call for the SAME logical dispatch
+  # could acquire the lock in that gap, scan RUN_LOG.md, see no entry yet
+  # for attempt 1, and also compute attempt=1 -- its own `mkdir
+  # "$ATTEMPT_DIR"` backstop then hard-fails ATTEMPT_DIR_COLLISION instead
+  # of correctly landing on attempt 2. Latent today (two roles are never
+  # allocated under the SAME logical dispatch id concurrently in this
+  # document's actual call graph), not exercised by any test; a future
+  # caller that does share a logical dispatch across concurrent shells
+  # would need the ATTEMPT_ALLOCATED write folded back inside this
+  # function's own lock hold, not left to record_event's separate one.
   _run_log_lock_release
+
+  record_event ATTEMPT_ALLOCATED dispatch_id="$DISPATCH_ID" \
+    logical_dispatch_id="$LOGICAL_DISPATCH_ID" phase="$phase" iteration="$iter2" \
+    role="$role" attempt="$ATTEMPT" launched=false \
+    reason="attempt identity allocated" || return 1
 
   # shellcheck disable=SC2034  # consumed by the caller after allocate_attempt returns
   STATUS_PATH="$ATTEMPT_DIR/STATUS.md"
@@ -2312,7 +2349,7 @@ The lifecycle runs in three phases, and only the last one forks:
 `DISPATCH_STARTED`'s own append (from inside a forked child, phase 3) and
 `DISPATCH_COMPLETED`'s append (from the parent, after `wait`, phases combined
 in `_dispatch_ingest_result`) both go through the very same mkdir-based
-`run-log.lock.d` mutex `allocate_attempt` already uses for its own
+`log.lock` mutex `allocate_attempt` already uses for its own
 `ATTEMPT_ALLOCATED` write — one lock guards every writer of `RUN_LOG.md`,
 whether that writer is the parent orchestrator shell or one of its own
 forked children. This is why a forked child writing to `RUN_LOG.md` does not
@@ -2336,62 +2373,14 @@ for the same dispatch id.
 
 <!-- lint: cookbook -->
 ```bash
-# ---- Provisional exclusive write lease (Task 6 seam) -----------------------
-# A single global mkdir-based mutex standing in for the full write-lease
-# protocol (write-lease.json, snapshot manifest, staleness/ambiguous-owner
-# reconciliation, cross-owner authority checks — spec S13, Task 8 Step 5).
-# This seam proves exactly the one property Task 6's own tests need: two
-# mutating attempts can never invoke their vendor concurrently. It does NOT
-# wait for a busy lease — an active lease here is always an IMMEDIATE typed
-# prelaunch failure, never a queued retry — and it carries no snapshot or
-# staleness reconciliation at all. Task 8 replaces both functions below
-# wholesale with the real `acquire_write_lease`/`release_write_lease`
-# (deliberately different names, so nothing here collides with that task's
-# own definitions).
-_dispatch_lease_try_acquire() {
-  # Usage: _dispatch_lease_try_acquire <role> <dispatch_id>
-  local role="$1" dispatch_id="$2" leasedir="$ORCHESTRATION_DIR/write-lease.d"
-  mkdir -p "$ORCHESTRATION_DIR"
-  if mkdir "$leasedir" 2>/dev/null; then
-    printf 'role=%s\ndispatch_id=%s\n' "$role" "$dispatch_id" > "$leasedir/owner"
-    return 0
-  fi
-  return 1
-}
-_dispatch_lease_release() {
-  # Usage: _dispatch_lease_release <role>
-  local role="$1" leasedir="$ORCHESTRATION_DIR/write-lease.d"
-  if [ -f "$leasedir/owner" ] && "$GREP_BIN" -qF "role=$role" "$leasedir/owner" 2>/dev/null; then
-    rm -rf "$leasedir"
-  fi
-}
-
-# ---- Lease-state classifier (Task 7 seam, RM02/RM03 only) ------------------
-# Extends the mkdir-mutex seam above JUST enough to distinguish an actively
-# held lease from a stale/ambiguous one (spec S14.3 RM02 vs RM03), by reusing
-# the SAME durable liveness signal dispatch_is_running already proves (a live
-# DISPATCH_STARTED with no matching completion) rather than inventing a
-# second one. It never reclaims a lease and never guesses: a lease directory
-# whose own owner file is missing, unreadable, or names a dispatch id that
-# is not (or no longer) running is STALE_OR_AMBIGUOUS_LEASE, which RM03
-# routes to a human HALT, never an automatic steal. The real write-lease
-# protocol (owner authority, staleness timeout, snapshot integrity — spec
-# S11) is Task 8's job; it replaces this alongside _dispatch_lease_try_
-# acquire/_release.
-_dispatch_lease_state() {
-  # Usage: _dispatch_lease_state <leasedir>
-  local leasedir="$1" owner_dispatch_id
-  if [ ! -f "$leasedir/owner" ]; then
-    echo STALE_OR_AMBIGUOUS_LEASE; return 0
-  fi
-  owner_dispatch_id="$("$GREP_BIN" -m1 '^dispatch_id=' "$leasedir/owner" 2>/dev/null)"
-  owner_dispatch_id="${owner_dispatch_id#dispatch_id=}"
-  if [ -n "$owner_dispatch_id" ] && dispatch_is_running "$owner_dispatch_id"; then
-    echo ACTIVE_LEASE_OWNER
-  else
-    echo STALE_OR_AMBIGUOUS_LEASE
-  fi
-}
+# ---- Exclusive write lease -------------------------------------------------
+# The real write-lease protocol (write-lease.json, snapshot manifest,
+# staleness/ambiguous-owner reconciliation, cross-owner authority checks --
+# spec S11) is defined in full under "Write leases and mutation snapshots"
+# below (`acquire_write_lease`/`release_write_lease`/`_write_lease_state`).
+# It replaces this section's original Task 6/7 provisional mkdir-mutex seam
+# (`_dispatch_lease_try_acquire`/`_dispatch_lease_release`/`_dispatch_lease_
+# state`) wholesale; nothing in this document still calls those three names.
 
 # ---- Attempt-scoped result record (child -> parent handoff) ----------------
 # A plain sanitized key=value file, one line per field (never RUN_LOG.md
@@ -2528,34 +2517,27 @@ _dispatch_prelaunch() {
 # later once some other code happens to get around to it. May run inside a
 # forked child (dispatch_parallel's fan-out); serialized against every
 # sibling, and against allocate_attempt's own ATTEMPT_ALLOCATED write, through
-# the same run-log.lock.d mutex — see the section intro above for why this
+# the same log.lock mutex — see the section intro above for why this
 # does not violate "the parent orchestrator is the sole writer of RUN_LOG.md".
 _dispatch_write_started() {
   # Usage: _dispatch_write_started <phase> <phase_name> <iteration> <role> \
   #        <vendor> <dispatch_id> <logical_dispatch_id> <status_path> <lease_ref>
   local phase="$1" phase_name="$2" iteration="$3" role="$4" vendor="$5"
   local dispatch_id="$6" logical="$7" status_path="$8" lease_ref="$9"
-  _run_log_lock_acquire || return 1
-  {
-    printf -- '--- %s  event=DISPATCH_STARTED\n' "$(iso_now)"
-    printf 'phase:                    %s\n' "$phase"
-    printf 'phase_name:               %s\n' "$phase_name"
-    printf 'iteration:                %s\n' "$(printf '%02d' "$iteration")"
-    printf 'role:                     %s\n' "$role"
-    printf 'vendor:                   %s\n' "$vendor"
-    printf 'dispatch_id:              %s\n' "$dispatch_id"
-    printf 'logical_dispatch_id:      %s\n' "$logical"
-    printf 'model:                    %s\n' "$(role_model "$role" 2>/dev/null)"
-    printf 'status_path:              %s\n' "$status_path"
-    printf 'cwd:                      %s\n' "${REPO_ROOT:-}"
-    printf 'lease:                    %s\n' "${lease_ref:-none}"
-    # Task 8 seam: real before/after mutation snapshots (spec S8, write-lease
-    # protocol Step 6) do not exist yet — "none" is an honest placeholder,
-    # never a guessed reference.
-    printf 'snapshot:                 none\n'
-    printf '\n'
-  } >> "$FEATURE_FOLDER/RUN_LOG.md"
-  _run_log_lock_release
+  # A real snapshot manifest exists ONLY for a mutating attempt (acquire_
+  # write_lease's own "before" capture, keyed by this exact dispatch_id --
+  # see "Write leases and mutation snapshots" below); a non-mutating role
+  # never acquires a lease, so it never gets one either, and "none" here is
+  # an honest value, not a placeholder pending later work.
+  local snapshot_ref=none
+  [ "${lease_ref:-none}" != none ] \
+    && snapshot_ref="$ORCHESTRATION_DIR/snapshots/$dispatch_id/manifest.json"
+  record_event DISPATCH_STARTED \
+    phase="$phase" iteration="$(printf '%02d' "$iteration")" dispatch_id="$dispatch_id" \
+    reason="vendor invocation starting" \
+    phase_name="$phase_name" role="$role" vendor="$vendor" logical_dispatch_id="$logical" \
+    model="$(role_model "$role" 2>/dev/null)" status_path="$status_path" \
+    cwd="${REPO_ROOT:-}" lease="${lease_ref:-none}" snapshot="$snapshot_ref"
 }
 
 # Phase 3: invoke, time, classify, and record ONE role that already passed
@@ -2575,7 +2557,7 @@ _dispatch_launch_attempt() {
   local out_path="${dp_stdout_path[$i]}" err_path="${dp_stderr_path[$i]}"
   local vend="${dp_vendor[$i]}" mut="${dp_mutates[$i]}" p_file="${dp_prompt_file[$i]}"
   local lease_ref=none
-  [ "$mut" = yes ] && lease_ref="$ORCHESTRATION_DIR/write-lease.d"
+  [ "$mut" = yes ] && lease_ref="$ORCHESTRATION_DIR/write-lease.json"
 
   # invoke_vendor forwards these AMBIENT (unexported) globals into the
   # vendor subprocess's environment -- it does not take them as arguments.
@@ -2615,6 +2597,18 @@ _dispatch_launch_attempt() {
   classification="$CLASSIFY_ATTEMPT_RESULT"; reason="$CLASSIFY_ATTEMPT_REASON"
   mutation_state="$(inspect_mutation_state "$role")"
 
+  # Authority enforcement (spec S11.1's "unexpected changes yield ARTIFACT_
+  # INTEGRITY_BLOCKED"): INTEGRITY_UNKNOWN covers BOTH a read-only role that
+  # left evidence of a change while holding no lease at all, and a mutating
+  # attempt whose own pre/post comparison became impossible -- either way,
+  # this is the one non-terminal signal that must never pass silently.
+  if [ "$mutation_state" = INTEGRITY_UNKNOWN ]; then
+    record_event ARTIFACT_INTEGRITY_BLOCKED lease_owner="$role" dispatch_id="$d_id" \
+      phase="$phase" iteration="$(printf '%02d' "$iteration")" \
+      reason="unexplained repository change (mutation_state=INTEGRITY_UNKNOWN)" \
+      >/dev/null 2>&1 || true
+  fi
+
   post_dispatch "$vrc" "$s_path" "$err_path" "$out_path" \
     >>"$a_dir/post-dispatch.log" 2>&1 || :
 
@@ -2629,10 +2623,9 @@ _dispatch_launch_attempt() {
     stdout_path="$out_path" stderr_path="$err_path" mutates="$mut" \
     mutation_state="$mutation_state"
 
-  # Authority enforcement (rejecting a foreign write outside this attempt's
-  # own lease) is Task 8's job (the real write-lease protocol). This seam
-  # releases only what IT acquired.
-  [ "$mut" = yes ] && _dispatch_lease_release "$role"
+  # release_write_lease removes only an EXACT valid owner match and captures
+  # the "after" snapshot -- see "Write leases and mutation snapshots" above.
+  [ "$mut" = yes ] && release_write_lease "$role"
 
   [ "$classification" = COMPLETED ]
 }
@@ -2678,20 +2671,12 @@ _dispatch_ingest_result() {
   local checkpoint_kind
   checkpoint_kind="$(role_checkpoint_kind "$role" 2>/dev/null)"
 
-  _run_log_lock_acquire || return 1
   if [ "$launched" != yes ]; then
-    {
-      printf -- '--- %s  event=DISPATCH_NOT_LAUNCHED\n' "$(iso_now)"
-      printf 'phase:                    %s\n' "$phase"
-      printf 'phase_name:               %s\n' "$phase_name"
-      printf 'iteration:                %s\n' "$(printf '%02d' "${iteration:-0}" 2>/dev/null || echo "$iteration")"
-      printf 'role:                     %s\n' "$role"
-      printf 'dispatch_id:              %s\n' "$dispatch_id"
-      printf 'logical_dispatch_id:      %s\n' "$logical_dispatch_id"
-      printf 'reason:                   %s\n' "$reason"
-      printf '\n'
-    } >> "$FEATURE_FOLDER/RUN_LOG.md"
-    _run_log_lock_release
+    record_event DISPATCH_NOT_LAUNCHED \
+      phase="$phase" iteration="$(printf '%02d' "${iteration:-0}" 2>/dev/null || echo "$iteration")" \
+      dispatch_id="$dispatch_id" reason="$reason" \
+      phase_name="$phase_name" role="$role" logical_dispatch_id="$logical_dispatch_id" \
+      || return 1
     DISPATCH_RESULT_CLASSIFICATION=PRELAUNCH_FAILED
     DISPATCH_RESULT_VERDICT=""
     DISPATCH_RESULT_REASON="$reason"
@@ -2700,53 +2685,49 @@ _dispatch_ingest_result() {
     return 1
   fi
 
-  {
-    printf -- '--- %s  event=DISPATCH_COMPLETED\n' "$(iso_now)"
-    printf 'phase:                    %s\n' "$phase"
-    printf 'phase_name:               %s\n' "$phase_name"
-    printf 'iteration:                %s\n' "$(printf '%02d' "$iteration")"
-    printf 'role:                     %s\n' "$role"
-    printf 'vendor:                   %s\n' "$vendor"
-    printf 'appendix:                 %s\n' "$role"
-    printf 'dispatch_id:              %s\n' "$dispatch_id"
-    printf 'logical_dispatch_id:      %s\n' "$logical_dispatch_id"
-    printf 'develop_it_git_sha:       %s\n' "${PROCESS_GIT_HEAD:-non-git}"
-    printf 'develop_it_file_sha256:   %s\n' "${PROCESS_FILE_SHA256:-}"
-    printf 'develop_it_dirty:         %s\n' "${PROCESS_DIRTY:-unknown}"
-    printf 'status_path:              %s\n' "$status_path"
-    printf 'verdict:                  %s\n' "$verdict"
-    printf 'classification:           %s\n' "$classification"
-    printf 'exit_code:                %s\n' "$exit_code"
-    printf 'model:                    %s\n' "$(role_model "$role" 2>/dev/null)"
-    printf 'start_ms:                 %s\n' "$start_ms"
-    printf 'end_ms:                   %s\n' "$end_ms"
-    printf 'duration_ms:              %s\n' "$wall_ms"
-    printf 'stdout_path:              %s\n' "$stdout_path"
-    printf 'stderr_path:              %s\n' "$stderr_path"
-    printf 'mutation_state:           %s\n' "$mutation_state"
-    printf 'checkpoint_kind:          %s\n' "$checkpoint_kind"
-    local kv
-    for kv in $usage_line; do
-      case "$kv" in model=*|duration_ms=*) continue ;; esac
-      printf '%-25s %s\n' "${kv%%=*}:" "${kv#*=}"
-    done
-    printf '\n'
-  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+  # parse_usage's nine usage-telemetry fields (model/duration_ms are already
+  # carried above by their own named fields; the remaining seven are pulled
+  # out by NAME here rather than passed through as an opaque tail, so
+  # record_event's declared-fields-only validation covers them too).
+  local usage_status_v="" tokens_input_new_v=0 tokens_input_cached_v=0 tokens_cache_write_v=0
+  local tokens_output_v=0 tokens_reasoning_v=0 cost_usd_v="n/a"
+  local kv kk vv
+  for kv in $usage_line; do
+    kk="${kv%%=*}"; vv="${kv#*=}"
+    case "$kk" in
+      usage_status)         usage_status_v="$vv" ;;
+      tokens_input_new)     tokens_input_new_v="$vv" ;;
+      tokens_input_cached)  tokens_input_cached_v="$vv" ;;
+      tokens_cache_write)   tokens_cache_write_v="$vv" ;;
+      tokens_output)        tokens_output_v="$vv" ;;
+      tokens_reasoning)     tokens_reasoning_v="$vv" ;;
+      cost_usd)             cost_usd_v="$vv" ;;
+    esac
+  done
+
+  record_event DISPATCH_COMPLETED \
+    phase="$phase" iteration="$(printf '%02d' "$iteration")" dispatch_id="$dispatch_id" \
+    reason="attempt classified: $classification" \
+    phase_name="$phase_name" role="$role" vendor="$vendor" appendix="$role" \
+    logical_dispatch_id="$logical_dispatch_id" \
+    develop_it_git_sha="${PROCESS_GIT_HEAD:-non-git}" \
+    develop_it_file_sha256="${PROCESS_FILE_SHA256:-}" develop_it_dirty="${PROCESS_DIRTY:-unknown}" \
+    status_path="$status_path" verdict="$verdict" classification="$classification" \
+    exit_code="$exit_code" model="$(role_model "$role" 2>/dev/null)" \
+    start_ms="$start_ms" end_ms="$end_ms" duration_ms="$wall_ms" \
+    stdout_path="$stdout_path" stderr_path="$stderr_path" mutation_state="$mutation_state" \
+    checkpoint_kind="$checkpoint_kind" \
+    tokens_input_new="$tokens_input_new_v" tokens_input_cached="$tokens_input_cached_v" \
+    tokens_cache_write="$tokens_cache_write_v" tokens_output="$tokens_output_v" \
+    tokens_reasoning="$tokens_reasoning_v" cost_usd="$cost_usd_v" usage_status="$usage_status_v" \
+    || return 1
 
   if [ "$classification" != COMPLETED ]; then
-    {
-      printf -- '--- %s  event=ATTEMPT_FAILED\n' "$(iso_now)"
-      printf 'phase:                    %s\n' "$phase"
-      printf 'phase_name:               %s\n' "$phase_name"
-      printf 'iteration:                %s\n' "$(printf '%02d' "$iteration")"
-      printf 'role:                     %s\n' "$role"
-      printf 'dispatch_id:              %s\n' "$dispatch_id"
-      printf 'classification:           %s\n' "$classification"
-      printf 'reason:                   %s\n' "$reason"
-      printf '\n'
-    } >> "$FEATURE_FOLDER/RUN_LOG.md"
+    record_event ATTEMPT_FAILED \
+      phase="$phase" iteration="$(printf '%02d' "$iteration")" dispatch_id="$dispatch_id" \
+      reason="$reason" phase_name="$phase_name" role="$role" classification="$classification" \
+      || return 1
   fi
-  _run_log_lock_release
 
   DISPATCH_RESULT_CLASSIFICATION="$classification"
   DISPATCH_RESULT_VERDICT="$verdict"
@@ -2898,7 +2879,12 @@ dispatch_parallel() {
   # phase 1, lease contention is an expected per-attempt outcome).
   for i in "${!roles[@]}"; do
     if [ "${dp_mutates[$i]}" = yes ]; then
-      if _dispatch_lease_try_acquire "${roles[$i]}" "${dp_dispatch_id[$i]}"; then
+      # Declared write path defaults to "." (the whole repository): no
+      # per-role narrower-path registry exists yet (a future task's job),
+      # and a mutating role like implementer/debugger may legitimately touch
+      # anything under $REPO_ROOT -- "." is the honest, non-overreaching
+      # declaration for that contract, not a placeholder.
+      if acquire_write_lease "${roles[$i]}" role "${dp_dispatch_id[$i]}" "$phase" "."; then
         :
       else
         dp_ok[$i]=0
@@ -2910,7 +2896,8 @@ dispatch_parallel() {
           vendor="${dp_vendor[$i]}" dispatch_id="${dp_dispatch_id[$i]}" \
           logical_dispatch_id="${dp_logical[$i]}" attempt="${dp_attempt[$i]}" \
           status_path="${dp_status_path[$i]}" classification=PRELAUNCH_FAILED \
-          reason="DISPATCH_WRITE_LEASE_UNAVAILABLE:$(_dispatch_lease_state "$ORCHESTRATION_DIR/write-lease.d")" \
+          reason="DISPATCH_WRITE_LEASE_UNAVAILABLE:$(_write_lease_recovery_state \
+            "$(_write_lease_state "$ORCHESTRATION_DIR/write-lease.json")")" \
           verdict="" usage_line="" \
           start_ms=0 end_ms=0 wall_ms=0 exit_code="" stdout_path="${dp_stdout_path[$i]}" \
           stderr_path="${dp_stderr_path[$i]}" mutates="${dp_mutates[$i]}" \
@@ -3290,46 +3277,32 @@ not spec text a future task should expect to find restated elsewhere.
 # Maps (classification, mutation/lease state) onto exactly one of the twelve
 # rows above. For classification=PRELAUNCH_FAILED, <state> is a LEASE
 # substate (CORRECTABLE / ACTIVE_LEASE_OWNER / STALE_OR_AMBIGUOUS_LEASE,
-# from _dispatch_lease_state or "correctable" by default) -- never one of
+# from _write_lease_recovery_state or "correctable" by default) -- never one of
 # the five repo mutation states, since a prelaunch failure never invoked the
 # vendor and has nothing yet to compare against a snapshot. Every other
 # classification takes a real inspect_mutation_state value. Sets
 # RECOVERY_MATRIX_ID/RECOVERY_ACTION; returns 1 only for a combination no
 # row covers (a process-definition bug, never silently swallowed).
-# Task 7 seam (not full record_event -- Task 8's job): appends ONE durable
-# event through the same direct-tag convention Task 6 already used for
-# RECOVERY_CAP_REACHED, below. Named so a future record_event can replace
-# the call site without touching recovery_action's own logic.
+# Routes through record_event (the canonical writer -- see "RUN_LOG events,
+# decisions, write leases, and snapshots" below); kept as a named wrapper
+# purely so recovery_action's own call site never has to change.
 _recovery_emit_orchestration_correction() {
   # Usage: _recovery_emit_orchestration_correction <logical_dispatch_id>
   local logical="$1"
-  _run_log_lock_acquire || return 1
-  {
-    printf -- '--- %s  event=ORCHESTRATION_CORRECTION\n' "$(iso_now)"
-    printf 'logical_dispatch_id:      %s\n' "$logical"
-    printf 'reason:                   correctable prelaunch defect (RM01)\n'
-    printf '\n'
-  } >> "$FEATURE_FOLDER/RUN_LOG.md"
-  _run_log_lock_release
+  record_event ORCHESTRATION_CORRECTION logical_dispatch_id="$logical" \
+    reason="correctable prelaunch defect (RM01)"
 }
 
 # Same convention, for RM09. This records that the vendor was found
 # unavailable -- ACTUALLY suppressing later dispatches to it (a run-scoped
-# flag every subsequent invoke_vendor call consults) is Task 8's
-# record_event/proposition-ledger job; this seam only makes the incident
-# durable, per spec S14.3's "emit one run-scoped vendor-unavailable event".
+# flag every subsequent invoke_vendor call consults) remains a later task's
+# job; this only makes the incident durable, per spec S14.3's "emit one
+# run-scoped vendor-unavailable event".
 _recovery_emit_vendor_unavailable() {
   # Usage: _recovery_emit_vendor_unavailable <logical_dispatch_id> <vendor>
   local logical="$1" vendor="${2:-unknown}"
-  _run_log_lock_acquire || return 1
-  {
-    printf -- '--- %s  event=VENDOR_UNAVAILABLE\n' "$(iso_now)"
-    printf 'logical_dispatch_id:      %s\n' "$logical"
-    printf 'vendor:                   %s\n' "$vendor"
-    printf 'reason:                   spend ceiling (RM09)\n'
-    printf '\n'
-  } >> "$FEATURE_FOLDER/RUN_LOG.md"
-  _run_log_lock_release
+  record_event VENDOR_UNAVAILABLE logical_dispatch_id="$logical" vendor="$vendor" \
+    reason="spend ceiling (RM09)"
 }
 
 recovery_action() {
@@ -3497,18 +3470,17 @@ recovery_retry_allowed() {
   used_count="$(_recovery_failed_attempts_used "$logical")"
   retries_used=$(( used_count > 0 ? used_count - 1 : 0 ))
   if [ "$retries_used" -ge "$cap_value" ]; then
-    _run_log_lock_acquire || return 1
-    {
-      printf -- '--- %s  event=RECOVERY_CAP_REACHED\n' "$(iso_now)"
-      printf 'logical_dispatch_id:      %s\n' "$logical"
-      printf 'cap:                      %s\n' "$cap_name"
-      printf 'cap_value:                %s\n' "$cap_value"
-      printf 'attempts_used:            %s\n' "$used_count"
-      printf '\n'
-    } >> "$FEATURE_FOLDER/RUN_LOG.md"
-    _run_log_lock_release
+    record_event RECOVERY_CAP_REACHED logical_dispatch_id="$logical" \
+      cap="$cap_name" cap_value="$cap_value" attempts_used="$used_count" \
+      reason="retry cap exhausted for action $action"
     return 1
   fi
+  # The counterpart RECOVERY_CAP_REACHED never previously had: a durable
+  # record of every retry the process actually AUTHORIZED, not just the
+  # ones it eventually denied.
+  record_event RECOVERY_AUTHORIZED logical_dispatch_id="$logical" action="$action" \
+    reason="retry authorized under $cap_name ($retries_used/$cap_value used)" \
+    >/dev/null 2>&1 || true
   return 0
 }
 ```
@@ -3701,6 +3673,657 @@ resume_dispatch_state() {
 }
 ```
 
+### RUN_LOG events, decisions, write leases, and snapshots (spec §11, §15)
+
+Every lifecycle, decision, or correction record durable in `RUN_LOG.md` shares
+one common envelope (spec §15.1): `event_id`, `event`, `timestamp`,
+`process_schema_version`, `phase`, `iteration`, `dispatch_id`,
+`caused_by_event_id`, `authority`, `reason`. `event` and `timestamp` are
+carried by the block's own header line — `--- <ISO-timestamp>  event=<NAME>`,
+the grammar every reader in this document already parses — never duplicated
+as a second body field. The other eight are body fields, always present
+(possibly empty for `phase`/`iteration`/`dispatch_id`/`caused_by_event_id`;
+`reason` is the one field that MUST be non-empty text). `record_event`, below,
+is the sole canonical writer; `event_id` is allocated monotonically from
+`RUN_LOG.md` itself, never from an in-memory counter (a fresh shell per phase
+means an in-memory counter cannot survive anyway).
+
+#### Event Contract Registry
+
+The table below is the normative row list `tests/lib/extract.py events` reads.
+`required_fields` lists ONLY the fields a type carries **beyond** the eight
+common-envelope fields above (a `;`-separated list, empty when a type needs
+nothing beyond the envelope) — the same `;`-list convention the Role Contract
+Registry already uses for multi-valued cells. `proposition_required=yes`
+marks the twelve event types whose occurrence must also yield an entry in
+`process-improvement-proposition.md` (Task 15/16's ledger; declaring the flag
+here does not itself populate that document).
+
+| event_type | required_fields | proposition_required |
+|---|---|---|
+| DISPATCH_NOT_LAUNCHED | phase_name;role;logical_dispatch_id | no |
+| DISPATCH_STARTED | phase_name;role;vendor;logical_dispatch_id;model;status_path;cwd;lease;snapshot | no |
+| DISPATCH_COMPLETED | phase_name;role;vendor;appendix;logical_dispatch_id;develop_it_git_sha;develop_it_file_sha256;develop_it_dirty;status_path;verdict;classification;exit_code;model;start_ms;end_ms;duration_ms;stdout_path;stderr_path;mutation_state;checkpoint_kind;tokens_input_new;tokens_input_cached;tokens_cache_write;tokens_output;tokens_reasoning;cost_usd;usage_status | no |
+| ATTEMPT_FAILED | phase_name;role;classification | yes |
+| RECOVERY_AUTHORIZED | logical_dispatch_id;action | yes |
+| RECOVERY_CAP_REACHED | logical_dispatch_id;cap;cap_value;attempts_used | yes |
+| ORCHESTRATION_CORRECTION | logical_dispatch_id | yes |
+| HALT |  | yes |
+| OWNER_DECISION | decision_id;authority_identity;scope;artifact_path;artifact_revision;evidence;alternatives_rejected;residual_risk;expiry;independent_rereview;follow_up_id | no |
+| RISK_ACCEPTED | decision_id;authority_identity;scope;artifact_path;artifact_revision;evidence;alternatives_rejected;residual_risk;expiry;independent_rereview;follow_up_id | no |
+| PHASE_ACCEPTED | decision_id;authority_identity;scope;artifact_path;artifact_revision;evidence;alternatives_rejected;residual_risk;expiry;independent_rereview;follow_up_id | no |
+| EVENT_CORRECTED | corrected_event_id;replacement_classification;evidence;downstream_effect | yes |
+| VENDOR_UNAVAILABLE | logical_dispatch_id;vendor | yes |
+| DEGRADED_REVIEW_ACCEPTED | decision_id;scope;evidence | yes |
+| CONTEXT7_UNAVAILABLE |  | no |
+| CONTEXT7_RESTORED | probe | no |
+| WRITE_LEASE_ACQUIRED | lease_owner;lease_authority | no |
+| WRITE_LEASE_RELEASED | lease_owner | no |
+| ARTIFACT_INTEGRITY_BLOCKED | lease_owner | yes |
+| GIT_FINALIZATION_RESULT | base_sha;candidate_sha;outcome | no |
+| ITERATION_CAP_REACHED | phase_name;iteration_cap | yes |
+| ITERATION_CAP_OVERRIDE | phase_name;iteration_cap | yes |
+| PROCESS_DEVIATION |  | yes |
+| ATTEMPT_ALLOCATED | logical_dispatch_id;role;attempt;launched | no |
+| CODEX_UNAVAILABLE | phase_name;role;vendor;failure_mode;status_path;verdict | no |
+| CLAUDE_FAILED | phase_name;role;vendor;failure_mode;status_path;verdict | no |
+| IMPLEMENTATION_BASELINE | base_sha;uncommitted_changes | no |
+| IMPLEMENTATION_BASELINE_BLOCKED | candidate_sha | no |
+| CODEX_DISABLED_BY_USER_CONSENT | phase_name;role;vendor;failure_mode;stderr_tail | no |
+| CODEX_SKIPPED_BY_USER_CONSENT | phase_name;role;vendor | no |
+| MODEL_REJECTED | phase_name;role;model;vendor | no |
+| DISPATCH_ORPHANED | role;role_mutates;action | no |
+
+`ATTEMPT_ALLOCATED` is one row beyond the spec's own 23-name list: it is the
+pre-existing attempt-identity event `allocate_attempt` has always written
+(Task 1), now routed through the same canonical writer as every other type
+rather than left as a bespoke direct append. The eight rows after it
+(code review fix, gap b) reconcile the registry with the "ONLY legal
+`event=` tags" list (below) and this document's own pre-schema-v2 prose,
+which already normatively requires each of them (e.g. `DISPATCH_ORPHANED`'s
+resume tables) -- without these rows, `record_event` could not write an
+event the process itself mandates, contradicting "the sole canonical
+writer." None of the eight has a live cookbook call site yet (they remain
+prose instructions to the orchestrator, same scope boundary as `HALT`
+above), so none is `proposition_required=yes` and none changes the twelve
+`yes` rows Step 3 names.
+
+<!-- lint: cookbook -->
+```bash
+# Additional (non-common) fields each event type carries, as the runtime
+# mirror of the Event Contract Registry's own `required_fields` column --
+# the SAME pattern `recovery_action`'s hand-coded rows already use against
+# `extract.py recovery` (a markdown table for humans/spec traceability, a
+# hand-written case statement for the runtime, cross-checked by a dedicated
+# test rather than re-parsed from Markdown on every call). `record_event` is
+# the only caller; an unrecognized type fails closed rather than silently
+# accepting an unvalidated event.
+#
+# Code review note (fix #7): enforcement does NOT flow FROM the Markdown
+# table -- editing a cell here has zero runtime effect until this case
+# statement is edited to match. The guarantee this document actually makes
+# is "a drift between the two trips tests/check_06_cookbook.sh's
+# bidirectional cross-check", not "the registry is live enforcement" --
+# exactly `recovery_action`'s own pre-existing guarantee, not a weaker one
+# invented for this function.
+event_required_fields() {
+  # Usage: event_required_fields EVENT_TYPE
+  case "$1" in
+    DISPATCH_NOT_LAUNCHED)      printf '%s\n' "phase_name;role;logical_dispatch_id" ;;
+    DISPATCH_STARTED)           printf '%s\n' "phase_name;role;vendor;logical_dispatch_id;model;status_path;cwd;lease;snapshot" ;;
+    DISPATCH_COMPLETED)         printf '%s\n' "phase_name;role;vendor;appendix;logical_dispatch_id;develop_it_git_sha;develop_it_file_sha256;develop_it_dirty;status_path;verdict;classification;exit_code;model;start_ms;end_ms;duration_ms;stdout_path;stderr_path;mutation_state;checkpoint_kind;tokens_input_new;tokens_input_cached;tokens_cache_write;tokens_output;tokens_reasoning;cost_usd;usage_status" ;;
+    ATTEMPT_FAILED)              printf '%s\n' "phase_name;role;classification" ;;
+    RECOVERY_AUTHORIZED)         printf '%s\n' "logical_dispatch_id;action" ;;
+    RECOVERY_CAP_REACHED)        printf '%s\n' "logical_dispatch_id;cap;cap_value;attempts_used" ;;
+    ORCHESTRATION_CORRECTION)    printf '%s\n' "logical_dispatch_id" ;;
+    HALT)                        printf '%s\n' "" ;;
+    OWNER_DECISION|RISK_ACCEPTED|PHASE_ACCEPTED)
+      printf '%s\n' "decision_id;authority_identity;scope;artifact_path;artifact_revision;evidence;alternatives_rejected;residual_risk;expiry;independent_rereview;follow_up_id" ;;
+    EVENT_CORRECTED)             printf '%s\n' "corrected_event_id;replacement_classification;evidence;downstream_effect" ;;
+    VENDOR_UNAVAILABLE)          printf '%s\n' "logical_dispatch_id;vendor" ;;
+    DEGRADED_REVIEW_ACCEPTED)    printf '%s\n' "decision_id;scope;evidence" ;;
+    CONTEXT7_UNAVAILABLE)        printf '%s\n' "" ;;
+    CONTEXT7_RESTORED)           printf '%s\n' "probe" ;;
+    WRITE_LEASE_ACQUIRED)        printf '%s\n' "lease_owner;lease_authority" ;;
+    WRITE_LEASE_RELEASED)        printf '%s\n' "lease_owner" ;;
+    ARTIFACT_INTEGRITY_BLOCKED)  printf '%s\n' "lease_owner" ;;
+    GIT_FINALIZATION_RESULT)     printf '%s\n' "base_sha;candidate_sha;outcome" ;;
+    ITERATION_CAP_REACHED|ITERATION_CAP_OVERRIDE)
+      printf '%s\n' "phase_name;iteration_cap" ;;
+    PROCESS_DEVIATION)           printf '%s\n' "" ;;
+    ATTEMPT_ALLOCATED)           printf '%s\n' "logical_dispatch_id;role;attempt;launched" ;;
+    CODEX_UNAVAILABLE|CLAUDE_FAILED)
+      printf '%s\n' "phase_name;role;vendor;failure_mode;status_path;verdict" ;;
+    IMPLEMENTATION_BASELINE)     printf '%s\n' "base_sha;uncommitted_changes" ;;
+    IMPLEMENTATION_BASELINE_BLOCKED) printf '%s\n' "candidate_sha" ;;
+    CODEX_DISABLED_BY_USER_CONSENT)
+      printf '%s\n' "phase_name;role;vendor;failure_mode;stderr_tail" ;;
+    CODEX_SKIPPED_BY_USER_CONSENT) printf '%s\n' "phase_name;role;vendor" ;;
+    MODEL_REJECTED)              printf '%s\n' "phase_name;role;model;vendor" ;;
+    DISPATCH_ORPHANED)           printf '%s\n' "role;role_mutates;action" ;;
+    *) echo "EVENT_TYPE_UNKNOWN:$1" >&2; return 1 ;;
+  esac
+}
+
+# Scans RUN_LOG.md for the highest existing event_id and returns one past it
+# -- never clock time, never an in-memory counter. The caller (record_event)
+# already holds the run-log lock, so this cannot race another allocation.
+_record_event_next_id() {
+  local log="${FEATURE_FOLDER:-}/RUN_LOG.md" max=0 n
+  if [ -f "$log" ]; then
+    while IFS= read -r n; do
+      [ "$n" -gt "$max" ] 2>/dev/null && max=$n
+    done < <("$GREP_BIN" -oE '^event_id:[[:space:]]+[0-9]+$' "$log" 2>/dev/null \
+              | "$GREP_BIN" -oE '[0-9]+$')
+  fi
+  printf '%d\n' $((max + 1))
+}
+
+# The sole canonical RUN_LOG event writer (spec S15.1/S15.3/S15.4). Assigns a
+# monotonic event_id, validates the common envelope plus every field the
+# Event Contract Registry declares for this type (rejecting anything NOT
+# declared, so the block's content can never silently drift from the
+# registry), takes the SAME run-log lock every other RUN_LOG writer in this
+# document uses (`_run_log_lock_acquire`/`_run_log_lock_release`, defined
+# above under "Attempt identity and attempt-scoped paths" -- one mutex for
+# every RUN_LOG.md writer, not a second one invented here), appends exactly
+# one fixed-order block, and releases. Decisions and corrections (spec
+# S15.3/S15.4) are ordinary events under this same mechanism: OWNER_DECISION/
+# RISK_ACCEPTED/PHASE_ACCEPTED/EVENT_CORRECTED are rows in the registry
+# above like any other type, not a separate function -- RUN_LOG is
+# append-only BY CONSTRUCTION here (every path through this function ends in
+# `>>`; nothing in this document ever opens RUN_LOG.md for anything else),
+# so "correct only by appending EVENT_CORRECTED" falls out for free: there is
+# no edit path to forget to avoid.
+#
+# Usage: record_event EVENT_TYPE KEY=VALUE [KEY=VALUE ...]
+# Sets RECORD_EVENT_ID (caller-visible) to the assigned event_id on success.
+record_event() {
+  local event_type="${1:-}"
+  [ -n "$event_type" ] || { echo "RECORD_EVENT_MISSING_TYPE" >&2; return 1; }
+  shift
+  local required_csv
+  required_csv="$(event_required_fields "$event_type")" || return 1
+  # The common envelope keys, beyond header event/timestamp (spec S15.1) --
+  # a local, not a top-level cookbook constant (this document's cookbook
+  # blocks are definitions-only; check_01_lint.sh enforces zero top-level
+  # statements in the extracted runtime).
+  local common_fields="phase iteration dispatch_id caused_by_event_id authority reason"
+
+  local -A fields=()
+  local kv k
+  for kv in "$@"; do
+    k="${kv%%=*}"
+    case " $common_fields " in
+      *" $k "*) : ;;
+      *)
+        case ";$required_csv;" in
+          *";$k;"*) : ;;
+          *) echo "RECORD_EVENT_UNKNOWN_FIELD:$event_type:$k" >&2; return 1 ;;
+        esac ;;
+    esac
+    fields["$k"]="${kv#*=}"
+  done
+
+  local phase="${fields[phase]:-}" iteration="${fields[iteration]:-}"
+  local dispatch_id="${fields[dispatch_id]:-}" caused_by="${fields[caused_by_event_id]:-}"
+  local authority="${fields[authority]:-process}" reason="${fields[reason]:-}"
+  case "$authority" in process|owner|role|system) : ;; *)
+    echo "RECORD_EVENT_BAD_AUTHORITY:$authority" >&2; return 1 ;;
+  esac
+  [ -n "$reason" ] || { echo "RECORD_EVENT_MISSING_REASON:$event_type" >&2; return 1; }
+
+  local -a req_arr=()
+  IFS=';' read -r -a req_arr <<<"$required_csv"
+  local req
+  for req in "${req_arr[@]}"; do
+    [ -n "$req" ] || continue
+    [ -n "${fields[$req]+x}" ] \
+      || { echo "RECORD_EVENT_MISSING_FIELD:$event_type:$req" >&2; return 1; }
+  done
+
+  mkdir -p "${ORCHESTRATION_DIR:-$FEATURE_FOLDER/.orchestration}"
+  _run_log_lock_acquire || return 1
+  local event_id schema
+  event_id="$(_record_event_next_id)"
+  schema="$(policy_value process_schema_version 2>/dev/null)"; [ -n "$schema" ] || schema=2
+  {
+    printf -- '--- %s  event=%s\n' "$(iso_now)" "$event_type"
+    printf '%-25s %s\n' "event_id:" "$event_id"
+    printf '%-25s %s\n' "process_schema_version:" "$schema"
+    printf '%-25s %s\n' "phase:" "$phase"
+    printf '%-25s %s\n' "iteration:" "$iteration"
+    printf '%-25s %s\n' "dispatch_id:" "$dispatch_id"
+    printf '%-25s %s\n' "caused_by_event_id:" "$caused_by"
+    printf '%-25s %s\n' "authority:" "$authority"
+    printf '%-25s %s\n' "reason:" "$reason"
+    for req in "${req_arr[@]}"; do
+      [ -n "$req" ] || continue
+      printf '%-25s %s\n' "${req}:" "${fields[$req]}"
+    done
+    printf '\n'
+  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+  # Step 3: "flushes/fsyncs" -- the SAME fsync helper bootstrap_runtime
+  # already uses for its own generated files, reused rather than
+  # reinvented; a plain `>>` alone only guarantees libc's buffer was
+  # handed to the kernel, not that it survived a crash immediately after.
+  _bootstrap_fsync_path "$FEATURE_FOLDER/RUN_LOG.md" 2>/dev/null || true
+  _run_log_lock_release
+  # shellcheck disable=SC2034  # consumed by the caller after record_event returns
+  RECORD_EVENT_ID="$event_id"
+}
+```
+
+**Migration note (Task 8 scope boundary).** Every RUN_LOG writer that was a
+real cookbook function before this task (`allocate_attempt`'s
+`ATTEMPT_ALLOCATED`, `_dispatch_write_started`'s `DISPATCH_STARTED`,
+`_dispatch_ingest_result`'s `DISPATCH_COMPLETED`/`DISPATCH_NOT_LAUNCHED`/
+`ATTEMPT_FAILED`, `_recovery_emit_orchestration_correction`'s
+`ORCHESTRATION_CORRECTION`, `_recovery_emit_vendor_unavailable`'s
+`VENDOR_UNAVAILABLE`, and `assert_dispatch_running_claim`'s
+`PROCESS_DEVIATION`) now routes through `record_event`. `recovery_retry_
+allowed` additionally now emits `RECOVERY_AUTHORIZED` on the path that grants
+a retry (the counterpart this document never previously logged, only its
+`RECOVERY_CAP_REACHED` denial). The decision types (`OWNER_DECISION`,
+`RISK_ACCEPTED`, `PHASE_ACCEPTED`, `EVENT_CORRECTED`) and `GIT_FINALIZATION_
+RESULT` have no live call site yet — no phase in this document currently
+narrates an owner decision or a Phase 10 finalization commit as literal
+cookbook code, only as prose — so this task defines their full contract
+(registry row, `event_required_fields` case, `record_event` compatibility)
+and leaves wiring an actual call site to whichever later task implements
+that phase behavior in code. The many pre-existing PROSE mentions of
+`event=HALT`/`event=CODEX_UNAVAILABLE`/`event=MODEL_REJECTED`/etc. elsewhere
+in this document (instructions to the live orchestrator, not cookbook
+functions this test harness executes) are unchanged by this task; `HALT`
+gains a registry row here because spec S15.2 requires one, not because every
+prose HALT site was rewritten to call `record_event` explicitly.
+
+**Decision and acceptance records (spec §15.3).** An `OWNER_DECISION`,
+`RISK_ACCEPTED`, or `PHASE_ACCEPTED` event is `record_event` called with:
+`decision_id` (a stable identifier for this decision), `authority_identity`
+(`operator`, `standing_process_policy`, or a named owner input — distinct
+from the common envelope's own `authority` enum, which instead names the
+CLASS of actor that caused this RUN_LOG entry to exist), `scope` (the exact
+finding/scope IDs covered), `artifact_path`/`artifact_revision` (what is
+being accepted, and at what revision), `evidence`, `alternatives_rejected`,
+`residual_risk`, `expiry` (`this attempt`, `this phase`, or `this run`),
+`independent_rereview` (whether independent re-review verified the result),
+and `follow_up_id` (when work remains). The orchestrator may only ever
+record a decision already granted by the process and within its existing
+autonomy ceiling — never one it infers for production changes, publication,
+destructive history operations, broad credential actions, or destruction of
+user work.
+
+**Corrections are append-only (spec §15.4).** RUN_LOG.md is never edited.
+Once a valid event is durable, later evidence corrects it by calling
+`record_event EVENT_CORRECTED corrected_event_id=<original> replacement_
+classification=<...> evidence=<...> downstream_effect=<...> reason=<...>`.
+Consumers follow the latest valid correction chain (by `corrected_event_id`)
+and retain the original block for audit — `record_event`'s own append-only
+construction (above) makes any other form of "correction" structurally
+unreachable.
+
+### Write leases and mutation snapshots (spec §11)
+
+Before a mutating role's attempt launches — or before direct orchestrator
+mutation in Phase 10 — the current controller atomically creates
+`$ORCHESTRATION_DIR/write-lease.json`:
+
+```json
+{"schema_version":2,"dispatch_id":null,"lease_owner":"orchestrator-finalization","authority":"orchestrator","phase":"10","acquired_at":"<UTC>","baseline_head":"<sha>","declared_write_paths":["<repo-relative>"],"declared_foreign_paths":["<repo-relative>"],"declared_foreign_commits":["<sha>"],"snapshot_manifest_path":"<absolute path>"}
+```
+
+For a dispatched role, `dispatch_id` is its string ID, `authority` is
+`"role"`, and `lease_owner` is the role name. Only one lease may exist at a
+time; a second mutating attempt is `PRELAUNCH_FAILED` (RM02/RM03, above).
+`release_write_lease` removes only an exact, valid owner match, after the
+classified outcome is already durable (this document's own attempt lifecycle
+already guarantees that ordering — see "Unified attempt dispatch" above:
+`_dispatch_launch_attempt` writes its attempt's `result.kv` before releasing
+anything). An interruption leaves the lease exactly where it is; resume
+classifies it (`_write_lease_state`, below) rather than reclaiming it.
+
+<!-- lint: cookbook -->
+```bash
+# Repository-containment check for one DECLARED_PATH (repo-relative; an
+# absolute input is rejected outright). realpath -m (no existence
+# requirement) rather than `canon`'s realpath -e: a declared write path may
+# name a file this attempt is about to CREATE, which does not exist yet.
+#
+# Code review fix #4 (Task 9 seam, noted explicitly): this check itself is
+# correct (verified against an absolute path, `..` traversal, a symlinked
+# directory, a symlink whose PARENT escapes, and a symlinked file), but it
+# is UNREACHABLE in production today for the same reason _snapshot_capture's
+# per-artifact branch is (above): dispatch_parallel's only live call to
+# acquire_write_lease declares "." for every mutating role, and "." always
+# resolves to $REPO_ROOT itself, which trivially passes containment. Nothing
+# in this document's fixed interfaces assigns a per-role declared-path
+# registry column, so there is currently no way for a real caller to
+# declare anything narrower -- and thus no real input this check can ever
+# actually reject. A later task adding that column is what activates this
+# guard; it needs no change itself when that happens.
+_write_lease_path_ok() {
+  local repo="$1" p="$2" resolved
+  case "$p" in /*) return 1 ;; esac
+  resolved="$(realpath -m -- "$repo/$p" 2>/dev/null)" || return 1
+  path_in_tree "$resolved" "$repo"
+}
+
+# Fine-grained classification of an EXISTING write-lease.json (spec S11.3's
+# four resume substates, plus ambiguous/malformed/absent). Never mutates the
+# file; never reclaims a lease. Reuses the SAME durable dispatch-lifecycle
+# evidence `resume_dispatch_state` already reads (`dispatch_is_running`,
+# `_dispatch_child_live`, `_dispatch_last_event_for_id`,
+# `_dispatch_completed_field`) rather than inventing a second liveness
+# signal for the lease file to carry.
+#
+# Code review fix #1: `dispatch_parallel`'s own Phase 2 (lease acquisition)
+# runs sequentially, BEFORE any child is forked in Phase 3 -- so at the
+# instant a losing sibling's own acquire attempt runs, the winner's lease
+# exists but its DISPATCH_STARTED does not yet (that is written from inside
+# the forked child, immediately before invoke_vendor). Treating that gap as
+# AMBIGUOUS_LEASE turned "ordinary same-batch contention" (this document's
+# own words, "Unified attempt dispatch" above) into an ARTIFACT_INTEGRITY_
+# BLOCKED alarm and an RM03 HALT instead of RM02's WAIT_FOR_OWNER -- verified
+# live before this fix. The WRITE_LEASE_STARTUP_GRACE_SECONDS window below
+# (default 30s, env-overridable like BOOTSTRAP_ORPHAN_AGE_SECONDS) is what
+# tells "no DISPATCH_STARTED yet because the owner just started" from "no
+# DISPATCH_STARTED and never will be, because something died before it
+# could write one": within the grace window, no evidence at all is treated
+# as the owner still being between acquire and launch (ACTIVE); past it, the
+# silence itself becomes the ambiguity signal.
+_write_lease_state() {
+  # Usage: _write_lease_state [lease_file]
+  local lease_file="${1:-${ORCHESTRATION_DIR:-}/write-lease.json}"
+  [ -f "$lease_file" ] || { echo NO_LEASE; return 0; }
+  jq empty "$lease_file" >/dev/null 2>&1 || { echo MALFORMED_LEASE; return 0; }
+  local dispatch_id authority acquired_at
+  dispatch_id="$(jq -r '.dispatch_id // empty' "$lease_file" 2>/dev/null)"
+  authority="$(jq -r '.authority // empty' "$lease_file" 2>/dev/null)"
+  acquired_at="$(jq -r '.acquired_at // empty' "$lease_file" 2>/dev/null)"
+  case "$authority" in role|orchestrator) : ;; *) echo MALFORMED_LEASE; return 0 ;; esac
+
+  if [ -z "$dispatch_id" ] || [ "$dispatch_id" = null ]; then
+    # Phase 10 direct orchestrator finalization: no dispatch id to check
+    # liveness against. Its mere presence blocks a second mutating writer
+    # for as long as it exists -- treated as active until explicitly
+    # released.
+    echo ACTIVE_LEASE_OWNER
+    return 0
+  fi
+
+  if dispatch_is_running "$dispatch_id"; then
+    if _dispatch_child_live "$dispatch_id"; then
+      echo ACTIVE_LEASE_OWNER
+    else
+      echo ORPHANED_UNOBSERVED_OWNER
+    fi
+    return 0
+  fi
+
+  case "$(_dispatch_last_event_for_id "$dispatch_id")" in
+    DISPATCH_COMPLETED)
+      if [ "$(_dispatch_completed_field "$dispatch_id" classification)" = COMPLETED ]; then
+        echo COMPLETED_LOST_RELEASE
+      else
+        echo OBSERVED_FAILED_OWNER
+      fi
+      ;;
+    "")
+      local now acquired_epoch age
+      now="$(date +%s)"
+      acquired_epoch="$(date -u -d "$acquired_at" +%s 2>/dev/null)"
+      if [ -n "$acquired_epoch" ]; then
+        age=$((now - acquired_epoch))
+      else
+        age=-1
+      fi
+      if [ "$age" -ge 0 ] && [ "$age" -le "${WRITE_LEASE_STARTUP_GRACE_SECONDS:-30}" ]; then
+        echo ACTIVE_LEASE_OWNER
+      else
+        echo AMBIGUOUS_LEASE
+      fi
+      ;;
+    *)
+      echo AMBIGUOUS_LEASE ;;
+  esac
+}
+
+# Folds the fine-grained classification above into the two-value vocabulary
+# recovery_action's PRELAUNCH_FAILED branch routes on (spec S14.3, RM02 vs
+# RM03): every non-live substate is treated identically -- never reclaimed
+# automatically, always routed to RM03's HALT for integrity reconciliation.
+_write_lease_recovery_state() {
+  case "$1" in
+    ACTIVE_LEASE_OWNER|NO_LEASE) echo "$1" ;;
+    *) echo STALE_OR_AMBIGUOUS_LEASE ;;
+  esac
+}
+
+# Exclusive creation of $ORCHESTRATION_DIR/write-lease.json (spec S11.1).
+# Usage: acquire_write_lease OWNER AUTHORITY DISPATCH_ID PHASE DECLARED_PATH...
+# OWNER is the lease_owner (a role name, or "orchestrator-finalization" for
+# direct Phase 10 mutation); AUTHORITY is "role" or "orchestrator";
+# DISPATCH_ID is the dispatch id string, or empty for Phase 10 (recorded as
+# JSON null). PHASE is a REQUIRED, explicit parameter (code review fix #2):
+# an earlier revision read an undeclared AMBIENT $phase, which happened to
+# exist only because dispatch_parallel's own caller declares a `local phase`
+# -- correct by accident there, but silently "phase":"" for any other
+# caller (Phase 10 finalization included, the exact case spec Step 5's own
+# JSON example spells out as "phase":"10"). Every DECLARED_PATH is verified
+# contained in $REPO_ROOT before anything is written. Refuses an active,
+# malformed, stale, or ambiguous existing lease -- and for anything other
+# than a genuinely live owner, additionally emits ARTIFACT_INTEGRITY_BLOCKED
+# and returns failure without ever launching a second writer (spec S11.1's
+# own words).
+acquire_write_lease() {
+  if [ "$#" -lt 4 ]; then
+    echo "WRITE_LEASE_USAGE:acquire_write_lease OWNER AUTHORITY DISPATCH_ID PHASE DECLARED_PATH..." >&2
+    return 1
+  fi
+  local owner="$1" authority="$2" dispatch_id="$3" phase="$4"; shift 4
+  local -a declared=("$@")
+  case "$authority" in role|orchestrator) : ;; *)
+    echo "WRITE_LEASE_BAD_AUTHORITY:$authority" >&2; return 1 ;;
+  esac
+  [ -n "$owner" ] || { echo "WRITE_LEASE_BAD_OWNER" >&2; return 1; }
+
+  local p
+  for p in "${declared[@]}"; do
+    _write_lease_path_ok "${REPO_ROOT:?}" "$p" \
+      || { echo "WRITE_LEASE_PATH_NOT_CONTAINED:$p" >&2; return 1; }
+  done
+
+  mkdir -p "${ORCHESTRATION_DIR:?}"
+  local lease_file="$ORCHESTRATION_DIR/write-lease.json"
+  local key manifest_dir
+  key="${dispatch_id:-$owner}"
+  manifest_dir="$ORCHESTRATION_DIR/snapshots/$key"
+  mkdir -p "$manifest_dir"
+
+  local dispatch_id_json declared_json baseline_head tmp
+  if [ -n "$dispatch_id" ]; then dispatch_id_json="$(jq -Rn --arg v "$dispatch_id" '$v')"
+  else dispatch_id_json=null; fi
+  baseline_head="$(git -C "${REPO_ROOT:-}" rev-parse HEAD 2>/dev/null || echo none)"
+  if [ "${#declared[@]}" -gt 0 ]; then
+    # ponytail: a declared path containing an embedded newline splits into
+    # two JSON array entries here (printf-then-jq-per-line has no other way
+    # to frame a path list). Every real caller today only ever declares "."
+    # (dispatch_parallel's own lease-phase call, below) -- a literal that
+    # can never contain a newline -- so this is a real but currently
+    # unreachable gap, not a live one; revisit with NUL-delimited framing if
+    # a future per-role path column ever lets a caller declare a real,
+    # attacker-influenceable path.
+    declared_json="$(printf '%s\n' "${declared[@]}" | jq -R . | jq -s .)"
+  else
+    declared_json='[]'
+  fi
+
+  tmp="$ORCHESTRATION_DIR/.write-lease.tmp.$BASHPID.$RANDOM"
+  jq -n \
+    --argjson schema_version 2 --argjson dispatch_id "$dispatch_id_json" \
+    --arg lease_owner "$owner" --arg authority "$authority" --arg phase "$phase" \
+    --arg acquired_at "$(iso_now)" --arg baseline_head "$baseline_head" \
+    --argjson declared_write_paths "$declared_json" \
+    --argjson declared_foreign_paths '[]' --argjson declared_foreign_commits '[]' \
+    --arg snapshot_manifest_path "$manifest_dir/manifest.json" \
+    '{schema_version:$schema_version, dispatch_id:$dispatch_id, lease_owner:$lease_owner,
+      authority:$authority, phase:$phase, acquired_at:$acquired_at,
+      baseline_head:$baseline_head, declared_write_paths:$declared_write_paths,
+      declared_foreign_paths:$declared_foreign_paths,
+      declared_foreign_commits:$declared_foreign_commits,
+      snapshot_manifest_path:$snapshot_manifest_path}' > "$tmp" 2>/dev/null \
+    || { rm -f "$tmp"; echo "WRITE_LEASE_BUILD_FAILED" >&2; return 1; }
+
+  if ln "$tmp" "$lease_file" 2>/dev/null; then
+    rm -f "$tmp"
+    _snapshot_capture before "$owner" "$dispatch_id" "$manifest_dir/manifest.json" "${declared[@]}"
+    record_event WRITE_LEASE_ACQUIRED lease_owner="$owner" lease_authority="$authority" \
+      dispatch_id="$dispatch_id" phase="$phase" \
+      authority="$([ "$authority" = orchestrator ] && echo system || echo role)" \
+      reason="write lease acquired"
+    return 0
+  fi
+  rm -f "$tmp"
+
+  local fine
+  fine="$(_write_lease_state "$lease_file")"
+  case "$(_write_lease_recovery_state "$fine")" in
+    ACTIVE_LEASE_OWNER)
+      echo "WRITE_LEASE_ACTIVE:$fine" >&2 ;;
+    *)
+      echo "WRITE_LEASE_BLOCKED:$fine" >&2
+      record_event ARTIFACT_INTEGRITY_BLOCKED lease_owner="$owner" \
+        dispatch_id="$dispatch_id" phase="$phase" \
+        reason="write lease blocked: existing lease is $fine" >/dev/null 2>&1 || true
+      ;;
+  esac
+  return 1
+}
+
+# Removes ONLY an exact, valid owner match (spec S11.3). A missing lease,
+# malformed JSON, or a lease held by someone else is refused, never forced --
+# the caller (dispatch_parallel/_dispatch_launch_attempt) only ever calls
+# this for a lease IT itself just acquired, so any mismatch here is a real
+# integrity signal, not routine contention. Captures the "after" snapshot
+# (spec S11.2) before the lease file itself disappears, once the classified
+# outcome is already durable (the caller's own attempt-result write already
+# happened by this point -- see the section intro above).
+release_write_lease() {
+  # Usage: release_write_lease OWNER
+  local owner="${1:-}" lease_file="${ORCHESTRATION_DIR:?}/write-lease.json"
+  [ -n "$owner" ] || { echo "WRITE_LEASE_BAD_OWNER" >&2; return 1; }
+  [ -f "$lease_file" ] || { echo "WRITE_LEASE_NOT_HELD:$owner" >&2; return 1; }
+  jq empty "$lease_file" >/dev/null 2>&1 \
+    || { echo "WRITE_LEASE_MALFORMED:$owner" >&2; return 1; }
+  local held_owner dispatch_id manifest_path
+  held_owner="$(jq -r '.lease_owner // empty' "$lease_file" 2>/dev/null)"
+  if [ "$held_owner" != "$owner" ]; then
+    echo "WRITE_LEASE_NOT_OWNER:$owner:$held_owner" >&2
+    return 1
+  fi
+  dispatch_id="$(jq -r '.dispatch_id // empty' "$lease_file" 2>/dev/null)"
+  manifest_path="$(jq -r '.snapshot_manifest_path // empty' "$lease_file" 2>/dev/null)"
+  [ -n "$manifest_path" ] && _snapshot_capture after "$owner" "$dispatch_id" "$manifest_path"
+  rm -f "$lease_file"
+  record_event WRITE_LEASE_RELEASED lease_owner="$owner" dispatch_id="$dispatch_id" \
+    reason="write lease released"
+}
+
+# Captures a before/after JSON snapshot manifest at $4 (spec S11.2): HEAD,
+# the full `git status --porcelain=v1 -z` tree state, hashes/blob IDs and a
+# copy of every existing declared artifact, process identity, the active
+# allow-list, known foreign changes, and the capture timestamp. "before" and
+# "after" share ONE manifest file (a top-level key each), so a later
+# authorized scoped-recovery read (spec S11.2/S11.3) sees both sides
+# together. Diagnostic and scoped-recovery input ONLY -- this document never
+# reads its own output back to perform an automatic rollback.
+#
+# Code review fix #3/#4 (Task 9 seam, noted explicitly rather than silently
+# incomplete): the per-artifact hash/copy branch below IS fully implemented
+# and unit-tested (tests/check_06_cookbook.sh, a real declared path), but is
+# UNREACHABLE in production today -- every live caller (dispatch_parallel's
+# lease-phase call to acquire_write_lease) declares only "." (the whole
+# repo), because no per-role narrower-path registry column exists yet (the
+# same gap `_write_lease_path_ok`'s containment check names below). HEAD
+# plus the porcelain status line still cover a "." declaration's integrity
+# need; the per-file branch activates automatically once a future task
+# starts declaring real per-role paths -- nothing here needs to change for
+# that. `declared_foreign_paths`/`declared_foreign_commits` in the write-
+# lease JSON (acquire_write_lease, above) are likewise always `[]`: nothing
+# in this document's fixed interfaces gives a caller a way to populate them,
+# so they are left as an honest empty default rather than a guessed value.
+_snapshot_capture() {
+  # Usage: _snapshot_capture before|after OWNER DISPATCH_ID MANIFEST_PATH [DECLARED_PATH...]
+  local stage="$1" owner="$2" dispatch_id="$3" manifest="$4"; shift 4
+  local -a declared=("$@")
+  mkdir -p "$(dirname "$manifest")" 2>/dev/null
+  local head status_z artifacts_json="[]" p h copies_dir
+  head="$(git -C "${REPO_ROOT:-}" rev-parse HEAD 2>/dev/null || echo none)"
+  status_z="$(git -C "${REPO_ROOT:-}" status --porcelain=v1 -z 2>/dev/null | tr '\0' '\n')"
+  copies_dir="$(dirname "$manifest")/$stage"
+  for p in "${declared[@]}"; do
+    [ "$p" = "." ] && continue
+    [ -f "${REPO_ROOT:-}/$p" ] || continue
+    h="$(git -C "${REPO_ROOT:-}" hash-object -- "$p" 2>/dev/null)"
+    [ -n "$h" ] || h="$(sha256sum "${REPO_ROOT:-}/$p" 2>/dev/null | cut -d' ' -f1)"
+    mkdir -p "$copies_dir/$(dirname "$p")" 2>/dev/null
+    cp -p "${REPO_ROOT:-}/$p" "$copies_dir/$p" 2>/dev/null || true
+    artifacts_json="$(printf '%s' "$artifacts_json" \
+      | jq --arg p "$p" --arg h "${h:-}" '. + [{"path":$p,"blob":$h}]' 2>/dev/null)"
+    [ -n "$artifacts_json" ] || artifacts_json="[]"
+  done
+  # The SAME fixed allow-list _mutation_dirty (above) already scans against
+  # -- reused, not re-invented, and recorded here so the manifest is
+  # self-describing about which changes are bookkeeping, never content.
+  local ff_rel orch_rel allow_list_json
+  ff_rel="${FEATURE_FOLDER#"${REPO_ROOT:-}"/}"
+  orch_rel="${ORCHESTRATION_DIR#"${REPO_ROOT:-}"/}"
+  allow_list_json="$(jq -n --arg a "$ff_rel/RUN_LOG.md" --arg b "$ff_rel/full_log.md" \
+    --arg c "$orch_rel" --arg d "$ff_rel/transcripts" \
+    '[$a, $b, $c, $d]')"
+  # "Known foreign changes" (spec S11.2): whatever was ALREADY dirty before
+  # this attempt acquired its lease is, by definition, not this attempt's
+  # own doing -- the prior "before" stage's own status line IS that record;
+  # only the "after" stage carries it; "before" has no earlier stage to cite.
+  local foreign_json='null'
+  local prior="{}"
+  if [ "$stage" = after ] && [ -f "$manifest" ]; then
+    prior="$(cat "$manifest" 2>/dev/null)"
+    [ -n "$prior" ] || prior="{}"
+    foreign_json="$(printf '%s' "$prior" | jq '.before.status // null')"
+  fi
+  jq -n \
+    --arg stage "$stage" --arg owner "$owner" --arg dispatch_id "${dispatch_id:-}" \
+    --arg head "$head" --arg status "$status_z" --argjson artifacts "$artifacts_json" \
+    --arg process_git_head "${PROCESS_GIT_HEAD:-}" --arg process_file_sha256 "${PROCESS_FILE_SHA256:-}" \
+    --arg process_dirty "${PROCESS_DIRTY:-}" --arg captured_at "$(iso_now)" --argjson prior "$prior" \
+    --argjson allow_list "$allow_list_json" --argjson foreign_changes "$foreign_json" \
+    '$prior + {($stage): {stage:$stage, owner:$owner, dispatch_id:$dispatch_id, head:$head,
+      status:$status, artifacts:$artifacts, process_git_head:$process_git_head,
+      process_file_sha256:$process_file_sha256, process_dirty:$process_dirty,
+      allow_list:$allow_list, foreign_changes:$foreign_changes,
+      captured_at:$captured_at}}' > "$manifest.tmp.$$" 2>/dev/null \
+    && mv "$manifest.tmp.$$" "$manifest" \
+    || rm -f "$manifest.tmp.$$"
+}
+```
+
+**Mutation-state authority enforcement (spec §11.1's "unexpected changes yield
+ARTIFACT_INTEGRITY_BLOCKED").** `inspect_mutation_state` (above) already
+classifies every attempt's tree comparison; `_dispatch_launch_attempt` now
+additionally emits `ARTIFACT_INTEGRITY_BLOCKED` the moment that classifier
+reports `INTEGRITY_UNKNOWN` — whether because a read-only role's contract was
+violated (it left evidence of a change while holding no lease at all) or
+because a mutating attempt's own pre/post comparison became impossible. A
+read-only role's own attempt therefore always resolves to exactly one of
+`NO_SIDE_EFFECTS` or this durable process-defect signal — never silently
+absorbed. Snapshots recorded above are diagnostic and scoped-recovery inputs
+only: nothing in this document reads `_snapshot_capture`'s own output back to
+perform a rollback; RM08's `HALT_EXACT_STATE` (Recovery Matrix, above)
+remains the only response to a genuinely dirty-and-uncheckpointed or
+integrity-unknown tree.
+
 ### Turn-start reconciliation (spec §13.3)
 
 At the beginning of every orchestrator turn, before narrating what happens
@@ -3740,21 +4363,18 @@ dispatch_is_running() {
 
 # A user-facing "role X is running" claim is only ever correct when
 # dispatch_is_running agrees. When it does not, this appends a durable
-# correction (the full typed proposition ledger is Task 8/15's job; this is
-# the minimal durable evidence Task 6 owes) and returns non-zero so the
-# caller corrects its own narration instead of repeating the false claim.
+# correction via record_event (the full typed proposition ledger remains a
+# later task's job; this is the minimal durable evidence this document owes)
+# and returns non-zero so the caller corrects its own narration instead of
+# repeating the false claim.
 assert_dispatch_running_claim() {
   # Usage: assert_dispatch_running_claim <dispatch_id> <narrated-claim>
   local id="$1" claim="$2"
   if dispatch_is_running "$id"; then
     return 0
   fi
-  {
-    printf -- '--- %s  event=PROCESS_DEVIATION\n' "$(iso_now)"
-    printf 'dispatch_id:              %s\n' "$id"
-    printf 'reason:                   %s\n' "narrated as running with no matching DISPATCH_STARTED: $claim"
-    printf '\n'
-  } >> "$FEATURE_FOLDER/RUN_LOG.md"
+  record_event PROCESS_DEVIATION dispatch_id="$id" \
+    reason="narrated as running with no matching DISPATCH_STARTED: $claim"
   return 1
 }
 ```
@@ -4342,16 +4962,46 @@ RUN_LOG event), never assumed to still be sitting in a shell variable.
 # Reconstruct the context7 policy from durable state. Called at the top of
 # EVERY phase block and on resume -- never assigned once and relied upon later,
 # because shell variables do not survive a phase boundary.
+#
+# Full spec S15.5 precedence, latest-event-wins (Task 8): the LATEST valid
+# CONTEXT7_UNAVAILABLE/CONTEXT7_RESTORED event in RUN_LOG.md always overrides
+# a Phase 1 STATUS reading that came before it -- a Phase-1-reachable probe
+# does NOT stay "required" forever if a later phase records the server going
+# unavailable. CONTEXT7_RESTORED only overrides back to "required" when its
+# own `probe:` field cites a successful deterministic probe; any other value
+# (or a missing probe field) is a restoration claim without evidence, so it
+# stays best-effort. Only with NO such event anywhere does this fall back to
+# Phase 1's own STATUS reading -- previously the ONLY signal this function
+# consulted, which meant a later CONTEXT7_UNAVAILABLE could never downgrade
+# an already-reachable Phase 1 reading.
 context7_policy() {
+  local log="$FEATURE_FOLDER/RUN_LOG.md" tag="" last="" probe="" line
+  if [ -f "$log" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        "--- "*"  event=CONTEXT7_UNAVAILABLE") tag=CONTEXT7_UNAVAILABLE; probe="" ;;
+        "--- "*"  event=CONTEXT7_RESTORED")    tag=CONTEXT7_RESTORED; probe="" ;;
+        "--- "*)                               tag="" ;;
+        "probe:"*)
+          [ "$tag" = CONTEXT7_RESTORED ] && probe="$(printf '%s' "${line#probe:}" \
+            | tr -d '[:space:]')" ;;
+      esac
+      case "$tag" in CONTEXT7_UNAVAILABLE|CONTEXT7_RESTORED) last="$tag" ;; esac
+    done < "$log"
+  fi
+  case "$last" in
+    CONTEXT7_UNAVAILABLE)
+      printf 'best-effort\n'; return 0 ;;
+    CONTEXT7_RESTORED)
+      if [ "$probe" = success ]; then
+        printf 'required\n'; return 0
+      fi
+      printf 'best-effort\n'; return 0
+      ;;
+  esac
   local st="$FEATURE_FOLDER/1-preflight/phase-1/claude-check-status.md"
   if [ -f "$st" ] && [ "$(status_field "$st" context7)" = reachable ]; then
     printf 'required\n'; return 0
-  fi
-  # Fall back to RUN_LOG: the STATUS file may have been relocated or the probe
-  # may have failed before writing one, and the event is the durable record.
-  if [ -f "$FEATURE_FOLDER/RUN_LOG.md" ] \
-     && "$GREP_BIN" -q 'event=CONTEXT7_UNAVAILABLE' "$FEATURE_FOLDER/RUN_LOG.md"; then
-    printf 'best-effort\n'; return 0
   fi
   # No evidence either way: refuse to guess. Guessing `required` would make
   # every dispatch fail; guessing `best-effort` would silently weaken the run.
@@ -5199,10 +5849,16 @@ Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 10 fix→re-revie
 `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE`, `MODEL_REJECTED`,
 `ATTEMPT_ALLOCATED`, `DISPATCH_STARTED`, `DISPATCH_COMPLETED`,
 `DISPATCH_NOT_LAUNCHED`, `ATTEMPT_FAILED`, `DISPATCH_ORPHANED`,
-`CONTEXT7_UNAVAILABLE`, `PROCESS_DEVIATION`, `ORCHESTRATION_CORRECTION`,
-`RECOVERY_CAP_REACHED`, `VENDOR_UNAVAILABLE` (plus the reserved
-`CODEX_RE_ENABLED_BY_USER`). An event entry NEVER substitutes for the
-`DISPATCH_COMPLETED` entry of an attempt that actually ran.
+`CONTEXT7_UNAVAILABLE`, `CONTEXT7_RESTORED`, `PROCESS_DEVIATION`,
+`ORCHESTRATION_CORRECTION`, `RECOVERY_CAP_REACHED`, `RECOVERY_AUTHORIZED`,
+`VENDOR_UNAVAILABLE`, `WRITE_LEASE_ACQUIRED`, `WRITE_LEASE_RELEASED`,
+`ARTIFACT_INTEGRITY_BLOCKED`, `GIT_FINALIZATION_RESULT`, `OWNER_DECISION`,
+`RISK_ACCEPTED`, `PHASE_ACCEPTED`, `EVENT_CORRECTED`,
+`DEGRADED_REVIEW_ACCEPTED` (plus the reserved `CODEX_RE_ENABLED_BY_USER`).
+Every type in this list beyond the legacy pre-schema-v2 names above has a row
+in the Event Contract Registry (below), which `record_event` validates
+against. An event entry NEVER substitutes for the `DISPATCH_COMPLETED` entry
+of an attempt that actually ran.
 
 **Dispatch entries.** `DISPATCH_STARTED` is written FIRST, by the process
 actually about to invoke the vendor (see "Unified attempt dispatch" above),
@@ -5213,12 +5869,17 @@ timestamp:
 
 ```
 --- 2026-05-28T17:48:44Z  event=DISPATCH_STARTED
+event_id:                 41
+process_schema_version:   2
 phase:                    3
-phase_name:               spec-review
 iteration:                01
+dispatch_id:              p03-i01-spec-reviewer-claude-a01
+caused_by_event_id:
+authority:                process
+reason:                   vendor invocation starting
+phase_name:               spec-review
 role:                     spec-reviewer-claude
 vendor:                   claude
-dispatch_id:              p03-i01-spec-reviewer-claude-a01
 logical_dispatch_id:      p03-i01-spec-reviewer-claude
 model:                    claude-opus-5
 status_path:              3-spec-review/01/attempts/p03-i01-spec-reviewer-claude-a01/STATUS.md
@@ -5227,13 +5888,18 @@ lease:                    none
 snapshot:                 none
 
 --- 2026-05-28T17:52:45Z  event=DISPATCH_COMPLETED
+event_id:                 42
+process_schema_version:   2
 phase:                    3
-phase_name:               spec-review
 iteration:                01
+dispatch_id:              p03-i01-spec-reviewer-claude-a01
+caused_by_event_id:
+authority:                process
+reason:                   attempt classified: COMPLETED
+phase_name:               spec-review
 role:                     spec-reviewer-claude
 vendor:                   claude
 appendix:                 spec-reviewer-claude
-dispatch_id:              p03-i01-spec-reviewer-claude-a01
 logical_dispatch_id:      p03-i01-spec-reviewer-claude
 develop_it_git_sha:       fd705aef83efe207cf12f668980544576b8849bc
 develop_it_file_sha256:   8c2f6bf5e9d3a4b1f5c7d8e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9
@@ -5259,14 +5925,20 @@ cost_usd:                 0.4823
 usage_status:             ok
 ```
 
-`lease` names the write-lease reference the attempt held while running
-(`none` for a non-mutating role); `snapshot` is a Task 8 seam — real
-before/after mutation snapshots (write-lease protocol Step 6) do not exist
-yet, so it is always `none` until that task lands. `mutation_state` and
-`checkpoint_kind` are likewise provisional/registry-derived placeholders
-pending Task 8's real snapshot classification (`NO_SIDE_EFFECTS`/`UNKNOWN`
-only — never `CLEAN_CHECKPOINTED`/`DIRTY_CHECKPOINTED`/etc., which require
-the real snapshot machinery).
+Every block, of every type, now carries the common envelope (spec S15.1):
+`event_id` (monotonic, assigned by `record_event`), `process_schema_version`,
+`phase`, `iteration`, `dispatch_id`, `caused_by_event_id` (blank unless a
+later correction cites the event it corrects), `authority`, and `reason`
+(always non-empty) — see "RUN_LOG events, decisions, write leases, and
+snapshots" below for the full contract and the canonical writer. `lease`
+names the write-lease reference the attempt held while running (`none` for a
+non-mutating role); `snapshot` names the real snapshot manifest path a
+mutating attempt's lease captured (`none` for a non-mutating role, which
+never acquires a lease and so never gets one). `mutation_state` and
+`checkpoint_kind` take the full real classification (`NO_SIDE_EFFECTS`,
+`CLEAN_CHECKPOINTED`, `DIRTY_CHECKPOINTED`, `DIRTY_UNCHECKPOINTED`, or
+`INTEGRITY_UNKNOWN` — the last of which also durably emits
+`ARTIFACT_INTEGRITY_BLOCKED`).
 
 A failed launched attempt additionally gets exactly one `event=ATTEMPT_FAILED`
 block, immediately after its `DISPATCH_COMPLETED`, naming the same

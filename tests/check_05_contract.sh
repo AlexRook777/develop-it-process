@@ -48,6 +48,30 @@ assert_present 'kill-after=60s' "$D" "T19: uniform kill-after grace"
 assert_absent 'timeout [0-9]+m ' "$D" "T19: no literal minute values in invocations"
 assert_present 'DISPATCH_STARTED' "$D" "T18: resumable dispatch event"
 
+# --- Task 8: durable events and write leases ---
+assert_present '^#### Event Contract Registry' "$D" "T8: Event Contract Registry heading present"
+assert_present '^record_event\(\) \{' "$D" "T8: record_event is a real cookbook function"
+assert_present '^event_required_fields\(\) \{' "$D" "T8: event_required_fields is a real cookbook function"
+assert_present '^acquire_write_lease\(\) \{' "$D" "T8: acquire_write_lease is a real cookbook function"
+assert_present '^release_write_lease\(\) \{' "$D" "T8: release_write_lease is a real cookbook function"
+assert_present 'GIT_FINALIZATION_RESULT' "$D" "T8: GIT_FINALIZATION_RESULT is a registered event type"
+# Code review fix (gap b): every legacy pre-schema-v2 tag the "ONLY legal
+# event= tags" list normatively requires must also have an Event Contract
+# Registry row, or record_event (the SOLE canonical writer) could not
+# write an event the process itself mandates.
+for _legacy_evt in CODEX_UNAVAILABLE CLAUDE_FAILED IMPLEMENTATION_BASELINE \
+  IMPLEMENTATION_BASELINE_BLOCKED CODEX_DISABLED_BY_USER_CONSENT \
+  CODEX_SKIPPED_BY_USER_CONSENT MODEL_REJECTED DISPATCH_ORPHANED; do
+  assert_present "^\| ${_legacy_evt} \|" "$D" \
+    "T8: legacy event type $_legacy_evt has an Event Contract Registry row"
+done
+assert_present '"schema_version":2,"dispatch_id":null,"lease_owner":"orchestrator-finalization"' "$D" \
+  "T8: write-lease.json shape matches the spec's exact example"
+assert_absent '_dispatch_lease_try_acquire\(\)\s*\{|_dispatch_lease_release\(\)\s*\{|_dispatch_lease_state\(\)\s*\{' "$D" \
+  "T8: the provisional Task 6/7 lease functions are retired, not left dangling"
+assert_absent 'ORCHESTRATION_DIR/write-lease\.d' "$D" "T8: no lingering directory-based lease path"
+assert_present 'ORCHESTRATION_DIR/write-lease\.json' "$D" "T8: the real JSON lease path is used"
+
 # --- Task 20: renames ---
 assert_absent 'claude-opus-verdict\.md|claude-opus-findings\.md' "$D" \
   "T20: model-free artifact filenames"
