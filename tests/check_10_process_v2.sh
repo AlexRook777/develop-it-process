@@ -752,4 +752,189 @@ case "$CHECKPOINT_BAD_REASON" in
   *) _fail "T9 unreachable commit: bad reason wrong: [$CHECKPOINT_BAD_REASON]" ;;
 esac
 
+# =============================================================================
+# Task 10: preflight_zero_token_gates -- the five zero-token gates (spec
+# S16.1) must run in order, each writing its own success event, and NO paid
+# probe or vendor dispatch may reach the fake CLI until all five succeed.
+# Each sub-case below injects a failure at one gate and proves the run never
+# got far enough to spend a token: FAKE_ARGV_LOG carries no `--model`/`-m`
+# invocation (the load-bearing assertion -- a real dispatch or model-ID probe
+# ALWAYS binds a model explicitly; canary_preflight's own `--help` syntax
+# pings never do, so they alone appearing is still "zero tokens spent", per
+# the gate order's own "zero-token" label -- see the cookbook section
+# "Preflight zero-token gate sequence").
+#
+# Gate 4 (process identity + gitignore) never halts by design -- identity was
+# already validated at gate 1, and the gitignore check is advisory-only (same
+# "never halt" rule the pre-existing Phase 1 prose already gave it) -- so
+# there is no failure injection for gate 4 here; its SUCCESS is proven by the
+# full-success case below recording its event.
+# =============================================================================
+T10_WORK="$BUILD/t10-gates"; rm -rf "$T10_WORK"; mkdir -p "$T10_WORK"
+T10_BIN_FULL="$T10_WORK/bin-full"
+build_minimal_path "$T10_BIN_FULL"
+
+_t10_new_repo() {
+  local repo="$1"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  ( cd "$repo" && : > seed && git add seed \
+    && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+  mkdir -p "$repo/docs/superpowers/specs"
+  ( cd "$repo" && : > docs/superpowers/specs/.gitkeep \
+    && git add docs/superpowers/specs/.gitkeep \
+    && git -c user.email=t@t -c user.name=t commit -qm seed-docs ) >/dev/null
+}
+
+# A dispatch-style invocation ALWAYS binds a model explicitly (`--model X` for
+# claude, `-m X` for codex -- see "Both vendors are bound explicitly").
+# canary_preflight's own `--help` pings never carry either flag.
+_t10_dispatch_calls() { "$GREP_BIN" -cE -- '--model |(^| )-m ' "$1" 2>/dev/null || true; }
+
+# ---- Gate 1 failure: invalid paths (REPO_ROOT does not exist) -------------
+T10_REPO1="$T10_WORK/g1-repo"; _t10_new_repo "$T10_REPO1"
+T10_ARGV1="$T10_WORK/g1-argv.log"; : > "$T10_ARGV1"
+g1_rc=0
+(
+  unset ORCHESTRATION_DIR RUNTIME_DIR   # a genuinely bare Phase -1 first shell -- init_v2_fixture above exports both from an unrelated folder
+  PATH="$T10_BIN_FULL"; FAKE_ARGV_LOG="$T10_ARGV1"
+  export PATH FAKE_ARGV_LOG
+  PROCESS_PATH="$PROCESS_DOC"
+  REPO_ROOT="$T10_WORK/does-not-exist"
+  FEATURE_FOLDER="$T10_REPO1/docs/superpowers/specs/g1-artifacts"
+  preflight_zero_token_gates
+) >"$T10_WORK/g1.out" 2>"$T10_WORK/g1.err" || g1_rc=$?
+assert_rc 1 "$g1_rc" "gate1 failure (bad REPO_ROOT): preflight_zero_token_gates fails"
+assert_line_count 0 "$T10_ARGV1" "gate1 failure: FAKE_ARGV_LOG is completely empty (gate 2 never ran)"
+# Code review round 2 fix (finding 5): a bad-paths gate-1 failure IS one of
+# the uniform-rule HALT gates (distinct from validate_existing_run_log's own
+# zero-write exception) -- _preflight_halt creates the folder and durably
+# records event=HALT.
+assert_present 'event=HALT' "$T10_REPO1/docs/superpowers/specs/g1-artifacts/RUN_LOG.md" \
+  "gate1 failure: a bad-paths failure durably records event=HALT (the uniform rule, not the existing-run-log exception)"
+assert_eq 0 "$("$GREP_BIN" -c 'event=PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE' "$T10_REPO1/docs/superpowers/specs/g1-artifacts/RUN_LOG.md" || true)" \
+  "gate1 failure: gate 1's own SUCCESS event is NOT durable"
+
+# ---- Gate 2 failure: a hard-required binary (jq) is missing ---------------
+T10_REPO2="$T10_WORK/g2-repo"; _t10_new_repo "$T10_REPO2"
+T10_BIN_NOJQ="$T10_WORK/bin-no-jq"; build_minimal_path "$T10_BIN_NOJQ" jq
+T10_ARGV2="$T10_WORK/g2-argv.log"; : > "$T10_ARGV2"
+g2_rc=0
+(
+  unset ORCHESTRATION_DIR RUNTIME_DIR
+  PATH="$T10_BIN_NOJQ"; FAKE_ARGV_LOG="$T10_ARGV2"
+  export PATH FAKE_ARGV_LOG
+  PROCESS_PATH="$PROCESS_DOC"
+  REPO_ROOT="$T10_REPO2"
+  FEATURE_FOLDER="$T10_REPO2/docs/superpowers/specs/g2-artifacts"
+  preflight_zero_token_gates
+) >"$T10_WORK/g2.out" 2>"$T10_WORK/g2.err" || g2_rc=$?
+assert_rc 1 "$g2_rc" "gate2 failure (missing jq): preflight_zero_token_gates fails"
+assert_line_count 0 "$T10_ARGV2" \
+  "gate2 failure: FAKE_ARGV_LOG is completely empty (canary_preflight's own binary check fails before any exec)"
+T10_LOG2="$T10_REPO2/docs/superpowers/specs/g2-artifacts/RUN_LOG.md"
+assert_present 'event=PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE' "$T10_LOG2" \
+  "gate2 failure: gate 1's success event IS durable"
+assert_eq 0 "$("$GREP_BIN" -c 'event=LOCAL_CLI_CANARIES_PASSED' "$T10_LOG2" || true)" \
+  "gate2 failure: gate 2's own success event is NOT durable"
+assert_present 'event=HALT' "$T10_LOG2" \
+  "gate2 failure: durably records event=HALT (not just an unenforced stderr message)"
+
+# ---- Gate 3 failure: target dirty tree ------------------------------------
+T10_REPO3="$T10_WORK/g3-repo"; _t10_new_repo "$T10_REPO3"
+( cd "$T10_REPO3" && printf 'dirty\n' >> seed )
+T10_ARGV3="$T10_WORK/g3-argv.log"; : > "$T10_ARGV3"
+g3_rc=0
+(
+  unset ORCHESTRATION_DIR RUNTIME_DIR
+  PATH="$T10_BIN_FULL"; FAKE_ARGV_LOG="$T10_ARGV3"
+  export PATH FAKE_ARGV_LOG
+  PROCESS_PATH="$PROCESS_DOC"
+  REPO_ROOT="$T10_REPO3"
+  FEATURE_FOLDER="$T10_REPO3/docs/superpowers/specs/g3-artifacts"
+  preflight_zero_token_gates
+) >"$T10_WORK/g3.out" 2>"$T10_WORK/g3.err" || g3_rc=$?
+assert_rc 1 "$g3_rc" "gate3 failure (dirty tree): preflight_zero_token_gates fails"
+assert_eq 0 "$(_t10_dispatch_calls "$T10_ARGV3")" \
+  "gate3 failure: zero MODEL-BOUND invocations reached the fake CLI (only canary's own --help pings may appear)"
+T10_LOG3="$T10_REPO3/docs/superpowers/specs/g3-artifacts/RUN_LOG.md"
+assert_present 'event=LOCAL_CLI_CANARIES_PASSED' "$T10_LOG3" "gate3 failure: gate 2's success event IS durable"
+assert_eq 0 "$("$GREP_BIN" -c 'event=TARGET_DIRTY_TREE_GATE_PASSED' "$T10_LOG3" || true)" \
+  "gate3 failure: gate 3's own success event is NOT durable"
+assert_present 'event=HALT' "$T10_LOG3" \
+  "gate3 failure: durably records event=HALT (not just an unenforced stderr message)"
+
+# ---- Gate 5 failure: runtime bootstrap (missing extractor) ----------------
+T10_REPO5="$T10_WORK/g5-repo"; _t10_new_repo "$T10_REPO5"
+T10_ARGV5="$T10_WORK/g5-argv.log"; : > "$T10_ARGV5"
+g5_rc=0
+(
+  unset ORCHESTRATION_DIR RUNTIME_DIR
+  PATH="$T10_BIN_FULL"; FAKE_ARGV_LOG="$T10_ARGV5"
+  export PATH FAKE_ARGV_LOG
+  PROCESS_PATH="$PROCESS_DOC"
+  REPO_ROOT="$T10_REPO5"
+  FEATURE_FOLDER="$T10_REPO5/docs/superpowers/specs/g5-artifacts"
+  PROCESS_REPO_ROOT="$T10_WORK/g5-fake-process-repo"   # no tests/lib/extract.py at all
+  mkdir -p "$PROCESS_REPO_ROOT"
+  git -C "$PROCESS_REPO_ROOT" init -q
+  ( cd "$PROCESS_REPO_ROOT" && : > f && git add f \
+    && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+  # PROCESS_PATH must live inside THIS fake PROCESS_REPO_ROOT for gate 1 to
+  # resolve it there instead of the real process repo.
+  mkdir -p "$PROCESS_REPO_ROOT/docs"
+  cp "$PROCESS_DOC" "$PROCESS_REPO_ROOT/docs/develop-it-prompt.md"
+  ( cd "$PROCESS_REPO_ROOT" && git add docs/develop-it-prompt.md \
+    && git -c user.email=t@t -c user.name=t commit -qm seed-doc ) >/dev/null
+  PROCESS_PATH="$PROCESS_REPO_ROOT/docs/develop-it-prompt.md"
+  preflight_zero_token_gates
+) >"$T10_WORK/g5.out" 2>"$T10_WORK/g5.err" || g5_rc=$?
+assert_rc 1 "$g5_rc" "gate5 failure (no extractor in PROCESS_REPO_ROOT): preflight_zero_token_gates fails"
+assert_eq 0 "$(_t10_dispatch_calls "$T10_ARGV5")" \
+  "gate5 failure: zero MODEL-BOUND invocations reached the fake CLI"
+T10_LOG5="$T10_REPO5/docs/superpowers/specs/g5-artifacts/RUN_LOG.md"
+assert_present 'event=PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED' "$T10_LOG5" \
+  "gate5 failure: gate 4's success event IS durable"
+assert_eq 0 "$("$GREP_BIN" -c 'event=RUNTIME_AND_REGISTRIES_VERIFIED' "$T10_LOG5" || true)" \
+  "gate5 failure: gate 5's own success event is NOT durable"
+assert_present 'event=HALT' "$T10_LOG5" \
+  "gate5 failure: durably records event=HALT (not just an unenforced stderr message)"
+assert_present 'reason:.*BOOTSTRAP_IO_ERROR' "$T10_LOG5" \
+  "gate5 failure: the HALT reason carries bootstrap_runtime's own failure token, not a generic message"
+
+# ---- Full success: all five gates pass, in order --------------------------
+T10_REPOS="$T10_WORK/success-repo"; _t10_new_repo "$T10_REPOS"
+T10_ARGVS="$T10_WORK/success-argv.log"; : > "$T10_ARGVS"
+gs_rc=0; gs_out=""
+# Code review round 2 fix (finding 2): print $RUNTIME_DIR from INSIDE the
+# subshell, right after the gates run -- if bootstrap_runtime were still
+# called inside its own `$(...)` (or any leaked/stale RUNTIME_DIR from
+# init_v2_fixture's earlier, unrelated fixture folder survived), the
+# `source "$RUNTIME_DIR/..."` line would use the WRONG path silently.
+gs_out="$(
+  unset ORCHESTRATION_DIR RUNTIME_DIR
+  PATH="$T10_BIN_FULL"; FAKE_ARGV_LOG="$T10_ARGVS"
+  export PATH FAKE_ARGV_LOG
+  PROCESS_PATH="$PROCESS_DOC"
+  REPO_ROOT="$T10_REPOS"
+  FEATURE_FOLDER="$T10_REPOS/docs/superpowers/specs/success-artifacts"
+  preflight_zero_token_gates
+  printf 'RUNTIME_DIR_SEEN=%s\n' "$RUNTIME_DIR"
+)" || gs_rc=$?
+assert_rc 0 "$gs_rc" "all five gates pass: preflight_zero_token_gates succeeds"
+case "$gs_out" in
+  GATES_PASSED*) _ok "all five gates pass: prints the GATES_PASSED marker" ;;
+  *) _fail "all five gates pass: unexpected output [$gs_out]" ;;
+esac
+gs_runtime_dir_seen="$(printf '%s\n' "$gs_out" | "$GREP_BIN" -oE 'RUNTIME_DIR_SEEN=.*' | cut -d= -f2- || true)"
+assert_eq "$T10_REPOS/docs/superpowers/specs/success-artifacts/.orchestration/runtime" \
+  "$gs_runtime_dir_seen" \
+  "gate5 success: RUNTIME_DIR points at THIS run's own folder, never a stale/inherited one from an unrelated fixture"
+T10_LOGS="$T10_REPOS/docs/superpowers/specs/success-artifacts/RUN_LOG.md"
+gate_order="$("$GREP_BIN" -oE 'event=(PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE|LOCAL_CLI_CANARIES_PASSED|TARGET_DIRTY_TREE_GATE_PASSED|PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED|RUNTIME_AND_REGISTRIES_VERIFIED)' "$T10_LOGS" | tr '\n' ' ')"
+assert_eq "event=PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE event=LOCAL_CLI_CANARIES_PASSED event=TARGET_DIRTY_TREE_GATE_PASSED event=PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED event=RUNTIME_AND_REGISTRIES_VERIFIED " \
+  "$gate_order" "all five gate-success events are durable, in the exact prescribed order"
+assert_eq 0 "$(_t10_dispatch_calls "$T10_ARGVS")" \
+  "all five gates pass: still zero MODEL-BOUND invocations -- preflight_zero_token_gates itself never dispatches probe_models or a skill probe (that is Phase -1's own subsequent step)"
+
 finish

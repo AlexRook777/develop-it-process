@@ -16,6 +16,43 @@ init_v2_fixture() {
   : > "$RUN_LOG"
 }
 
+# ---- build_minimal_path (Task 10) -------------------------------------------
+# Builds a scratch bin directory that mirrors every REAL binary already on
+# the CALLER's current PATH (so it must run BEFORE PATH is overridden) --
+# not just canary_preflight's own hard-required list, since the cookbook's
+# OTHER helpers (record_event, dirty_tree_check, bootstrap_runtime, ...) rely
+# on ordinary coreutils (`dirname`, `basename`, `ln`, `mktemp`, ...) that list
+# never names -- while symlinking `claude`/`codex` to the fakebin stubs
+# instead of the real binaries so a real launch is observable. Any tool named
+# in EXCLUDE is left out entirely -- `command -v` for that name then finds
+# nothing anywhere, simulating a genuinely missing binary (Step 1's gate-2
+# failure injection) WITHOUT ever invoking the fake CLI, which a "claude
+# --help fails" injection could not guarantee (the --help call itself would
+# already be one invocation).
+#
+# Usage: build_minimal_path DEST_DIR [EXCLUDE...]
+build_minimal_path() {
+  local dest="$1"; shift
+  local exclude=" $* "
+  mkdir -p "$dest"
+  local dir tool
+  local -a _bmp_dirs
+  # shellcheck disable=SC2153  # PATH is the real, un-overridden caller PATH
+  IFS=: read -r -a _bmp_dirs <<< "$PATH"
+  for dir in "${_bmp_dirs[@]}"; do
+    [ -d "$dir" ] || continue
+    for tool in "$dir"/*; do
+      [ -f "$tool" ] && [ -x "$tool" ] || continue
+      tool="${tool##*/}"
+      [ -e "$dest/$tool" ] && continue   # first PATH hit wins, like real PATH resolution
+      case "$exclude" in *" $tool "*) continue ;; esac
+      ln -sf "$(command -v "$tool")" "$dest/$tool" 2>/dev/null
+    done
+  done
+  case "$exclude" in *" claude "*) : ;; *) ln -sf "$_TESTS_DIR/fakebin/claude" "$dest/claude" ;; esac
+  case "$exclude" in *" codex "*) : ;; *) ln -sf "$_TESTS_DIR/fakebin/codex" "$dest/codex" ;; esac
+}
+
 # ---- run_fake_attempt (Task 5) ----------------------------------------------
 # A private role-contracts copy for run_fake_attempt's own two fixture roles
 # (preflight-claude / preflight-codex), with their timeout_minutes shrunk to a

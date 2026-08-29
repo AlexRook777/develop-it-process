@@ -54,6 +54,263 @@ else
   _fail "process_identity is not defined"
 fi
 
+# --- Task 10: process_identity's four typed develop_it_dirty states --------
+if declare -F process_identity >/dev/null; then
+  _t10_pi="$(mktemp -d)"
+  git -C "$_t10_pi" init -q
+  printf 'v1\n' > "$_t10_pi/f.txt"
+  ( cd "$_t10_pi" && git add f.txt \
+    && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+
+  # no: tracked, matches HEAD exactly.
+  PROCESS_PATH="$_t10_pi/f.txt" PROCESS_REPO_ROOT="$_t10_pi" PROCESS_PATH_REL="f.txt" process_identity
+  assert_eq no "$PROCESS_DIRTY" "T10 develop_it_dirty=no: tracked and matches HEAD"
+  assert_eq "" "$PROCESS_DIRTY_REASON" "T10 develop_it_dirty=no: no reason attached"
+
+  # yes: tracked, differs from HEAD.
+  printf 'v2\n' >> "$_t10_pi/f.txt"
+  PROCESS_PATH="$_t10_pi/f.txt" PROCESS_REPO_ROOT="$_t10_pi" PROCESS_PATH_REL="f.txt" process_identity
+  assert_eq yes "$PROCESS_DIRTY" "T10 develop_it_dirty=yes: tracked and differs from HEAD"
+  ( cd "$_t10_pi" && git checkout -q -- f.txt )
+
+  # untracked: never added to the index at all.
+  printf 'never added\n' > "$_t10_pi/untracked.txt"
+  PROCESS_PATH="$_t10_pi/untracked.txt" PROCESS_REPO_ROOT="$_t10_pi" PROCESS_PATH_REL="untracked.txt" process_identity
+  assert_eq untracked "$PROCESS_DIRTY" "T10 develop_it_dirty=untracked: never in the index"
+
+  # untracked (ignored-untracked counts the same, per spec S16.2 step 4).
+  printf 'ignored.txt\n' > "$_t10_pi/.gitignore"
+  printf 'ignored content\n' > "$_t10_pi/ignored.txt"
+  PROCESS_PATH="$_t10_pi/ignored.txt" PROCESS_REPO_ROOT="$_t10_pi" PROCESS_PATH_REL="ignored.txt" process_identity
+  assert_eq untracked "$PROCESS_DIRTY" "T10 develop_it_dirty=untracked: ignored-untracked is the SAME outcome as plain-untracked"
+
+  # unknown: non-git PROCESS_REPO_ROOT, with a reason attached.
+  _t10_nongit="$(mktemp -d)"
+  printf 'x\n' > "$_t10_nongit/f.txt"
+  PROCESS_PATH="$_t10_nongit/f.txt" PROCESS_REPO_ROOT="$_t10_nongit" PROCESS_PATH_REL="f.txt" process_identity
+  assert_eq unknown "$PROCESS_DIRTY" "T10 develop_it_dirty=unknown: non-git PROCESS_REPO_ROOT"
+  [ -n "$PROCESS_DIRTY_REASON" ] \
+    && _ok "T10 develop_it_dirty=unknown: a reason is always attached" \
+    || _fail "T10 develop_it_dirty=unknown: no reason attached"
+  rm -rf "$_t10_nongit"
+
+  # Code review round 2 fix: an UNBORN branch (a real git repo, zero commits)
+  # is a DIFFERENT non-git-HEAD case than a non-git directory -- git
+  # rev-parse HEAD there prints the literal word "HEAD" to stdout AND still
+  # exits non-zero, which "2>/dev/null || echo non-git" INSIDE the command
+  # substitution used to turn into the two-line garbage "HEAD" + "non-git"
+  # (never matching a plain "= non-git" test, so the unborn-branch case fell
+  # through to git ls-files and was misreported as untracked).
+  _t10_unborn="$(mktemp -d)"
+  git -C "$_t10_unborn" init -q
+  printf 'x\n' > "$_t10_unborn/f.txt"
+  PROCESS_PATH="$_t10_unborn/f.txt" PROCESS_REPO_ROOT="$_t10_unborn" PROCESS_PATH_REL="f.txt" process_identity
+  assert_eq unknown "$PROCESS_DIRTY" \
+    "T10 develop_it_dirty=unknown: an UNBORN branch (real git repo, zero commits) is unknown, not untracked"
+  assert_eq non-git "$PROCESS_GIT_HEAD" \
+    "T10 develop_it_dirty=unknown: PROCESS_GIT_HEAD is the clean sentinel, never git's own multi-line stdout garbage"
+  rm -rf "$_t10_unborn"
+
+  # PROCESS_FILE_SHA256 is computed independently of git in every state
+  # (spec S16.2 step 6) -- verify it against a plain sha256sum even for the
+  # non-git case above, and again here for the untracked case.
+  expected_sha="$(sha256sum "$_t10_pi/untracked.txt" | cut -d' ' -f1)"
+  PROCESS_PATH="$_t10_pi/untracked.txt" PROCESS_REPO_ROOT="$_t10_pi" PROCESS_PATH_REL="untracked.txt" process_identity
+  assert_eq "$expected_sha" "$PROCESS_FILE_SHA256" \
+    "T10 PROCESS_FILE_SHA256 matches a plain sha256sum regardless of develop_it_dirty state"
+
+  rm -rf "$_t10_pi"
+else
+  _fail "process_identity is not defined (Task 10 four-state coverage)"
+fi
+
+# --- Task 10: validate_existing_run_log's four states -----------------------
+if declare -F validate_existing_run_log >/dev/null; then
+  _t10_ff="$(mktemp -d)/artifacts"; mkdir -p "$_t10_ff"
+  FEATURE_FOLDER="$_t10_ff"
+
+  # absent: no file at all.
+  rc=0; out="$(validate_existing_run_log 2>"$BUILD/t10-velog-absent.err")" || rc=$?
+  assert_rc 0 "$rc" "T10 validate_existing_run_log: absent RUN_LOG.md succeeds"
+  assert_eq NEW_RUN_ELIGIBLE "$out" "T10 validate_existing_run_log: absent -> NEW_RUN_ELIGIBLE"
+  assert_eq "" "$(cat "$BUILD/t10-velog-absent.err")" "T10 absent: writes nothing to stderr either"
+
+  # malformed: has a real "event=" tag (so it is NOT the v1/garbage case
+  # below) but no entry declares process_schema_version: 2.
+  printf -- '--- 2020-01-01T00:00:00Z  event=DISPATCH_STARTED\nphase: 1\n\n' > "$_t10_ff/RUN_LOG.md"
+  _t10_malformed_size="$(wc -c < "$_t10_ff/RUN_LOG.md")"
+  rc=0; out="$(validate_existing_run_log 2>"$BUILD/t10-velog-malformed.err")" || rc=$?
+  assert_rc 1 "$rc" "T10 validate_existing_run_log: malformed RUN_LOG.md fails"
+  assert_contains "RUN_LOG_SCHEMA_MALFORMED" "$BUILD/t10-velog-malformed.err" \
+    "T10 malformed: names itself distinctly from the v1 case"
+  assert_contains "recorded process version" "$BUILD/t10-velog-malformed.err" \
+    "T10 malformed: instructs use of the recorded process version"
+  assert_eq "$_t10_malformed_size" "$(wc -c < "$_t10_ff/RUN_LOG.md")" \
+    "T10 malformed: RUN_LOG.md is byte-identical after the call -- zero bytes written"
+
+  # v1: legacy bare "--- <ts>  dispatch" blocks, no "event=" tag anywhere.
+  printf -- '--- 2020-01-01T00:00:00Z  dispatch\nphase: 1\n\n' > "$_t10_ff/RUN_LOG.md"
+  _t10_v1_size="$(wc -c < "$_t10_ff/RUN_LOG.md")"
+  rc=0; out="$(validate_existing_run_log 2>"$BUILD/t10-velog-v1.err")" || rc=$?
+  assert_rc 1 "$rc" "T10 validate_existing_run_log: v1 RUN_LOG.md fails"
+  assert_contains "RUN_LOG_SCHEMA_V1_OR_UNKNOWN" "$BUILD/t10-velog-v1.err" "T10 v1: names itself"
+  assert_contains "recorded process version" "$BUILD/t10-velog-v1.err" \
+    "T10 v1: instructs use of the recorded process version"
+  assert_eq "$_t10_v1_size" "$(wc -c < "$_t10_ff/RUN_LOG.md")" \
+    "T10 v1: RUN_LOG.md is byte-identical after the call -- zero bytes written"
+
+  # mismatched-identity: valid schema-v2 shape, but develop_it_git_sha names a
+  # commit that is NOT the current PROCESS_GIT_HEAD.
+  PROCESS_GIT_HEAD="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+  printf -- '--- 2020-01-01T00:00:00Z  event=PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE\nprocess_schema_version:   2\ndevelop_it_git_sha:       0000000000000000000000000000000000000000\n\n' \
+    > "$_t10_ff/RUN_LOG.md"
+  _t10_mismatch_size="$(wc -c < "$_t10_ff/RUN_LOG.md")"
+  rc=0; out="$(validate_existing_run_log 2>"$BUILD/t10-velog-mismatch.err")" || rc=$?
+  assert_rc 1 "$rc" "T10 validate_existing_run_log: mismatched-identity RUN_LOG.md fails"
+  assert_contains "RUN_LOG_IDENTITY_MISMATCH" "$BUILD/t10-velog-mismatch.err" "T10 mismatch: names itself"
+  assert_contains "recorded process version" "$BUILD/t10-velog-mismatch.err" \
+    "T10 mismatch: instructs use of the recorded process version"
+  assert_eq "$_t10_mismatch_size" "$(wc -c < "$_t10_ff/RUN_LOG.md")" \
+    "T10 mismatch: RUN_LOG.md is byte-identical after the call -- zero bytes written"
+
+  # A MATCHING identity is RESUME_ELIGIBLE, never a false HALT.
+  PROCESS_GIT_HEAD="0000000000000000000000000000000000000000"
+  rc=0; out="$(validate_existing_run_log 2>"$BUILD/t10-velog-match.err")" || rc=$?
+  assert_rc 0 "$rc" "T10 validate_existing_run_log: matching identity succeeds"
+  assert_eq RESUME_ELIGIBLE "$out" "T10 validate_existing_run_log: matching schema-v2 + identity -> RESUME_ELIGIBLE"
+
+  unset PROCESS_GIT_HEAD
+  rm -rf "$(dirname "$_t10_ff")"
+else
+  _fail "validate_existing_run_log is not defined"
+fi
+
+# --- Task 10: vendor_proven / vendor_proven_mark revocation rules -----------
+if declare -F vendor_proven >/dev/null && declare -F vendor_proven_mark >/dev/null; then
+  _t10_vp_ff="$(mktemp -d)/artifacts"; mkdir -p "$_t10_vp_ff"
+  FEATURE_FOLDER="$_t10_vp_ff"
+  ORCHESTRATION_DIR="$_t10_vp_ff/.orchestration"
+  mkdir -p "$ORCHESTRATION_DIR"
+  : > "$_t10_vp_ff/RUN_LOG.md"
+
+  assert_eq false "$(vendor_proven claude)" "T10 vendor_proven: false before any evidence exists"
+
+  vendor_proven_mark claude implementer >/dev/null
+  assert_eq true "$(vendor_proven claude)" \
+    "T10 vendor_proven: a substantive dispatch success marks the vendor proven"
+  assert_eq false "$(vendor_proven codex)" \
+    "T10 vendor_proven: marking one vendor never proves the OTHER"
+
+  # A cheap/publication failure classification for the SAME vendor must NOT
+  # revoke a prior proof (spec S16.3: "a later cheap probe/publication
+  # failure cannot revoke it").
+  record_event DISPATCH_COMPLETED phase=6 iteration=00 dispatch_id=p06-i00-x-a01 \
+    reason="attempt classified: PUBLICATION_LOST" phase_name=implementation role=implementer \
+    vendor=claude appendix=implementer logical_dispatch_id=p06-i00-x \
+    develop_it_git_sha=non-git develop_it_file_sha256=deadbeef develop_it_dirty=no \
+    status_path=/dev/null verdict="" classification=PUBLICATION_LOST exit_code=0 model=m \
+    start_ms=0 end_ms=0 duration_ms=0 stdout_path=/dev/null stderr_path=/dev/null \
+    mutation_state=NO_SIDE_EFFECTS checkpoint_kind=none tokens_input_new=0 \
+    tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 \
+    cost_usd=n/a usage_status=unavailable >/dev/null
+  assert_eq true "$(vendor_proven claude)" \
+    "T10 vendor_proven: a PUBLICATION_LOST classification does NOT revoke a prior proof"
+
+  # A PERMANENT_VENDOR_ERROR classification (auth/permission/invalid-model
+  # refusal) for the SAME vendor DOES revoke it.
+  record_event DISPATCH_COMPLETED phase=6 iteration=00 dispatch_id=p06-i00-x-a02 \
+    reason="attempt classified: PERMANENT_VENDOR_ERROR" phase_name=implementation role=implementer \
+    vendor=claude appendix=implementer logical_dispatch_id=p06-i00-x \
+    develop_it_git_sha=non-git develop_it_file_sha256=deadbeef develop_it_dirty=no \
+    status_path=/dev/null verdict="" classification=PERMANENT_VENDOR_ERROR exit_code=1 model=m \
+    start_ms=0 end_ms=0 duration_ms=0 stdout_path=/dev/null stderr_path=/dev/null \
+    mutation_state=NO_SIDE_EFFECTS checkpoint_kind=none tokens_input_new=0 \
+    tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 \
+    cost_usd=n/a usage_status=unavailable >/dev/null
+  assert_eq false "$(vendor_proven claude)" \
+    "T10 vendor_proven: a PERMANENT_VENDOR_ERROR classification DOES revoke a prior proof"
+
+  # Re-marking after revocation re-proves it.
+  vendor_proven_mark claude implementer >/dev/null
+  assert_eq true "$(vendor_proven claude)" \
+    "T10 vendor_proven: a fresh substantive success re-proves the vendor after revocation"
+
+  # event=MODEL_REJECTED for the SAME vendor also revokes.
+  record_event MODEL_REJECTED phase=1 iteration=00 phase_name=preflight role=implementer \
+    model=m vendor=claude reason="rejected" >/dev/null
+  assert_eq false "$(vendor_proven claude)" \
+    "T10 vendor_proven: a MODEL_REJECTED event for the same vendor revokes it"
+
+  # Code review round 2 fix: SPEND_CEILING (the other named revoking
+  # classification, spec S16.3) was implemented but never covered by a test.
+  vendor_proven_mark claude implementer >/dev/null
+  assert_eq true "$(vendor_proven claude)" \
+    "T10 vendor_proven: re-proven before the SPEND_CEILING case"
+  record_event DISPATCH_COMPLETED phase=6 iteration=00 dispatch_id=p06-i00-x-a03 \
+    reason="attempt classified: SPEND_CEILING" phase_name=implementation role=implementer \
+    vendor=claude appendix=implementer logical_dispatch_id=p06-i00-x \
+    develop_it_git_sha=non-git develop_it_file_sha256=deadbeef develop_it_dirty=no \
+    status_path=/dev/null verdict="" classification=SPEND_CEILING exit_code=1 model=m \
+    start_ms=0 end_ms=0 duration_ms=0 stdout_path=/dev/null stderr_path=/dev/null \
+    mutation_state=NO_SIDE_EFFECTS checkpoint_kind=none tokens_input_new=0 \
+    tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 \
+    cost_usd=n/a usage_status=unavailable >/dev/null
+  assert_eq false "$(vendor_proven claude)" \
+    "T10 vendor_proven: a SPEND_CEILING classification DOES revoke a prior proof"
+
+  rm -rf "$(dirname "$_t10_vp_ff")"
+else
+  _fail "vendor_proven / vendor_proven_mark are not both defined"
+fi
+
+# --- Task 10: applicable_optional_skills is the installed ∩ relevant set ----
+if declare -F applicable_optional_skills >/dev/null; then
+  assert_eq "b;c" "$(applicable_optional_skills "a;b;c" "b;c;d")" \
+    "T10 applicable_optional_skills: intersection, installed order preserved"
+  assert_eq "" "$(applicable_optional_skills "a;b" "c;d")" \
+    "T10 applicable_optional_skills: disjoint sets -> empty"
+  assert_eq "" "$(applicable_optional_skills "" "a;b")" \
+    "T10 applicable_optional_skills: nothing installed -> empty (optional absence never halts)"
+else
+  _fail "applicable_optional_skills is not defined"
+fi
+
+# --- Task 10: skills_reprobe_needed re-probes on any single trigger --------
+if declare -F skills_reprobe_needed >/dev/null; then
+  assert_eq false "$(skills_reprobe_needed no no no)" \
+    "T10 skills_reprobe_needed: no trigger -> no re-probe"
+  assert_eq true "$(skills_reprobe_needed yes no no)" \
+    "T10 skills_reprobe_needed: prior READY contradiction -> re-probe (the observed preflight-codex false negative)"
+  assert_eq true "$(skills_reprobe_needed no yes no)" \
+    "T10 skills_reprobe_needed: filesystem evidence of presence -> re-probe"
+  assert_eq true "$(skills_reprobe_needed no no yes)" \
+    "T10 skills_reprobe_needed: publication lost -> re-probe"
+else
+  _fail "skills_reprobe_needed is not defined"
+fi
+
+# --- Code review round 2 fix (finding 3): vendor_preflight_reprobe_once
+# makes vendor_proven a real behavioural input at Phases 3/5/7, not
+# write-only telemetry.
+if declare -F vendor_preflight_reprobe_once >/dev/null; then
+  _t10_vpr_ff="$(mktemp -d)/artifacts"; mkdir -p "$_t10_vpr_ff"
+  FEATURE_FOLDER="$_t10_vpr_ff"
+  ORCHESTRATION_DIR="$_t10_vpr_ff/.orchestration"
+  mkdir -p "$ORCHESTRATION_DIR"
+  : > "$_t10_vpr_ff/RUN_LOG.md"
+
+  assert_eq no "$(vendor_preflight_reprobe_once codex 0)"     "T10 vendor_preflight_reprobe_once: not proven -> no re-probe, accept the failure"
+
+  vendor_proven_mark codex spec-reviewer-codex >/dev/null
+  assert_eq yes "$(vendor_preflight_reprobe_once codex 0)"     "T10 vendor_preflight_reprobe_once: proven + Mode 0 (cheap probe shape) -> re-probe once"
+  assert_eq yes "$(vendor_preflight_reprobe_once codex 4)"     "T10 vendor_preflight_reprobe_once: proven + Mode 4 (malformed STATUS) -> re-probe once"
+  assert_eq no "$(vendor_preflight_reprobe_once codex 5)"     "T10 vendor_preflight_reprobe_once: proven + Mode 5 (quota/rate-limit signal) -> NEVER re-probe, accept as real"
+
+  rm -rf "$(dirname "$_t10_vpr_ff")"
+else
+  _fail "vendor_preflight_reprobe_once is not defined"
+fi
+
 # --- now_ms returns 13-digit epoch milliseconds (uutils date lacks %3N) ---
 if declare -F now_ms >/dev/null; then
   ms="$(now_ms)"
@@ -200,6 +457,7 @@ if declare -F render_prompt >/dev/null; then
   STATUS_PUBLISHER_PATH=/tmp/ff/.orchestration/runtime/publish-status
   CONTINUATION_PATH=""
   DECLARED_FOREIGN_CHANGES=""
+  APPLICABLE_OPTIONAL_SKILLS=""
   RUNTIME_DIR="$FEATURE_FOLDER/.orchestration/runtime"
 
   body="$(render_prompt spec-reviewer-claude)" \
@@ -1527,6 +1785,8 @@ _t8_code_types="$(printf '%s\n' \
   PROCESS_DEVIATION ATTEMPT_ALLOCATED \
   CODEX_UNAVAILABLE CLAUDE_FAILED IMPLEMENTATION_BASELINE IMPLEMENTATION_BASELINE_BLOCKED \
   CODEX_DISABLED_BY_USER_CONSENT CODEX_SKIPPED_BY_USER_CONSENT MODEL_REJECTED DISPATCH_ORPHANED \
+  PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE LOCAL_CLI_CANARIES_PASSED TARGET_DIRTY_TREE_GATE_PASSED \
+  PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED RUNTIME_AND_REGISTRIES_VERIFIED VENDOR_PROVEN \
   | sort)"
 assert_eq "$_t8_code_types" "$_t8_registry_types" \
   "event_required_fields' own type list matches the Event Contract Registry exactly"

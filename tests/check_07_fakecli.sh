@@ -260,6 +260,19 @@ seq_ok="$(_events_for_dispatch_id "$id_ok" "$FEATURE_FOLDER/RUN_LOG.md" | tr '\n
 assert_eq "DISPATCH_STARTED DISPATCH_COMPLETED " "$seq_ok" \
   "a successful launched attempt records STARTED then COMPLETED, and nothing else"
 
+# --- Task 10: a substantive (non-preflight) COMPLETED dispatch marks its
+# vendor proven end to end, through the real dispatch_attempt call site ----
+assert_present 'event=VENDOR_PROVEN' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "a substantive COMPLETED dispatch (summarizer-spec) durably marks VENDOR_PROVEN"
+vp_block_id="$(awk -v RS='' '/event=VENDOR_PROVEN/ { print; exit }' "$FEATURE_FOLDER/RUN_LOG.md" \
+  | "$GREP_BIN" -m1 -oE 'dispatch_id:[[:space:]]*[^[:space:]]+' | "$GREP_BIN" -oE '[^[:space:]]+$')"
+assert_eq "$id_ok" "$vp_block_id" \
+  "the VENDOR_PROVEN block itself (not just the file somewhere) names the dispatch that proved it"
+assert_eq true "$(vendor_proven claude)" \
+  "vendor_proven reads back true for claude after the real dispatch_attempt call site marked it"
+assert_eq false "$(vendor_proven codex)" \
+  "vendor_proven still reads false for codex -- marking one vendor never proves the other"
+
 # 3b. A launched, CLASSIFIED-FAILED attempt (permanent vendor error): STARTED,
 #     COMPLETED, THEN exactly one ATTEMPT_FAILED referencing the same id.
 : > "$FEATURE_FOLDER/RUN_LOG.md"
@@ -983,6 +996,28 @@ san_rows=$(wc -l < "$san_log" | tr -d ' ')
 assert_eq 3 "$san_rows" "a hostile FAKE_MODE/model/dispatch id still yields one log row per call"
 san_bad=$(awk -F'\t' 'NF != 10 { n++ } END { print n+0 }' "$san_log")
 assert_eq 0 "$san_bad" "every FAKE_LOG row has exactly 10 tab-separated fields"
+
+# --- Code review round 2 fix (finding 7): probe_models was never exercised
+# offline. Spec S16.1 step 6: "one paid probe per DISTINCT model" -- verify
+# the dedup (fewer invocations than roles) and the accept/reject branches.
+python3 "$REPO_TOP/tests/lib/extract.py" roles > /dev/null
+_pm_claude_models=$(tail -n +2 "$BUILD/roles.tsv" | awk -F'	' '$2=="claude"{print $3}' | sort -u | wc -l | tr -d ' ')
+_pm_codex_models=$(tail -n +2 "$BUILD/roles.tsv" | awk -F'	' '$2=="codex"{print $3}' | sort -u | wc -l | tr -d ' ')
+
+: > "$FAKE_ARGV_LOG"
+probe_models yes
+assert_rc 0 $? "probe_models accepts every pinned model id (fakebin default 'complete' mode)"
+assert_eq "$_pm_claude_models" "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)"   "probe_models makes exactly one claude call per DISTINCT model, not per role"
+assert_eq "$_pm_codex_models" "$("$GREP_BIN" -c '^codex ' "$FAKE_ARGV_LOG" || true)"   "probe_models makes exactly one codex call per DISTINCT model, not per role"
+
+: > "$FAKE_ARGV_LOG"
+probe_models no
+assert_rc 0 $? "probe_models codex_present=no still accepts every claude model"
+assert_eq 0 "$("$GREP_BIN" -c '^codex ' "$FAKE_ARGV_LOG" || true)"   "probe_models codex_present=no skips every codex row entirely (never misdiagnosed as MODEL_REJECTED)"
+
+: > "$FAKE_ARGV_LOG"
+FAKE_RC=1 probe_models yes >/dev/null 2>&1
+assert_rc 1 $? "probe_models reports failure when a model id is rejected"
 
 # --- Task 8 Step 6: unauthorized mutation with NO lease held at all --------
 # A read-only role (mutates=no) never calls acquire_write_lease. If it still

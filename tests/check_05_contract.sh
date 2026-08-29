@@ -135,4 +135,107 @@ else
   printf '%s\n' "$offenders" | while IFS= read -r l; do note "$l"; done
 fi
 
+# --- Task 10: preflight and context evidence gates --------------------------
+assert_present '^preflight_zero_token_gates\(\) \{' "$D" \
+  "T10: preflight_zero_token_gates is a real cookbook function"
+assert_present '^validate_existing_run_log\(\) \{' "$D" \
+  "T10: validate_existing_run_log is a real cookbook function"
+assert_present '^vendor_proven\(\) \{' "$D" "T10: vendor_proven is a real cookbook function"
+assert_present '^vendor_proven_mark\(\) \{' "$D" "T10: vendor_proven_mark is a real cookbook function"
+assert_present '^applicable_optional_skills\(\) \{' "$D" \
+  "T10: applicable_optional_skills is a real cookbook function"
+assert_present '^skills_reprobe_needed\(\) \{' "$D" \
+  "T10: skills_reprobe_needed is a real cookbook function"
+assert_present '^verify_gitignore_guard\(\) \{' "$D" \
+  "T10: verify_gitignore_guard is a real cookbook function"
+
+for _t10_evt in PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE LOCAL_CLI_CANARIES_PASSED \
+  TARGET_DIRTY_TREE_GATE_PASSED PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED \
+  RUNTIME_AND_REGISTRIES_VERIFIED VENDOR_PROVEN; do
+  assert_present "^\| ${_t10_evt} \|" "$D" \
+    "T10: $_t10_evt has an Event Contract Registry row"
+done
+
+# The gate-order function must have a real call site in Phase -1's own prose
+# (the "helper that works but sits on no path a real run reaches" failure
+# mode named in prior task reviews) -- not just a cookbook definition.
+assert_present '`preflight_zero_token_gates` \(see cookbook\) to run them' "$D" \
+  "T10: preflight_zero_token_gates has a real call site in Phase -1 prose"
+
+# vendor_proven_mark's real call site: _dispatch_ingest_result marks every
+# substantive (non-preflight) COMPLETED dispatch proven, at the ONE choke
+# point every dispatch_attempt/dispatch_parallel call routes through.
+assert_present 'vendor_proven_mark "\$vendor" "\$role" "\$dispatch_id"' "$D" \
+  "T10: vendor_proven_mark has a real call site in _dispatch_ingest_result"
+
+# DEGRADED_REVIEW_ACCEPTED (spec S16.5): registry row already covered by the
+# Task 8 legacy-event loop above; Task 10 adds its first real call site.
+assert_present 'record_event DEGRADED_REVIEW_ACCEPTED' "$D" \
+  "T10: DEGRADED_REVIEW_ACCEPTED has a real call site (Phase 7 one-vendor continuation)"
+
+# Skill-evidence fields are real registry columns for BOTH preflight roles,
+# not just prose -- required_status_fields is what publish-status actually
+# enforces (STATUS_MISSING_ROLE_FIELD), so a drift here is a real appendix bug.
+assert_present '\| preflight-claude \|.*required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent' \
+  "$D" "T10: preflight-claude's registry row declares skill-evidence fields"
+assert_present '\| preflight-codex \|.*required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent' \
+  "$D" "T10: preflight-codex's registry row declares skill-evidence fields"
+
+# develop_it_dirty is a FOUR-state enum (spec S16.2), not the old yes/no pair.
+assert_present 'develop_it_dirty: +no \| yes \| untracked \| unknown' "$D" \
+  "T10: develop_it_dirty is documented as a four-state enum"
+assert_present 'git ls-files --error-unmatch' "$D" \
+  "T10: untracked detection uses git ls-files --error-unmatch before diffing"
+
+# --- Code review round 2 fixes -----------------------------------------------
+# Finding 1: the RUN_LOG lock helper must tolerate an unset $ORCHESTRATION_DIR
+# (the exact state gate 1 of Phase -1's first real shell is in, before gate 5
+# ever runs bootstrap_runtime).
+assert_present 'local lockfile="\$\{1:-\$\{ORCHESTRATION_DIR:-\$FEATURE_FOLDER/\.orchestration\}/log\.lock\}"' "$D" \
+  "T10 review: _run_log_lock_acquire/_release tolerate an unset ORCHESTRATION_DIR"
+
+# Finding 2: bootstrap_runtime must never be called inside a command
+# substitution (that would discard the globals it exists to set).
+assert_absent 'bootstrap_result="\$\(bootstrap_runtime\)"' "$D" \
+  "T10 review: bootstrap_runtime is never called inside \$(...) at gate 5"
+assert_present 'if ! bootstrap_runtime >"\$bootstrap_tmp"' "$D" \
+  "T10 review: gate 5 calls bootstrap_runtime bare, capturing stdout via a plain redirect"
+
+# Finding 3: vendor_proven (the reader) needs a real call site beyond the
+# vendor_proven_mark writer, or proven-capability evidence is write-only.
+assert_present '^vendor_preflight_reprobe_once\(\) \{' "$D" \
+  "T10 review: vendor_preflight_reprobe_once is a real cookbook function"
+assert_present 'call `vendor_preflight_reprobe_once codex' "$D" \
+  "T10 review: vendor_preflight_reprobe_once has real call sites in the per-phase preflight gates"
+_reprobe_sites="$("$GREP_BIN" -c 'call `vendor_preflight_reprobe_once codex' "$D" || true)"
+assert_eq 3 "$_reprobe_sites" \
+  "T10 review: vendor_preflight_reprobe_once is wired into all three per-phase gates (3, 5, 7)"
+
+# Finding 4/8: the Step 1.0 HALT-logging rule names the CURRENT gate order
+# and numbering, not the pre-Task-10 one (canary was step 2, model probe was
+# step 3 -- both moved).
+assert_present 'gates 2 \(local CLI canaries\), 3 \(target dirty-tree gate\), 5 \(runtime \+' "$D" \
+  "T10 review: the HALT-logging rule paragraph names the CURRENT gate order"
+assert_present 'one exception is gate 1.s existing-run-log validation' "$D" \
+  "T10 review: gate 1's zero-write exception to the uniform HALT rule is documented, not contradicted"
+
+# Finding 5: every gate failure in preflight_zero_token_gates must itself
+# durably record event=HALT -- not leave it to unenforced prose.
+assert_present '^_preflight_halt\(\) \{' "$D" "T10 review: _preflight_halt is a real cookbook function"
+_halt_call_sites="$("$GREP_BIN" -c '_preflight_halt "gate' "$D" || true)"
+assert_eq 4 "$_halt_call_sites" \
+  "T10 review: preflight_zero_token_gates calls _preflight_halt at all four failable gates (1, 2, 3, 5)"
+
+# Finding 6: applicable_optional_skills has a real call site (durable
+# reconstruction, not a dangling variable), and plan-writer actually
+# receives it as a rendered appendix input.
+assert_present 'APPLICABLE_OPTIONAL_SKILLS="\$\(applicable_optional_skills "\$OPTIONAL_SKILLS" "\$_relevant_skills"' "$D" \
+  "T10 review: applicable_optional_skills has a real call site in reconstruct_durable_inputs"
+assert_present '^[[:space:]]+APPLICABLE_OPTIONAL_SKILLS$' "$D" \
+  "T10 review: APPLICABLE_OPTIONAL_SKILLS is listed as a render_keys() entry"
+assert_present '\| plan-writer \|.*applicable_optional_skills' "$D" \
+  "T10 review: plan-writer's registry row declares applicable_optional_skills as an input"
+assert_absent '\$\{?RELEVANT_SKILLS' "$D" \
+  "T10 review: no dangling \$RELEVANT_SKILLS reference remains"
+
 finish

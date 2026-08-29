@@ -81,17 +81,22 @@ For every step that produces or modifies an artifact:
    appendix:                 <name>
    develop_it_git_sha:       <git HEAD of process file>
    develop_it_file_sha256:   <sha256sum of $PROCESS_PATH>
-   develop_it_dirty:         yes | no
+   develop_it_dirty:         no | yes | untracked | unknown
    status_path:              <path>
    verdict:                  <verdict>
    ```
 
 `develop_it_git_sha` is `git -C "$PROCESS_REPO_ROOT" rev-parse HEAD`;
 `develop_it_file_sha256` is `sha256sum "$PROCESS_PATH" | cut -d' ' -f1`;
-`develop_it_dirty` is `yes` when the working-tree copy differs from
-`git -C "$PROCESS_REPO_ROOT" show "HEAD:$PROCESS_PATH_REL"`, `no` when it
-matches, and `unknown` outside a git repo. All three describe THIS document, not
-the project under development — a bare `git` call would report the wrong repo.
+`develop_it_dirty` is one of four typed states (spec S16.2 -- see
+`process_identity` in the cookbook): `no` when the working-tree copy matches
+`git -C "$PROCESS_REPO_ROOT" show "HEAD:$PROCESS_PATH_REL"`, `yes` when it
+differs, `untracked` when `git ls-files --error-unmatch` finds the file is
+not in the index at all (plain-untracked and ignored-untracked are the SAME
+outcome), and `unknown` for a non-git repository or an unreadable identity
+check -- always paired with a `develop_it_dirty_reason` in that last case.
+All fields describe THIS document, not the project under development — a
+bare `git` call would report the wrong repo.
 
 Failure events (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`) use the event-tagged variant with `failure_mode: <n>`.
 
@@ -207,13 +212,13 @@ this account and is used for the cheap `preflight-codex` probe;
 
 | Role | Vendor | Model | Effort | Timeout minutes | Mutates | Long running | May spawn children | Required inputs | Optional inputs | Status template | Outputs | Verdicts | Required status fields | Checkpoint kind | Phases |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| preflight-claude | claude | claude-haiku-4-5 | — | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2;context7 | none | 1 |
-| preflight-codex | codex | gpt-5.6-luna | medium | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2 | none | 1 |
-| context-discovery | claude | claude-sonnet-5 | — | 30 | no | no | no | feature_folder;resolved_models | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | READY;BLOCKED | common_v2 | none | 2 |
+| preflight-claude | claude | claude-haiku-4-5 | — | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2;context7;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent | none | 1 |
+| preflight-codex | codex | gpt-5.6-luna | medium | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent | none | 1 |
+| context-discovery | claude | claude-sonnet-5 | — | 30 | no | no | no | feature_folder;resolved_models | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | READY;BLOCKED | common_v2;relevant_skills;relevant_skills_reasons | none | 2 |
 | spec-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
 | spec-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
 | spec-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;spec_path;findings_paths | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2 | document-fixer | 3 |
-| plan-writer | claude | claude-opus-5 | — | 120 | yes | yes | no | feature_folder;spec_path;context7_policy | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;plan_path;progress.jsonl | DONE;BLOCKED | common_v2 | plan | 4 |
+| plan-writer | claude | claude-opus-5 | — | 120 | yes | yes | no | feature_folder;spec_path;context7_policy | continuation_path;declared_foreign_changes;applicable_optional_skills | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;plan_path;progress.jsonl | DONE;BLOCKED | common_v2 | plan | 4 |
 | plan-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
 | plan-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
 | plan-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;plan_path;findings_paths | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2 | document-fixer | 5 |
@@ -579,17 +584,56 @@ validate_roots() {
 }
 
 # ---- Process-file identity (logged in every dispatch entry) -----------------
-# All three fields describe THIS document, so every git call targets
+# All fields describe THIS document, so every git call targets
 # PROCESS_REPO_ROOT. A bare `git` call would report the target project instead.
+#
+# develop_it_dirty (spec S16.2) is one of FOUR typed states, never a bare
+# yes/no:
+#   no        tracked, and matches HEAD:$PROCESS_PATH_REL exactly.
+#   yes       tracked, and differs from HEAD:$PROCESS_PATH_REL.
+#   untracked git ls-files --error-unmatch fails for $PROCESS_PATH_REL -- this
+#             is the SAME outcome whether the file is plain-untracked or
+#             ignored-untracked (ls-files only ever lists what is IN the
+#             index; both are equally "not in the index"), so one check
+#             covers both per spec S16.2 step 4.
+#   unknown   non-git repository, OR `git diff --quiet` itself failed for a
+#             reason other than "a diff exists" (exit code > 1 -- a real I/O
+#             or object-database error). PROCESS_DIRTY_REASON is always set
+#             when this state is reported, and only then.
+# PROCESS_FILE_SHA256 is computed from the file's own bytes via sha256sum,
+# independently of git entirely (spec S16.2 step 6) -- it is correct in
+# every one of the four states above, including non-git.
 process_identity() {
   PROCESS_FILE_SHA256="$(sha256sum "$PROCESS_PATH" | cut -d' ' -f1)"
-  PROCESS_GIT_HEAD="$(git -C "$PROCESS_REPO_ROOT" rev-parse HEAD 2>/dev/null || echo non-git)"
+  # Code review round 2 fix: `2>/dev/null || echo non-git` INSIDE the
+  # substitution is wrong on an unborn branch -- git prints the literal
+  # word "HEAD" to STDOUT (not just its fatal: message to stderr) and
+  # still exits non-zero, so the substitution would capture the TWO-LINE
+  # garbage string "HEAD\nnon-git", never matching a plain `= non-git`
+  # test. Check the exit code OUTSIDE the substitution instead, so a
+  # failure always resets PROCESS_GIT_HEAD to the clean sentinel,
+  # discarding whatever partial stdout git produced.
+  PROCESS_GIT_HEAD="$(git -C "$PROCESS_REPO_ROOT" rev-parse HEAD 2>/dev/null)" \
+    || PROCESS_GIT_HEAD=non-git
+  PROCESS_DIRTY_REASON=""
   if [ "$PROCESS_GIT_HEAD" = non-git ]; then
     PROCESS_DIRTY=unknown
-  elif git -C "$PROCESS_REPO_ROOT" diff --quiet HEAD -- "$PROCESS_PATH_REL" 2>/dev/null; then
-    PROCESS_DIRTY=no
+    PROCESS_DIRTY_REASON="PROCESS_REPO_ROOT has no HEAD (non-git or unborn branch)"
+  elif ! git -C "$PROCESS_REPO_ROOT" ls-files --error-unmatch -- "$PROCESS_PATH_REL" \
+         >/dev/null 2>&1; then
+    PROCESS_DIRTY=untracked
   else
-    PROCESS_DIRTY=yes
+    local diff_rc=0
+    git -C "$PROCESS_REPO_ROOT" diff --quiet HEAD -- "$PROCESS_PATH_REL" 2>/dev/null \
+      || diff_rc=$?
+    if [ "$diff_rc" -eq 0 ]; then
+      PROCESS_DIRTY=no
+    elif [ "$diff_rc" -eq 1 ]; then
+      PROCESS_DIRTY=yes
+    else
+      PROCESS_DIRTY=unknown
+      PROCESS_DIRTY_REASON="git diff HEAD -- \$PROCESS_PATH_REL failed (rc=$diff_rc)"
+    fi
   fi
 }
 
@@ -687,8 +731,33 @@ reconstruct_durable_inputs() {
 
   # Applicable optional skills: best-effort from Phase 1's own record. Never
   # gates -- an absent or unreadable record just means "none recorded".
-  # shellcheck disable=SC2034  # consumed by the calling phase shell's skill-loading step
-  OPTIONAL_SKILLS="$(status_field "$FEATURE_FOLDER/1-preflight/phase-1/claude-check-status.md" loaded_skills 2>/dev/null)"
+  # `optional_skills_present` (spec S16.3/S16.4) is a required registry field
+  # for both preflight roles (never the earlier "loaded_skills", a name that
+  # was never actually written by either appendix), formatted as a
+  # bracket-comma list like every other skill-evidence field this document
+  # writes; `applicable_optional_skills` (see cookbook) takes the SAME
+  # ";"-separated convention the Role Contract Registry's own multi-valued
+  # cells use, so the bracket/comma form is normalized to that here, once,
+  # rather than by every caller.
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  OPTIONAL_SKILLS="$(status_field "$FEATURE_FOLDER/1-preflight/phase-1/claude-check-status.md" optional_skills_present 2>/dev/null \
+    | tr -d '[]' | sed -E 's/,[[:space:]]*/;/g')"
+
+  # Applicable optional skills (spec S16.4): installed (OPTIONAL_SKILLS,
+  # above) intersected with THIS run's relevant set -- context-discovery's
+  # own `relevant_skills` STATUS field (2-context-discovery/status.md),
+  # normalized the SAME bracket-to-";" way. Recomputed fresh in every
+  # phase's shell from the two durable STATUS records, exactly like
+  # CONTEXT7_POLICY/OPTIONAL_SKILLS above -- never persisted anywhere new
+  # (the orchestrator's canonical write list has no slot for it, and none
+  # is needed: recomputation is cheap and keeps this in sync with either
+  # source ever being corrected). Absent before Phase 2 completes, which is
+  # fine -- Phase 4 (plan-writer) is the first real consumer.
+  local _relevant_skills
+  _relevant_skills="$(status_field "$FEATURE_FOLDER/2-context-discovery/status.md" relevant_skills 2>/dev/null \
+    | tr -d '[]' | sed -E 's/,[[:space:]]*/;/g')"
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  APPLICABLE_OPTIONAL_SKILLS="$(applicable_optional_skills "$OPTIONAL_SKILLS" "$_relevant_skills" 2>/dev/null)"
 
   # Findings / debugger-reverification inputs are optional by nature -- only
   # set when a prior round left one behind -- so they are reconstructed
@@ -1555,7 +1624,7 @@ _run_log_lock_acquire() {
   # mechanism (spec S10.1's "per-file lock" and this document's own "use
   # the existing mutex, do not invent another" are the same requirement
   # once the lock file itself is parameterized, not two competing ones).
-  local lockfile="${1:-$ORCHESTRATION_DIR/log.lock}" tries=0 tmp lockdir
+  local lockfile="${1:-${ORCHESTRATION_DIR:-$FEATURE_FOLDER/.orchestration}/log.lock}" tries=0 tmp lockdir
   lockdir="$(dirname "$lockfile")"
   mkdir -p "$lockdir"
   # $BASHPID, not $$: a `( ... ) &` subshell fork (dispatch_parallel's own
@@ -1578,7 +1647,7 @@ _run_log_lock_acquire() {
 }
 _run_log_lock_release() {
   # Usage: _run_log_lock_release [LOCKFILE] -- same default as acquire.
-  local lockfile="${1:-$ORCHESTRATION_DIR/log.lock}"
+  local lockfile="${1:-${ORCHESTRATION_DIR:-$FEATURE_FOLDER/.orchestration}/log.lock}"
   rm -f "$lockfile" 2>/dev/null || true
 }
 
@@ -1777,7 +1846,8 @@ render_keys() {
     RELEVANT_ARTIFACTS FINAL_DIFF ACCEPTED_SPEC IMPLEMENTATION_SUMMARY \
     TEST_SUMMARY REVIEW_SUMMARY DECISIONS EXCLUSIONS FOLLOWUPS DOCS_INVENTORY \
     PHASE_DIR DISPATCH_ID LOGICAL_DISPATCH_ID ATTEMPT ROLE_CONTRACTS_PATH \
-    STATUS_PUBLISHER_PATH CONTINUATION_PATH DECLARED_FOREIGN_CHANGES RUNTIME_DIR
+    STATUS_PUBLISHER_PATH CONTINUATION_PATH DECLARED_FOREIGN_CHANGES RUNTIME_DIR \
+    APPLICABLE_OPTIONAL_SKILLS
 }
 
 render_prompt() {
@@ -2744,6 +2814,13 @@ _dispatch_ingest_result() {
       phase="$phase" iteration="$(printf '%02d' "$iteration")" dispatch_id="$dispatch_id" \
       reason="$reason" phase_name="$phase_name" role="$role" classification="$classification" \
       || return 1
+  elif [ "$role" != preflight-claude ] && [ "$role" != preflight-codex ]; then
+    # spec S16.3: a SUBSTANTIVE dispatch (anything beyond the cheap preflight
+    # probes, which mark vendor_proven separately and more conservatively at
+    # Phase 1 Step 1.1 item 8) that completes successfully proves its vendor
+    # for the rest of the run. See "Evidence-based capability: vendor_proven"
+    # above for the read side and the three signatures that CAN revoke it.
+    vendor_proven_mark "$vendor" "$role" "$dispatch_id" || return 1
   fi
 
   DISPATCH_RESULT_CLASSIFICATION="$classification"
@@ -3818,6 +3895,12 @@ here does not itself populate that document).
 | CODEX_SKIPPED_BY_USER_CONSENT | phase_name;role;vendor | no |
 | MODEL_REJECTED | phase_name;role;model;vendor | no |
 | DISPATCH_ORPHANED | role;role_mutates;action | no |
+| PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE | run_log_state | no |
+| LOCAL_CLI_CANARIES_PASSED | codex_present | no |
+| TARGET_DIRTY_TREE_GATE_PASSED |  | no |
+| PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED | develop_it_dirty;develop_it_dirty_reason | no |
+| RUNTIME_AND_REGISTRIES_VERIFIED | bootstrap_result | no |
+| VENDOR_PROVEN | role;vendor | no |
 
 `ATTEMPT_ALLOCATED` is one row beyond the spec's own 23-name list: it is the
 pre-existing attempt-identity event `allocate_attempt` has always written
@@ -3832,6 +3915,21 @@ writer." None of the eight has a live cookbook call site yet (they remain
 prose instructions to the orchestrator, same scope boundary as `HALT`
 above), so none is `proposition_required=yes` and none changes the twelve
 `yes` rows Step 3 names.
+
+**The six rows after `DISPATCH_ORPHANED` are Task 10's preflight-evidence
+gates** (spec §16.1/§16.3). `PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE`,
+`LOCAL_CLI_CANARIES_PASSED`, `TARGET_DIRTY_TREE_GATE_PASSED`,
+`PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED`, and `RUNTIME_AND_REGISTRIES_
+VERIFIED` are the five zero-token gates' own success markers, written in
+that exact order by `preflight_zero_token_gates` (see cookbook, below); each
+is written ONLY after its own gate passes, so a HALT at gate N means events
+1..N-1 are durable and N is not — the very evidence "Inject failure at each
+gate" tests assert against. `VENDOR_PROVEN` is written the first time a
+vendor completes one substantive (non-preflight-probe) dispatch
+successfully; see "Evidence-based capability: `vendor_proven`" below for the
+reader that answers whether a vendor is currently proven. None of the six
+is `proposition_required` — they are routine successful-gate evidence, not
+failures or deviations.
 
 <!-- lint: cookbook -->
 ```bash
@@ -3887,6 +3985,13 @@ event_required_fields() {
     CODEX_SKIPPED_BY_USER_CONSENT) printf '%s\n' "phase_name;role;vendor" ;;
     MODEL_REJECTED)              printf '%s\n' "phase_name;role;model;vendor" ;;
     DISPATCH_ORPHANED)           printf '%s\n' "role;role_mutates;action" ;;
+    PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE) printf '%s\n' "run_log_state" ;;
+    LOCAL_CLI_CANARIES_PASSED)   printf '%s\n' "codex_present" ;;
+    TARGET_DIRTY_TREE_GATE_PASSED) printf '%s\n' "" ;;
+    PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED)
+      printf '%s\n' "develop_it_dirty;develop_it_dirty_reason" ;;
+    RUNTIME_AND_REGISTRIES_VERIFIED) printf '%s\n' "bootstrap_result" ;;
+    VENDOR_PROVEN)               printf '%s\n' "role;vendor" ;;
     *) echo "EVENT_TYPE_UNKNOWN:$1" >&2; return 1 ;;
   esac
 }
@@ -5428,6 +5533,362 @@ The feature folder accumulates orchestration state (`RUN_LOG.md`, STATUS files, 
 
 If neither holds, surface a one-line note to the user during Phase 1: "Recommend adding `docs/superpowers/specs/*-artifacts/` to `.gitignore` so orchestration artifacts do not pollute commits." This is a warning, not a halt — the allow-list in `dirty_tree_check` handles the runtime risk.
 
+<!-- lint: cookbook -->
+```bash
+# Prints one hygiene-recommendation warning line on stdout when the
+# .gitignore pattern is absent; prints nothing when it is present. This is
+# advisory ONLY: dirty_tree_check's own allow-list ALWAYS covers
+# $FEATURE_FOLDER regardless (see its own body above), so the runtime
+# dirty-check risk is already handled either way -- an absent .gitignore
+# entry only means orchestration artifacts stay untracked-but-unignored,
+# a cosmetic `git status` nuisance, never a functional gap. It is normal
+# and expected for this to print on every run whose target repo has not
+# yet added the pattern; it is not a sign anything is broken. Never halts
+# -- always returns 0.
+verify_gitignore_guard() {
+  local gi="$REPO_ROOT/.gitignore"
+  if [ -f "$gi" ] && "$GREP_BIN" -q -- 'docs/superpowers/specs/\*-artifacts/' "$gi"; then
+    return 0
+  fi
+  printf 'warn: recommend adding docs/superpowers/specs/*-artifacts/ to .gitignore so orchestration artifacts do not pollute commits\n'
+  return 0
+}
+```
+
+### Preflight zero-token gate sequence (spec §16.1) and existing-run-log validation (spec §16.2 step-1 prerequisite)
+
+Phase −1 runs FIVE zero-token gates, strictly in this order, before any paid
+model probe or vendor dispatch: (1) paths + new-run schema eligibility, (2)
+local CLI canaries, (3) target dirty-tree gate, (4) process identity +
+gitignore, (5) runtime + registries. Each gate writes its own success event
+to `RUN_LOG.md` via `record_event` — and ONLY on success; a HALT at any gate
+means every LATER gate's event is durably absent, along with every paid
+probe and every subprocess dispatch: this is the single load-bearing
+invariant the whole preflight design exists to prove. `preflight_zero_token_
+gates`, below, is the ONE place this order is expressed as code; Phase −1's
+own prose (Step 1.0/1.1) calls it rather than re-deriving the sequence.
+
+**Existing-folder schema eligibility (spec §16.2, gate 1).** Before gate 1
+can emit its success event, it must decide whether an EXISTING
+`$FEATURE_FOLDER/RUN_LOG.md` (the operator re-running against a folder that
+already has one — resuming, or having pointed at the wrong folder) is safe to
+resume into. `validate_existing_run_log` answers this and, critically, never
+writes a single byte to `RUN_LOG.md` itself in ANY of its four outcomes —
+appending to a log this function cannot yet vouch for (wrong schema, or a
+different process-file version than the one that started the run) would
+corrupt the very evidence a human needs to recover. A HALT from this
+function is surfaced to the user directly; it is not one of the generic
+Step-1.0 "create the folder and log an `event=HALT`" gates, because the
+folder already exists here and its log is the thing in question.
+
+<!-- lint: cookbook -->
+```bash
+# Reads $FEATURE_FOLDER/RUN_LOG.md if present. NEVER writes anything, in any
+# of its four outcomes. Prints one of NEW_RUN_ELIGIBLE / RESUME_ELIGIBLE on
+# stdout and returns 0, or a HALT token (RUN_LOG_SCHEMA_V1_OR_UNKNOWN /
+# RUN_LOG_SCHEMA_MALFORMED / RUN_LOG_IDENTITY_MISMATCH) on stderr, with an
+# instruction to use the run's recorded process version, and returns 1.
+#
+#   absent (no file, or a zero-byte file)      -> NEW_RUN_ELIGIBLE
+#   malformed (no schema-v2 event= entries at
+#     all -- neither legacy nor v2 shape)      -> RUN_LOG_SCHEMA_MALFORMED, HALT
+#   v1 (has "--- <ts>  dispatch" blocks but no
+#     "event=" tag anywhere)                   -> RUN_LOG_SCHEMA_V1_OR_UNKNOWN, HALT
+#   mismatched identity (schema-v2, but the
+#     earliest recorded develop_it_git_sha
+#     differs from the CURRENT process commit) -> RUN_LOG_IDENTITY_MISMATCH, HALT
+#   valid v2, matching identity                 -> RESUME_ELIGIBLE
+validate_existing_run_log() {
+  local log="$FEATURE_FOLDER/RUN_LOG.md"
+  if [ ! -s "$log" ]; then
+    printf 'NEW_RUN_ELIGIBLE\n'
+    return 0
+  fi
+
+  if ! "$GREP_BIN" -q -- '^--- .*  event=' "$log"; then
+    echo "RUN_LOG_SCHEMA_V1_OR_UNKNOWN" >&2
+    echo "  $log has no schema-v2 event entries (legacy schema-v1 log, or unrecognized content)." >&2
+    echo "  Use this run's recorded process version to continue it, or start a new feature folder." >&2
+    return 1
+  fi
+
+  if ! "$GREP_BIN" -q -- '^process_schema_version:[[:space:]]*2$' "$log"; then
+    echo "RUN_LOG_SCHEMA_MALFORMED" >&2
+    echo "  $log has event entries but none declares process_schema_version: 2." >&2
+    echo "  Use this run's recorded process version to continue it, or start a new feature folder." >&2
+    return 1
+  fi
+
+  local recorded
+  recorded="$("$GREP_BIN" -m1 -oE '^develop_it_git_sha:[[:space:]]*[^[:space:]]+' "$log" \
+              | "$GREP_BIN" -oE '[^[:space:]]+$')"
+  if [ -n "$recorded" ] && [ "$recorded" != non-git ] && [ "$recorded" != "$PROCESS_GIT_HEAD" ]; then
+    echo "RUN_LOG_IDENTITY_MISMATCH" >&2
+    echo "  This run started under process commit $recorded; the current checkout is $PROCESS_GIT_HEAD." >&2
+    echo "  Check out commit $recorded of $PROCESS_REPO_ROOT (this run's recorded process version) to resume it, or start a new feature folder." >&2
+    return 1
+  fi
+
+  printf 'RESUME_ELIGIBLE\n'
+}
+
+# Runs the five zero-token gates (spec S16.1 steps 1-5), in order, writing
+# one record_event success marker per gate. Returns 0 with all five durable
+# and $CODEX_PRESENT set ("yes"|"no"), or non-zero the instant any gate
+# fails -- no later gate's event, and no paid probe or dispatch, is ever
+# reached. $FEATURE_FOLDER must already be set (derived from the spec path
+# per "Naming convention") and MUST NOT yet be assumed to exist; this
+# function creates it.
+# The uniform Step 1.0 HALT-logging rule, as real code: creates
+# $FEATURE_FOLDER if needed (safe even when gate 1's own validate_roots
+# failed -- $FEATURE_FOLDER is a pure string transform of the spec path,
+# independent of REPO_ROOT/PROCESS_PATH validity) and appends ONE
+# event=HALT entry naming the reason, then returns 1. NEVER called for
+# gate 1's validate_existing_run_log failure -- that is the ONE documented
+# exception (zero bytes written; see "Preflight zero-token gate sequence"
+# above) and returns 1 directly instead, before this function is reached.
+_preflight_halt() {
+  echo "halt: $1" >&2
+  mkdir -p "$FEATURE_FOLDER"
+  record_event HALT reason="$1" 2>/dev/null
+  return 1
+}
+
+preflight_zero_token_gates() {
+  # Gate 1: paths + new-run schema eligibility.
+  init_orchestration_vars || { _preflight_halt "gate1 invalid paths"; return 1; }
+  local run_log_state
+  run_log_state="$(validate_existing_run_log)" || return 1
+  mkdir -p "$FEATURE_FOLDER"
+  record_event PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE \
+    run_log_state="$run_log_state" reason="paths validated against PROCESS_REPO_ROOT; run_log $run_log_state" \
+    || return 1
+
+  # Gate 2: local CLI/binary canaries (no token spend).
+  local canary_out
+  canary_out="$(canary_preflight)" || { _preflight_halt "gate2 canary_preflight failed"; return 1; }
+  CODEX_PRESENT="${canary_out#*codex_present=}"
+  record_event LOCAL_CLI_CANARIES_PASSED \
+    codex_present="$CODEX_PRESENT" reason="canary_preflight ok" || return 1
+
+  # Gate 3: target dirty-tree gate. $SPEC_PATH/$PLAN_PATH/$FEATURE_FOLDER are
+  # not yet derivable this early, so dirty_tree_check's own automatic
+  # allow-list entries for them stay empty; $PROCESS_PATH lives in the OTHER
+  # repository (PROCESS_REPO_ROOT != REPO_ROOT, enforced by validate_roots)
+  # and never appears in $REPO_ROOT's own porcelain output regardless.
+  dirty_tree_check || { _preflight_halt "gate3 dirty_tree_check failed"; return 1; }
+  record_event TARGET_DIRTY_TREE_GATE_PASSED reason="dirty_tree_check ok" || return 1
+
+  # Gate 4: process identity (already resolved by gate 1's
+  # init_orchestration_vars) + gitignore guard (advisory only, never halts).
+  local gitignore_warning
+  gitignore_warning="$(verify_gitignore_guard)"
+  [ -z "$gitignore_warning" ] || echo "$gitignore_warning" >&2
+  record_event PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED \
+    develop_it_dirty="$PROCESS_DIRTY" develop_it_dirty_reason="${PROCESS_DIRTY_REASON:-}" \
+    reason="identity resolved against PROCESS_REPO_ROOT" || return 1
+
+  # Gate 5: runtime + registries. bootstrap_runtime is idempotent and safe
+  # to call even when $RUNTIME_DIR already verifies (BOOTSTRAP_REUSED).
+  #
+  # MUST NOT be called inside a `$(...)` command substitution: bootstrap_
+  # runtime's own doc comment says it sets ORCHESTRATION_DIR/RUNTIME_DIR
+  # "non-local, for the rest of this phase's shell" -- a command
+  # substitution forks a subshell, so those assignments (and every other
+  # global bootstrap_runtime sets) would die with it, exactly the "never
+  # rely on a subshell to preserve globals" rule `run_timed`'s own doc
+  # comment already states elsewhere in this cookbook. Every other call
+  # site in this document (e.g. the Phase 6 worked example above) calls it
+  # bare for the same reason; capture its printed token via a plain
+  # redirect instead, which does not fork.
+  local bootstrap_result bootstrap_tmp bootstrap_err
+  bootstrap_tmp="$(mktemp)"; bootstrap_err="$(mktemp)"
+  if ! bootstrap_runtime >"$bootstrap_tmp" 2>"$bootstrap_err"; then
+    # record_event's reason field is ONE line (blocks are blank-line
+    # separated) -- bootstrap_runtime's own stderr can legitimately span
+    # several (a token line plus indented detail), so flatten before
+    # handing it to _preflight_halt.
+    _preflight_halt "gate5 bootstrap_runtime failed: $(tr '\n' ' ' < "$bootstrap_err")"
+    rm -f "$bootstrap_tmp" "$bootstrap_err"
+    return 1
+  fi
+  cat "$bootstrap_err" >&2
+  bootstrap_result="$(cat "$bootstrap_tmp")"
+  rm -f "$bootstrap_tmp" "$bootstrap_err"
+  # shellcheck disable=SC1090  # RUNTIME_DIR is set by bootstrap_runtime above, in THIS shell
+  source "$RUNTIME_DIR/develop-it-runtime.sh" || return 1
+  record_event RUNTIME_AND_REGISTRIES_VERIFIED \
+    bootstrap_result="$bootstrap_result" reason="bootstrap_runtime ok" || return 1
+
+  printf 'GATES_PASSED codex_present=%s\n' "$CODEX_PRESENT"
+}
+```
+
+### Evidence-based capability: `vendor_proven` (spec §16.3)
+
+A **substantive** dispatch (a real role attempt — never the minimal model-ID
+probe or a preflight probe) that completes successfully marks its vendor
+"proven" for the rest of the run. A later low-cost failure — a per-phase
+preflight probe, or a publication loss — can never revoke that: only an
+auth failure, a model rejection, or a run-scoped spend ceiling can. This
+is tracked in `RUN_LOG.md`, never an in-memory flag (a fresh shell per
+phase cannot keep one), by scanning for the LATEST of either a
+`VENDOR_PROVEN` event for that vendor, or one of the three revoking failure
+signatures, whichever is later in file order.
+
+<!-- lint: cookbook -->
+```bash
+# Usage: vendor_proven_mark VENDOR ROLE [DISPATCH_ID]
+# Call once, immediately after a substantive dispatch's classification comes
+# back COMPLETED with a non-failure verdict. Idempotent: recording it twice
+# is harmless (the reader only cares whether at least one exists after the
+# last revocation). DISPATCH_ID, when known, rides on the common envelope's
+# own `dispatch_id` field -- "role and event ID" evidence (spec S16.3) is the
+# VENDOR_PROVEN event's own `event_id` (assigned by record_event) plus this.
+vendor_proven_mark() {
+  local vendor="$1" role="$2" dispatch_id="${3:-}"
+  record_event VENDOR_PROVEN role="$role" vendor="$vendor" dispatch_id="$dispatch_id" \
+    reason="substantive dispatch completed: role=$role vendor=$vendor"
+}
+
+# Usage: vendor_proven VENDOR   -> prints "true" or "false"
+# A vendor is proven iff its LATEST relevant RUN_LOG entry (in file order) is
+# a VENDOR_PROVEN event for that vendor, rather than a revoking signature for
+# that vendor: `event=MODEL_REJECTED` (a rejected model id -- Phase -1's
+# model-probe gate), or a DISPATCH_COMPLETED/ATTEMPT_FAILED entry whose
+# classification is `SPEND_CEILING` (run-scoped spend ceiling) or
+# `PERMANENT_VENDOR_ERROR` (classify_attempt's auth/permission/invalid-model
+# refusal signature -- see "Ordered failure classification" above). A cheap
+# probe or publication-loss failure (`TIMED_OUT`, `TRANSIENT_TRANSPORT_ERROR`,
+# `EXITED_NO_STATUS`, `PUBLICATION_LOST`, `UNKNOWN_VENDOR_ERROR`) carries
+# none of those, so it can never revoke a prior proof.
+vendor_proven() {
+  local vendor="$1" log="$FEATURE_FOLDER/RUN_LOG.md"
+  [ -f "$log" ] || { printf 'false\n'; return 0; }
+  "$PYTHON_BIN" - "$log" "$vendor" <<'PY'
+import re, sys
+path, vendor = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8", errors="replace").read()
+blocks = text.split("\n\n")
+state = False
+revoke_re = re.compile(r"^classification:\s*(SPEND_CEILING|PERMANENT_VENDOR_ERROR)\s*$", re.M)
+for b in blocks:
+    m = re.search(r"^---\s+[^\s]+\s+event=([^\s]+)", b, re.M)
+    if not m:
+        continue
+    event = m.group(1)
+    vline = re.search(r"^vendor:\s*([^\s]+)\s*$", b, re.M)
+    v = vline.group(1) if vline else None
+    if v != vendor:
+        continue
+    if event == "VENDOR_PROVEN":
+        state = True
+    elif event == "MODEL_REJECTED" or revoke_re.search(b):
+        state = False
+print("true" if state else "false")
+PY
+}
+
+# Usage: vendor_preflight_reprobe_once VENDOR MODE
+# Decides whether a per-phase preflight probe FAILURE (Modes 0-5, "Mode-
+# specific response table") should be accepted at face value, or given one
+# re-probe before the phase degrades to single-vendor coverage. This is
+# what makes `vendor_proven` (spec S16.3) a real behavioural input at
+# Phases 3/5/7 rather than write-only telemetry the per-phase gate never
+# reads: a vendor already proven THIS run by a real substantive dispatch
+# gets one extra chance against a probe wobble -- the SAME "known false
+# negative, re-probe rather than degrade" pattern `skills_reprobe_needed`
+# already applies to skill probes, generalized to vendor-availability
+# probes. Mode 5 (quota/rate-limit signal) is excluded: it is evidence of
+# an actual capacity problem, the closest this probe's own taxonomy comes
+# to the "spend ceiling" signature that legitimately revokes proven
+# capability -- re-probing it would just spend another cheap call to
+# rediscover the same real quota exhaustion.
+# Prints "yes" (re-probe once, then accept whatever the second probe says)
+# or "no" (accept this failure immediately, degrade as before).
+# NOTE ON SCOPE: "once" is once per per-phase gate, not once per run. This is
+# a stateless decision keyed on (vendor_proven, mode), so a run that wobbles at
+# Phases 3, 5 and 7 performs up to three re-probes -- one per gate. That is the
+# intent: it mirrors the sticky-within-phase semantics of codex_available, and
+# each re-probe is a single cheap `micro` call. A SUCCESSFUL re-probe records
+# no event, so a run that wobbled and recovered leaves no audit trail of the
+# retry; only the degradation path is durable.
+vendor_preflight_reprobe_once() {
+  local vendor="$1" mode="$2"
+  case "$mode" in
+    5) printf 'no\n'; return 0 ;;
+  esac
+  if [ "$(vendor_proven "$vendor" 2>/dev/null)" = true ]; then
+    printf 'yes\n'
+  else
+    printf 'no\n'
+  fi
+}
+```
+
+### Optional-skill applicability (spec §16.4)
+
+Discovery is marketplace-agnostic: Phase 2 records whatever Superpowers
+skills/plugins are actually installed, and computes the intersection with
+what THIS run's work types/project capabilities call for. Neither side is
+hand-enumerated by this document.
+
+<!-- lint: cookbook -->
+```bash
+# Usage: applicable_optional_skills INSTALLED_CSV RELEVANT_CSV
+# Both arguments are ";"-separated skill-name lists (the same convention the
+# Role Contract Registry's own multi-valued cells use). Prints the ordered,
+# deduplicated intersection, ";"-separated, on stdout -- installed skills
+# NOT called for by this run's work types are never included, and relevant
+# skills NOT installed never appear either (their absence is not a halt --
+# see spec S16.4, "optional absence never halts").
+applicable_optional_skills() {
+  local installed="$1" relevant="$2"
+  "$PYTHON_BIN" - "$installed" "$relevant" <<'PY'
+import sys
+installed = [s for s in sys.argv[1].split(";") if s]
+relevant = [s for s in sys.argv[2].split(";") if s]
+relevant_set = set(relevant)
+seen = []
+for s in installed:
+    if s in relevant_set and s not in seen:
+        seen.append(s)
+print(";".join(seen))
+PY
+}
+```
+
+### Missing-skill re-probe rule (spec §16.3)
+
+A `MISSING_SKILLS` verdict is not always a true negative: a plugin-root scan
+racing a filesystem mount, or a subprocess that read a stale skills index,
+can misreport a skill as absent when the CLI genuinely has it (observed in
+practice with `preflight-codex`). The process re-probes ONCE — never in a
+loop — when any of the three conditions below holds; a second consecutive
+`MISSING_SKILLS` after that one re-probe is accepted as real.
+
+<!-- lint: cookbook -->
+```bash
+# Usage: skills_reprobe_needed PRIOR_READY_THIS_RUN FS_EVIDENCE_PRESENT PUBLICATION_LOST
+#   PRIOR_READY_THIS_RUN   "yes" iff an earlier phase in the SAME run already
+#                          recorded READY for this vendor (a per-phase missing
+#                          claim contradicting that is the first trigger).
+#   FS_EVIDENCE_PRESENT    "yes" iff a deterministic filesystem check (skill
+#                          directory or SKILL.md present under a checked
+#                          plugin root) shows the skill actually exists.
+#   PUBLICATION_LOST       "yes" iff the attempt reached a `.tmp` STATUS
+#                          publication but never renamed it (lost final
+#                          STATUS -- see "File policy for non-READY paths").
+# Prints "true" or "false". Any single "yes" among the three triggers one.
+skills_reprobe_needed() {
+  local prior_ready="${1:-no}" fs_evidence="${2:-no}" publication_lost="${3:-no}"
+  case "$prior_ready$fs_evidence$publication_lost" in
+    *yes*) printf 'true\n' ;;
+    *)     printf 'false\n' ;;
+  esac
+}
+```
+
 ### Reading the right files at the right time
 
 The strict orchestrator rules say "STATUS files only." During failure handling you may need a few more bytes. Distinguish carefully:
@@ -5820,15 +6281,24 @@ Goal: confirm the environment is sound (binaries, CLI syntax, working tree) AND 
 These checks are free (no token spend) and catch environmental issues that previously consumed real dispatch attempts. Run them BEFORE creating the feature folder or invoking skill probes.
 
 **Every halting gate in Step 1.0 is logged, and creates `$FEATURE_FOLDER` in
-order to log it.** This resolves an ambiguity the gates would otherwise carry:
-they run before the feature folder exists, yet steps 3 and 6 below prescribe a
-RUN_LOG write. The rule is uniform — a Step 1.0 gate that HALTs first creates
-`$FEATURE_FOLDER` (and `RUN_LOG.md` inside it), then appends its entry, then
-STOPs. Use the gate's own event tag where one exists (`MODEL_REJECTED` for step
-3, `CODEX_UNAVAILABLE` for step 6) and `event=HALT` for the gates that have none
-(the step 2 canary and the step 4 dirty-tree check). Do not skip the folder to
-avoid the write, and do not invent an event tag outside the legal set in
-Resumability.
+order to log it -- with exactly ONE exception, named below.** This resolves an
+ambiguity the gates would otherwise carry: they run before the feature folder
+exists, yet several of them prescribe a RUN_LOG write. The rule is uniform for
+gates 2 (local CLI canaries), 3 (target dirty-tree gate), 5 (runtime +
+registries), the Mode-0 codex check, and the paid model-ID probe: a gate that
+HALTs first creates `$FEATURE_FOLDER` (and `RUN_LOG.md` inside it), then
+appends its entry, then STOPs. Use the gate's own event tag where one exists
+(`CODEX_UNAVAILABLE` for the Mode-0 codex check, `MODEL_REJECTED` for the paid
+model-ID probe) and `event=HALT` for the gates that have none (gates 2, 3, and
+5). Do not skip the folder to avoid the write, and do not invent an event tag
+outside the legal set in Resumability.
+
+**The one exception is gate 1's existing-run-log validation
+(`validate_existing_run_log`).** A HALT there (`RUN_LOG_SCHEMA_V1_OR_UNKNOWN`,
+`RUN_LOG_SCHEMA_MALFORMED`, or `RUN_LOG_IDENTITY_MISMATCH`) writes ZERO bytes
+to `RUN_LOG.md` and creates no new folder — see gate 1's own description
+below for why: the log at that path cannot yet be trusted, so this is not a
+case the uniform rule was ever meant to cover.
 
 This is implementable at every gate because `$FEATURE_FOLDER` is a pure string
 transform of the spec path (see "Naming convention") and `init_orchestration_vars`
@@ -5843,30 +6313,108 @@ role is `NEVER_LAUNCHED` — the retry is a genuine fresh Phase 1, not a resume.
 is one empty folder after a failed gate; the benefit is that no HALT in this
 process is silent.
 
-1. Initialise the orchestration variables from the "Runtime cookbook & guardrails" section (`PROCESS_PATH`, `REPO_ROOT`, `PYTHON_BIN`, `PROCESS_FILE_SHA256`, `PROCESS_GIT_HEAD`, `PROCESS_DIRTY`).
-2. Run `canary_preflight` (see cookbook). It checks: `claude`, `timeout`, `awk`, `sed`, `jq`, `git`, `date`, `sha256sum`, `cut`, `mkdir`, `mv`, `tail`, `tr`, `grep`, `realpath`, `env` are on PATH (hard-required); `codex` is optional (its absence sets `codex_present=no` and drives the failover policy below, not a halt); `python3` is on PATH (hard-required — render_prompt cannot function without it); `claude --help` and `codex exec --help` succeed. On halt, create `$FEATURE_FOLDER`, append an `event=HALT` entry naming the missing binary or the failing syntax check (per the logging rule above), surface the same to the user, and STOP — do not proceed to skill probes.
-3. Run `probe_models`, **but branch on `codex_present` first**. The probe invokes
-   both CLIs; running it while the Codex binary is absent reports `MODEL_REJECTED`
-   for `gpt-5.6-sol` when the real condition is `CODEX_UNAVAILABLE` mode 0 — a
-   misdiagnosis that sends the user to edit the Models table instead of installing
-   the CLI. Pass the canary's flag through:
+**Gate order is the load-bearing invariant (spec §16.1): no paid model probe
+and no vendor subprocess of any kind may start until all five zero-token
+gates below have each emitted their success event, IN ORDER.** Call
+`preflight_zero_token_gates` (see cookbook) to run them:
+
+1. **Gate 1 — paths + new-run schema eligibility.** Initialises the
+   orchestration variables (`PROCESS_PATH`, `REPO_ROOT`, `PROCESS_REPO_ROOT`,
+   `PYTHON_BIN`, `PROCESS_FILE_SHA256`, `PROCESS_GIT_HEAD`, `PROCESS_DIRTY`)
+   via `init_orchestration_vars`, THEN calls `validate_existing_run_log` (see
+   "Preflight zero-token gate sequence" cookbook section) to decide whether
+   an existing `$FEATURE_FOLDER/RUN_LOG.md` is safe to resume into. On
+   `RUN_LOG_SCHEMA_V1_OR_UNKNOWN`, `RUN_LOG_SCHEMA_MALFORMED`, or
+   `RUN_LOG_IDENTITY_MISMATCH`: HALT immediately, surfacing the printed
+   instruction to use this run's recorded process version (or start a new
+   feature folder) to the user. **Do NOT create `$FEATURE_FOLDER` or write
+   anything to `RUN_LOG.md` on this specific HALT** — the log at that path
+   cannot yet be trusted, so appending to it (even an `event=HALT`) would be
+   writing into evidence this gate cannot vouch for; this is the one HALT in
+   Step 1.0 that writes zero bytes. On success (`NEW_RUN_ELIGIBLE` for a
+   fresh folder, `RESUME_ELIGIBLE` for a matching schema-v2 log), the gate
+   creates `$FEATURE_FOLDER` and appends `event=PATHS_AND_NEW_RUN_SCHEMA_
+   ELIGIBLE`.
+2. **Gate 2 — local CLI canaries.** Runs `canary_preflight`: `claude`,
+   `timeout`, `awk`, `sed`, `jq`, `git`, `date`, `sha256sum`, `cut`, `mkdir`,
+   `mv`, `tail`, `tr`, `grep`, `realpath`, `env` are on PATH (hard-required);
+   `codex` is optional (its absence sets `codex_present=no` and drives the
+   failover policy below, not a halt at this gate); `python3` is on PATH
+   (hard-required — `render_prompt` cannot function without it); `claude
+   --help` and `codex exec --help` succeed. On halt: append an `event=HALT`
+   entry naming the missing binary or the failing syntax check (per the
+   logging rule above), surface the same to the user, and STOP — do not
+   proceed to gate 3, do not run any probe. On success, appends
+   `event=LOCAL_CLI_CANARIES_PASSED` with `codex_present`.
+3. **Gate 3 — target dirty-tree gate.** Runs `dirty_tree_check`. On halt:
+   append an `event=HALT` entry listing the offending paths (per the logging
+   rule above), then list them to the user and ask them to commit or stash
+   before re-running. On success, appends `event=TARGET_DIRTY_TREE_GATE_
+   PASSED`.
+4. **Gate 4 — process identity + gitignore.** Process identity was already
+   resolved by gate 1's `init_orchestration_vars` (`$PROCESS_DIRTY` is one of
+   `no|yes|untracked|unknown`, the last always paired with `$PROCESS_DIRTY_
+   REASON` — see "Process-file identity" cookbook comment). This gate
+   additionally runs `verify_gitignore_guard`: confirms that
+   `docs/superpowers/specs/*-artifacts/` (or the equivalent pattern matching
+   the eventual `$FEATURE_FOLDER`) is either listed in `.gitignore` OR that
+   the orchestrator's runtime dirty-check allow-list already covers it (it
+   does). If neither holds, emit a one-line warning recommending the
+   `.gitignore` addition; do NOT halt — this gate never fails. Appends
+   `event=PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED` with `develop_it_dirty`
+   and `develop_it_dirty_reason` (empty unless `develop_it_dirty=unknown`).
+5. **Gate 5 — runtime + registries.** Calls `bootstrap_runtime` (see "Runtime
+   extraction contract" in the cookbook) to materialize `$FEATURE_FOLDER/
+   .orchestration/runtime/` — this is the run's first bootstrap, so it always
+   extracts fresh (`BOOTSTRAP_OK`) on a genuinely new run, or verifies and
+   reuses (`BOOTSTRAP_REUSED`) on a resume. On any non-zero return, HALT:
+   append an `event=HALT` entry naming the token printed on stderr
+   (`RUNTIME_MANIFEST_INVALID:...`, `BOOTSTRAP_RACE_LOST_INVALID:...`, or
+   `BOOTSTRAP_IO_ERROR:...`), then STOP before any subprocess dispatch. On
+   success, `preflight_zero_token_gates` immediately `source`s
+   `$RUNTIME_DIR/develop-it-runtime.sh` — every helper referenced from here
+   on (`dispatch_parallel`, `validate_status`, `context7_policy`, ...) comes
+   from that sourced file — and appends `event=RUNTIME_AND_REGISTRIES_
+   VERIFIED` with `bootstrap_result`.
+
+**Only after all five gates above have succeeded** may the run spend a
+single token:
+
+6. **Mode 0 codex check (zero-token; evaluated here, not re-run).** If
+   gate 2's `canary_preflight` reported `codex_present=no` (Mode 0 — binary
+   missing, environmental), HALT unconditionally. Surface the remediation
+   message ("Install the Codex CLI and re-run") and STOP. Do NOT prompt the
+   user, do NOT continue in claude-only mode, do NOT proceed further. A
+   missing Codex binary at Phase 1 is an environment defect that must be
+   fixed before the run can proceed in any mode; the previous silent-degrade
+   behavior masked broken setups. This matches the Phase 1 row of the
+   Mode-specific response table (Mode 0 → HALT) and Step 1.1 step 6's Mode 0
+   branch — Phase 1 Mode 0 is the only failure mode at Phase 1 that bypasses
+   the user consent prompt, because there is no working Codex CLI to even
+   produce a meaningful stderr tail for the user to consent on. Log
+   `event=CODEX_UNAVAILABLE` with `phase: 1`, `phase_name: preflight`,
+   `failure_mode: 0`, and `stderr_tail: <canary output>` to `RUN_LOG.md`
+   immediately before STOP so the HALT is auditable.
+7. **Paid minimal model-ID probe — the FIRST token this run ever spends.**
+   Run `probe_models "$CODEX_PRESENT"` (the flag `preflight_zero_token_gates`
+   set from gate 2), one minimal call per distinct pinned model id:
 
    <!-- lint: snippet -->
    ```bash
-   probe_models "$codex_present"   # "yes" | "no"
+   probe_models "$CODEX_PRESENT"   # "yes" | "no"
    ```
 
-   When it is `no`, every codex row is skipped and the existing Mode-0 branch below
-   handles the missing binary on its own terms. Every id it does probe must be
-   accepted. On any rejection, HALT: print each `role=<role> model=<id>` line,
-   noting that this document pins its models deliberately; there is
-   no fallback path. Instruct the user to update the Models table. Log
-   `event=MODEL_REJECTED` with the offending roles to `RUN_LOG.md` before
-   stopping. This is a runtime gate; `tests/check_90_live_models.sh` performs the
-   same probe as an opt-in test.
-4. Run `dirty_tree_check` (see cookbook). Allowed dirty paths at this stage: `$PROCESS_PATH` only (the spec is provided by the user but may still be in the working tree; that is OK because the spec path is added to the allow-list once derived). On halt, create `$FEATURE_FOLDER`, append an `event=HALT` entry listing the offending paths (per the logging rule above), then list them to the user and ask them to commit or stash before re-running.
-5. Verify the gitignore guard: confirm that `docs/superpowers/specs/*-artifacts/` (or the equivalent pattern matching the eventual `$FEATURE_FOLDER`) is either listed in `.gitignore` OR that the orchestrator's runtime dirty-check allow-list covers it (the cookbook's `dirty_tree_check` does cover it). If neither holds, emit a one-line warning recommending the `.gitignore` addition; do NOT halt.
-6. If `canary_preflight` returned `codex_present=no` (Mode 0 — binary missing, environmental), HALT unconditionally. Surface the remediation message ("Install the Codex CLI and re-run") and STOP. Do NOT prompt the user, do NOT continue in claude-only mode, do NOT proceed to Step 1.1. A missing Codex binary at Phase 1 is an environment defect that must be fixed before the run can proceed in any mode; the previous silent-degrade behavior masked broken setups. This matches the Phase 1 row of the Mode-specific response table (Mode 0 → HALT) and Step 1.1 step 6's Mode 0 branch — Phase 1 Mode 0 is the only failure mode at Phase 1 that bypasses the user consent prompt, because there is no working Codex CLI to even produce a meaningful stderr tail for the user to consent on. Log `event=CODEX_UNAVAILABLE` with `phase: 1`, `phase_name: preflight`, `failure_mode: 0`, and `stderr_tail: <canary output>` to `RUN_LOG.md` immediately before STOP so the HALT is auditable.
+   When it is `no`, every codex row is skipped and the Mode-0 branch above
+   already handled the missing binary on its own terms. Every id it does
+   probe must be accepted. On any rejection, HALT: print each `role=<role>
+   model=<id>` line, noting that this document pins its models deliberately;
+   there is no fallback path. Instruct the user to update the Models table.
+   Log `event=MODEL_REJECTED` with the offending roles to `RUN_LOG.md` before
+   stopping. This is a runtime gate; `tests/check_90_live_models.sh` performs
+   the same probe as an opt-in test.
+
+Only once step 7 accepts every pinned model id does Step 1.1 below dispatch
+the first real subprocess (the skill/MCP capability probes).
 
 ### Required skills
 
@@ -5896,13 +6444,30 @@ previous behaviour — hid the degradation from the final report.
 
 ### Step 1.1 — Skill probe flow
 
-1. Determine the feature folder path from the input spec filename (see Per-feature artifacts folder). Create it and its `1-preflight/` subfolder with `mkdir -p`. Then call `bootstrap_runtime` (see "Runtime extraction contract" in the cookbook) to materialize `$FEATURE_FOLDER/.orchestration/runtime/` — this is the run's first bootstrap, so it always extracts fresh (`BOOTSTRAP_OK`). On any non-zero return, HALT: create `$FEATURE_FOLDER` (already done by this step) and append an `event=HALT` entry naming the token printed on stderr (`RUNTIME_MANIFEST_INVALID:...`, `BOOTSTRAP_RACE_LOST_INVALID:...`, or `BOOTSTRAP_IO_ERROR:...`), then STOP before any subprocess dispatch. Immediately `source "$RUNTIME_DIR/develop-it-runtime.sh"` — every helper referenced below (`dispatch_parallel`, `validate_status`, `context7_policy`, ...) comes from that sourced file, not from re-pasting this cookbook.
+1. `$FEATURE_FOLDER` and `$FEATURE_FOLDER/.orchestration/runtime/` already exist — Step 1.0's `preflight_zero_token_gates` (gates 1 and 5) created and bootstrapped them, and already `source`d `$RUNTIME_DIR/develop-it-runtime.sh` — every helper referenced below (`dispatch_parallel`, `validate_status`, `context7_policy`, ...) comes from that sourced file. This step only needs to create the `1-preflight/` subfolder with `mkdir -p`.
 2. **Dispatch both preflight subprocesses in parallel using `dispatch_parallel 1 00 preflight-claude preflight-codex`** (see "Reviewer parallelization" cookbook; preflight has no shared state between vendors, so this is safe as the very first dispatch of the run). This is the ONLY dispatch mechanism for Step 1.1 — there is no separate `dispatch_attempt` call for either preflight role.
    - **Claude subprocess (always dispatched):** role `preflight-claude`. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Transcript: `<feature-folder>/transcripts/<dispatch_id>.stdout` (stdout) and `<dispatch_id>.stderr` (stderr) — `allocate_attempt`'s naming form. This role's timeout comes from the Models table via `role_timeout`.
 3. **Codex subprocess (dispatched if and only if `codex_available = true`):** role `preflight-codex`, dispatched by the SAME `dispatch_parallel` call named in step 2 — not a second, separate dispatch. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Transcript: `<feature-folder>/transcripts/<dispatch_id>.stdout` (stdout) and `<dispatch_id>.stderr` (stderr). Model and effort are resolved per-role from the Models table, which is what puts preflight in `micro` mode per the "Codex reviewer modes" table.
-4. Read only the two STATUS files. Validate each with `validate_status` (see cookbook).
+4. Read only the two STATUS files. Validate each with `validate_status` (see cookbook). Each STATUS carries `required_skills_present`, `required_skills_missing`, `optional_skills_present`, and `optional_skills_absent` (spec §16.3/§16.4) — bracket-list values, same shape as the pre-existing `x_missing_skills`/`x_loaded_skills` fields — plus `x_plugin_roots_checked` naming every plugin root/path the probe inspected for an absent requirement. This is the durable capability evidence; downstream phases read it from the relocated `1-preflight/phase-1/<vendor>-check-status.md` rather than re-probing.
 4a. Read the `context7` field from `claude-check-status.md`. If it is `unreachable`, append one `event=CONTEXT7_UNAVAILABLE` entry to `RUN_LOG.md` (phase 1). Do NOT halt — this only affects `context7_policy()` (see cookbook) for the rest of the run. If it is `reachable`, no RUN_LOG entry is needed; `context7_policy()` reads the STATUS field directly.
-5. If either reports `verdict=MISSING_SKILLS`, print to the user: which CLI is missing which skills, plus an install hint ("Install the Superpowers plugin (e.g. `claude plugin install superpowers`) and re-run this prompt against the same feature folder"). HALT.
+5. **Missing-skill re-probe (spec §16.3).** If either STATUS reports
+   `verdict=MISSING_SKILLS`, do NOT immediately HALT. Call `skills_reprobe_
+   needed` (see cookbook) with: (a) `yes` iff an earlier phase in THIS run
+   already recorded `READY` for that vendor (scan `RUN_LOG.md` — a per-phase
+   missing claim contradicting a prior READY is the known false-negative
+   pattern observed with `preflight-codex`); (b) `yes` iff a deterministic
+   filesystem check shows the named skill directory/`SKILL.md` actually
+   exists under one of the checked plugin roots; (c) `yes` iff the STATUS
+   file itself, or its sibling `.tmp.*`, shows the attempt reached publication
+   but lost its final STATUS. On `true`, re-dispatch that ONE vendor's
+   preflight role once more (same `dispatch_parallel` mechanism, a fresh
+   attempt) and use the re-probe's verdict in place of the first. A second
+   consecutive `MISSING_SKILLS` (from the re-probe, or when re-probe was not
+   indicated) is accepted as real: print to the user which CLI is missing
+   which skills (from `required_skills_missing` plus `x_plugin_roots_
+   checked`), plus an install hint ("Install the Superpowers plugin (e.g.
+   `claude plugin install superpowers`) and re-run this prompt against the
+   same feature folder"). HALT.
 6. If the `codex` check fails, apply the "Distinguish orchestration bugs from vendor failures" filter from Failure handling first. If the captured stderr indicates a local CLI usage error (`unexpected argument`, `Usage:`, `unknown option`), this is an orchestration bug, not a Codex outage — correct the invocation per the cookbook's "CLI invocation forms" and retry once. Otherwise branch on the failure mode:
    - **Mode 0 (binary missing — environmental):** HALT unconditionally. Surface the remediation message ("Install the Codex CLI and re-run") and STOP. Do NOT prompt the user. A missing binary is an environment defect that must be fixed before the run can proceed in any mode; silently degrading would mask a broken setup.
    - **Modes 1, 2, 3, 4 (after the one allowed Mode-4 retry), or 5:** prompt the user interactively: `Codex is unavailable (mode=<N>, stderr=<tail>). Continue in claude-only mode for this run? [y/N]`. A non-interactive run may pre-answer this prompt by setting `CODEX_CONSENT=y|n`. When `CODEX_CONSENT` is unset and stdin is not a TTY, HALT rather than reading EOF as "no" — a silent EOF-as-no would let an unattended run degrade without anyone actually consenting.
@@ -5910,7 +6475,7 @@ previous behaviour — hid the degradation from the final report.
      - On `N`, `CODEX_CONSENT=n`, or any non-`y` response: HALT and surface the same remediation as Mode 0.
      - On EOF with `CODEX_CONSENT` unset and stdin not a TTY: HALT and surface the same remediation as Mode 0 — do not treat the EOF itself as an answer.
 7. If the `claude` check fails, HALT. Claude is required for every phase — there is no claude-less degraded mode and no user prompt.
-8. If both report `READY`, run Step 1.2 (artifact relocation, defined immediately below) **FIRST**, then append one `RUN_LOG.md` entry per subprocess whose `status_path` names the **relocated** path (`1-preflight/phase-1/<vendor>-check-status.md`). After the entries are written, proceed to Phase 2.
+8. If both report `READY`, run Step 1.2 (artifact relocation, defined immediately below) **FIRST**, then append one `RUN_LOG.md` entry per subprocess whose `status_path` names the **relocated** path (`1-preflight/phase-1/<vendor>-check-status.md`). Call `vendor_proven_mark claude preflight-claude` and, if codex ran and is `READY`, `vendor_proven_mark codex preflight-codex` — this preflight probe is `micro`/cheap by design, so `vendor_proven_mark` here is a starting floor (spec §16.3 evidence), not the primary source of proof; the first SUBSTANTIVE per-phase dispatch that completes (reviewer, plan-writer, implementer, ...) re-marks it regardless. After the entries are written, proceed to Phase 2.
 
    **Relocate, then log — never the reverse.** Logging first would record
    `1-preflight/<vendor>-check-status.md`, a path Step 1.2 vacates microseconds
@@ -5967,10 +6532,28 @@ Phase 1 always runs in full on a fresh invocation. There is no cross-run preflig
 ## Phase 2 — Context discovery (delegated)
 
 Dispatch one `claude` subprocess for role `context-discovery`. The subagent:
-- Lists available Superpowers skills in the environment.
+- Lists available Superpowers skills in the environment (marketplace-agnostic — whatever plugin roots are actually configured, not a hard-coded location).
 - Reads `CLAUDE.md` (and any nested `CLAUDE.md` files).
-- Identifies project conventions relevant to the SDLC flow.
+- Identifies project conventions relevant to the SDLC flow, AND this run's work types / project capabilities (e.g. "has a test suite", "touches a web frontend", "uses a specific framework") — from which it reports `relevant_skills` (+ `relevant_skills_reasons`, one reason per skill) in its own STATUS: the "relevant" side of spec §16.4's applicability computation. It does NOT compute the intersection itself — see below.
 - Writes a short context summary file at `<feature-folder>/2-context-discovery/status.md` with `verdict=READY` plus the resolved skill names per phase.
+
+**Optional-skill applicability (spec §16.4) is computed by the orchestrator,
+not the subagent, and recomputed fresh in every later phase's shell** —
+`reconstruct_durable_inputs` (see "Durable input reconstruction" above) sets
+`$APPLICABLE_OPTIONAL_SKILLS` from `installed ∩ relevant`: `OPTIONAL_SKILLS`
+(Phase 1's `optional_skills_present` record) intersected with this phase's
+own read of `2-context-discovery/status.md`'s `relevant_skills` field, via
+the `applicable_optional_skills` cookbook helper. There is nothing to do at
+Phase 2 itself beyond the dispatch above; the plan writer (Phase 4) is the
+first real consumer — it receives `$APPLICABLE_OPTIONAL_SKILLS` as a
+rendered appendix input (its own reasons are `relevant_skills_reasons` from
+Phase 2's STATUS, carried unchanged: an "applicable" skill's reason IS the
+"relevant" reason that survived the intersection). Implementation (Phase 6)
+passes only the task-relevant subset of it to each worker, recording actual
+usage per task in its own summary — an installed skill NOT called for by
+this run's work types is never passed down, and a relevant skill NOT
+installed is never treated as missing (optional absence never halts, per
+spec §16.4).
 
 Before rendering the appendix, resolve and export the role→model map so the
 dispatched session can copy it verbatim instead of calling `role_model` itself
@@ -6022,7 +6605,7 @@ Before iter 01's first reviewer dispatch (the gate's **first work dispatch**, de
 6. Append one RUN_LOG dispatch entry per probe with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 3-spec-review/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
 7. Branch on the verdicts:
    - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
-   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** set `codex_available = false` for the remainder of Phase 3 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `failure_mode: <N>`, and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase, matching every other vendor-side failure mid-run. Proceed to step 1 of the iteration loop with `codex_available = false`.
+   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 3 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase, matching every other vendor-side failure mid-run. Proceed to step 1 of the iteration loop with `codex_available = false`.
    - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed).
 
 ### File policy for non-READY paths (applies to every per-phase preflight gate)
@@ -6107,7 +6690,7 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 6. Append one RUN_LOG dispatch entry per probe with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 5-plan-review/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
 7. Branch on the verdicts:
    - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
-   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** set `codex_available = false` for the remainder of Phase 5 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `failure_mode: <N>`, and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase. Proceed to step 1 of the iteration loop with `codex_available = false`.
+   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 5 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase. Proceed to step 1 of the iteration loop with `codex_available = false`.
    - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed).
 
 The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this gate.
@@ -6314,10 +6897,12 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 6. Append one RUN_LOG dispatch entry per probe with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 7-code-review/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
 7. Branch on the verdicts:
    - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
-   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** set `codex_available = false` for the remainder of Phase 7 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `failure_mode: <N>`, and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1. Proceed to step 1 of the iteration loop with `codex_available = false`.
-   - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed).
+   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 7 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1. **Before proceeding, record the required degraded-coverage decision (spec §16.5):** append `record_event DEGRADED_REVIEW_ACCEPTED decision_id="p7-degraded-<run>" scope="phase=7;iteration=00" evidence="codex_unavailable failure_mode=<N>"` (`authority_identity: standing_process_policy` — this is a decision the process itself pre-authorizes for a single-vendor Phase 7 continuation, within the orchestrator's existing autonomy ceiling; it is never inferred ad hoc). A one-vendor Phase 7 MAY NOT proceed to the iteration loop without this event durable in `RUN_LOG.md` — this is what makes the degradation explicit rather than a silent strict PASS (the readiness writer's own rules already force `READY_WITH_NOTES` downstream; this event is what makes the ACCEPTANCE, not just the fact of degradation, auditable). Proceed to step 1 of the iteration loop with `codex_available = false`.
+   - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed). No `DEGRADED_REVIEW_ACCEPTED` is needed here — full dual-vendor coverage is not degraded.
 
 The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this gate.
+
+**Dual-vendor finding union (spec §16.5).** When both reviewers ran this iteration, their findings are the UNION, never a replacement: a `PASS` from one reviewer never cancels or supersedes a `blockers`/`majors` finding the OTHER reviewer reported for the same iteration. The iteration-dependent gate (see "Review-gate severity policy") already sums `blockers + majors` ACROSS every active reviewer for this reason — an implementation that reads only the "worse" of the two verdicts, or short-circuits once either reviewer reports PASS, silently drops the other reviewer's findings and must not be generated.
 
 ### Step 7.1 — Iteration loop
 
@@ -6573,7 +7158,10 @@ Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 10 fix→re-revie
 `VENDOR_UNAVAILABLE`, `WRITE_LEASE_ACQUIRED`, `WRITE_LEASE_RELEASED`,
 `ARTIFACT_INTEGRITY_BLOCKED`, `GIT_FINALIZATION_RESULT`, `OWNER_DECISION`,
 `RISK_ACCEPTED`, `PHASE_ACCEPTED`, `EVENT_CORRECTED`,
-`DEGRADED_REVIEW_ACCEPTED` (plus the reserved `CODEX_RE_ENABLED_BY_USER`).
+`DEGRADED_REVIEW_ACCEPTED`, `PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE`,
+`LOCAL_CLI_CANARIES_PASSED`, `TARGET_DIRTY_TREE_GATE_PASSED`,
+`PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED`, `RUNTIME_AND_REGISTRIES_VERIFIED`,
+`VENDOR_PROVEN` (plus the reserved `CODEX_RE_ENABLED_BY_USER`).
 Every type in this list beyond the legacy pre-schema-v2 names above has a row
 in the Event Contract Registry (below), which `record_event` validates
 against. An event entry NEVER substitutes for the `DISPATCH_COMPLETED` entry
@@ -6668,10 +7256,15 @@ of the whole pair — no `DISPATCH_STARTED`, no `DISPATCH_COMPLETED`.
 (Relative `status_path` is encouraged; absolute is allowed when ambiguous.
 `develop_it_git_sha` is `git -C "$PROCESS_REPO_ROOT" rev-parse HEAD`;
 `develop_it_file_sha256` is `sha256sum "$PROCESS_PATH" | cut -d' ' -f1`;
-`develop_it_dirty` is `yes` when the working-tree copy differs from
-`git -C "$PROCESS_REPO_ROOT" show "HEAD:$PROCESS_PATH_REL"`, `no` when it
-matches, and `unknown` outside a git repo. All three describe THIS document, not
-the project under development — a bare `git` call would report the wrong repo.)
+`develop_it_dirty` is one of four typed states (spec S16.2 -- see
+`process_identity` in the cookbook): `no` when the working-tree copy matches
+`git -C "$PROCESS_REPO_ROOT" show "HEAD:$PROCESS_PATH_REL"`, `yes` when it
+differs, `untracked` when `git ls-files --error-unmatch` finds the file is
+not in the index at all (plain-untracked and ignored-untracked are the SAME
+outcome), and `unknown` for a non-git repository or an unreadable identity
+check -- always paired with a `develop_it_dirty_reason` in that last case.
+All fields describe THIS document, not the project under development — a
+bare `git` call would report the wrong repo.)
 
 **Usage telemetry fields.** Every `DISPATCH_COMPLETED` entry MUST carry the nine telemetry fields shown above (`model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`, `usage_status`). Values come from `parse_usage` (see cookbook). Field semantics:
 
@@ -7126,7 +7719,7 @@ You are a one-shot preflight checker invoked by the develop-it orchestrator. You
 - Optional inputs: `none`
 - Outputs: `check_status`
 - Allowed verdicts: `READY;MISSING_SKILLS`
-- Required status fields: `common_v2;context7`
+- Required status fields: `common_v2;context7;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent`
 - Checkpoint kind: `none`
 - Phases: `1`
 
@@ -7136,7 +7729,7 @@ You are a one-shot preflight checker invoked by the develop-it orchestrator. You
 
 ## Required skill probes
 
-Attempt to load each of these Superpowers skills. For each, report `LOADED` or `MISSING`.
+Attempt to load each of these Superpowers skills. For each, report `LOADED` or `MISSING`, and name every plugin root/path you checked before reporting a skill `MISSING` (marketplace-agnostic: check every configured plugin root, not one hard-coded location).
 - superpowers:writing-plans
 - superpowers:subagent-driven-development
 - superpowers:systematic-debugging
@@ -7145,6 +7738,16 @@ Attempt to load each of these Superpowers skills. For each, report `LOADED` or `
 - superpowers:requesting-code-review
 - superpowers:receiving-code-review
 - superpowers:finishing-a-development-branch
+
+## Optional skill discovery
+
+List every OTHER Superpowers skill you find installed under any checked
+plugin root that is NOT in the required list above — this is the raw
+"installed" side of Phase 2's later `applicable_optional_skills =
+installed ∩ relevant` computation (see Phase 2). Report each such skill name
+as `optional_skills_present`. Nothing is required-but-absent at this phase
+(optionality is scored against a project's actual needs at Phase 2, not
+here), so report `optional_skills_absent` as an empty list.
 
 ## Required MCP probe
 
@@ -7186,7 +7789,12 @@ artifact_revision: <sha256 or git commit sha of what you produced, or the litera
 output_count: 0
 checkpoint_path: null
 context7: reachable | unreachable
-x_missing_skills: [skill1, skill2, ...] (empty list if READY)
+required_skills_present: [skill1, skill2, ...]
+required_skills_missing: [skill3, ...] (empty list if READY)
+optional_skills_present: [skill4, ...] (empty list if none installed beyond the required set)
+optional_skills_absent: []
+x_plugin_roots_checked: [/path/one, /path/two, ...]
+x_missing_skills: [skill1, skill2, ...] (empty list if READY; same content as required_skills_missing, kept for back-compat)
 x_loaded_skills: [skill3, skill4, ...]
 STATUS
 ```
@@ -7214,7 +7822,7 @@ You are a one-shot preflight checker invoked by the develop-it orchestrator. You
 - Optional inputs: `none`
 - Outputs: `check_status`
 - Allowed verdicts: `READY;MISSING_SKILLS`
-- Required status fields: `common_v2`
+- Required status fields: `common_v2;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent`
 - Checkpoint kind: `none`
 - Phases: `1`
 
@@ -7232,7 +7840,15 @@ You are a one-shot preflight checker invoked by the develop-it orchestrator. You
 - `superpowers:subagent-driven-development`
 - `superpowers:verification-before-completion`
 
-For each, report `LOADED` if the skill's directory or `SKILL.md` file exists, or `MISSING` if it does not. Do NOT read the contents of `SKILL.md`. Do NOT load the skill. A path existence check is sufficient.
+For each, report `LOADED` if the skill's directory or `SKILL.md` file exists, or `MISSING` if it does not. Do NOT read the contents of `SKILL.md`. Do NOT load the skill. A path existence check is sufficient. Name every plugin root/path checked before reporting `MISSING` — this is the evidence a re-probe request (see Phase -1 Step 1.1 step 5) uses to tell a genuine absence from a stale listing.
+
+## Optional skill discovery
+
+List every OTHER installed Superpowers skill directory found under a
+checked plugin root, beyond the required list above, as `optional_skills_
+present` (existence check only — same `micro`-mode restriction). Report
+`optional_skills_absent` as an empty list (see the parallel note in
+`preflight-claude`'s appendix — optionality is scored at Phase 2, not here).
 
 Do NOT execute any other actions. Do NOT read project files. Do NOT run broad `find` or `rg` over the repo. Do NOT write any file other than the status file below.
 
@@ -7263,7 +7879,12 @@ published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
 artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
 output_count: 0
 checkpoint_path: null
-x_missing_skills: [skill1, skill2, ...] (empty list if READY)
+required_skills_present: [skill1, skill2, ...]
+required_skills_missing: [skill3, ...] (empty list if READY)
+optional_skills_present: [skill4, ...] (empty list if none installed beyond the required set)
+optional_skills_absent: []
+x_plugin_roots_checked: [/path/one, /path/two, ...]
+x_missing_skills: [skill1, skill2, ...] (empty list if READY; same content as required_skills_missing, kept for back-compat)
 x_loaded_skills: [skill3, skill4, ...]
 STATUS
 ```
@@ -7282,7 +7903,7 @@ You are dispatched by the develop-it orchestrator to discover the project's envi
 - Optional inputs: `none`
 - Outputs: `status`
 - Allowed verdicts: `READY;BLOCKED`
-- Required status fields: `common_v2`
+- Required status fields: `common_v2;relevant_skills;relevant_skills_reasons`
 - Checkpoint kind: `none`
 - Phases: `2`
 
@@ -7296,9 +7917,10 @@ Use only read-only inspection. You do NOT load `subagent-driven-development` her
 
 ## Tasks
 
-1. Enumerate Superpowers skills available in the environment. Use the platform's skill-listing mechanism.
+1. Enumerate Superpowers skills available in the environment. Use the platform's skill-listing mechanism (marketplace-agnostic — whatever plugin roots are actually configured, not a hard-coded location).
 2. Read the root `CLAUDE.md` and any nested `CLAUDE.md` files relevant to the SDLC flow. Summarize project conventions in one paragraph.
 3. Inspect the input spec path (the orchestrator records this in `RUN_LOG.md` and the feature folder name encodes the slug — derive the spec path: take the feature folder name, strip `-artifacts`, append `-design.md`, prepend `docs/superpowers/specs/`). Confirm the spec exists. Do NOT read its body.
+4. Identify this run's work types / project capabilities from what you observed above (e.g. "has a test suite", "touches a web frontend", "uses a specific framework") and, from those, list every OPTIONAL Superpowers skill from step 1's enumeration that is genuinely relevant to THIS run (spec §16.4's "relevant" side of `installed ∩ relevant` — the orchestrator computes the intersection itself once your STATUS is durable; you do not compute it). For each relevant skill, give a one-line reason naming the specific work type/capability that makes it relevant. Report the skill list as `relevant_skills` and the parallel one-line reasons (same order, same count) as `relevant_skills_reasons`. An empty list is legitimate and never blocks `READY` — optional-skill absence never halts (spec §16.4).
 4. Copy the resolved role→model map below verbatim into your STATUS file under
    `resolved_models:`. It was produced by the orchestrator from the Models table.
    Do NOT re-derive, alias, or substitute ids, and do NOT consult
@@ -7340,6 +7962,8 @@ x_available_skills: [skill, ...]
 x_project_conventions: <one paragraph>
 x_resolved_models: <one role:model-id pair per line, exactly as supplied in $RESOLVED_MODELS>
 x_spec_path: <absolute>
+relevant_skills: [skill1, skill2, ...] (empty list if none are relevant)
+relevant_skills_reasons: [reason1, reason2, ...] (same order and count as relevant_skills)
 STATUS
 ```
 
@@ -7646,7 +8270,7 @@ You are a plan author invoked as a fresh subprocess. You have no shared context.
 ## Role contract
 
 - Required inputs: `feature_folder;spec_path;context7_policy`
-- Optional inputs: `continuation_path;declared_foreign_changes`
+- Optional inputs: `continuation_path;declared_foreign_changes;applicable_optional_skills`
 - Outputs: `status;plan_path;progress.jsonl`
 - Allowed verdicts: `DONE;BLOCKED`
 - Required status fields: `common_v2`
@@ -7660,6 +8284,7 @@ You are a plan author invoked as a fresh subprocess. You have no shared context.
 - `$CONTEXT7_POLICY` — `required` or `best-effort` (see below)
 - `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
 - `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
+- `$APPLICABLE_OPTIONAL_SKILLS` — `;`-separated optional Superpowers skills installed AND relevant to this run's work types (spec §16.4's `installed ∩ relevant`; empty before Phase 2 completes or when none apply — never treat an empty value as an error). When non-empty, prefer these skills for any optional/task-specific guidance the plan calls for; do not invent a need for a skill not in this list.
 
 ## Required skills
 
@@ -9317,12 +9942,12 @@ You are the final readiness reporter. You have no shared context.
    - **Implementation result** — task count, commits, `implementation_base_sha`, verification, no-secret check, browser-QA result if applicable. If a post-debug re-verification occurred, note it.
    - **Test results** — `final_test_verdict` (`PASS` / `FAILED` / `SKIPPED`), execution mode (`start-all-tests.sh` — a project-specific convention — vs discovered suites), rounds used, fix rounds dispatched, and — when `FAILED` — the residual-failure detail carried over from `all-test-summary.md` (failing test names, error excerpts, what each fix round attempted).
    - **Git result** — commit SHAs or `SKIPPED` reason.
-   - **Degradations** — one line per `event=CONTEXT7_UNAVAILABLE`, `event=DISPATCH_ORPHANED`, or `event=MODEL_REJECTED` entry found in `RUN_LOG.md`, naming the affected roles. Omit this section only when RUN_LOG contains none of these events. Any degradation present forces the readiness verdict to at least `READY_WITH_NOTES` — never a silent `READY`.
+   - **Degradations** — one line per `event=CONTEXT7_UNAVAILABLE`, `event=DISPATCH_ORPHANED`, `event=MODEL_REJECTED`, or `event=DEGRADED_REVIEW_ACCEPTED` entry found in `RUN_LOG.md`, naming the affected roles (for `DEGRADED_REVIEW_ACCEPTED`, the `scope` field). Omit this section only when RUN_LOG contains none of these events. Any degradation present forces the readiness verdict to at least `READY_WITH_NOTES` — never a silent `READY`.
    - **Skipped optional steps** — list anything bypassed and why.
    - **Deferred MAJOR items** — total count + per-gate breakdown of MAJOR findings open when a gate passed under the relaxed rule (iterations 3–10, `blockers=0`, `majors>0`); each was addressed by that gate's final fix pass (fixed, not re-reviewed). Read from each gate's summary file (the summarizer records deferred majors there). Present this section only when at least one gate carried deferred majors. NOTE: this section's presence is NOT the trigger for `READY_WITH_NOTES` — a relaxed-tier pass forces `READY_WITH_NOTES` on its own (see the readiness-verdict rule), so a clean relaxed pass produces `READY_WITH_NOTES` with this section absent.
    - **Residual MINOR/NIT items** — total count + per-gate breakdown.
    - **Run history** — number of resumes, vendor failover events from RUN_LOG, baseline SHA capture.
-   - **Readiness verdict** — `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, the all-tests `final_test_verdict` is `PASS` or `SKIPPED`, every preflight verdict is `READY` or `SKIPPED`, AND the "Degradations" section is empty (no `CONTEXT7_UNAVAILABLE` / `DISPATCH_ORPHANED` / `MODEL_REJECTED` events) — a run cannot be reported `READY` with any degradation present, regardless of how the rest of the run went; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain, OR (c) the "Degradations" section is non-empty and none of the `NOT_READY` conditions below apply; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including an all-tests `final_test_verdict` of `FAILED` (residual test failures after the fix cap — `NOT_READY` even when everything else passed; the "Test results" section carries the detail), any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), or any claude preflight that is not `READY`.
+   - **Readiness verdict** — `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, the all-tests `final_test_verdict` is `PASS` or `SKIPPED`, every preflight verdict is `READY` or `SKIPPED`, AND the "Degradations" section is empty (no `CONTEXT7_UNAVAILABLE` / `DISPATCH_ORPHANED` / `MODEL_REJECTED` / `DEGRADED_REVIEW_ACCEPTED` events) — a run cannot be reported `READY` with any degradation present, regardless of how the rest of the run went; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain, OR (c) the "Degradations" section is non-empty and none of the `NOT_READY` conditions below apply; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including an all-tests `final_test_verdict` of `FAILED` (residual test failures after the fix cap — `NOT_READY` even when everything else passed; the "Test results" section carries the detail), any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), or any claude preflight that is not `READY`.
    - **Usage rollup** — emit a final `## Usage rollup` section containing four parts in this order:
      1. **Grand total** (one row) — columns: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration`. Sum across every dispatch entry in `RUN_LOG.md`.
      2. **Per-phase table** — one row per phase that ran (use `phase_name` for the row label). Same columns as grand total, plus a leading `Phase` column. Include a final `TOTAL` row that matches the grand total.
