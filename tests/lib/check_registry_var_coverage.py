@@ -26,6 +26,11 @@ EXEMPT_VARS = {
     "FEATURE_FOLDER", "PHASE_DIR", "DISPATCH_ID", "LOGICAL_DISPATCH_ID",
     "ATTEMPT", "ROLE_CONTRACTS_PATH", "STATUS_PUBLISHER_PATH", "GREP_BIN",
     "RESOLVED_MODELS",
+    # Task 9: every checkpointed appendix sources the generated runtime to
+    # call checkpoint_append directly (the same mechanical plumbing role as
+    # ROLE_CONTRACTS_PATH/STATUS_PUBLISHER_PATH -- how it reaches the
+    # generated runtime, not a declared business input).
+    "RUNTIME_DIR",
 }
 
 APPENDIX = re.compile(r"<!-- BEGIN: ([a-z0-9-]+) -->(.*?)<!-- END: \1 -->", re.S)

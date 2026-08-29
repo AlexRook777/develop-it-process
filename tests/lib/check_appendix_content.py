@@ -26,8 +26,11 @@ CHECKS = [
     ("implementer", r"NEEDS_DEBUG.{0,3}if verification failed", "verdict rule: NEEDS_DEBUG"),
     ("implementer", r"No-secret check result", "human summary contents: no-secret check"),
     ("implementer", r"drift from .subagent_type: impl-worker. is auditable", "implementer/impl-worker drift audit"),
-    ("implementation-fixer", r"progress\.jsonl.{0,3}incrementally", "progress.jsonl durability note"),
-    ("documentation-writer", r"progress\.jsonl.{0,3}incrementally", "progress.jsonl durability note"),
+    # Task 9: progress.jsonl is now a real checkpoint_append call site, not
+    # free-hand "write it yourself" prose -- check for the real call rather
+    # than the retired "incrementally" wording.
+    ("implementation-fixer", r"checkpoint_append", "progress.jsonl checkpoint_append call"),
+    ("documentation-writer", r"checkpoint_append", "progress.jsonl checkpoint_append call"),
     ("spec-fixer", r"addressed_blockers", "addressed_blockers/majors/deferred_minors fields"),
     ("debugger", r"does not promise verification passes", "advisory verdict note"),
     ("test-fixer", r"does not promise the suite passes", "advisory verdict note"),

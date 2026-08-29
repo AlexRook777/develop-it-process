@@ -106,6 +106,18 @@ assert_present 'uv run pytest' "$D" "T20: test discovery uses uv"
 assert_present 'CODEX_CONSENT' "$D" "T20: non-interactive consent override"
 assert_present 'context7.*MCP server' "$D" "T20: context7 is described as an MCP server"
 
+# --- Task 9: resumable role checkpoints ---
+assert_present '^checkpoint_append\(\) \{' "$D" "T9: checkpoint_append is a real cookbook function"
+assert_present '^checkpoint_resume_state\(\) \{' "$D" "T9: checkpoint_resume_state is a real cookbook function"
+assert_present '^checkpoint_partial_isolated\(\) \{' "$D" "T9: checkpoint_partial_isolated is a real cookbook function"
+assert_present '^reconstruct_checkpoint_state\(\) \{' "$D" "T9: reconstruct_checkpoint_state is a real cookbook function"
+assert_present 'CONTINUATION_CAP_REACHED' "$D" "T9: CONTINUATION_CAP_REACHED is a registered event type"
+assert_present '\| document-fixer \|' "$D" "T9: spec/plan fixers get a real checkpoint kind, not none"
+assert_present 'artifact-complete\.json' "$D" "T9: plan-writer's structural-completion artifact is documented"
+assert_present '\$FEATURE_FOLDER/6-implementation/sdd/' "$D" "T9: SDD custody root is documented"
+assert_present 'continuation_path;declared_foreign_changes' "$D" \
+  "T9: at least one role declares the new continuation-input optional inputs"
+
 # --- Final review: non-fragile timeout-literal guard ---
 # `assert_absent 'timeout [0-9]+m '` (T19) and a hand-composed `Timeout:? +N
 # *min` guard both missed real regressions ("120 min", "300-minute") because

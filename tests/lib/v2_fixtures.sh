@@ -119,3 +119,32 @@ write_fake_lease() {
     >> "$file"
   printf '"snapshot_manifest_path":"%s"}\n' "$(dirname "$file")/fake-lease-manifest.json" >> "$file"
 }
+
+# ---- write_fake_checkpoint (Task 9) -----------------------------------------
+# Appends ONE well-formed common-schema-v2 checkpoint record (spec S10.1) to
+# PROGRESS_PATH by hand -- the fixture-side counterpart to checkpoint_append's
+# own JSON shape, for tests that build up a progress.jsonl line by line
+# (valid multi-record files, then a deliberately corrupted line appended on
+# top) without going through the real dispatch lifecycle. Every field
+# checkpoint_resume_state itself reads is present, so a caller testing "does
+# checkpoint_resume_state reject field X" starts from an otherwise-valid
+# record.
+#
+# Usage: write_fake_checkpoint PROGRESS_PATH DISPATCH_ID SEQUENCE STATE UNIT_ID \
+#          [ARTIFACT_PATH] [ARTIFACT_SHA256] [COMMIT_SHA] [NEXT_UNIT]
+write_fake_checkpoint() {
+  local path="$1" dispatch_id="$2" sequence="$3" state="$4" unit_id="$5"
+  local artifact_path="${6:-}" artifact_sha256="${7:-}" commit_sha="${8:-}" next_unit="${9:-}"
+  mkdir -p "$(dirname "$path")"
+  jq -cn --argjson schema_version 2 --arg dispatch_id "$dispatch_id" \
+    --argjson sequence "$sequence" --arg role test-role --arg unit_type task \
+    --arg unit_id "$unit_id" --arg state "$state" --arg artifact_path "$artifact_path" \
+    --arg artifact_sha256 "$artifact_sha256" --arg commit_sha "$commit_sha" \
+    --argjson finding_ids '[]' --arg verification PASS --arg next_unit "$next_unit" \
+    --arg timestamp "1970-01-01T00:00:00Z" \
+    '{schema_version:$schema_version, dispatch_id:$dispatch_id, sequence:$sequence,
+      role:$role, unit_type:$unit_type, unit_id:$unit_id, state:$state,
+      artifact_path:$artifact_path, artifact_sha256:$artifact_sha256,
+      commit_sha:$commit_sha, finding_ids:$finding_ids, verification:$verification,
+      next_unit:$next_unit, timestamp:$timestamp}' >> "$path"
+}

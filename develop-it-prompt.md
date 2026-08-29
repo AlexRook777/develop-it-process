@@ -212,17 +212,17 @@ this account and is used for the cheap `preflight-codex` probe;
 | context-discovery | claude | claude-sonnet-5 | — | 30 | no | no | no | feature_folder;resolved_models | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | READY;BLOCKED | common_v2 | none | 2 |
 | spec-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
 | spec-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
-| spec-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;spec_path;findings_paths | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 3 |
-| plan-writer | claude | claude-opus-5 | — | 120 | yes | yes | no | feature_folder;spec_path;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;plan_path | DONE;BLOCKED | common_v2 | none | 4 |
+| spec-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;spec_path;findings_paths | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2 | document-fixer | 3 |
+| plan-writer | claude | claude-opus-5 | — | 120 | yes | yes | no | feature_folder;spec_path;context7_policy | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;plan_path;progress.jsonl | DONE;BLOCKED | common_v2 | plan | 4 |
 | plan-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
 | plan-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
-| plan-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;plan_path;findings_paths | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 5 |
-| implementer | claude | claude-opus-5 | — | 300 | yes | yes | yes | feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy | findings_paths;debugger_status_path | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | implementation_summary;status | DONE;FAILED;NEEDS_DEBUG;BLOCKED | common_v2;verification | implementation | 6 |
+| plan-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;plan_path;findings_paths | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2 | document-fixer | 5 |
+| implementer | claude | claude-opus-5 | — | 300 | yes | yes | yes | feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy | findings_paths;debugger_status_path;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | implementation_summary;status | DONE;FAILED;NEEDS_DEBUG;BLOCKED | common_v2;verification | implementation | 6 |
 | impl-worker | claude | claude-sonnet-5 | — | 300 | yes | yes | no | task_brief | context7_policy | none | changed_paths | none | none | implementation | child |
 | debugger | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;plan_path;implementation_summary_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 6 |
 | code-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
 | code-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
-| implementation-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | accepted_plan;reviewed_revision;finding_ids;iteration;write_lease | run_log;relevant_artifacts | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | changed_paths;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;finding_dispositions | implementation | 7 |
+| implementation-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | accepted_plan;reviewed_revision;finding_ids;iteration;write_lease | run_log;relevant_artifacts;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | changed_paths;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;finding_dispositions | implementation | 7 |
 | all-tests-runner | claude | claude-sonnet-5 | — | 60 | yes | yes | no | feature_folder;repo_root;round | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;test_report | PASS;FAIL;SKIPPED | common_v2 | none | 8 |
 | test-fixer | claude | claude-sonnet-5 | — | 60 | yes | yes | no | feature_folder;plan_path;round;test_report_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 8 |
 | summarizer-spec | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 3 |
@@ -230,7 +230,7 @@ this account and is used for the cheap `preflight-codex` probe;
 | summarizer-implementation | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 6 |
 | summarizer-code-review | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 7 |
 | summarizer-all-tests | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 8 |
-| documentation-writer | claude | claude-sonnet-5 | — | 60 | yes | yes | no | final_diff;accepted_spec;accepted_plan;implementation_summary;test_summary;review_summary;decisions;exclusions;followups;write_lease | docs_inventory;run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | uat.md;planned-vs-realized.md;documentation-validation.md;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;documentation_validation | document | 9 |
+| documentation-writer | claude | claude-sonnet-5 | — | 60 | yes | yes | no | final_diff;accepted_spec;accepted_plan;implementation_summary;test_summary;review_summary;decisions;exclusions;followups;write_lease | docs_inventory;run_log;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | uat.md;planned-vs-realized.md;documentation-validation.md;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;documentation_validation | document | 9 |
 | readiness-writer | claude | claude-opus-5 | — | 20 | no | no | no | feature_folder;spec_path;plan_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | report;status | DONE | common_v2 | none | 10 |
 
 This table is the ONLY place a model, effort, timeout, contract shape, or
@@ -696,15 +696,19 @@ reconstruct_durable_inputs() {
   DEBUGGER_STATUS_PATH="$FEATURE_FOLDER/6-implementation/debugger-status.md"
   [ -f "$DEBUGGER_STATUS_PATH" ] || DEBUGGER_STATUS_PATH=""
 
-  # Continuation/checkpoint paths and declared foreign changes/commits: this
-  # revision does not yet define a durable event/artifact for either -- that
-  # lands with the checkpoint/continuation runtime (a later task). Reconstruct
-  # them as empty rather than inventing an undocumented format; neither is a
-  # required_input of any current registry row, so no phase below treats
-  # their absence as PRELAUNCH_FAILED.
-  # shellcheck disable=SC2034  # reserved for the checkpoint/continuation runtime (a later task)
+  # Continuation/checkpoint paths and declared foreign changes: initialized
+  # empty here (Task 9) so render_prompt's `${!k+x}` substitution always
+  # sees them "set", even for a phase whose own checkpointed role has never
+  # failed -- but NOT actually reconstructed here. That real reconstruction
+  # (`reconstruct_checkpoint_state`, "Checkpoint contract" below) genuinely
+  # needs $ROLE_CONTRACTS_PATH (role_attempt_dir -> role_phases), which does
+  # not exist yet at THIS point in a real phase's shell -- bootstrap_runtime
+  # and its `source "$RUNTIME_DIR/develop-it-runtime.sh"` line, both of
+  # which run AFTER init_orchestration_vars returns, are what materialize
+  # it. A phase with a checkpointed role calls `reconstruct_checkpoint_state`
+  # itself, once the runtime is sourced (see the per-phase snippet below).
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
   CONTINUATION_PATH=""
-  # shellcheck disable=SC2034  # reserved for the checkpoint/continuation runtime (a later task)
   DECLARED_FOREIGN_CHANGES=""
 
   case "$phase" in
@@ -1541,14 +1545,25 @@ document is permitted to construct a `dispatch_id` for a top-level role.
 # list) and is the SAME primitive acquire_write_lease already uses for its
 # own exclusive creation, below.
 _run_log_lock_acquire() {
-  local lockfile="$ORCHESTRATION_DIR/log.lock" tries=0 tmp
-  mkdir -p "$ORCHESTRATION_DIR"
+  # Usage: _run_log_lock_acquire [LOCKFILE] -- defaults to the shared
+  # RUN_LOG mutex every existing caller already relies on (record_event,
+  # allocate_attempt, ...), none of which pass an argument, so their
+  # behavior is byte-for-byte unchanged. checkpoint_append ("Checkpoint
+  # contract" below) passes its OWN progress.jsonl's own lock path instead,
+  # giving each checkpoint file a genuinely independent PER-FILE lock while
+  # reusing this exact SAME `ln` primitive -- never a second locking
+  # mechanism (spec S10.1's "per-file lock" and this document's own "use
+  # the existing mutex, do not invent another" are the same requirement
+  # once the lock file itself is parameterized, not two competing ones).
+  local lockfile="${1:-$ORCHESTRATION_DIR/log.lock}" tries=0 tmp lockdir
+  lockdir="$(dirname "$lockfile")"
+  mkdir -p "$lockdir"
   # $BASHPID, not $$: a `( ... ) &` subshell fork (dispatch_parallel's own
   # fan-out, or this file's own 8-way concurrency test) keeps $$ pointing at
   # the ORIGINAL shell, so every forked sibling would otherwise build the
   # SAME tmp name -- a real collision this exact concurrency test caught.
   # $BASHPID is the actual PID of the running shell and differs per fork.
-  tmp="$ORCHESTRATION_DIR/.log.lock.owner.$BASHPID.$RANDOM"
+  tmp="$lockdir/.$(basename "$lockfile").owner.$BASHPID.$RANDOM"
   printf '%s\n' "$$" > "$tmp" || { echo "RUN_LOG_LOCK_TMP_FAILED" >&2; return 1; }
   until ln "$tmp" "$lockfile" 2>/dev/null; do
     tries=$((tries + 1))
@@ -1562,7 +1577,9 @@ _run_log_lock_acquire() {
   rm -f "$tmp"
 }
 _run_log_lock_release() {
-  rm -f "$ORCHESTRATION_DIR/log.lock" 2>/dev/null || true
+  # Usage: _run_log_lock_release [LOCKFILE] -- same default as acquire.
+  local lockfile="${1:-$ORCHESTRATION_DIR/log.lock}"
+  rm -f "$lockfile" 2>/dev/null || true
 }
 
 # Derives the next two-digit attempt monotonically from EVERY prior
@@ -1760,7 +1777,7 @@ render_keys() {
     RELEVANT_ARTIFACTS FINAL_DIFF ACCEPTED_SPEC IMPLEMENTATION_SUMMARY \
     TEST_SUMMARY REVIEW_SUMMARY DECISIONS EXCLUSIONS FOLLOWUPS DOCS_INVENTORY \
     PHASE_DIR DISPATCH_ID LOGICAL_DISPATCH_ID ATTEMPT ROLE_CONTRACTS_PATH \
-    STATUS_PUBLISHER_PATH
+    STATUS_PUBLISHER_PATH CONTINUATION_PATH DECLARED_FOREIGN_CHANGES RUNTIME_DIR
 }
 
 render_prompt() {
@@ -3253,7 +3270,7 @@ below implements the same routing directly, including RM08's override
 | RM04 | PUBLICATION_LOST | NO_SIDE_EFFECTS | Retry once up to publication_retry_cap; never promote .tmp; allocate a new attempt |
 | RM05 | TIMED_OUT,TRANSIENT_TRANSPORT_ERROR,EXITED_NO_STATUS | NO_SIDE_EFFECTS | Fresh retry once up to transient_retry_cap; allocate a new attempt |
 | RM06 | TIMED_OUT,TRANSIENT_TRANSPORT_ERROR,EXITED_NO_STATUS,PUBLICATION_LOST | CLEAN_CHECKPOINTED | Dispatch continuation up to continuation_cap; allocate a new attempt |
-| RM07 | TIMED_OUT,TRANSIENT_TRANSPORT_ERROR,EXITED_NO_STATUS,PUBLICATION_LOST | DIRTY_CHECKPOINTED | Run integrity reconciliation, then continuation up to continuation_cap only if the partial unit is isolated |
+| RM07 | TIMED_OUT,TRANSIENT_TRANSPORT_ERROR,EXITED_NO_STATUS,PUBLICATION_LOST | DIRTY_CHECKPOINTED | Run integrity reconciliation, then continuation up to continuation_cap only if the partial unit is isolated (requires the 3-argument `recovery_action CLASSIFICATION STATE LOGICAL_DISPATCH_ID` call form -- the 2-argument form cannot decide isolation and reports RECONCILE_UNKNOWN_NO_LOGICAL_ID) |
 | RM08 | ANY_FAILURE | DIRTY_UNCHECKPOINTED,INTEGRITY_UNKNOWN | HALT with exact paths/state; no second writer launches |
 | RM09 | SPEND_CEILING | NO_SIDE_EFFECTS,CLEAN_CHECKPOINTED,DIRTY_CHECKPOINTED | Emit one run-scoped vendor-unavailable event; suppress later calls to that vendor; halt or use an explicitly accepted degraded path |
 | RM10 | PERMANENT_VENDOR_ERROR,UNKNOWN_VENDOR_ERROR | NO_SIDE_EFFECTS,CLEAN_CHECKPOINTED,DIRTY_CHECKPOINTED | No automatic retry; halt or use the documented vendor-degradation decision |
@@ -3307,8 +3324,23 @@ _recovery_emit_vendor_unavailable() {
 
 recovery_action() {
   # Usage: recovery_action <classification> <state> [logical_dispatch_id] [vendor]
-  # <logical_dispatch_id>/<vendor> are optional and used ONLY to name the
-  # RM01/RM09 events above -- every other row ignores them.
+  # <vendor> is optional and used ONLY to name the RM09 event below.
+  # <logical_dispatch_id> is optional for every row EXCEPT RM07 (code
+  # review fix: this used to say "every other row ignores them", which
+  # stopped being true the moment RM07's real isolation wiring landed --
+  # DIRTY_CHECKPOINTED now REQUIRES it to resolve the failed attempt's own
+  # checkpoint before it can honestly judge isolation). The two-argument
+  # call form `recovery_action CLASSIFICATION MUTATION_STATE` -- the
+  # plan's own fixed interface -- is still legal for every row but RM07;
+  # for RM07 specifically it cannot decide isolation at all and reports
+  # `RECONCILE_UNKNOWN_NO_LOGICAL_ID` rather than silently guessing
+  # "not isolated" (see the DIRTY_CHECKPOINTED case below). A caller that
+  # reaches RM07 MUST supply the real logical_dispatch_id, and MUST have
+  # done so before allocating any continuation attempt for it -- resume-
+  # state reads the LATEST attempt already durable in RUN_LOG
+  # (_recovery_checkpoint_context, "Checkpoint contract" below), so
+  # recovery_action's own verdict has to be consulted BEFORE allocate_
+  # attempt mints the continuation's new attempt id, never after.
   local classification="$1" state="$2" logical="${3:-}" vendor="${4:-}"
   RECOVERY_MATRIX_ID=""; RECOVERY_ACTION=""
 
@@ -3356,13 +3388,42 @@ recovery_action() {
           RECOVERY_MATRIX_ID=RM06; RECOVERY_ACTION=CONTINUE_WITHIN_CAP ;;
         DIRTY_CHECKPOINTED)
           # RM07's own "isolated" test (spec: "continuation ... only if the
-          # partial unit is isolated") is NOT evaluated here -- there is no
-          # owned-artifact/checkpoint-boundary ledger yet to ask (spec S8/
-          # S11, Task 8/9). This seam always answers CONTINUE_IF_ISOLATED
-          # optimistically; the orchestrator narrative is what actually
-          # gates the continuation dispatch until that ledger exists.
+          # partial unit is isolated"), closed as of Task 9 -- code review
+          # fix: resume-state now runs HERE, before this decision, not
+          # after it (the ordering the original pass got backwards, which
+          # made RM07 permanently RECONCILE_BLOCKED_NOT_ISOLATED on any real
+          # call). `_recovery_checkpoint_context` resolves $logical's own
+          # most recent attempt and runs checkpoint_resume_state against
+          # ITS real progress.jsonl right now; `checkpoint_partial_isolated`
+          # then judges the tree against that freshly-resolved state. The
+          # matrix ID is RM07 either way (this combination always routes
+          # here); only the ACTION differs, exactly like RM11's own
+          # NO_SIDE_EFFECTS/mutating split above.
+          #
+          # `$logical` MISSING entirely (the plan's own two-argument fixed
+          # call form) is a DISTINCT case from "resolvable but genuinely not
+          # isolated" (round 2 code review fix): RM07 cannot be decided
+          # honestly with no logical dispatch id to resolve a checkpoint
+          # from at all, so it says so with its own token
+          # (RECONCILE_UNKNOWN_NO_LOGICAL_ID) instead of silently reporting
+          # the SAME "not isolated" a real, evaluated non-isolated case
+          # reports. A NON-empty `$logical` whose resolution still fails
+          # (no attempt found, no checkpoint at that path) legitimately
+          # fails closed to RECONCILE_BLOCKED_NOT_ISOLATED -- that IS a
+          # real attempt to evaluate isolation, just one with nothing to
+          # confirm it, which is exactly the "cannot prove isolated" case
+          # this whole gate exists to fail closed on.
           RECOVERY_MATRIX_ID=RM07
-          RECOVERY_ACTION=RECONCILE_THEN_CONTINUE_IF_ISOLATED
+          if [ -z "$logical" ]; then
+            RECOVERY_ACTION=RECONCILE_UNKNOWN_NO_LOGICAL_ID
+          else
+            _recovery_checkpoint_context "$logical" 2>/dev/null || true
+            if checkpoint_partial_isolated; then
+              RECOVERY_ACTION=RECONCILE_THEN_CONTINUE_IF_ISOLATED
+            else
+              RECOVERY_ACTION=RECONCILE_BLOCKED_NOT_ISOLATED
+            fi
+          fi
           ;;
         *)
           echo "RECOVERY_ACTION_UNMAPPED_STATE:$classification:$state" >&2
@@ -3463,6 +3524,16 @@ recovery_retry_allowed() {
     CONTINUE_WITHIN_CAP| \
     RECONCILE_THEN_CONTINUE_IF_ISOLATED| \
     RECONCILE_THEN_CONTINUE_IF_SAFE)        cap_name=continuation_cap ;;
+    # Code review fix: this used to fall through to the `*) return 0`
+    # default below, which reads as "no cap applies, proceed" -- exactly
+    # backwards for an action whose own name says NOT_ISOLATED. A non-
+    # isolated dirty checkpoint is never retried/continued, unconditionally,
+    # with no cap-count check at all (there is nothing to count up to).
+    # RECONCILE_UNKNOWN_NO_LOGICAL_ID (round 2 fix) gets the identical
+    # treatment: a caller that could not even ask the question never gets
+    # to proceed as if the answer were "no cap applies" either.
+    RECONCILE_BLOCKED_NOT_ISOLATED| \
+    RECONCILE_UNKNOWN_NO_LOGICAL_ID)       return 1 ;;
     *) return 0 ;;
   esac
   cap_value="$(policy_value "$cap_name")" \
@@ -3470,9 +3541,22 @@ recovery_retry_allowed() {
   used_count="$(_recovery_failed_attempts_used "$logical")"
   retries_used=$(( used_count > 0 ? used_count - 1 : 0 ))
   if [ "$retries_used" -ge "$cap_value" ]; then
-    record_event RECOVERY_CAP_REACHED logical_dispatch_id="$logical" \
-      cap="$cap_name" cap_value="$cap_value" attempts_used="$used_count" \
-      reason="retry cap exhausted for action $action"
+    # Continuation caps (spec S10.4/S6 Step 6) get their OWN durable event
+    # name -- CONTINUATION_CAP_REACHED, never the generic RECOVERY_CAP_
+    # REACHED every other capped action still uses -- because "a checkpointed
+    # role ran out of resumes" is a distinct, propositable signal from an
+    # ordinary retry/correction cap running out ("stop for human direction",
+    # never silently restart from scratch). Same counting, same cap lookup,
+    # only the emitted event differs.
+    if [ "$cap_name" = continuation_cap ]; then
+      record_event CONTINUATION_CAP_REACHED logical_dispatch_id="$logical" \
+        cap="$cap_name" cap_value="$cap_value" attempts_used="$used_count" \
+        reason="continuation cap exhausted for action $action"
+    else
+      record_event RECOVERY_CAP_REACHED logical_dispatch_id="$logical" \
+        cap="$cap_name" cap_value="$cap_value" attempts_used="$used_count" \
+        reason="retry cap exhausted for action $action"
+    fi
     return 1
   fi
   # The counterpart RECOVERY_CAP_REACHED never previously had: a durable
@@ -3695,7 +3779,7 @@ The table below is the normative row list `tests/lib/extract.py events` reads.
 common-envelope fields above (a `;`-separated list, empty when a type needs
 nothing beyond the envelope) — the same `;`-list convention the Role Contract
 Registry already uses for multi-valued cells. `proposition_required=yes`
-marks the twelve event types whose occurrence must also yield an entry in
+marks the thirteen event types whose occurrence must also yield an entry in
 `process-improvement-proposition.md` (Task 15/16's ledger; declaring the flag
 here does not itself populate that document).
 
@@ -3707,6 +3791,7 @@ here does not itself populate that document).
 | ATTEMPT_FAILED | phase_name;role;classification | yes |
 | RECOVERY_AUTHORIZED | logical_dispatch_id;action | yes |
 | RECOVERY_CAP_REACHED | logical_dispatch_id;cap;cap_value;attempts_used | yes |
+| CONTINUATION_CAP_REACHED | logical_dispatch_id;cap;cap_value;attempts_used | yes |
 | ORCHESTRATION_CORRECTION | logical_dispatch_id | yes |
 | HALT |  | yes |
 | OWNER_DECISION | decision_id;authority_identity;scope;artifact_path;artifact_revision;evidence;alternatives_rejected;residual_risk;expiry;independent_rereview;follow_up_id | no |
@@ -3775,6 +3860,7 @@ event_required_fields() {
     ATTEMPT_FAILED)              printf '%s\n' "phase_name;role;classification" ;;
     RECOVERY_AUTHORIZED)         printf '%s\n' "logical_dispatch_id;action" ;;
     RECOVERY_CAP_REACHED)        printf '%s\n' "logical_dispatch_id;cap;cap_value;attempts_used" ;;
+    CONTINUATION_CAP_REACHED)    printf '%s\n' "logical_dispatch_id;cap;cap_value;attempts_used" ;;
     ORCHESTRATION_CORRECTION)    printf '%s\n' "logical_dispatch_id" ;;
     HALT)                        printf '%s\n' "" ;;
     OWNER_DECISION|RISK_ACCEPTED|PHASE_ACCEPTED)
@@ -4100,6 +4186,79 @@ _write_lease_recovery_state() {
   esac
 }
 
+# Every currently-dirty repo-relative path, for the lease JSON's own
+# declared_foreign_paths (spec S10.4's "declared foreign changes", which a
+# continuation's isolation check later reads back) -- captured fresh ONLY
+# on a dispatch's FIRST attempt, and durably persisted there (below) so
+# every LATER attempt for the SAME logical dispatch can carry it FORWARD
+# instead of re-deriving it. Code review fix (round 2): a 2nd-or-later
+# attempt must not re-derive from the CURRENT tree at all -- the current
+# tree may already carry the prior, dying attempt's own uncheckpointed
+# mutation, and re-deriving would launder that into "foreign" (round 1's
+# bug). But discarding the declaration outright (returning `[]` for every
+# continuation, round 1's own fix) over-corrects: it also discards
+# genuinely pre-existing foreign dirt that attempt 1 legitimately declared,
+# capping every continuation on a non-pristine tree at 1 regardless of the
+# policy's own continuation_cap. Carrying attempt 1's OWN durable
+# declaration forward is the precise fix -- it was captured before ANY
+# attempt (including attempt 1 itself) had a chance to mutate anything, so
+# it can never contain a dying attempt's own leftover work, and it still
+# preserves real pre-run dirt across every continuation. checkpoint_
+# partial_isolated separately tolerates the checkpoint's own declared
+# dirty-unit artifact_path regardless of this list's contents. The fixed
+# orchestration-bookkeeping paths (RUN_LOG.md/full_log.md/$ORCHESTRATION_DIR/
+# transcripts//attempts/ subtrees -- the SAME allow-list _mutation_dirty and
+# checkpoint_partial_isolated already use) are excluded from the fresh
+# capture: they are never "foreign", they are this process's own
+# bookkeeping.
+#
+# Usage: _write_lease_foreign_paths_now DISPATCH_ID
+_write_lease_foreign_paths_now() {
+  local dispatch_id="${1:-}" attempt_num logical carry_file
+  attempt_num="$(printf '%s\n' "$dispatch_id" | "$GREP_BIN" -oE '[0-9]{2}$')"
+  if [ -n "$attempt_num" ] && [ "$((10#$attempt_num))" -gt 1 ]; then
+    logical="${dispatch_id%-a[0-9][0-9]}"
+    carry_file="${ORCHESTRATION_DIR:-}/snapshots/${logical}-a01/declared-foreign-paths.json"
+    if [ -f "$carry_file" ]; then
+      cat "$carry_file"
+    else
+      echo '[]'
+    fi
+    return 0
+  fi
+  local ff_rel orch_rel
+  ff_rel="${FEATURE_FOLDER#"${REPO_ROOT:-}"/}"
+  orch_rel="${ORCHESTRATION_DIR#"${REPO_ROOT:-}"/}"
+  local entry status path out=()
+  while IFS= read -r -d '' entry; do
+    status="${entry:0:2}"; path="${entry:3}"
+    case "$path" in
+      "$ff_rel/RUN_LOG.md"|"$ff_rel/full_log.md") continue ;;
+      "$orch_rel"|"$orch_rel"/*) continue ;;
+      "$ff_rel/transcripts"|"$ff_rel/transcripts"/*) continue ;;
+      "$ff_rel"/*/attempts/*) continue ;;
+    esac
+    out+=("$path")
+    case "$status" in R*|C*) IFS= read -r -d '' _ || true ;; esac
+  done < <(git -C "${REPO_ROOT:-}" status --porcelain=v1 --untracked-files=all -z 2>/dev/null)
+  local result
+  if [ "${#out[@]}" -gt 0 ]; then
+    result="$(printf '%s\n' "${out[@]}" | jq -R . | jq -s -c .)"
+  else
+    result='[]'
+  fi
+  # Durable so a LATER continuation (above) can carry it forward instead of
+  # re-deriving from a tree its own dying predecessor has since mutated.
+  # Lives under the SAME never-deleted snapshots/ directory acquire_write_
+  # lease already creates for this exact dispatch_id (_snapshot_capture,
+  # below) -- one more small file there, not a new durable-storage location.
+  if [ -n "$dispatch_id" ]; then
+    mkdir -p "${ORCHESTRATION_DIR:-}/snapshots/$dispatch_id" 2>/dev/null
+    printf '%s\n' "$result" > "${ORCHESTRATION_DIR:-}/snapshots/$dispatch_id/declared-foreign-paths.json" 2>/dev/null || true
+  fi
+  printf '%s\n' "$result"
+}
+
 # Exclusive creation of $ORCHESTRATION_DIR/write-lease.json (spec S11.1).
 # Usage: acquire_write_lease OWNER AUTHORITY DISPATCH_ID PHASE DECLARED_PATH...
 # OWNER is the lease_owner (a role name, or "orchestrator-finalization" for
@@ -4159,13 +4318,30 @@ acquire_write_lease() {
     declared_json='[]'
   fi
 
+  # declared_foreign_paths (Task 9 seam, closed across two review rounds:
+  # round 1 caught unfiltered capture laundering a dying continuation-
+  # predecessor's own uncheckpointed mutation into "foreign"; round 2 caught
+  # that fix over-correcting to `[]` on every continuation, which also
+  # discarded genuinely pre-existing foreign dirt and capped continuation_
+  # cap at 1 on any non-pristine tree). `_write_lease_foreign_paths_now`
+  # (above) now captures real pre-existing dirt fresh ONLY on a dispatch's
+  # first attempt (excluding this process's own bookkeeping paths), persists
+  # THAT declaration durably, and every later attempt for the same logical
+  # dispatch carries it forward unchanged -- see its own doc comment for the
+  # full rationale. declared_foreign_commits stays `[]`: this process never
+  # has more than one lease/writer at a time, so there is no OTHER actor's
+  # commit for a fresh acquisition to declare against baseline_head -- an
+  # honest empty default, not a guessed value.
+  local foreign_paths_json
+  foreign_paths_json="$(_write_lease_foreign_paths_now "$dispatch_id")"
+
   tmp="$ORCHESTRATION_DIR/.write-lease.tmp.$BASHPID.$RANDOM"
   jq -n \
     --argjson schema_version 2 --argjson dispatch_id "$dispatch_id_json" \
     --arg lease_owner "$owner" --arg authority "$authority" --arg phase "$phase" \
     --arg acquired_at "$(iso_now)" --arg baseline_head "$baseline_head" \
     --argjson declared_write_paths "$declared_json" \
-    --argjson declared_foreign_paths '[]' --argjson declared_foreign_commits '[]' \
+    --argjson declared_foreign_paths "$foreign_paths_json" --argjson declared_foreign_commits '[]' \
     --arg snapshot_manifest_path "$manifest_dir/manifest.json" \
     '{schema_version:$schema_version, dispatch_id:$dispatch_id, lease_owner:$lease_owner,
       authority:$authority, phase:$phase, acquired_at:$acquired_at,
@@ -4249,10 +4425,15 @@ release_write_lease() {
 # plus the porcelain status line still cover a "." declaration's integrity
 # need; the per-file branch activates automatically once a future task
 # starts declaring real per-role paths -- nothing here needs to change for
-# that. `declared_foreign_paths`/`declared_foreign_commits` in the write-
-# lease JSON (acquire_write_lease, above) are likewise always `[]`: nothing
-# in this document's fixed interfaces gives a caller a way to populate them,
-# so they are left as an honest empty default rather than a guessed value.
+# that. `declared_foreign_paths` in the write-lease JSON (acquire_write_lease,
+# above) is populated as of Task 9 (`_write_lease_foreign_paths_now`'s own
+# raw pre-acquisition status scan) -- a checkpointed continuation's
+# isolation test (`checkpoint_partial_isolated`, "Checkpoint contract"
+# below) reads it back. `declared_foreign_commits` stays an honest empty
+# `[]`: this process never holds more than one lease/writer at a time, so a
+# fresh acquisition never has another actor's commit to declare against
+# baseline_head in the first place -- not an unpopulated gap, a vocabulary
+# with nothing to say yet.
 _snapshot_capture() {
   # Usage: _snapshot_capture before|after OWNER DISPATCH_ID MANIFEST_PATH [DECLARED_PATH...]
   local stage="$1" owner="$2" dispatch_id="$3" manifest="$4"; shift 4
@@ -4323,6 +4504,522 @@ only: nothing in this document reads `_snapshot_capture`'s own output back to
 perform a rollback; RM08's `HALT_EXACT_STATE` (Recovery Matrix, above)
 remains the only response to a genuinely dirty-and-uncheckpointed or
 integrity-unknown tree.
+
+### Checkpoint contract and resumable continuation (spec §10)
+
+Durable progress is append-only JSONL at the current attempt's own
+`$PHASE_DIR/<iteration-or-round>/attempts/$DISPATCH_ID/progress.jsonl` —
+exactly `role_attempt_dir`'s own path plus `/progress.jsonl`, never a second
+convention. Every record uses this exact common schema, in this exact key
+order:
+
+```json
+{"schema_version":2,"dispatch_id":"p06-i00-implementer-a02","sequence":7,"role":"implementer","unit_type":"task","unit_id":"task-07","state":"completed","artifact_path":"/absolute/path","artifact_sha256":"<sha256>","commit_sha":"<git-sha>","finding_ids":[],"verification":"PASS","next_unit":"task-08","timestamp":"<UTC-ISO-8601>"}
+```
+
+`state` is `completed` for a finished unit or `partial` for one still in
+flight — the vocabulary every checkpointed appendix below and
+`checkpoint_resume_state` (below) share. Records are sequence-monotonic
+**within one attempt's own file** and validated before append; a malformed
+or discontinuous checkpoint is evidence of partial state but cannot
+authorize automatic continuation until an integrity check resolves it —
+even its own well-formed PREFIX stays unusable until that reconciliation
+runs (this is the subtle half of the rule: a truncated or out-of-order
+SUFFIX does not just taint itself, it blocks the otherwise-good records
+before it too, until reconciliation explicitly re-admits them).
+
+**Role-specific checkpoint rules (spec §10.2).**
+
+- **Implementer:** append after every committed task and its review. Record
+  task/report/diff paths (`artifact_path`), commit SHA, verification, next
+  task, and the SDD working directory (see SDD custody, below — carried in
+  STATUS, not in the checkpoint record itself, since the fixed schema above
+  has no field for it).
+- **Plan writer:** append after every completed top-level section. Once
+  every required section passes structural validation, atomically publish
+  `artifact-complete.json` (`{"schema_version":2,"plan_path":"<path>",
+  "completed_at":"<UTC>"}`, same exclusive-creation `ln` primitive as every
+  other atomic artifact in this document) before any optional summary prose
+  and before the terminal STATUS publish.
+- **Spec/plan fixers:** receive at most `document_fixer_batch_size` finding
+  IDs and append after every disposition. Record the next unresolved ID
+  (`next_unit`) and the post-edit artifact hash (`artifact_sha256`).
+- **Long reviewers:** may append partial finding-group records after
+  coherent sections. A partial record (`state:"partial"`) is never a verdict
+  by itself — complete coverage plus a terminal STATUS publish is required
+  before `verdict` means anything.
+- **Implementation fixer:** append after every finding-specific commit and
+  its verification.
+- **Documentation writer:** append per completed documentation output and
+  self-correction round.
+
+Each checkpointed appendix's `## Publish STATUS` heredoc already carries
+`checkpoint_path: $PHASE_DIR/.../progress.jsonl` when a checkpoint exists
+for that role, or `checkpoint_path: null` when the role's own
+`checkpoint_kind` (Role Contract Registry, above) is `none` — the registry's
+`checkpoint_kind` column and each appendix's own declared value are kept in
+sync (`tests/check_02_markers.sh`'s `contract_drift` comparison; `render_
+prompt`'s `${!k+x}` substitution never lets one drift from the other
+silently).
+
+**SDD custody (spec §10.3).** The implementer configures the SDD skill root
+as `$FEATURE_FOLDER/6-implementation/sdd/`. If the installed skill cannot
+accept a root, the implementer instead mirrors each completed task's brief,
+report, progress update, and review diff into that same directory
+IMMEDIATELY after that task — never only at terminal STATUS; a run that
+dies mid-implementation must still find every task mirrored so far on disk.
+STATUS records both the original working path (`x_sdd_original_path`) and
+the durable mirror path (`x_sdd_durable_path`) as `x_`-namespaced fields.
+
+<!-- lint: cookbook -->
+```bash
+# The sole canonical checkpoint writer (spec S10.1). Validates the common
+# envelope's required fields, then -- code review fix -- runs the SAME
+# strict `checkpoint_resume_state` parser resume reads use to determine
+# what "last" means, rather than a separate lenient scanner: an existing
+# malformed/discontinuous suffix now genuinely REFUSES the append (spec
+# S10.1's "cannot authorize automatic continuation" protects writes too,
+# not just resume reads -- a lenient scanner that silently skipped a
+# truncated line let a new record build on top of it undetected). The
+# required sequence is exactly `last + 1` (contiguous, never merely
+# increasing) so a write can never itself create the gap resume-side
+# validation would later reject. Appends exactly one JSON object per line
+# under a lock scoped to THIS progress_path (`_run_log_lock_acquire`'s own
+# optional-lockfile-argument form, "Attempt identity" above) -- a genuinely
+# per-file lock, reusing the existing `ln` primitive rather than inventing
+# a second one.
+#
+# Usage: checkpoint_append PROGRESS_PATH DISPATCH_ID ROLE KEY=VALUE...
+# Required KEY=VALUE fields: sequence, unit_type, unit_id, state,
+# artifact_path, artifact_sha256, commit_sha, verification, next_unit.
+# Optional: finding_ids (a JSON array literal; default []).
+checkpoint_append() {
+  local progress_path="$1" dispatch_id="$2" role="$3"; shift 3
+  [ -n "$progress_path" ] && [ -n "$dispatch_id" ] && [ -n "$role" ] \
+    || { echo "CHECKPOINT_APPEND_USAGE" >&2; return 1; }
+  local -A f=()
+  local kv k
+  for kv in "$@"; do
+    k="${kv%%=*}"
+    f["$k"]="${kv#*=}"
+  done
+  local req
+  for req in sequence unit_type unit_id state artifact_path artifact_sha256 \
+             commit_sha verification next_unit; do
+    [ -n "${f[$req]+x}" ] || { echo "CHECKPOINT_APPEND_MISSING_FIELD:$req" >&2; return 1; }
+  done
+  case "${f[sequence]}" in
+    ''|*[!0-9]*) echo "CHECKPOINT_APPEND_BAD_SEQUENCE:${f[sequence]}" >&2; return 1 ;;
+  esac
+
+  mkdir -p "$(dirname "$progress_path")" 2>/dev/null
+  local lockfile="$progress_path.lock"
+  _run_log_lock_acquire "$lockfile" || return 1
+  local last=0
+  if [ -f "$progress_path" ]; then
+    # Run checkpoint_resume_state inside a SUBSHELL (command substitution),
+    # not directly: it sets the CHECKPOINT_* globals, and this is only an
+    # INTERNAL lookup of "what sequence/state is this file at", not the
+    # caller's own resume-state call -- calling it directly would clobber
+    # whatever a caller (e.g. recovery_action, just before deciding to
+    # continue) already had in those same globals (code review fix: latent
+    # today since every real call site is a role subprocess with nothing
+    # else reading them, but real the moment an orchestrator-side caller
+    # runs both in one shell). A subshell's own variable assignments never
+    # escape it, so this reads the two values it needs off stdout instead.
+    local _resume_line _resume_state _resume_seq _resume_reason
+    _resume_line="$(checkpoint_resume_state "$progress_path" "$dispatch_id"       && printf '%s	%s	%s' "$CHECKPOINT_STATE" "$CHECKPOINT_LAST_SEQUENCE" "$CHECKPOINT_BAD_REASON")"
+    IFS=$'	' read -r _resume_state _resume_seq _resume_reason <<<"$_resume_line"
+    if [ "$_resume_state" = NEEDS_RECONCILIATION ]; then
+      _run_log_lock_release "$lockfile"
+      echo "CHECKPOINT_APPEND_NEEDS_RECONCILIATION:$_resume_reason" >&2
+      return 1
+    fi
+    last="${_resume_seq:-0}"
+  fi
+  if [ "${f[sequence]}" -ne $((last + 1)) ]; then
+    _run_log_lock_release "$lockfile"
+    echo "CHECKPOINT_SEQUENCE_NOT_INCREASING:${f[sequence]}!=$((last + 1))" >&2
+    return 1
+  fi
+  local finding_ids="${f[finding_ids]:-[]}"
+  local record
+  # -c (compact): this is JSONL -- exactly one line per record. jq -n's
+  # default pretty-printed multi-line output would silently shred the
+  # "one record per line" invariant checkpoint_resume_state's own reader
+  # depends on.
+  record="$(jq -cn \
+    --argjson schema_version 2 --arg dispatch_id "$dispatch_id" \
+    --argjson sequence "${f[sequence]}" --arg role "$role" \
+    --arg unit_type "${f[unit_type]}" --arg unit_id "${f[unit_id]}" \
+    --arg state "${f[state]}" --arg artifact_path "${f[artifact_path]}" \
+    --arg artifact_sha256 "${f[artifact_sha256]}" --arg commit_sha "${f[commit_sha]}" \
+    --argjson finding_ids "$finding_ids" --arg verification "${f[verification]}" \
+    --arg next_unit "${f[next_unit]}" --arg timestamp "$(iso_now)" \
+    '{schema_version:$schema_version, dispatch_id:$dispatch_id, sequence:$sequence,
+      role:$role, unit_type:$unit_type, unit_id:$unit_id, state:$state,
+      artifact_path:$artifact_path, artifact_sha256:$artifact_sha256,
+      commit_sha:$commit_sha, finding_ids:$finding_ids, verification:$verification,
+      next_unit:$next_unit, timestamp:$timestamp}' 2>/dev/null)"
+  if [ -z "$record" ]; then
+    _run_log_lock_release "$lockfile"
+    echo "CHECKPOINT_APPEND_BUILD_FAILED" >&2
+    return 1
+  fi
+  printf '%s\n' "$record" >> "$progress_path"
+  _bootstrap_fsync_path "$progress_path" 2>/dev/null || true
+  _run_log_lock_release "$lockfile"
+}
+
+# Parses PROGRESS_PATH in strict order and validates every record BEFORE
+# treating it as part of the resumable prefix (spec S10.1: "cannot authorize
+# automatic continuation until an integrity check resolves it"). Never
+# mutates the file. Sets, always: CHECKPOINT_STATE (NO_CHECKPOINT / VALID /
+# NEEDS_RECONCILIATION), CHECKPOINT_LAST_SEQUENCE, CHECKPOINT_LAST_DISPATCH_ID,
+# CHECKPOINT_COMPLETED_UNITS (space-separated unit_ids, state=completed),
+# CHECKPOINT_DIRTY_UNIT (the sole open, never-completed unit_id in the
+# valid-so-far prefix, or empty), CHECKPOINT_DIRTY_ARTIFACT_PATH (that open
+# unit's own artifact_path, for the isolation test below), CHECKPOINT_
+# NEXT_UNIT, and CHECKPOINT_BAD_REASON (why the file is not fully VALID, if
+# it is not). A record failing ANY check below ends the valid prefix right
+# there -- everything before it still counts as partial-state evidence nothing
+# from it or after is trusted for authorizing new work.
+#
+# Usage: checkpoint_resume_state PROGRESS_PATH EXPECTED_DISPATCH_ID
+checkpoint_resume_state() {
+  local path="$1" expected_id="$2"
+  CHECKPOINT_STATE=NO_CHECKPOINT
+  CHECKPOINT_LAST_SEQUENCE=0
+  CHECKPOINT_LAST_DISPATCH_ID=""
+  CHECKPOINT_COMPLETED_UNITS=""
+  CHECKPOINT_DIRTY_UNIT=""
+  CHECKPOINT_DIRTY_ARTIFACT_PATH=""
+  CHECKPOINT_NEXT_UNIT=""
+  CHECKPOINT_BAD_REASON=""
+  [ -f "$path" ] || return 0
+
+  local -A open_units=()
+  local line n=0 ok=1 last_seq=0
+  local schema dispatch_id sequence state unit_id artifact_path artifact_sha256 commit_sha next_unit
+  # `read -r line || [ -n "$line" ]`, not a bare `read`: a genuinely
+  # TRUNCATED final record (no trailing newline -- an interrupted write) has
+  # `read` return non-zero at EOF while still populating $line with the
+  # partial content. A bare `while read` loop condition would silently DROP
+  # that iteration -- exactly the "truncated final record" fixture this
+  # function must instead recognize as MALFORMED, not quietly ignore.
+  while IFS= read -r line || [ -n "$line" ]; do
+    # $n counts REAL record lines only (incremented AFTER the blank-skip):
+    # a whitespace-only file ("\n\n\n") must report NO_CHECKPOINT, not a
+    # vacuous VALID with zero units -- incrementing before the blank check
+    # let $n go non-zero on pure whitespace and slipped past the "$n -eq 0"
+    # guard below (code review fix).
+    [ -n "$line" ] || continue
+    n=$((n + 1))
+    if ! printf '%s' "$line" | jq -e . >/dev/null 2>&1; then
+      ok=0; CHECKPOINT_BAD_REASON="MALFORMED_RECORD_AT_LINE_$n"; break
+    fi
+    schema="$(printf '%s' "$line" | jq -r '.schema_version // empty')"
+    dispatch_id="$(printf '%s' "$line" | jq -r '.dispatch_id // empty')"
+    sequence="$(printf '%s' "$line" | jq -r '.sequence // empty')"
+    state="$(printf '%s' "$line" | jq -r '.state // empty')"
+    unit_id="$(printf '%s' "$line" | jq -r '.unit_id // empty')"
+    artifact_path="$(printf '%s' "$line" | jq -r '.artifact_path // empty')"
+    artifact_sha256="$(printf '%s' "$line" | jq -r '.artifact_sha256 // empty')"
+    commit_sha="$(printf '%s' "$line" | jq -r '.commit_sha // empty')"
+    next_unit="$(printf '%s' "$line" | jq -r '.next_unit // empty')"
+
+    if [ "$schema" != 2 ]; then
+      ok=0; CHECKPOINT_BAD_REASON="BAD_SCHEMA_AT_LINE_$n"; break
+    fi
+    if [ -n "$expected_id" ] && [ "$dispatch_id" != "$expected_id" ]; then
+      ok=0; CHECKPOINT_BAD_REASON="WRONG_DISPATCH_ID_AT_LINE_$n:$dispatch_id"; break
+    fi
+    case "$sequence" in ''|*[!0-9]*)
+      ok=0; CHECKPOINT_BAD_REASON="BAD_SEQUENCE_AT_LINE_$n"; break ;;
+    esac
+    # Strictly CONTIGUOUS, not merely increasing (code review fix): a gap
+    # (1 then 7) is exactly the "discontinuous checkpoint" spec S10.1 already
+    # promises gets blocked -- `-le` alone let a gap silently report VALID.
+    if [ "$sequence" -ne $((last_seq + 1)) ]; then
+      ok=0
+      CHECKPOINT_BAD_REASON="SEQUENCE_NOT_INCREASING_AT_LINE_$n:$sequence!=$((last_seq + 1))"
+      break
+    fi
+    if [ -n "$artifact_path" ] && [ "$artifact_path" != null ]; then
+      case "$artifact_path" in
+        "${FEATURE_FOLDER:-\x00}"|"${FEATURE_FOLDER:-\x00}"/*) : ;;
+        *)
+          ok=0
+          CHECKPOINT_BAD_REASON="ARTIFACT_PATH_OUTSIDE_FEATURE_FOLDER_AT_LINE_$n:$artifact_path"
+          break ;;
+      esac
+      if [ -f "$artifact_path" ] && [ -n "$artifact_sha256" ] && [ "$artifact_sha256" != null ]; then
+        local real_sha
+        real_sha="$(sha256sum "$artifact_path" 2>/dev/null | cut -d' ' -f1)"
+        if [ "$real_sha" != "$artifact_sha256" ]; then
+          ok=0
+          CHECKPOINT_BAD_REASON="STALE_ARTIFACT_REVISION_AT_LINE_$n:$artifact_path"
+          break
+        fi
+      fi
+    fi
+    if [ -n "$commit_sha" ] && [ "$commit_sha" != null ]; then
+      if ! git -C "${REPO_ROOT:-}" cat-file -e "${commit_sha}^{commit}" 2>/dev/null; then
+        ok=0
+        CHECKPOINT_BAD_REASON="COMMIT_NOT_IN_REPO_AT_LINE_$n:$commit_sha"
+        break
+      fi
+      if ! git -C "${REPO_ROOT:-}" merge-base --is-ancestor "$commit_sha" HEAD 2>/dev/null; then
+        ok=0
+        CHECKPOINT_BAD_REASON="COMMIT_NOT_REACHABLE_FROM_HEAD_AT_LINE_$n:$commit_sha"
+        break
+      fi
+    fi
+
+    last_seq="$sequence"
+    # shellcheck disable=SC2034  # consumed by the caller after checkpoint_resume_state returns
+    CHECKPOINT_LAST_SEQUENCE="$sequence"
+    # shellcheck disable=SC2034  # consumed by the caller after checkpoint_resume_state returns
+    CHECKPOINT_LAST_DISPATCH_ID="$dispatch_id"
+    # shellcheck disable=SC2034  # consumed by the caller after checkpoint_resume_state returns
+    CHECKPOINT_NEXT_UNIT="$next_unit"
+    if [ "$state" = completed ]; then
+      CHECKPOINT_COMPLETED_UNITS="${CHECKPOINT_COMPLETED_UNITS:+$CHECKPOINT_COMPLETED_UNITS }$unit_id"
+      unset "open_units[$unit_id]" 2>/dev/null || true
+    else
+      open_units["$unit_id"]="$artifact_path"
+    fi
+  done < "$path"
+
+  if [ "$n" -eq 0 ]; then
+    CHECKPOINT_STATE=NO_CHECKPOINT
+    return 0
+  fi
+
+  local dirty_count="${#open_units[@]}"
+  if [ "$dirty_count" -eq 1 ]; then
+    local -a _open_keys=("${!open_units[@]}")
+    CHECKPOINT_DIRTY_UNIT="${_open_keys[0]}"
+    CHECKPOINT_DIRTY_ARTIFACT_PATH="${open_units[${_open_keys[0]}]}"
+  fi
+
+  if [ "$ok" -eq 1 ] && [ "$dirty_count" -le 1 ]; then
+    CHECKPOINT_STATE=VALID
+  else
+    [ -n "$CHECKPOINT_BAD_REASON" ] || CHECKPOINT_BAD_REASON="MULTIPLE_DIRTY_PARTIAL_UNITS:$dirty_count"
+    # shellcheck disable=SC2034  # consumed by the caller after checkpoint_resume_state returns
+    CHECKPOINT_STATE=NEEDS_RECONCILIATION
+  fi
+  return 0
+}
+
+# RM07's own "is the partial unit isolated" test (spec: "continuation ...
+# only if the partial unit is isolated"). Meaningful only once checkpoint_
+# resume_state has already run and set $CHECKPOINT_DIRTY_UNIT for the
+# failed attempt's own progress.jsonl -- a caller with no checkpoint context
+# at all (empty $CHECKPOINT_DIRTY_UNIT) always fails closed, never
+# optimistically isolated. "Isolated" means: every currently-dirty path in
+# the tree is either the one open unit's own declared artifact
+# ($CHECKPOINT_DIRTY_ARTIFACT_PATH), a pre-existing foreign path the current
+# write-lease already declared (declared_foreign_paths, spec S10.4's
+# "declared foreign changes" -- `_write_lease_foreign_paths_now`'s own
+# capture, above), or the fixed orchestration-bookkeeping allow-list
+# (RUN_LOG.md/full_log.md/$ORCHESTRATION_DIR/transcripts//attempts/
+# subtrees -- the SAME paths `_mutation_dirty`, above, exempts; duplicated
+# here as four short case arms rather than extracted into a shared helper,
+# since refactoring `_mutation_dirty` itself carries real regression risk
+# for a property this is the only other caller of).
+checkpoint_partial_isolated() {
+  # Usage: checkpoint_partial_isolated [LEASE_FILE]
+  local lease_file="${1:-${ORCHESTRATION_DIR:-}/write-lease.json}"
+  # CHECKPOINT_STATE must be VALID, not merely "$CHECKPOINT_DIRTY_UNIT is
+  # non-empty" (code review fix: a malformed/discontinuous SUFFIX after a
+  # genuinely partial prefix left $CHECKPOINT_DIRTY_UNIT set from that valid
+  # prefix, so a NEEDS_RECONCILIATION file authorized continuation exactly
+  # like a fully VALID one -- the one gate Step 5 actually requires never
+  # ran). VALID already implies at most one dirty unit (checkpoint_resume_
+  # state's own dirty_count<=1 condition), so this one check subsumes both.
+  [ "${CHECKPOINT_STATE:-}" = VALID ] || return 1
+  [ -n "${CHECKPOINT_DIRTY_UNIT:-}" ] || return 1
+  local ff_rel orch_rel
+  ff_rel="${FEATURE_FOLDER#"${REPO_ROOT:-}"/}"
+  orch_rel="${ORCHESTRATION_DIR#"${REPO_ROOT:-}"/}"
+  # Seeded with one empty sentinel, not `()`: `"${foreign[@]}"` on a
+  # genuinely EMPTY array aborts under `set -u` on bash 4.0-4.3 (fixed in
+  # 4.4+) -- the sentinel keeps the array always non-empty and never
+  # matches a real (non-empty) path, the same guard `_write_lease_foreign_
+  # paths_now`'s own `-gt 0` check applies by a different route.
+  local -a foreign=("")
+  if [ -f "$lease_file" ]; then
+    while IFS= read -r p; do [ -n "$p" ] && foreign+=("$p"); done \
+      < <(jq -r '.declared_foreign_paths[]? // empty' "$lease_file" 2>/dev/null)
+  fi
+  local own_rel=""
+  if [ -n "${CHECKPOINT_DIRTY_ARTIFACT_PATH:-}" ] && [ "$CHECKPOINT_DIRTY_ARTIFACT_PATH" != null ]; then
+    own_rel="${CHECKPOINT_DIRTY_ARTIFACT_PATH#"${REPO_ROOT:-}"/}"
+  fi
+  local entry status path f is_ok
+  while IFS= read -r -d '' entry; do
+    status="${entry:0:2}"; path="${entry:3}"
+    case "$path" in
+      "$ff_rel/RUN_LOG.md"|"$ff_rel/full_log.md") continue ;;
+      "$orch_rel"|"$orch_rel"/*) continue ;;
+      "$ff_rel/transcripts"|"$ff_rel/transcripts"/*) continue ;;
+      "$ff_rel"/*/attempts/*) continue ;;
+    esac
+    is_ok=0
+    [ -n "$own_rel" ] && [ "$path" = "$own_rel" ] && is_ok=1
+    for f in "${foreign[@]}"; do [ "$f" = "$path" ] && is_ok=1 && break; done
+    [ "$is_ok" -eq 1 ] || return 1
+    case "$status" in R*|C*) IFS= read -r -d '' _ || true ;; esac
+  done < <(git -C "${REPO_ROOT:-}" status --porcelain=v1 --untracked-files=all -z 2>/dev/null)
+  return 0
+}
+
+# Recovers the ROLE suffix from a p<token>-i<NN>-<role> logical dispatch id
+# -- the same token/iteration-marker parse role_attempt_dir itself uses,
+# reused here rather than re-derived, so this can never drift from what a
+# real dispatch_id actually looks like.
+_logical_role() {
+  # Usage: _logical_role LOGICAL_DISPATCH_ID
+  local logical="$1" tok iter
+  tok="$(printf '%s\n' "$logical" | "$GREP_BIN" -oE '^p[^-]+')"
+  iter="$(printf '%s\n' "$logical" | "$GREP_BIN" -oE -- '-i[0-9]{2}-' | head -1)"
+  [ -n "$tok" ] && [ -n "$iter" ] || return 1
+  printf '%s\n' "${logical#"$tok""$iter"}"
+}
+
+# Highest ALREADY-ALLOCATED attempt id for LOGICAL, or failure if none has
+# been allocated yet -- a thin, side-effect-free wrapper around next_unused_
+# attempt's own "next" number (minus one). Deliberately NOT a shared helper
+# that also resolves the progress.jsonl PATH and stashes a second value in a
+# global: this function is always called through `$(...)` command
+# substitution, which runs in a SUBSHELL -- any sibling global a callee sets
+# there is invisible to the caller once the subshell exits (a real bug this
+# document's own review caught: an earlier version tried exactly that and
+# silently lost LATEST_ATTEMPT_ID every time). One pure stdout value avoids
+# the whole class of bug.
+_latest_attempt_id() {
+  # Usage: _latest_attempt_id LOGICAL_DISPATCH_ID
+  local logical="$1" latest_num
+  latest_num="$(next_unused_attempt "$logical" 2>/dev/null)" || return 1
+  [ "$latest_num" -gt 1 ] || return 1
+  printf '%s-a%02d\n' "$logical" "$((latest_num - 1))"
+}
+
+# RM07's REAL wiring (code review fix -- this closes the "isolation test is
+# reachable only from the unit test" gap): runs checkpoint_resume_state
+# against the JUST-FAILED attempt's OWN progress.jsonl, in the RIGHT order
+# -- BEFORE checkpoint_partial_isolated's decision needs it, not after, and
+# not left to a caller that never calls it at all. Always resets CHECKPOINT_
+# DIRTY_UNIT/STATE first: a caller with no resolvable logical id (or no
+# checkpoint at that path) must fail closed on FRESH empty state, never on
+# whatever a PREVIOUS, unrelated recovery_action call left behind.
+#
+# ORDERING CONSTRAINT (documented per code review, round 2 -- was implicit):
+# `_latest_attempt_id` (below) resolves the HIGHEST attempt id ALREADY
+# durable in RUN_LOG for this logical dispatch, i.e. the failed attempt
+# recovery_action is being asked to reconcile. The caller MUST invoke
+# recovery_action (and therefore this function) BEFORE allocate_attempt
+# mints the continuation's own NEW attempt id -- allocating first would
+# make this resolve to the CONTINUATION's own (not-yet-run) attempt instead
+# of the failed one. The real flow already satisfies this (a phase decides
+# whether/how to redispatch from the classified failure, THEN allocates);
+# this is a genuine ordering requirement on any caller, not an accident of
+# today's call graph, so it is spelled out here rather than left implicit.
+_recovery_checkpoint_context() {
+  # Usage: _recovery_checkpoint_context LOGICAL_DISPATCH_ID -- call BEFORE
+  # allocate_attempt mints a continuation's own new attempt id (see above).
+  local logical="$1" role latest_id dir path
+  CHECKPOINT_STATE=""
+  CHECKPOINT_DIRTY_UNIT=""
+  [ -n "$logical" ] || return 1
+  role="$(_logical_role "$logical")" || return 1
+  latest_id="$(_latest_attempt_id "$logical")" || return 1
+  dir="$(role_attempt_dir "$role" "$latest_id" 2>/dev/null)" || return 1
+  path="$dir/progress.jsonl"
+  checkpoint_resume_state "$path" "$latest_id"
+}
+
+# Best-effort continuation-context reconstruction for ONE checkpointed role
+# (spec S10.4's "continuation input"): populates CONTINUATION_PATH (the
+# failed attempt's own validated-on-disk checkpoint path, or empty) and
+# DECLARED_FOREIGN_CHANGES (space-separated, from the CURRENT write-lease's
+# own declared_foreign_paths, or empty). Read-only; never allocates an
+# attempt or authorizes anything -- recovery_action/recovery_retry_allowed
+# paired with checkpoint_resume_state still gate whether a continuation may
+# actually launch.
+_reconstruct_continuation_state() {
+  # Usage: _reconstruct_continuation_state ROLE LOGICAL_DISPATCH_ID
+  local role="$1" logical="$2" path
+  [ -n "$logical" ] || return 0
+  case "$(resume_dispatch_state "$logical" 2>/dev/null)" in
+    FAILED_OBSERVED) : ;;
+    *) return 0 ;;
+  esac
+  local latest_id dir
+  latest_id="$(_latest_attempt_id "$logical")" || return 0
+  dir="$(role_attempt_dir "$role" "$latest_id" 2>/dev/null)" || return 0
+  path="$dir/progress.jsonl"
+  [ -f "$path" ] && CONTINUATION_PATH="$path"
+  if [ -f "${ORCHESTRATION_DIR:-}/write-lease.json" ]; then
+    DECLARED_FOREIGN_CHANGES="$(jq -r '.declared_foreign_paths[]? // empty' \
+      "$ORCHESTRATION_DIR/write-lease.json" 2>/dev/null | tr '\n' ' ')"
+    DECLARED_FOREIGN_CHANGES="${DECLARED_FOREIGN_CHANGES% }"
+  fi
+}
+
+# Dispatches _reconstruct_continuation_state to the right role/logical-id
+# for a given phase (spec S10.2's six checkpointed roles). Unlike reconstruct_
+# durable_inputs's OTHER reconstructions (registry-free -- status_field/git
+# only), this one genuinely needs $ROLE_CONTRACTS_PATH (role_attempt_dir ->
+# role_phases), so it MUST run AFTER bootstrap_runtime/`source "$RUNTIME_DIR/
+# develop-it-runtime.sh"` -- never inside init_orchestration_vars itself,
+# whose own reconstructions run BEFORE that source line (see the per-phase
+# snippet below). <iteration> defaults to "00" (the three single-shot
+# phases: 4, 6, 9); pass the phase's own current $ITERATION for the three
+# that iterate (3, 5, 7) once that phase's loop has set it.
+reconstruct_checkpoint_state() {
+  # Usage: reconstruct_checkpoint_state PHASE [ITERATION]
+  local phase="$1" iter="${2:-00}" role="" logical=""
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  CONTINUATION_PATH=""
+  DECLARED_FOREIGN_CHANGES=""
+  case "$phase" in
+    3) role=spec-fixer ;;
+    4) role=plan-writer; iter=00 ;;
+    5) role=plan-fixer ;;
+    6) role=implementer; iter=00 ;;
+    7) role=implementation-fixer ;;
+    9) role=documentation-writer; iter=00 ;;
+    *) return 0 ;;
+  esac
+  logical="p$(printf '%02d' "$phase")-i$(printf '%02d' "$((10#$iter))")-$role"
+  _reconstruct_continuation_state "$role" "$logical"
+}
+```
+
+**Continuation input (spec §10.4).** Once `recovery_action` yields
+`RECONCILE_THEN_CONTINUE_IF_ISOLATED`/`CONTINUE_WITHIN_CAP`/`RECONCILE_THEN_
+CONTINUE_IF_SAFE` and `recovery_retry_allowed` authorizes it (never past
+`continuation_cap`, below), the orchestrator calls `reconstruct_checkpoint_
+state <phase> [<iteration>]` to populate `$CONTINUATION_PATH`/`$DECLARED_
+FOREIGN_CHANGES`, then dispatches exactly like any other attempt
+(`allocate_attempt` mints a genuinely NEW `dispatch_id` under the SAME
+logical id — never reuses the failed attempt's own attempt directory). The
+continuation receives, through the rendered appendix: the prior dispatch's
+own validated checkpoint path and last sequence (`$CONTINUATION_PATH`, plus
+whatever `checkpoint_resume_state "$CONTINUATION_PATH" <prior-dispatch-id>`
+reports), completed unit IDs and commits (`$CHECKPOINT_COMPLETED_UNITS`),
+current HEAD/tree (a fresh `git` read, always live), the one dirty partial
+unit if any (`$CHECKPOINT_DIRTY_UNIT`), snapshot/lease paths (the CURRENT
+lease, `$ORCHESTRATION_DIR/write-lease.json`), declared foreign changes
+(`$DECLARED_FOREIGN_CHANGES`), and its own continuation budget
+(`policy_value continuation_cap` via `recovery_retry_allowed`). The role
+verifies this input before any mutation, reconciles at most the one dirty
+partial unit, never repeats a completed unit, and emits new checkpoint
+records under its own new `dispatch_id` — never appending to the prior
+attempt's `progress.jsonl`.
 
 ### Turn-start reconciliation (spec §13.3)
 
@@ -5021,11 +5718,20 @@ rest defined:
 
 <!-- lint: snippet -->
 ```bash
-# Phase 7's block, for example, opens with exactly this line, followed
-# immediately by bootstrapping and sourcing the verified runtime.
-init_orchestration_vars 7 || exit 1
+# Phase 6's block, for example, opens with exactly this line, followed
+# immediately by bootstrapping and sourcing the verified runtime. Phase 6
+# (not 7) is the worked example here on purpose (code review fix, round 2):
+# 6 is single-shot -- iteration is always 00 -- so this exact call, with no
+# second argument, is a REAL lookup that finds a real prior attempt's
+# checkpoint whenever the implementer previously failed; the equivalent
+# call for an ITERATING phase (3, 5, 7) genuinely needs that round's own
+# $ITERATION and belongs inside that phase's own loop body instead (see
+# Phase 3/5/7's own iteration-loop steps, and check_10_process_v2.sh's
+# dedicated phase-7-with-iteration coverage), not this top-of-block example.
+init_orchestration_vars 6 || exit 1
 bootstrap_runtime || exit 1
 source "$RUNTIME_DIR/develop-it-runtime.sh"
+reconstruct_checkpoint_state 6
 ```
 
 `init_orchestration_vars <phase>` calls `reconstruct_durable_inputs <phase>`
@@ -5033,6 +5739,16 @@ unconditionally (spec §6.3). It sets `CONTEXT7_POLICY` itself, so a phase block
 never calls `context7_policy` directly; a missing durable input exits non-zero
 with `PRELAUNCH_FAILED:<contract-name>` rather than letting a later
 `render_prompt` fail as an unset-variable render error.
+
+The trailing `reconstruct_checkpoint_state <phase>` call (spec §10.4,
+"Checkpoint contract" above) is what a phase with a checkpointed role
+(3, 4, 5, 6, 7, 9) uses to populate `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_
+CHANGES` before rendering that role's appendix — it cannot run any earlier
+than this, since it needs the registry `source` line just above it. A
+phase whose checkpointed role ITERATES (3, 5, 7) re-calls it with that
+round's own `$ITERATION` from inside its iteration loop, right before a
+continuation redispatch; the three single-shot phases (4, 6, 9) need only
+this one top-of-block call.
 
 `bootstrap_runtime` is small enough (together with the "Orchestration
 variables" block it depends on) to paste directly into every phase's fresh
@@ -5330,6 +6046,7 @@ For each iteration N (start at 1, hard cap at 10):
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only the verdict files.
 4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
+   - Call `reconstruct_checkpoint_state 3 "$ITERATION"` first (spec-fixer is checkpointed, "Checkpoint contract" above) so `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_CHANGES` reflect this exact iteration's own prior attempt, if any, before rendering the appendix.
    - Dispatch one `claude` subprocess for role `spec-fixer`. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (newline-separated list of findings files from this iteration). The fixer edits the canonical spec in place. This role's timeout comes from the Models table via `role_timeout`.
    - Increment N. Loop from step 1.
 5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
@@ -5406,6 +6123,7 @@ For each iteration N (start at 1, hard cap at 10):
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
 4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
+   - Call `reconstruct_checkpoint_state 5 "$ITERATION"` first (plan-fixer is checkpointed, "Checkpoint contract" above) so `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_CHANGES` reflect this exact iteration's own prior attempt, if any, before rendering the appendix.
    - Dispatch one `claude` subprocess for role `plan-fixer`. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS`. This role's timeout comes from the Models table via `role_timeout`.
    - Increment N. Loop.
 5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
@@ -5617,10 +6335,11 @@ For each iteration N (start at 1, hard cap at 10):
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files.
 4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
+   - Call `reconstruct_checkpoint_state 6` first (the re-dispatched `implementer` publishes under its own fixed phase-6/iteration-00 identity regardless of which gate triggers the re-dispatch, "Checkpoint contract" above) so `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_CHANGES` reflect its own prior attempt, if any, before rendering the appendix.
    - Re-dispatch the implementer subagent (role `implementer`, Phase 6 appendix) with `$FINDINGS_PATHS` so it patches the implementation. This role's timeout (from the Models table via `role_timeout`) exceeds a single Bash tool call, so issue this re-dispatch as **one Bash tool call with `run_in_background: true`**.
    - Increment N. Loop.
 5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
-   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** re-dispatch the implementer subagent (role `implementer`, Phase 6 appendix) with `$FINDINGS_PATHS` (findings files from the passing iteration) so it patches the implementation, again as **one Bash tool call with `run_in_background: true`**. Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). The implementer's own verification must still PASS; if it reports `BLOCKED` or verification fails, HALT and surface to the user.
+   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** call `reconstruct_checkpoint_state 6` first (same reason as step 4 above), then re-dispatch the implementer subagent (role `implementer`, Phase 6 appendix) with `$FINDINGS_PATHS` (findings files from the passing iteration) so it patches the implementation, again as **one Bash tool call with `run_in_background: true`**. Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). The implementer's own verification must still PASS; if it reports `BLOCKED` or verification fails, HALT and surface to the user.
    - Dispatch one `claude` subprocess for role `summarizer-code-review`. Outputs: `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`. The summarizer records any deferred majors in the summary file.
    - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 8.
 
@@ -6843,11 +7562,11 @@ You are a spec patcher invoked as a fresh subprocess. You have no shared context
 ## Role contract
 
 - Required inputs: `feature_folder;iteration;spec_path;findings_paths`
-- Optional inputs: `none`
-- Outputs: `status`
+- Optional inputs: `continuation_path;declared_foreign_changes`
+- Outputs: `status;progress.jsonl`
 - Allowed verdicts: `DONE;BLOCKED`
 - Required status fields: `common_v2`
-- Checkpoint kind: `none`
+- Checkpoint kind: `document-fixer`
 - Phases: `3`
 
 ## Inputs
@@ -6856,15 +7575,32 @@ You are a spec patcher invoked as a fresh subprocess. You have no shared context
 - `$ITERATION` — the iteration whose findings you are addressing
 - `$SPEC_PATH`
 - `$FINDINGS_PATHS` — newline-separated absolute paths to active reviewer findings files (1 or 2)
+- `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
+- `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
+
+You are assigned at most `document_fixer_batch_size` finding IDs at a time (see the `document_fixer_batch_size` policy) — never the unbounded full findings file across every iteration.
 
 ## Behavior
 
-1. Read each findings file.
-2. Read `$SPEC_PATH`.
-3. Address every BLOCKER and MAJOR finding by patching the spec in place. Use Edit.
-4. Address MINOR findings only when the change is trivial and improves clarity; skip them otherwise (they are allowed to remain).
-5. Where reviewers disagree, prefer the more conservative reading (more explicit, more constrained, less ambiguous).
-6. Where a finding requires a decision that cannot be made without user input (e.g. choosing between two equally valid scopes), DO NOT guess. Set verdict=BLOCKED.
+1. If `$CONTINUATION_PATH` is set, read it first: it is a prior attempt's own `progress.jsonl`. Resume from its last recorded `next_unit` — never re-patch a finding its records already mark disposed. Reconcile at most the one dirty (`state: partial`) finding, if any, using `$DECLARED_FOREIGN_CHANGES` to recognize which currently-dirty paths are pre-existing, not yours.
+2. Read each findings file.
+3. Read `$SPEC_PATH`.
+4. Address every BLOCKER and MAJOR finding by patching the spec in place. Use Edit.
+5. Address MINOR findings only when the change is trivial and improves clarity; skip them otherwise (they are allowed to remain).
+6. Where reviewers disagree, prefer the more conservative reading (more explicit, more constrained, less ambiguous).
+7. Where a finding requires a decision that cannot be made without user input (e.g. choosing between two equally valid scopes), DO NOT guess. Set verdict=BLOCKED.
+
+After every finding disposition, call `checkpoint_append` -- the generated runtime's own checkpoint writer (spec S10.1; never hand-write the JSON line yourself, the same "one sanctioned writer" discipline the STATUS publisher already enforces for STATUS):
+
+<!-- lint: snippet -->
+```bash
+source "$RUNTIME_DIR/develop-it-runtime.sh"
+checkpoint_append "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl" "$DISPATCH_ID" spec-fixer \
+  sequence="<next integer, starting at 1>" unit_type=finding unit_id="<finding id>" \
+  state=completed artifact_path="$SPEC_PATH" \
+  artifact_sha256="<sha256 of \$SPEC_PATH after this disposition>" commit_sha=null \
+  verification=PASS next_unit="<next unresolved finding id in this batch, or the literal word null>"
+```
 
 ## Publish STATUS
 
@@ -6892,7 +7628,7 @@ reason: <one line, or the literal word null>
 published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
 artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
 output_count: 0
-checkpoint_path: null
+checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
 x_addressed_blockers: <int>
 x_addressed_majors: <int>
 x_deferred_minors: <int>
@@ -6910,11 +7646,11 @@ You are a plan author invoked as a fresh subprocess. You have no shared context.
 ## Role contract
 
 - Required inputs: `feature_folder;spec_path;context7_policy`
-- Optional inputs: `none`
-- Outputs: `status;plan_path`
+- Optional inputs: `continuation_path;declared_foreign_changes`
+- Outputs: `status;plan_path;progress.jsonl`
 - Allowed verdicts: `DONE;BLOCKED`
 - Required status fields: `common_v2`
-- Checkpoint kind: `none`
+- Checkpoint kind: `plan`
 - Phases: `4`
 
 ## Inputs
@@ -6922,6 +7658,8 @@ You are a plan author invoked as a fresh subprocess. You have no shared context.
 - `$FEATURE_FOLDER`
 - `$SPEC_PATH` — absolute path to the approved spec
 - `$CONTEXT7_POLICY` — `required` or `best-effort` (see below)
+- `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
+- `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
 
 ## Required skills
 
@@ -6939,11 +7677,23 @@ Prefer `context7` over web search for library docs. Skip it only for: refactorin
 
 ## Behavior
 
-1. Read `$SPEC_PATH` in full.
-2. Enumerate every external library / framework / SDK / API / CLI tool implied by the spec. For each, use `context7` to resolve the library ID and fetch the relevant docs (API syntax, configuration, version migration notes, setup instructions). Cite the specific symbol/method names, version, and any pitfalls inside the plan tasks so the implementer does not have to re-research them.
-3. Produce the implementation plan at the skill's default location: `docs/superpowers/plans/<spec-basename-without-design>-plan.md`. Determine the exact filename from the spec basename (strip `-design.md`, append `-plan.md`).
-4. The plan must satisfy every "No Placeholders" rule from `superpowers:writing-plans` (no TBD, no "implement later", exact file paths, full code per step, etc.). Code snippets in the plan must reflect current library APIs as confirmed via `context7`, not training-data guesses.
-5. The plan must cover every requirement / acceptance criterion in the spec.
+1. If `$CONTINUATION_PATH` is set, read it first: it is a prior attempt's own `progress.jsonl`. Resume writing from the next incomplete top-level section its records name (`next_unit`) — never re-write a section already marked `completed`. Reconcile at most the one dirty (`state: partial`) section, if any, using `$DECLARED_FOREIGN_CHANGES` to recognize pre-existing dirty paths that are not yours.
+2. Read `$SPEC_PATH` in full.
+3. Enumerate every external library / framework / SDK / API / CLI tool implied by the spec. For each, use `context7` to resolve the library ID and fetch the relevant docs (API syntax, configuration, version migration notes, setup instructions). Cite the specific symbol/method names, version, and any pitfalls inside the plan tasks so the implementer does not have to re-research them.
+4. Produce the implementation plan at the skill's default location: `docs/superpowers/plans/<spec-basename-without-design>-plan.md`. Determine the exact filename from the spec basename (strip `-design.md`, append `-plan.md`). After every completed top-level section, call `checkpoint_append` -- the generated runtime's own checkpoint writer (never hand-write the JSON line yourself):
+
+   <!-- lint: snippet -->
+   ```bash
+   source "$RUNTIME_DIR/develop-it-runtime.sh"
+   checkpoint_append "$PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl" "$DISPATCH_ID" plan-writer \
+     sequence="<next integer, starting at 1>" unit_type=section unit_id="<section heading>" \
+     state=completed artifact_path="<absolute path to the plan file>" \
+     artifact_sha256="<sha256 of the plan file after this section>" commit_sha=null \
+     verification=PASS next_unit="<next section heading, or the literal word null>"
+   ```
+5. The plan must satisfy every "No Placeholders" rule from `superpowers:writing-plans` (no TBD, no "implement later", exact file paths, full code per step, etc.). Code snippets in the plan must reflect current library APIs as confirmed via `context7`, not training-data guesses.
+6. The plan must cover every requirement / acceptance criterion in the spec.
+7. Once every required section has passed structural validation, atomically publish `$PHASE_DIR/00/attempts/$DISPATCH_ID/artifact-complete.json` (exclusive `ln`-style creation, never overwritten) with `{"schema_version":2,"plan_path":"<absolute path to the plan file>","completed_at":"<UTC-ISO-8601>"}` — BEFORE any optional summary prose and before the terminal STATUS publish below.
 
 ## Publish STATUS
 
@@ -6972,7 +7722,7 @@ published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
 artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
 output_count: 1
 output_01: <absolute path to the plan file>
-checkpoint_path: null
+checkpoint_path: $PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl
 x_task_count: <int>
 STATUS
 ```
@@ -7184,11 +7934,11 @@ You are a plan patcher invoked as a fresh subprocess. You have no shared context
 ## Role contract
 
 - Required inputs: `feature_folder;iteration;plan_path;findings_paths`
-- Optional inputs: `none`
-- Outputs: `status`
+- Optional inputs: `continuation_path;declared_foreign_changes`
+- Outputs: `status;progress.jsonl`
 - Allowed verdicts: `DONE;BLOCKED`
 - Required status fields: `common_v2`
-- Checkpoint kind: `none`
+- Checkpoint kind: `document-fixer`
 - Phases: `5`
 
 ## Inputs
@@ -7197,14 +7947,31 @@ You are a plan patcher invoked as a fresh subprocess. You have no shared context
 - `$ITERATION`
 - `$PLAN_PATH`
 - `$FINDINGS_PATHS` — newline-separated absolute paths to reviewer findings files
+- `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
+- `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
+
+You are assigned at most `document_fixer_batch_size` finding IDs at a time.
 
 ## Behavior
 
-1. Read each findings file and `$PLAN_PATH`.
-2. Patch the plan in place to address every BLOCKER and MAJOR finding.
-3. Address trivial MINOR findings opportunistically.
-4. Where a finding requires user input, set `verdict=BLOCKED`.
-5. Preserve the plan's overall structure (header, file structure section, task numbering, TDD shape).
+1. If `$CONTINUATION_PATH` is set, read it first: resume from its last recorded `next_unit`, reconcile at most the one dirty (`state: partial`) finding using `$DECLARED_FOREIGN_CHANGES`, and never re-patch a finding its records already mark disposed.
+2. Read each findings file and `$PLAN_PATH`.
+3. Patch the plan in place to address every BLOCKER and MAJOR finding.
+4. Address trivial MINOR findings opportunistically.
+5. Where a finding requires user input, set `verdict=BLOCKED`.
+6. Preserve the plan's overall structure (header, file structure section, task numbering, TDD shape).
+
+After every finding disposition, call `checkpoint_append` -- the generated runtime's own checkpoint writer (spec S10.1; never hand-write the JSON line yourself):
+
+<!-- lint: snippet -->
+```bash
+source "$RUNTIME_DIR/develop-it-runtime.sh"
+checkpoint_append "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl" "$DISPATCH_ID" plan-fixer \
+  sequence="<next integer, starting at 1>" unit_type=finding unit_id="<finding id>" \
+  state=completed artifact_path="$PLAN_PATH" \
+  artifact_sha256="<sha256 of \$PLAN_PATH after this disposition>" commit_sha=null \
+  verification=PASS next_unit="<next unresolved finding id in this batch, or the literal word null>"
+```
 
 ## Publish STATUS
 
@@ -7232,7 +7999,7 @@ reason: <one line, or the literal word null>
 published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
 artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
 output_count: 0
-checkpoint_path: null
+checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
 x_addressed_blockers: <int>
 x_addressed_majors: <int>
 x_deferred_minors: <int>
@@ -7250,7 +8017,7 @@ You are the implementation supervisor for this feature, invoked as a fresh subpr
 ## Role contract
 
 - Required inputs: `feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy`
-- Optional inputs: `findings_paths;debugger_status_path`
+- Optional inputs: `findings_paths;debugger_status_path;continuation_path;declared_foreign_changes`
 - Outputs: `implementation_summary;status`
 - Allowed verdicts: `DONE;FAILED;NEEDS_DEBUG;BLOCKED`
 - Required status fields: `common_v2;verification`
@@ -7266,6 +8033,12 @@ You are the implementation supervisor for this feature, invoked as a fresh subpr
 - `$FINDINGS_PATHS` — newline-separated absolute paths to code-review findings (only set during Phase 7 re-dispatch)
 - `$DEBUGGER_STATUS_PATH` — absolute path to `debugger-status.md` (only set during a post-debug re-verification dispatch)
 - `$CONTEXT7_POLICY` — `required` or `best-effort` (see below)
+- `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
+- `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
+
+## SDD custody
+
+Configure the SDD skill root as `$FEATURE_FOLDER/6-implementation/sdd/`. If the installed skill cannot accept a root, mirror each completed task's brief, report, progress update, and review diff into that same directory IMMEDIATELY after that task — never only at terminal STATUS. Record both paths as `x_sdd_original_path`/`x_sdd_durable_path` in STATUS (see below).
 
 ## Required skills
 
@@ -7312,11 +8085,22 @@ Three modes, mutually exclusive — determined by which optional inputs are set:
 
 ### Mode A — Fresh implementation (neither `$DEBUGGER_STATUS_PATH` nor `$FINDINGS_PATHS` is set)
 
+0. If `$CONTINUATION_PATH` is set, read it first: it is a prior attempt's own `progress.jsonl`. Resume from the task its last record names as `next_unit` — never re-run a task already marked `completed`. Reconcile at most the one dirty (`state: partial`) task, if any, using `$DECLARED_FOREIGN_CHANGES` to recognize which currently-dirty paths are pre-existing, not yours.
 1. Read `$PLAN_PATH`.
 2. Execute the plan task-by-task using `subagent-driven-development`. Commit per task per the plan's TDD shape.
 3. Run the plan's verification at the end (and per the verification skill).
 4. Apply no-secret checks when the feature touches credentials, config, notebooks, examples, generated artifacts, or deployment files. Record the no-secret check result in the summary.
-5. Track per-task progress in `$FEATURE_FOLDER/6-implementation/subagent-logs/` (one file per task).
+5. Track per-task progress in `$FEATURE_FOLDER/6-implementation/subagent-logs/` (one file per task). After every committed task AND its review, call `checkpoint_append` -- the generated runtime's own checkpoint writer (never hand-write the JSON line yourself):
+
+   <!-- lint: snippet -->
+   ```bash
+   source "$RUNTIME_DIR/develop-it-runtime.sh"
+   checkpoint_append "$PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl" "$DISPATCH_ID" implementer \
+     sequence="<next integer, starting at 1>" unit_type=task unit_id="<task id>" \
+     state=completed artifact_path="<absolute path to that task's report/diff>" \
+     artifact_sha256="<sha256 of that report>" commit_sha="<the task's own commit SHA>" \
+     verification="<PASS|FAIL>" next_unit="<next task id, or the literal word null>"
+   ```
 6. Write the summary and publish STATUS (see "Publish STATUS" below).
 
 ### Mode B — Post-debug re-verification (`$DEBUGGER_STATUS_PATH` is set)
@@ -7386,6 +8170,8 @@ checkpoint_path: $PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl
 verification: PASS | FAIL | PARTIAL
 x_tasks_completed: <int> / <total>
 x_commit_shas: [sha1, sha2, ...]
+x_sdd_original_path: <the SDD skill's own working directory, or the literal word null>
+x_sdd_durable_path: $FEATURE_FOLDER/6-implementation/sdd/
 STATUS
 ```
 
@@ -7718,7 +8504,7 @@ You are the Phase 7 code-review fixer, invoked as a fresh subprocess by the deve
 ## Role contract
 
 - Required inputs: `accepted_plan;reviewed_revision;finding_ids;iteration;write_lease`
-- Optional inputs: `run_log;relevant_artifacts`
+- Optional inputs: `run_log;relevant_artifacts;continuation_path;declared_foreign_changes`
 - Outputs: `changed_paths;progress.jsonl`
 - Allowed verdicts: `DONE;PARTIAL;BLOCKED`
 - Required status fields: `common_v2;changed_paths;finding_dispositions`
@@ -7733,17 +8519,30 @@ You are the Phase 7 code-review fixer, invoked as a fresh subprocess by the deve
 - `$WRITE_LEASE` — proof you hold the single write lease for this dispatch
 - `$RUN_LOG` — this run's `RUN_LOG.md`, for failover/continuation context (optional)
 - `$RELEVANT_ARTIFACTS` — newline-separated paths the orchestrator has already identified as touched by the findings (optional; you may still discover more)
+- `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
+- `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
 
 ## Behavior
 
 1. Confirm you hold `$WRITE_LEASE`. If it is absent or expired, write STATUS with `verdict=BLOCKED, reason=write-lease-not-held` and exit 0 — never mutate without the lease.
-2. Read only the findings named in `$FINDING_IDS`, not the full findings file — a batch is bounded (see the `document_fixer_batch_size` policy) and out-of-batch findings are a later iteration's job.
-3. For each finding, apply the minimal correct fix. Do not restructure code the finding did not flag.
-4. Record, per finding, one disposition: `fixed`, `deferred` (with reason), or `disputed` (with reason) — this becomes `finding_dispositions`.
-5. Run the plan's own verification commands for the paths you touched (not the full suite — Phase 8 owns that).
-6. Never touch files outside `$REVIEWED_REVISION..HEAD`'s diff scope plus the files the findings explicitly name.
+2. If `$CONTINUATION_PATH` is set, read it first: resume from the finding its last record names as `next_unit`, reconcile at most the one dirty (`state: partial`) finding using `$DECLARED_FOREIGN_CHANGES`, and never re-fix a finding its records already mark disposed.
+3. Read only the findings named in `$FINDING_IDS`, not the full findings file — a batch is bounded (see the `document_fixer_batch_size` policy) and out-of-batch findings are a later iteration's job.
+4. For each finding, apply the minimal correct fix. Do not restructure code the finding did not flag.
+5. Record, per finding, one disposition: `fixed`, `deferred` (with reason), or `disputed` (with reason) — this becomes `finding_dispositions`.
+6. Run the plan's own verification commands for the paths you touched (not the full suite — Phase 8 owns that).
+7. Never touch files outside `$REVIEWED_REVISION..HEAD`'s diff scope plus the files the findings explicitly name.
 
-Write `progress.jsonl` incrementally (one line per finding disposition) so a debugger-style resume can reconstruct partial progress.
+After every finding-specific commit and verification, call `checkpoint_append` -- the generated runtime's own checkpoint writer (never hand-write the JSON line yourself) -- so a debugger-style resume can reconstruct partial progress:
+
+<!-- lint: snippet -->
+```bash
+source "$RUNTIME_DIR/develop-it-runtime.sh"
+checkpoint_append "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl" "$DISPATCH_ID" implementation-fixer \
+  sequence="<next integer, starting at 1>" unit_type=finding unit_id="<finding id>" \
+  state=completed artifact_path="<absolute path to the changed file>" \
+  artifact_sha256="<sha256 of that file after this fix>" commit_sha="<this finding's own commit SHA>" \
+  verification="<PASS|FAIL>" next_unit="<next assigned finding id, or the literal word null>"
+```
 
 ## Publish STATUS
 
@@ -8370,7 +9169,7 @@ You are the Phase 9 documentation/handoff writer, invoked as a fresh subprocess 
 ## Role contract
 
 - Required inputs: `final_diff;accepted_spec;accepted_plan;implementation_summary;test_summary;review_summary;decisions;exclusions;followups;write_lease`
-- Optional inputs: `docs_inventory;run_log`
+- Optional inputs: `docs_inventory;run_log;continuation_path;declared_foreign_changes`
 - Outputs: `uat.md;planned-vs-realized.md;documentation-validation.md;progress.jsonl`
 - Allowed verdicts: `DONE;PARTIAL;BLOCKED`
 - Required status fields: `common_v2;changed_paths;documentation_validation`
@@ -8391,17 +9190,30 @@ You are the Phase 9 documentation/handoff writer, invoked as a fresh subprocess 
 - `$WRITE_LEASE` — proof you hold the single write lease for this dispatch
 - `$DOCS_INVENTORY` — pre-existing user-facing docs the orchestrator has identified as possibly affected (optional)
 - `$RUN_LOG` — this run's `RUN_LOG.md`, for failover context (optional)
+- `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
+- `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
 
 ## Behavior
 
 1. Confirm you hold `$WRITE_LEASE`. If absent or expired, write STATUS with `verdict=BLOCKED, reason=write-lease-not-held` and exit 0.
-2. Cross-reference `$ACCEPTED_SPEC` and `$ACCEPTED_PLAN` against `$FINAL_DIFF` to write `planned-vs-realized.md`: what was planned, what actually shipped, and any material deviation.
-3. Write `uat.md`: concrete, reproducible user-acceptance steps for the shipped behavior.
-4. Validate structurally: every path named in `planned-vs-realized.md` and `uat.md` must exist in `$FINAL_DIFF` or the repository; every claim must trace to `$IMPLEMENTATION_SUMMARY`, `$TEST_SUMMARY`, or `$REVIEW_SUMMARY`. Record the result in `documentation-validation.md`.
-5. Self-correct: if structural validation fails, fix the document and re-validate, up to the `documentation_fix_cap` policy limit. Do not loop past it — record residual gaps instead.
-6. Do not touch source or test files — this role produces documentation artifacts only.
+2. If `$CONTINUATION_PATH` is set, read it first: resume from the document its last record names as `next_unit`, reconcile at most the one dirty (`state: partial`) document using `$DECLARED_FOREIGN_CHANGES`, and never re-draft a document already marked `completed`.
+3. Cross-reference `$ACCEPTED_SPEC` and `$ACCEPTED_PLAN` against `$FINAL_DIFF` to write `planned-vs-realized.md`: what was planned, what actually shipped, and any material deviation.
+4. Write `uat.md`: concrete, reproducible user-acceptance steps for the shipped behavior.
+5. Validate structurally: every path named in `planned-vs-realized.md` and `uat.md` must exist in `$FINAL_DIFF` or the repository; every claim must trace to `$IMPLEMENTATION_SUMMARY`, `$TEST_SUMMARY`, or `$REVIEW_SUMMARY`. Record the result in `documentation-validation.md`.
+6. Self-correct: if structural validation fails, fix the document and re-validate, up to the `documentation_fix_cap` policy limit. Do not loop past it — record residual gaps instead.
+7. Do not touch source or test files — this role produces documentation artifacts only.
 
-Write `progress.jsonl` incrementally as each document is drafted and validated.
+After each document is drafted/validated, and after each self-correction round, call `checkpoint_append` -- the generated runtime's own checkpoint writer (never hand-write the JSON line yourself):
+
+<!-- lint: snippet -->
+```bash
+source "$RUNTIME_DIR/develop-it-runtime.sh"
+checkpoint_append "$PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl" "$DISPATCH_ID" documentation-writer \
+  sequence="<next integer, starting at 1>" unit_type=document unit_id="<uat.md, planned-vs-realized.md, or documentation-validation.md>" \
+  state=completed artifact_path="<absolute path to that document>" \
+  artifact_sha256="<sha256 of that document>" commit_sha=null \
+  verification=PASS next_unit="<next document name, or the literal word null>"
+```
 
 ## Publish STATUS
 

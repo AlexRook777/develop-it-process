@@ -75,6 +75,9 @@ DISPATCH_ID="p03-i01-spec-reviewer-claude-a01"
 LOGICAL_DISPATCH_ID="p03-i01-spec-reviewer-claude"
 ATTEMPT=01
 STATUS_PUBLISHER_PATH="$FEATURE_FOLDER/../.orchestration/runtime/publish-status"
+CONTINUATION_PATH=""
+DECLARED_FOREIGN_CHANGES=""
+RUNTIME_DIR="$FEATURE_FOLDER/.orchestration/runtime"
 
 # --- Sanity check: render_prompt must succeed with these fixture values -----
 # If this fails, every assertion below fails for the wrong reason (an unset

@@ -198,6 +198,9 @@ if declare -F render_prompt >/dev/null; then
   LOGICAL_DISPATCH_ID=p07-i00-implementation-fixer
   ATTEMPT=01
   STATUS_PUBLISHER_PATH=/tmp/ff/.orchestration/runtime/publish-status
+  CONTINUATION_PATH=""
+  DECLARED_FOREIGN_CHANGES=""
+  RUNTIME_DIR="$FEATURE_FOLDER/.orchestration/runtime"
 
   body="$(render_prompt spec-reviewer-claude)" \
     && _ok "render_prompt extracts a known appendix from unexported variables" \
@@ -1516,7 +1519,7 @@ python3 "$REPO_TOP/tests/lib/extract.py" events > "$BUILD/events.tsv"
 _t8_registry_types="$(tail -n +2 "$BUILD/events.tsv" | cut -f1 | sort)"
 _t8_code_types="$(printf '%s\n' \
   DISPATCH_NOT_LAUNCHED DISPATCH_STARTED DISPATCH_COMPLETED ATTEMPT_FAILED \
-  RECOVERY_AUTHORIZED RECOVERY_CAP_REACHED ORCHESTRATION_CORRECTION HALT \
+  RECOVERY_AUTHORIZED RECOVERY_CAP_REACHED CONTINUATION_CAP_REACHED ORCHESTRATION_CORRECTION HALT \
   OWNER_DECISION RISK_ACCEPTED PHASE_ACCEPTED EVENT_CORRECTED VENDOR_UNAVAILABLE \
   DEGRADED_REVIEW_ACCEPTED CONTEXT7_UNAVAILABLE CONTEXT7_RESTORED \
   WRITE_LEASE_ACQUIRED WRITE_LEASE_RELEASED ARTIFACT_INTEGRITY_BLOCKED \
@@ -1542,7 +1545,8 @@ done < <(printf '%s\n' "$_t8_registry_types")
 assert_eq "" "$_t8_mismatch" \
   "event_required_fields agrees with the registry's required_fields column for every type"
 _t8_yes_count="$(tail -n +2 "$BUILD/events.tsv" | awk -F'\t' '$3=="yes"' | wc -l | tr -d ' ')"
-assert_eq 12 "$_t8_yes_count" "exactly twelve event types are proposition_required=yes"
+assert_eq 13 "$_t8_yes_count" \
+  "exactly thirteen event types are proposition_required=yes (Task 9 adds CONTINUATION_CAP_REACHED)"
 
 # --- record_event flushes/fsyncs its append (Step 3, code review fix #5) ---
 if declare -F record_event >/dev/null; then

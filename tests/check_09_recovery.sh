@@ -242,6 +242,39 @@ _drive_rm RM07 TRANSIENT_TRANSPORT_ERROR DIRTY_CHECKPOINTED transient dirty-chec
 _drive_rm RM07 PUBLICATION_LOST DIRTY_CHECKPOINTED publication-lost dirty-checkpointed 28 \
   "RM07b: publication lost, DIRTY_CHECKPOINTED"
 
+# Code review fix B: _drive_rm's own 2-arg recovery_action call (no logical
+# dispatch id) can ONLY ever exercise RM07's fail-closed path -- assert
+# that explicitly, not just "RECOVERY_ACTION is non-empty", so the sweep
+# above is not silently mistaken for a real isolation evaluation.
+assert_eq RECONCILE_UNKNOWN_NO_LOGICAL_ID "$RECOVERY_ACTION" \
+  "RM07b (2-arg sweep): reports the distinct 'cannot decide, no logical id' token, never a real isolation verdict"
+
+# --- RM07, 3-arg form: recovery_action decides isolation for REAL when
+# given the logical dispatch id -- both outcomes, isolated and not. -------
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
+allocate_attempt 6 90 debugger >/dev/null
+rm07_3arg_logical="$LOGICAL_DISPATCH_ID"
+rm07_3arg_dispatch="$DISPATCH_ID"
+acquire_write_lease debugger role "$rm07_3arg_dispatch" 6 "." >/dev/null
+rm07_3arg_progress="$ATTEMPT_DIR/progress.jsonl"
+write_fake_checkpoint "$rm07_3arg_progress" "$rm07_3arg_dispatch" 1 completed task-01 "" "" "" task-02
+write_fake_checkpoint "$rm07_3arg_progress" "$rm07_3arg_dispatch" 2 partial task-02 "" "" "" task-02
+
+recovery_action TIMED_OUT DIRTY_CHECKPOINTED "$rm07_3arg_logical"
+assert_eq RM07 "$RECOVERY_MATRIX_ID" "RM07 3-arg form: still RM07"
+assert_eq RECONCILE_THEN_CONTINUE_IF_ISOLATED "$RECOVERY_ACTION" \
+  "RM07 3-arg form: a genuinely isolated dirty checkpoint (no unexplained dirt beyond its own open unit) is authorized"
+
+rm07_3arg_stray="$FEATURE_FOLDER/6-implementation/rm07-3arg-stray.txt"
+mkdir -p "$(dirname "$rm07_3arg_stray")"
+printf 'unexplained\n' > "$rm07_3arg_stray"
+recovery_action TIMED_OUT DIRTY_CHECKPOINTED "$rm07_3arg_logical"
+assert_eq RECONCILE_BLOCKED_NOT_ISOLATED "$RECOVERY_ACTION" \
+  "RM07 3-arg form: an extra unexplained dirty path correctly defeats isolation"
+rm -f "$rm07_3arg_stray"
+release_write_lease debugger >/dev/null
+
 # --- RM08: any failure, DIRTY_UNCHECKPOINTED or INTEGRITY_UNKNOWN -> HALT.
 # Every declared mutation state for this row is exercised.
 _drive_rm RM08 TRANSIENT_TRANSPORT_ERROR DIRTY_UNCHECKPOINTED transient dirty-uncheckpointed 29 \
