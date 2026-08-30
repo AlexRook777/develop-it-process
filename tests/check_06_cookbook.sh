@@ -460,6 +460,8 @@ if declare -F render_prompt >/dev/null; then
   DECLARED_FOREIGN_CHANGES=""
   APPLICABLE_OPTIONAL_SKILLS=""
   RUNTIME_DIR="$FEATURE_FOLDER/.orchestration/runtime"
+  MODE=A
+  CONTINUATION_PRIOR_CLASSIFICATION=""
 
   body="$(render_prompt spec-reviewer-claude)" \
     && _ok "render_prompt extracts a known appendix from unexported variables" \
@@ -1157,9 +1159,26 @@ trailing_and_hits=$(python3 - "$BUILD/cookbook.sh" <<'PY'
 import re, sys
 lines = open(sys.argv[1]).read().splitlines()
 hits = 0
+# Code review fix (round 1, finding 4): the original detector inspected only
+# the SINGLE physical line before a function's closing brace. A block closer
+# (`fi`/`done`/`esac`) on that line hides the real last-executed statement
+# one level INSIDE the block -- e.g. `[ -n "$X" ] && Y=1` immediately
+# followed by `fi` then `}` -- which is exactly the shape Task 13's own
+# reconstruct_checkpoint_state regression took (proven live: with its
+# `return 0` removed, this detector still printed 0 hits while check_10
+# aborted mid-run under set -e). Walk backward through any depth of trailing
+# bare block-closer lines to find the statement that actually executes last.
+CLOSERS = {"fi", "done", "esac"}
+def _skippable(s):
+    return s in CLOSERS or s == "" or s.startswith("#")
 for i, line in enumerate(lines):
     if line.strip() == "}" and i > 0:
-        prev = lines[i - 1].strip()
+        j = i - 1
+        while j >= 0 and _skippable(lines[j].strip()):
+            j -= 1
+        if j < 0:
+            continue
+        prev = lines[j].strip()
         if not prev or prev.startswith(("if ", "elif ", "while ", "until ", "#")):
             continue
         # A bare "cmd &&" with nothing after it is itself a syntax error, so

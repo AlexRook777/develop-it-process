@@ -231,7 +231,7 @@ assert_eq 4 "$_halt_call_sites" \
 # receives it as a rendered appendix input.
 assert_present 'APPLICABLE_OPTIONAL_SKILLS="\$\(applicable_optional_skills "\$OPTIONAL_SKILLS" "\$_relevant_skills"' "$D" \
   "T10 review: applicable_optional_skills has a real call site in reconstruct_durable_inputs"
-assert_present '^[[:space:]]+APPLICABLE_OPTIONAL_SKILLS$' "$D" \
+assert_present '[[:space:]]APPLICABLE_OPTIONAL_SKILLS([[:space:]]|$)' "$D" \
   "T10 review: APPLICABLE_OPTIONAL_SKILLS is listed as a render_keys() entry"
 assert_present '\| plan-writer \|.*applicable_optional_skills' "$D" \
   "T10 review: plan-writer's registry row declares applicable_optional_skills as an input"
@@ -373,5 +373,88 @@ assert_present 'marked `STALE` without a vendor call' "$D" \
 assert_present '\| implementer \|.*DONE;DONE_WITH_EXCLUSIONS;FAILED;NEEDS_DEBUG;BLOCKED' "$D" \
   "T12: implementer's registry row declares DONE_WITH_EXCLUSIONS as a legal verdict"
 assert_present 'DONE_WITH_EXCLUSIONS' "$D" "T12: DONE_WITH_EXCLUSIONS is documented"
+
+# --- Task 13: separate implementation continuation from finding repair -----
+# No ACTIVE Mode C section survives (the one surviving mention is the
+# historical "that role's Mode C is retired" footnote in Phase 7's own
+# dispatch prose, never a heading naming a live behavior).
+assert_absent '^### Mode C' "$D" \
+  "T13: no active 'Mode C' section survives"
+assert_present '### Mode D' "$D" \
+  "T13: Mode D (continuation) is its own documented section, not folded into Mode A"
+assert_present 'INCOMPLETE_CONTINUABLE' "$D" \
+  "T13: a clean timeout after committed tasks is documented as INCOMPLETE_CONTINUABLE, not terminal failure"
+assert_present '\| implementer \|.*;mode \|' "$D" \
+  "T13: implementer's registry row declares mode as a required input"
+assert_present 'ROLE_SCOPE_VIOLATION' "$D" \
+  "T13: a role dispatched with another role's exclusive scope (e.g. finding_ids) is rejected as ROLE_SCOPE_VIOLATION"
+assert_present 'DISPATCH_INVALID_MODE' "$D" \
+  "T13: an implementer \$MODE outside A|B|D is rejected before launch as DISPATCH_INVALID_MODE"
+assert_present 'disjoint' "$D" \
+  "T13: concurrently-dispatched impl-worker children receive a disjoint declared-path set"
+for _t13_field in x_completed_task_ids x_baseline_sha x_final_sha \
+  x_declared_foreign_changes x_remaining_handoffs; do
+  assert_present "^${_t13_field}:" "$D" \
+    "T13: implementer's published STATUS template carries $_t13_field"
+done
+
+# Code review fix (round 1, finding 5): implementation-fixer's own appendix
+# must carry a ripple check, remeasurement of measurement-based findings, and
+# an explicit "unrelated opportunity -> follow-up, not code" rule -- all
+# three explicit in spec S17.3/S18.4 and Task 13 Step 5, none of which the
+# fixer's own bounded-batch loop previously stated. Scoped to the fixer's own
+# appendix body (the same extraction T11's summarizer checks already use) so
+# this cannot pass on the strength of spec-fixer/plan-fixer/debugger already
+# saying "ripple check"/"remeasure" elsewhere in the document.
+_t13_fixer_body="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"<!-- BEGIN: implementation-fixer -->(.*?)<!-- END: implementation-fixer -->", text, re.S)
+print(m.group(1) if m else "")
+PY
+)"
+case "$_t13_fixer_body" in
+  *'ripple check'*) _ok "T13: implementation-fixer's own appendix states the ripple-check rule" ;;
+  *) _fail "T13: implementation-fixer's own appendix does NOT mention a ripple check" ;;
+esac
+case "$_t13_fixer_body" in
+  *'remeasure'*) _ok "T13: implementation-fixer's own appendix requires remeasuring measurement-based findings" ;;
+  *) _fail "T13: implementation-fixer's own appendix does NOT require remeasurement" ;;
+esac
+case "$_t13_fixer_body" in
+  *'UNRELATED'*'follow-up'*) _ok "T13: implementation-fixer's own appendix states the unrelated-opportunity-becomes-a-follow-up rule" ;;
+  *) _fail "T13: implementation-fixer's own appendix does NOT state the unrelated-opportunity rule" ;;
+esac
+
+# Code review fix (round 1, finding 6): "the reviewed baseline/final diff"
+# (spec S20.7) means IMPLEMENTATION_BASE_SHA..REVIEWED_REVISION -- the WHOLE
+# reviewed implementation -- not REVIEWED_REVISION..HEAD, which is the
+# fixer's OWN in-progress commit range and is trivially empty at dispatch
+# time (REVIEWED_REVISION is captured as HEAD immediately before dispatch).
+# implementation_base_sha must be a real optional input AND actually read.
+assert_present '\| implementation-fixer \|.*implementation_base_sha' "$D" \
+  "T13: implementation-fixer's registry row declares implementation_base_sha as an input"
+case "$_t13_fixer_body" in
+  *'IMPLEMENTATION_BASE_SHA..$REVIEWED_REVISION'*) _ok "T13: implementation-fixer's own appendix reads the reviewed baseline/final diff (IMPLEMENTATION_BASE_SHA..REVIEWED_REVISION)" ;;
+  *) _fail "T13: implementation-fixer's own appendix does NOT read IMPLEMENTATION_BASE_SHA..REVIEWED_REVISION" ;;
+esac
+
+# Code review fix (round 1, finding 8): three of the five new x_ STATUS
+# fields (x_baseline_sha, x_final_sha, x_remaining_handoffs) now have a real
+# reader -- readiness-writer's own "Implementation result" section -- not
+# just a template emitting them into a file nothing else opens.
+_t13_readiness_body="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"<!-- BEGIN: readiness-writer -->(.*?)<!-- END: readiness-writer -->", text, re.S)
+print(m.group(1) if m else "")
+PY
+)"
+for _t13_consumed_field in x_baseline_sha x_final_sha x_remaining_handoffs; do
+  case "$_t13_readiness_body" in
+    *"$_t13_consumed_field"*) _ok "T13: readiness-writer's own appendix reads implementer-status.md's $_t13_consumed_field" ;;
+    *) _fail "T13: readiness-writer's own appendix does NOT read $_t13_consumed_field" ;;
+  esac
+done
 
 finish

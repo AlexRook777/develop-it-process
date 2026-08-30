@@ -71,4 +71,10 @@ while IFS= read -r role; do
 done < <(printf '%s\n' "$top_level_roles")
 assert_eq "" "$drift" "every appendix contract declaration matches its registry row"
 
+# --- Task 13: impl-worker (child-only, phases=child) never gets a top-level
+# appendix marker of its own -- it has no independent dispatch identity, so
+# a `BEGIN: impl-worker` marker would be an orphan nothing ever renders.
+assert_absent 'BEGIN: impl-worker' "$PROCESS_DOC" \
+  "T13: impl-worker (child-only role) has no top-level appendix marker"
+
 finish

@@ -257,12 +257,12 @@ this account and is used for the cheap `preflight-codex` probe;
 | plan-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
 | plan-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
 | plan-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;plan_path;finding_ids | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2;changed_paths;finding_dispositions | document-fixer | 5 |
-| implementer | claude | claude-opus-5 | — | 300 | yes | yes | yes | feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy | debugger_status_path;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | implementation_summary;status | DONE;DONE_WITH_EXCLUSIONS;FAILED;NEEDS_DEBUG;BLOCKED | common_v2;verification | implementation | 6 |
+| implementer | claude | claude-opus-5 | — | 300 | yes | yes | yes | feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy;mode | debugger_status_path;continuation_path;continuation_prior_classification;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | implementation_summary;status | DONE;DONE_WITH_EXCLUSIONS;FAILED;NEEDS_DEBUG;BLOCKED | common_v2;verification | implementation | 6 |
 | impl-worker | claude | claude-sonnet-5 | — | 300 | yes | yes | no | task_brief | context7_policy | none | changed_paths | none | none | implementation | child |
 | debugger | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;plan_path;implementation_summary_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 6 |
 | code-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
 | code-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
-| implementation-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | accepted_plan;reviewed_revision;finding_ids;iteration;write_lease | run_log;relevant_artifacts;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | changed_paths;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;finding_dispositions | implementation | 7 |
+| implementation-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | accepted_plan;reviewed_revision;finding_ids;iteration;write_lease | implementation_base_sha;run_log;relevant_artifacts;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | changed_paths;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;finding_dispositions | implementation | 7 |
 | all-tests-runner | claude | claude-sonnet-5 | — | 60 | yes | yes | no | feature_folder;repo_root;round | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;test_report | PASS;FAIL;SKIPPED | common_v2 | none | 8 |
 | test-fixer | claude | claude-sonnet-5 | — | 60 | yes | yes | no | feature_folder;plan_path;round;test_report_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 8 |
 | summarizer-spec | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 3 |
@@ -1922,6 +1922,7 @@ render_keys() {
     TEST_SUMMARY REVIEW_SUMMARY DECISIONS EXCLUSIONS FOLLOWUPS DOCS_INVENTORY \
     PHASE_DIR DISPATCH_ID LOGICAL_DISPATCH_ID ATTEMPT ROLE_CONTRACTS_PATH \
     STATUS_PUBLISHER_PATH CONTINUATION_PATH DECLARED_FOREIGN_CHANGES RUNTIME_DIR \
+    MODE CONTINUATION_PRIOR_CLASSIFICATION \
     APPLICABLE_OPTIONAL_SKILLS
 }
 
@@ -2271,6 +2272,21 @@ invoke_vendor() {
     claude|codex) : ;;
     *) echo "INVOKE_VENDOR_UNKNOWN_VENDOR:$role:$vendor" >&2; return 95 ;;
   esac
+
+  # Task 13 review fix (finding 10): may_spawn_children was a registry column
+  # no dispatch code ever READ. EXTRA_VENDOR_ARGS is the ONE mechanism that
+  # actually spawns children (the --agents sub-subagent model pin, Phase 6's
+  # own dispatch snippet) -- gate its use here, at invoke_vendor's own single
+  # choke point, on the dispatching role's own registry declaration, rather
+  # than trusting every future caller to remember the rule.
+  # declare -p first, under set -u: ${#EXTRA_VENDOR_ARGS[@]} itself throws
+  # "unbound variable" for a TRULY unset array (unlike a scalar's ${x:-}),
+  # so the length check must be short-circuited behind an existence probe
+  # that never references the array's expansion directly.
+  if declare -p EXTRA_VENDOR_ARGS >/dev/null 2>&1 && [ "${#EXTRA_VENDOR_ARGS[@]}" -gt 0 ]; then
+    [ "$(role_may_spawn_children "$role" 2>/dev/null)" = yes ] \
+      || { echo "INVOKE_VENDOR_SPAWN_NOT_AUTHORIZED:$role" >&2; return 95; }
+  fi
 
   [ -n "$prompt_file" ] && [ -r "$prompt_file" ] \
     || { echo "INVOKE_VENDOR_PROMPT_MISSING:$prompt_file" >&2; return 96; }
@@ -2627,6 +2643,36 @@ _dispatch_prelaunch() {
     *";$phase;"*) : ;;
     *) reject="${reject:-DISPATCH_PHASE_NOT_APPLICABLE}" ;;
   esac
+
+  # Task 13: any role whose OWN contract declares `mode` as a required input
+  # (today, only `implementer`) must be dispatched with an EXPLICIT
+  # $MODE=A|B|D -- never inferred here, never left to guess. Any other value,
+  # including unset, is rejected before a single token is spent. This is what
+  # makes "Mode C" unrepresentable: there is no fourth legal value to select it.
+  case ";$(role_required_inputs "$role" 2>/dev/null);" in
+    *";mode;"*)
+      case "${MODE:-}" in
+        A|B|D) : ;;
+        *) reject="${reject:-DISPATCH_INVALID_MODE}" ;;
+      esac
+      ;;
+  esac
+
+  # Task 13: $FINDING_IDS names the review-repair scope (spec S17.3/S18.4) --
+  # only a role whose OWN contract declares finding_ids (today: spec-fixer,
+  # plan-fixer, implementation-fixer) may ever consume it. A role dispatched
+  # while FINDING_IDS is set but its contract never declared it -- most
+  # notably the plain `implementer` -- is asked to repair a code-review
+  # finding outside its own role, which is a scope violation, not a missing-
+  # input defect. This also catches an ambient $FINDING_IDS leaking forward
+  # from an earlier Phase 7 dispatch into a later, unrelated one.
+  if [ -n "${FINDING_IDS:-}" ]; then
+    case ";$(role_required_inputs "$role" 2>/dev/null);" in
+      *";finding_ids;"*) : ;;
+      *) reject="${reject:-ROLE_SCOPE_VIOLATION}" ;;
+    esac
+  fi
+
   render_prompt --check "$role" >/dev/null 2>"$attempt_dir/render-check.err" \
     || reject="${reject:-DISPATCH_RENDER_CHECK_FAILED}"
 
@@ -5151,12 +5197,16 @@ _recovery_checkpoint_context() {
 
 # Best-effort continuation-context reconstruction for ONE checkpointed role
 # (spec S10.4's "continuation input"): populates CONTINUATION_PATH (the
-# failed attempt's own validated-on-disk checkpoint path, or empty) and
+# failed attempt's own validated-on-disk checkpoint path, or empty),
 # DECLARED_FOREIGN_CHANGES (space-separated, from the CURRENT write-lease's
-# own declared_foreign_paths, or empty). Read-only; never allocates an
-# attempt or authorizes anything -- recovery_action/recovery_retry_allowed
-# paired with checkpoint_resume_state still gate whether a continuation may
-# actually launch.
+# own declared_foreign_paths, or empty), and CONTINUATION_PRIOR_CLASSIFICATION
+# (spec S20.6's "prior classification" -- the failed attempt's own
+# classify_attempt result, e.g. TIMED_OUT/PUBLICATION_LOST/DIRTY_CHECKPOINTED,
+# read via the SAME _dispatch_completed_field helper resume_dispatch_state
+# itself already uses, never a second reader of DISPATCH_COMPLETED). Read-
+# only; never allocates an attempt or authorizes anything -- recovery_action/
+# recovery_retry_allowed paired with checkpoint_resume_state still gate
+# whether a continuation may actually launch.
 _reconstruct_continuation_state() {
   # Usage: _reconstruct_continuation_state ROLE LOGICAL_DISPATCH_ID
   local role="$1" logical="$2" path
@@ -5170,6 +5220,8 @@ _reconstruct_continuation_state() {
   dir="$(role_attempt_dir "$role" "$latest_id" 2>/dev/null)" || return 0
   path="$dir/progress.jsonl"
   [ -f "$path" ] && CONTINUATION_PATH="$path"
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  CONTINUATION_PRIOR_CLASSIFICATION="$(_dispatch_completed_field "$latest_id" classification 2>/dev/null)"
   if [ -f "${ORCHESTRATION_DIR:-}/write-lease.json" ]; then
     DECLARED_FOREIGN_CHANGES="$(jq -r '.declared_foreign_paths[]? // empty' \
       "$ORCHESTRATION_DIR/write-lease.json" 2>/dev/null | tr '\n' ' ')"
@@ -5193,6 +5245,8 @@ reconstruct_checkpoint_state() {
   # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
   CONTINUATION_PATH=""
   DECLARED_FOREIGN_CHANGES=""
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  CONTINUATION_PRIOR_CLASSIFICATION=""
   case "$phase" in
     3) role=spec-fixer ;;
     4) role=plan-writer; iter=00 ;;
@@ -5204,6 +5258,22 @@ reconstruct_checkpoint_state() {
   esac
   logical="p$(printf '%02d' "$phase")-i$(printf '%02d' "$((10#$iter))")-$role"
   _reconstruct_continuation_state "$role" "$logical"
+
+  # Task 13: phase 6's implementer is the one role with an explicit mode
+  # contract (A|B|D). This is the SAME call the Phase 6 preamble already
+  # makes to populate $CONTINUATION_PATH, so deriving the default $MODE here
+  # -- A when there is nothing to continue, D once a real continuation
+  # checkpoint is found -- keeps both facts resolved together, from the same
+  # evidence, in one place. Step 6.2 (post-debug re-dispatch) overrides this
+  # to MODE=B itself, right before that re-dispatch; nothing here ever
+  # produces B, since a debugger pass is orthogonal to whether a PRIOR
+  # implementer attempt left a continuable checkpoint.
+  if [ "$phase" = 6 ]; then
+    # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+    MODE=A
+    [ -n "$CONTINUATION_PATH" ] && MODE=D
+  fi
+  return 0
 }
 ```
 
@@ -5219,15 +5289,29 @@ continuation receives, through the rendered appendix: the prior dispatch's
 own validated checkpoint path and last sequence (`$CONTINUATION_PATH`, plus
 whatever `checkpoint_resume_state "$CONTINUATION_PATH" <prior-dispatch-id>`
 reports), completed unit IDs and commits (`$CHECKPOINT_COMPLETED_UNITS`),
-current HEAD/tree (a fresh `git` read, always live), the one dirty partial
-unit if any (`$CHECKPOINT_DIRTY_UNIT`), snapshot/lease paths (the CURRENT
-lease, `$ORCHESTRATION_DIR/write-lease.json`), declared foreign changes
+the prior attempt's own classification (`$CONTINUATION_PRIOR_CLASSIFICATION`
+-- e.g. `TIMED_OUT`/`PUBLICATION_LOST`/`DIRTY_CHECKPOINTED`, spec S20.6's
+"prior classification"), current HEAD/tree (a fresh `git` read, always
+live), the one dirty partial unit if any (`$CHECKPOINT_DIRTY_UNIT`),
+snapshot/lease paths (the CURRENT lease,
+`$ORCHESTRATION_DIR/write-lease.json`), declared foreign changes
 (`$DECLARED_FOREIGN_CHANGES`), and its own continuation budget
 (`policy_value continuation_cap` via `recovery_retry_allowed`). The role
 verifies this input before any mutation, reconciles at most the one dirty
 partial unit, never repeats a completed unit, and emits new checkpoint
 records under its own new `dispatch_id` — never appending to the prior
 attempt's `progress.jsonl`.
+
+For the implementer specifically (spec §20.6), this continuation IS `Mode D`
+(see the `implementer` appendix, below) — `reconstruct_checkpoint_state 6`
+sets `$MODE=D` itself whenever it finds a real `$CONTINUATION_PATH`, so the
+same evidence that authorizes a continuation is what selects the mode that
+consumes it. RM06's `CLEAN_CHECKPOINTED` classification (a TIMED_OUT attempt
+whose last checkpoint left nothing dirty, because every completed task was
+already committed and checkpointed before the clock ran out) is
+**`INCOMPLETE_CONTINUABLE`**, never a terminal failure: the controller
+continues it up to `continuation_cap` exactly like any other row this table
+authorizes, via Mode D.
 
 ### Turn-start reconciliation (spec §13.3)
 
@@ -7960,8 +8044,9 @@ For each iteration N (start at 1, hard cap `review_iteration_cap`):
    - `FINDING_IDS="$(select_finding_batch "$PHASE_DIR/$ITERATION/findings-catalog.jsonl")"` (bounded to `document_fixer_batch_size`, blockers first) — the SAME path the spec-fixer appendix itself reads (`$PHASE_DIR/$ITERATION/findings-catalog.jsonl`), never a phase-relative alias.
    - Dispatch one `claude` subprocess for role `spec-fixer`. Inputs: `$SPEC_PATH`, `$FINDING_IDS`. The fixer edits the canonical spec in place and calls `record_finding_disposition` for every assigned ID (spec §17.3's six-value vocabulary — never a bare "fixed the majors" with no per-ID record). This role's timeout comes from the Models table via `role_timeout`.
    - `dispositions_complete "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" $FINDING_IDS` — a fixer returning `DONE` with an undispositioned assigned ID is an orchestration bug (spec §17.3's "no assigned finding may disappear"); treat it as `CLAUDE_FAILED`/Mode 4.
+   - `unset FINDING_IDS` immediately afterward — this round's reviewers (re-dispatched at step 1 of the next loop) never declare `finding_ids` in their own contract; a stale non-empty `$FINDING_IDS` left over from this fixer dispatch would scope-reject them (`ROLE_SCOPE_VIOLATION`) before they ever launch.
    - Capture `bytes_after="$(wc -c < "$SPEC_PATH")"`, tally this round's new/recurring/resolved/reopened/fix-regression counts from the catalog, and call `record_convergence_signals 3 "$ITERATION" "$bytes_before" "$bytes_after" ...`.
-   - Call `divergence_check 3 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"`. On `yes:<reason>`: `record_event DIVERGENCE_DETECTED phase_name=spec-review divergence_reason=<reason> ...`; if this is the `divergent_round_cap`-th consecutive divergent round, `record_event DIVERGENT_ROUND_CAP_REACHED ...` and dispatch exactly ONE consolidation-priority `spec-fixer` batch (same dispatch mechanism, prioritizing deletion/replacement/contradiction-removal/provenance-repair per spec §18.3 over addressing new findings) instead of the ordinary batch above — it is still bounded and still followed by step 1's `validate_artifact` and a full re-review; do not silently return to unlimited additive fixing.
+   - Call `divergence_check 3 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"`. On `yes:<reason>`: `record_event DIVERGENCE_DETECTED phase_name=spec-review divergence_reason=<reason> ...`; if this is the `divergent_round_cap`-th consecutive divergent round, `record_event DIVERGENT_ROUND_CAP_REACHED ...` and dispatch exactly ONE consolidation-priority `spec-fixer` batch — re-populate `FINDING_IDS="$(select_finding_batch ...)"` first, since it was unset above and `spec-fixer` requires it — (same dispatch mechanism, prioritizing deletion/replacement/contradiction-removal/provenance-repair per spec §18.3 over addressing new findings) instead of the ordinary batch above — it is still bounded and still followed by step 1's `validate_artifact` and a full re-review; do not silently return to unlimited additive fixing.
    - Increment N. Loop from step 1 — the reviewers ALWAYS run again against the fixer's new revision; there is no iteration, including the cap, at which a fixer's own STATUS substitutes for a subsequent reviewer verdict (spec §18.2).
 5. When the gate passes — `blockers=0` and (iterations 1–2: `majors=0`) or (iterations 3+: every open major dispositioned):
    - Dispatch one `claude` subprocess for role `summarizer-spec`. Inputs: `$FEATURE_FOLDER`. Outputs: `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md`. The summarizer records any deferred/accepted-risk majors (read from the final catalog) in the summary file.
@@ -8042,8 +8127,9 @@ For each iteration N (start at 1, hard cap `review_iteration_cap`):
    - `FINDING_IDS="$(select_finding_batch "$PHASE_DIR/$ITERATION/findings-catalog.jsonl")"` — the SAME path the plan-fixer appendix itself reads.
    - Dispatch one `claude` subprocess for role `plan-fixer`. Inputs: `$PLAN_PATH`, `$FINDING_IDS`. The fixer calls `record_finding_disposition` for every assigned ID. This role's timeout comes from the Models table via `role_timeout`.
    - `dispositions_complete "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" $FINDING_IDS`; treat a gap as Mode 4.
+   - `unset FINDING_IDS` immediately afterward — the next iteration's reviewers never declare `finding_ids` and would otherwise be scope-rejected by a stale value.
    - Capture `bytes_after`, tally this round's counts, and call `record_convergence_signals 5 "$ITERATION" ...`.
-   - Call `divergence_check 5 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"` and apply the SAME divergence handling as Step 3.1 (record the event(s); at `divergent_round_cap` dispatch one consolidation-priority `plan-fixer` batch instead of the ordinary one).
+   - Call `divergence_check 5 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"` and apply the SAME divergence handling as Step 3.1 (record the event(s); at `divergent_round_cap` re-populate `FINDING_IDS` via `select_finding_batch` and dispatch one consolidation-priority `plan-fixer` batch instead of the ordinary one).
    - Increment N. Loop from step 1 — reviewers ALWAYS run again; no cap-adjacent fixer dispatch ever substitutes for the next reviewer round.
 5. When the gate passes:
    - Dispatch one `claude` subprocess for role `summarizer-plan`. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. The summarizer records any deferred/accepted-risk majors (from the final catalog) in the summary file.
@@ -8142,7 +8228,12 @@ If `IMPLEMENTATION_BASE_SHA=non-git`, Phase 9 will be SKIPPED and the code revie
 ### Step 6.1 — Dispatch implementer
 
 Dispatch one `claude` subprocess for role `implementer`. Inputs: `$FEATURE_FOLDER`,
-`$PLAN_PATH`, `$SPEC_PATH`, `$IMPLEMENTATION_BASE_SHA`. The subagent loads
+`$PLAN_PATH`, `$SPEC_PATH`, `$IMPLEMENTATION_BASE_SHA`, `$MODE`. `$MODE` was
+already resolved to `A` (fresh) or `D` (continuation) by this phase's own
+top-of-block `reconstruct_checkpoint_state 6` call (see the Checkpoint
+contract, above) — never set it again here. `_dispatch_prelaunch` rejects any
+value outside `A|B|D` before a single token is spent (`DISPATCH_INVALID_MODE`);
+Mode C no longer exists as a value this contract can express. The subagent loads
 `superpowers:subagent-driven-development` and runs the full per-task implementation
 loop internally (it dispatches its own sub-subagents per plan task as the skill
 prescribes). Per-task logs go under `6-implementation/subagent-logs/`. This role's
@@ -8187,7 +8278,7 @@ debugger-status.md is ADVISORY: the canonical implementation status remains `imp
 
 1. Dispatch one `claude` subprocess for role `debugger`. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_SUMMARY_PATH`, `$IMPLEMENTATION_BASE_SHA`. The debugger loads `superpowers:systematic-debugging`. It edits source/tests as needed and writes `<feature-folder>/6-implementation/debugger-status.md`. This role's timeout comes from the Models table via `role_timeout`.
 2. On debugger `verdict=DONE`:
-   - **Re-dispatch the implementer** (role `implementer`), additionally passing `$DEBUGGER_STATUS_PATH=<feature-folder>/6-implementation/debugger-status.md`. The implementer re-runs the plan's verification (it does NOT re-do task work), appends the post-debug verification result to `implementation-summary.md`, and atomically rewrites `implementer-status.md`. This is still the `implementer` role, so its timeout (from the Models table via `role_timeout`) exceeds a single Bash tool call — issue this re-dispatch as **one Bash tool call with `run_in_background: true`** as well.
+   - **Re-dispatch the implementer** (role `implementer`), setting `MODE=B` (overriding whatever the phase preamble left it at — post-debug re-verification is never a continuation, regardless of what `$CONTINUATION_PATH` says) and additionally passing `$DEBUGGER_STATUS_PATH=<feature-folder>/6-implementation/debugger-status.md`. The implementer re-runs the plan's verification (it does NOT re-do task work), appends the post-debug verification result to `implementation-summary.md`, and atomically rewrites `implementer-status.md`. This is still the `implementer` role, so its timeout (from the Models table via `role_timeout`) exceeds a single Bash tool call — issue this re-dispatch as **one Bash tool call with `run_in_background: true`** as well.
    - Read the rewritten `implementer-status.md`. Proceed to Phase 7 only when `verdict` is `DONE` or `DONE_WITH_EXCLUSIONS`, `verification=PASS`, AND `validate_verification_records "$(status_field "$FEATURE_FOLDER/6-implementation/implementer-status.md" x_verification_records_path)"` (cookbook) also succeeds — the same zero-token gate Step 6.1 applies, re-run here because Mode B rewrote this same evidence file.
    - If the re-run still reports `verification != PASS`, loop back to Step 6.2 step 1 (debugger). Cap at 3 debugger→re-verify iterations; on cap, HALT.
 3. On debugger `verdict=BLOCKED`, HALT.
@@ -8260,8 +8351,9 @@ For each iteration N (start at 1, hard cap `review_iteration_cap`):
 4. Apply the iteration-dependent gate against the catalog counts — **iterations 1–2:** re-dispatch when `blockers + majors > 0`; **iterations 3 and up:** re-dispatch when `blockers > 0` OR any open major still lacks a disposition:
    - Call `reconstruct_checkpoint_state 7 "$ITERATION"` (`implementation-fixer` is Phase 7's own checkpointed role — see the `reconstruct_checkpoint_state` case table above — so this reads `p07-i$ITERATION-implementation-fixer`'s own prior attempt, never Phase 6's) so `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_CHANGES` reflect this exact iteration's own prior attempt, if any, before rendering the appendix.
    - `FINDING_IDS="$(select_finding_batch "$PHASE_DIR/$ITERATION/findings-catalog.jsonl")"` — the SAME path implementation-fixer itself reads; `ACCEPTED_PLAN="$PLAN_PATH"`; `WRITE_LEASE="$ORCHESTRATION_DIR/write-lease.json"`.
-   - Dispatch one `claude` subprocess for role `implementation-fixer` (NOT `implementer` — that role's Mode C is retired; a bounded per-finding fixer that never re-derives scope from the plan is what spec §17.3/§18.4 require). Inputs: `$ACCEPTED_PLAN`, `$REVIEWED_REVISION`, `$FINDING_IDS`, `$WRITE_LEASE`. This role's timeout (from the Models table via `role_timeout`) exceeds a single Bash tool call, so issue this dispatch as **one Bash tool call with `run_in_background: true`**.
+   - Dispatch one `claude` subprocess for role `implementation-fixer` (NOT `implementer` — that role's Mode C is retired; a bounded per-finding fixer that never re-derives scope from the plan is what spec §17.3/§18.4 require). Inputs: `$ACCEPTED_PLAN`, `$REVIEWED_REVISION`, `$IMPLEMENTATION_BASE_SHA`, `$FINDING_IDS`, `$WRITE_LEASE`. This role's timeout (from the Models table via `role_timeout`) exceeds a single Bash tool call, so issue this dispatch as **one Bash tool call with `run_in_background: true`**.
    - `dispositions_complete "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" $FINDING_IDS`; a `DONE` verdict with a gap is Mode 4/`CLAUDE_FAILED`. `PARTIAL` is continuable progress (spec §17.3) — treat exactly like an in-cap continuation, never a gate pass.
+   - `unset FINDING_IDS` immediately afterward — the next iteration's reviewers (and, once this gate passes, `summarizer-code-review`/Phase 8/Phase 9's own dispatches) never declare `finding_ids` and would otherwise be scope-rejected by a stale value left over from this fixer dispatch.
    - Capture this round's byte/section counts and finding-transition tallies from the catalog and call `record_convergence_signals 7 "$ITERATION" ...`.
    - Call `divergence_check 7 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"` and apply the SAME divergence handling as Step 3.1.
    - Increment N. Loop from step 1 — reviewers ALWAYS run again against the fixer's new commit; the retired "final fix pass, no re-review" text no longer exists in this phase.
@@ -9984,8 +10076,8 @@ You are the implementation supervisor for this feature, invoked as a fresh subpr
 
 ## Role contract
 
-- Required inputs: `feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy`
-- Optional inputs: `debugger_status_path;continuation_path;declared_foreign_changes`
+- Required inputs: `feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy;mode`
+- Optional inputs: `debugger_status_path;continuation_path;continuation_prior_classification;declared_foreign_changes`
 - Outputs: `implementation_summary;status`
 - Allowed verdicts: `DONE;DONE_WITH_EXCLUSIONS;FAILED;NEEDS_DEBUG;BLOCKED`
 - Required status fields: `common_v2;verification`
@@ -9998,9 +10090,11 @@ You are the implementation supervisor for this feature, invoked as a fresh subpr
 - `$PLAN_PATH` — absolute path to the approved plan
 - `$SPEC_PATH` — absolute path to the approved spec (for cross-reference only)
 - `$IMPLEMENTATION_BASE_SHA` — git SHA captured before any implementer dispatch (or the literal `non-git` if outside a git repo)
-- `$DEBUGGER_STATUS_PATH` — absolute path to `debugger-status.md` (only set during a post-debug re-verification dispatch)
+- `$MODE` — `A`, `B`, or `D` (see Behavior). This is what SELECTS your behavior below — never infer it yourself from which optional input happens to be set. The orchestrator resolves it before every dispatch and `_dispatch_prelaunch` rejects any other value (`DISPATCH_INVALID_MODE`) before you are ever launched, so you can trust it is exactly one of the three.
+- `$DEBUGGER_STATUS_PATH` — absolute path to `debugger-status.md` (set only when `$MODE=B`)
 - `$CONTEXT7_POLICY` — `required` or `best-effort` (see below)
-- `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
+- `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (set only when `$MODE=D`; empty otherwise)
+- `$CONTINUATION_PRIOR_CLASSIFICATION` — the prior attempt's own outcome classification (e.g. `TIMED_OUT`, `PUBLICATION_LOST`, `DIRTY_CHECKPOINTED`; set only when `$MODE=D`) — spec §20.6's "prior classification". `PUBLICATION_LOST` in particular means the prior attempt likely completed its work but its STATUS never made it to disk; weight your own re-verification accordingly rather than assuming a `TIMED_OUT`-style genuine mid-task cutoff.
 - `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
 
 ## SDD custody
@@ -10046,17 +10140,38 @@ review / code-quality review) you are conceptually assigning it. Record the
 agent type each task actually used in `implementation-summary.md` (see
 Output) so any drift from `impl-worker` is auditable.
 
+**Child-worker boundary.** You are the ONLY role that may spawn `impl-worker`
+children, and only because your own registry row says `may_spawn_children=
+yes` — `impl-worker`'s own row says `may_spawn_children=no`, so a child may
+never itself spawn a grandchild; it does its one task and returns. A child
+never acquires the repository-wide write lease (`.orchestration/write-
+lease.json`) independently — you hold the single write lease for this entire
+Phase 6 dispatch, and every child's edits land as part of your own mutation,
+never a separate lease of its own.
+When you dispatch more than one `impl-worker` concurrently, give each a
+disjoint set of files/paths to touch — never assign two concurrently-running
+children overlapping paths, or their writes race. A child's own result is
+hash-addressed: its report/diff gets a real file under
+`6-implementation/subagent-logs/` (or the SDD durable root) and you record
+that file's `sha256sum` as `artifact_sha256` in the `checkpoint_append` call
+you make for its task (see Mode A step 5, below) — that hash, not prose, is
+what proves the checkpoint matches what the child actually produced.
+
 ## Behavior
 
-Two modes, mutually exclusive — determined by which optional inputs are set.
-(A third mode, Phase 7 code-review fixing, used to live here but is retired:
-Phase 7 dispatches the bounded `implementation-fixer` role instead — see its
-own appendix, below — which never re-runs the plan's task loop or re-derives
-scope from the plan, per spec §17.3/§18.4.)
+Three explicit modes, selected by `$MODE` — never inferred, never mutually
+guessed from which optional input happens to be set. `$MODE=C` does not
+exist: the old third mode (Phase 7 code-review fixing) used to live here but
+is retired. Phase 7 dispatches the bounded `implementation-fixer` role
+instead — see its own appendix, below — which never re-runs the plan's task
+loop or re-derives scope from the plan, per spec §17.3/§18.4. If you are ever
+asked (through a finding-ids input, or any other input naming specific review
+findings) to repair a code-review finding, that is outside your role
+contract entirely — `_dispatch_prelaunch` rejects it as `ROLE_SCOPE_
+VIOLATION` before you would ever be launched to do it.
 
-### Mode A — Fresh implementation (`$DEBUGGER_STATUS_PATH` is not set)
+### Mode A — Fresh implementation (`$MODE=A`)
 
-0. If `$CONTINUATION_PATH` is set, read it first: it is a prior attempt's own `progress.jsonl`. Resume from the task its last record names as `next_unit` — never re-run a task already marked `completed`. Reconcile at most the one dirty (`state: partial`) task, if any, using `$DECLARED_FOREIGN_CHANGES` to recognize which currently-dirty paths are pre-existing, not yours.
 1. Read `$PLAN_PATH`.
 2. Execute the plan task-by-task using `subagent-driven-development`. Commit per task per the plan's TDD shape.
 3. Run every command the plan's `## Task Contract` block declares under `verification` (spec §19.2). For EACH command, call `append_verification_record` -- the generated runtime's own writer (never hand-write the JSON line yourself) -- to `$FEATURE_FOLDER/6-implementation/verification-records.jsonl` (truncate/start this file fresh in Mode A; Mode B appends to it instead, see below):
@@ -10095,7 +10210,7 @@ scope from the plan, per spec §17.3/§18.4.)
    ```
 6. Write the summary and publish STATUS (see "Publish STATUS" below).
 
-### Mode B — Post-debug re-verification (`$DEBUGGER_STATUS_PATH` is set)
+### Mode B — Post-debug re-verification (`$MODE=B`)
 
 You are being re-dispatched after the debugger has applied fixes. Your job is ONLY to re-validate, not to do new task work.
 
@@ -10103,6 +10218,23 @@ You are being re-dispatched after the debugger has applied fixes. Your job is ON
 2. Run the plan's verification commands in full and APPEND one new `append_verification_record` call per command to the SAME `$FEATURE_FOLDER/6-implementation/verification-records.jsonl` Mode A wrote (never truncate it here -- this is the post-debug re-verification, not a fresh run). Reuse the SAME `verification_id` Mode A used for each command -- `validate_verification_records` evaluates only the LATEST record per `verification_id`, so a fresh outcome under the same ID is how a post-debug PASS supersedes the pre-debug FAIL; a newly-invented ID for the same check would leave the old FAIL sitting alongside the new PASS as two unrelated, permanently-failing entries. Run no-secret checks if applicable.
 3. APPEND a new section to `$FEATURE_FOLDER/6-implementation/implementation-summary.md` headed "Post-debug verification (timestamp)" with: debugger root cause, debugger fix summary, the verification commands run, their results, any DONE_WITH_CONCERNS notes.
 4. Set the verdict for the post-debug state: `DONE` if every verification record now passes with no `EXCLUDED` records at all, `DONE_WITH_EXCLUSIONS` if every non-excluded required record passes and every `EXCLUDED` record's evidence is policy-valid (spec §19.2, same rule as Mode A); otherwise `NEEDS_DEBUG` (orchestrator will loop) or `BLOCKED`. Publish it in the one "Publish STATUS" step below — never write or rename the STATUS file yourself.
+
+### Mode D — Continuation (`$MODE=D`)
+
+You are a fresh dispatch resuming a PRIOR implementer attempt (same logical
+dispatch, same phase, same iteration) that never reached a terminal verdict —
+most commonly a clean `TIMED_OUT` after some tasks were already committed and
+checkpointed (RM06's `CLEAN_CHECKPOINTED`), which is `INCOMPLETE_CONTINUABLE`,
+not a failure. This dispatch counts against `continuation_cap` (`policy_value
+continuation_cap`); the orchestrator has already confirmed you are still
+within it before dispatching you.
+
+1. Read `$CONTINUATION_PRIOR_CLASSIFICATION` first — it tells you WHAT KIND of interruption you are resuming from before you look at anything else. `PUBLICATION_LOST` means the prior attempt's own work likely finished but its STATUS write never landed: expect the checkpoint to show every task already `completed`, with only STATUS publication remaining. `TIMED_OUT`/`DIRTY_CHECKPOINTED` mean a genuine mid-task cutoff: expect a real dirty partial task per step 2.
+2. Read `$CONTINUATION_PATH` — the prior attempt's own `progress.jsonl`. Verify its completed task/commit records against the real tree (`git log`/`git show` each `commit_sha`, confirm each `artifact_path`'s `artifact_sha256` still matches) before trusting any of it.
+3. Reconcile AT MOST the one dirty (`state: partial`) task, if any, using `$DECLARED_FOREIGN_CHANGES` to recognize which currently-dirty paths are pre-existing and not yours. Never re-run or re-commit a task the checkpoint already marks `completed` — that would duplicate committed work.
+4. Continue the plan task-by-task from the checkpoint's own `next_unit`, exactly like Mode A steps 1–5 (same `append_verification_record`/`checkpoint_append` calls, same `## Task Contract` verification), but never repeating a task this attempt's own history already completed.
+5. If every plan task was already `completed` at the point you resumed (only verification remained outstanding), skip straight to running the plan's verification commands, same as Mode A step 3.
+6. Write the summary (APPEND a "Continuation (timestamp)" section naming which attempt you resumed, its prior classification, and what you reconciled) and publish STATUS (see "Publish STATUS" below) with the SAME verdict rules as Mode A.
 
 Write the human-facing summary FIRST:
 
@@ -10155,7 +10287,12 @@ checkpoint_path: $PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl
 verification: PASS | FAIL | PARTIAL
 x_verification_records_path: $FEATURE_FOLDER/6-implementation/verification-records.jsonl
 x_tasks_completed: <int> / <total>
+x_completed_task_ids: [task-01, task-02, ...]
 x_commit_shas: [sha1, sha2, ...]
+x_baseline_sha: $IMPLEMENTATION_BASE_SHA
+x_final_sha: <git rev-parse HEAD after your last commit, or the literal word null if you made none>
+x_declared_foreign_changes: [<pre-existing dirty path this attempt did not touch>, ...] (or the literal word null if none)
+x_remaining_handoffs: [<follow-up id or short description>, ...] (or the literal word null if none)
 x_sdd_original_path: <the SDD skill's own working directory, or the literal word null>
 x_sdd_durable_path: $FEATURE_FOLDER/6-implementation/sdd/
 STATUS
@@ -10483,7 +10620,7 @@ You are the Phase 7 code-review fixer, invoked as a fresh subprocess by the deve
 ## Role contract
 
 - Required inputs: `accepted_plan;reviewed_revision;finding_ids;iteration;write_lease`
-- Optional inputs: `run_log;relevant_artifacts;continuation_path;declared_foreign_changes`
+- Optional inputs: `implementation_base_sha;run_log;relevant_artifacts;continuation_path;declared_foreign_changes`
 - Outputs: `changed_paths;progress.jsonl`
 - Allowed verdicts: `DONE;PARTIAL;BLOCKED`
 - Required status fields: `common_v2;changed_paths;finding_dispositions`
@@ -10494,6 +10631,7 @@ You are the Phase 7 code-review fixer, invoked as a fresh subprocess by the deve
 
 - `$ACCEPTED_PLAN` — absolute path to the approved plan (the plan-writer's accepted output)
 - `$REVIEWED_REVISION` — the implementation SHA the code-review findings were raised against
+- `$IMPLEMENTATION_BASE_SHA` — git SHA captured before Phase 6's implementer ever ran (or the literal `non-git`); together with `$REVIEWED_REVISION` this bounds the REVIEWED baseline/final diff (spec §20.7) — the complete implementation the reviewers evaluated, distinct from `$REVIEWED_REVISION..HEAD` (your OWN in-progress commits this dispatch, which starts empty and grows only as you commit)
 - `$FINDING_IDS` — the specific finding identifiers assigned to you this iteration, space-separated (never the whole findings catalog — see the `document_fixer_batch_size` policy)
 - `$WRITE_LEASE` — proof you hold the single write lease for this dispatch
 - `$RUN_LOG` — this run's `RUN_LOG.md`, for failover/continuation context (optional)
@@ -10505,11 +10643,13 @@ You are the Phase 7 code-review fixer, invoked as a fresh subprocess by the deve
 
 1. Confirm you hold `$WRITE_LEASE`. If it is absent or expired, write STATUS with `verdict=BLOCKED, reason=write-lease-not-held` and exit 0 — never mutate without the lease.
 2. If `$CONTINUATION_PATH` is set, read it first: resume from the finding its last record names as `next_unit`, reconcile at most the one dirty (`state: partial`) finding using `$DECLARED_FOREIGN_CHANGES`, and never re-fix a finding its records already mark disposed.
-3. Read ONLY the findings named in `$FINDING_IDS` from `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (`jq --arg id ... 'select(.finding_id==$id)'`, one lookup per assigned ID) — a batch is bounded (see the `document_fixer_batch_size` policy) and out-of-batch findings are a later iteration's job.
-4. For each finding, apply the minimal correct fix. Do not restructure code the finding did not flag.
-5. Record, per finding, exactly one disposition from spec §17.3's six-value vocabulary — `fixed`, `subsumed_by:<finding_id>`, `already_satisfied`, `blocked`, `accepted_risk:<decision_id>`, or `deferred:<followup_id>` — by calling `record_finding_disposition` (the generated runtime's own disposition writer, never a hand-written status change); this becomes `finding_dispositions`.
-6. Run the plan's own verification commands for the paths you touched (not the full suite — Phase 8 owns that).
-7. Never touch files outside `$REVIEWED_REVISION..HEAD`'s diff scope plus the files the findings explicitly name.
+3. Read `git diff $IMPLEMENTATION_BASE_SHA..$REVIEWED_REVISION` (when `$IMPLEMENTATION_BASE_SHA` is not `non-git`) — the reviewed baseline/final diff spec §20.7 requires you to have, giving you the COMPLETE reviewed implementation for context before you narrow to your assigned findings. This is a READ, not your write-scope boundary (see step 9, below).
+4. Read ONLY the findings named in `$FINDING_IDS` from `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (`jq --arg id ... 'select(.finding_id==$id)'`, one lookup per assigned ID) — a batch is bounded (see the `document_fixer_batch_size` policy) and out-of-batch findings are a later iteration's job.
+5. For each finding, apply the minimal correct fix. Do not restructure code the finding did not flag. If fixing an assigned finding surfaces an UNRELATED opportunity (a real improvement the finding itself did not flag), do NOT fold it into this pass — note it in your human-facing summary as a follow-up for a human to triage later; only code addressing an assigned finding ID belongs in this pass's commits (spec §17.3/§18.4).
+6. Inspect adjacent code, tests, and documentation your fix may have made stale (ripple check), per spec §18.4 — the same rule spec-fixer and plan-fixer already apply to their own edits.
+7. Record, per finding, exactly one disposition from spec §17.3's six-value vocabulary — `fixed`, `subsumed_by:<finding_id>`, `already_satisfied`, `blocked`, `accepted_risk:<decision_id>`, or `deferred:<followup_id>` — by calling `record_finding_disposition` (the generated runtime's own disposition writer, never a hand-written status change); this becomes `finding_dispositions`.
+8. Run the plan's own verification commands for the paths you touched (not the full suite — Phase 8 owns that). If an assigned finding is measurement-based (a performance/benchmark/latency/throughput finding), remeasure under the SAME controlled conditions as the original measurement before dispositioning it `fixed` — an unremeasured performance fix is not verified (same rule the debugger already applies to its own fixes).
+9. Never touch files outside `$REVIEWED_REVISION..HEAD`'s diff scope plus the files the findings explicitly name.
 
 <!-- lint: snippet -->
 ```bash
@@ -11300,7 +11440,7 @@ You are the final readiness reporter. You have no shared context.
    - **Artifacts** — paths to canonical spec, canonical plan, all summary files, AND `<feature-folder>/process-improvement-proposition.md`. The proposition file is listed by path only — its content is NOT read for verdict purposes. If the file does not exist at Phase 10 (no mandatory triggers fired and no spontaneous entries were emitted), list it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
    - **Preflight verdicts** — per `(phase, vendor)` table for phases in {1, 3, 5, 6, 7}: each row reports `phase`, `vendor`, classification (`READY` / `SKIPPED` / `FAILED` / `INVALID_ORCHESTRATION`), and `failure_mode` (if `FAILED`) or skip-reason (if `SKIPPED`). Phase 1 rows are read from `1-preflight/phase-1/`; per-phase rows from `<phase-dir>/preflight/`. Any `INVALID_ORCHESTRATION` row forces the overall readiness verdict to `NOT_READY`.
    - **Reviewer verdicts** — per-gate iteration counts, final verdicts, `partial_review` flag with per-gate `codex_unavailable_reason` if any.
-   - **Implementation result** — task count, commits, `implementation_base_sha`, verification, no-secret check, browser-QA result if applicable. If a post-debug re-verification occurred, note it.
+   - **Implementation result** — task count, commits, `implementation_base_sha`, verification, no-secret check, browser-QA result if applicable. If a post-debug re-verification occurred, note it. Read `implementer-status.md`'s own `x_baseline_sha`/`x_final_sha` (cross-check `x_baseline_sha` against `9-git-finalization/git-status.md`'s `implementation_base_sha` — a mismatch is itself a degradation worth a Degradations line) and `x_remaining_handoffs` (surfaced as its own bulleted list under this section when non-null — this is where a Mode D continuation's own leftover follow-ups become visible to the user, not silently dropped).
    - **Test results** — `final_test_verdict` (`PASS` / `FAILED` / `SKIPPED`), execution mode (`start-all-tests.sh` — a project-specific convention — vs discovered suites), rounds used, fix rounds dispatched, and — when `FAILED` — the residual-failure detail carried over from `all-test-summary.md` (failing test names, error excerpts, what each fix round attempted).
    - **Git result** — commit SHAs or `SKIPPED` reason.
    - **Degradations** — one line per `event=CONTEXT7_UNAVAILABLE`, `event=DISPATCH_ORPHANED`, `event=MODEL_REJECTED`, or `event=DEGRADED_REVIEW_ACCEPTED` entry found in `RUN_LOG.md`, naming the affected roles (for `DEGRADED_REVIEW_ACCEPTED`, the `scope` field). Omit this section only when RUN_LOG contains none of these events. Any degradation present forces the readiness verdict to at least `READY_WITH_NOTES` — never a silent `READY`.

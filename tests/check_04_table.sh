@@ -94,4 +94,19 @@ fi
 # no extracted contract may name the retired finishing-branch role
 assert_absent 'finishing-branch' "$BUILD/roles.tsv" "no extracted contract contains finishing-branch"
 
+# --- Task 13: implementer modes + child-worker spawn boundary --------------
+assert_tsv_field "$BUILD/roles.tsv" implementer required_inputs \
+  "feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy;mode"
+assert_eq yes "$(role_may_spawn_children implementer)" \
+  "T13: the implementer's own contract says may_spawn_children=yes"
+assert_eq no  "$(role_may_spawn_children impl-worker)" \
+  "T13: impl-worker's own contract forbids spawning a grandchild"
+
+# Code review fix (round 1, finding 11): the two checks above only look at
+# TWO of the 25 registry rows -- prove the claim in their own messages ("only
+# the implementer") against every OTHER role too, not just these two.
+_t13_spawn_offenders="$(awk -F '\t' 'NR>1 && $1!="implementer" && $8=="yes" {print $1}' "$BUILD/roles.tsv")"
+assert_eq "" "$_t13_spawn_offenders" \
+  "T13: no role OTHER than implementer says may_spawn_children=yes anywhere in the registry"
+
 finish

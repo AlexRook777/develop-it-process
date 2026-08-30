@@ -627,6 +627,17 @@ _t9_generic_cap_count="$("$GREP_BIN" -c 'event=RECOVERY_CAP_REACHED' "$RUN_LOG" 
 assert_eq 0 "$_t9_generic_cap_count" \
   "a continuation-cap denial never ALSO emits the generic RECOVERY_CAP_REACHED"
 
+# --- Task 13: reconstruct_checkpoint_state 6 also derives the implementer's
+# own $MODE -- A when there is nothing to continue (no p06-i00-implementer
+# attempt has failed yet; the RUN_LOG at this point only names the UNRELATED
+# p06-i60-implementer logical id from the continuation-cap test above). ----
+CONTINUATION_PATH=""; DECLARED_FOREIGN_CHANGES=""; MODE=""
+reconstruct_checkpoint_state 6
+assert_eq "" "$CONTINUATION_PATH" \
+  "T13: no p06-i00-implementer attempt exists yet, so there is nothing to continue"
+assert_eq A "$MODE" \
+  "T13: reconstruct_checkpoint_state 6 defaults MODE=A when there is no continuation to resume"
+
 # --- reconstruct_checkpoint_state: recovers a failed attempt's own
 # validated checkpoint path for a real, non-iterative phase (6). ------------
 : > "$RUN_LOG"
@@ -643,10 +654,18 @@ record_event DISPATCH_COMPLETED phase=6 iteration=00 dispatch_id="$T9_RECON_ID" 
   mutation_state=DIRTY_CHECKPOINTED checkpoint_kind=implementation tokens_input_new=0 \
   tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 cost_usd=0 \
   usage_status=ok >/dev/null
-CONTINUATION_PATH=""; DECLARED_FOREIGN_CHANGES=""
+CONTINUATION_PATH=""; DECLARED_FOREIGN_CHANGES=""; MODE=""; CONTINUATION_PRIOR_CLASSIFICATION=""
 reconstruct_checkpoint_state 6
 assert_eq "$T9_PROGRESS" "$CONTINUATION_PATH" \
   "reconstruct_checkpoint_state recovers the failed attempt's own checkpoint path for phase 6"
+assert_eq D "$MODE" \
+  "T13: reconstruct_checkpoint_state 6 sets MODE=D once a real continuation checkpoint is found"
+# Code review fix (round 1, finding 7): spec S20.6's "prior classification"
+# input -- the DISPATCH_COMPLETED record set up above (immediately before
+# this block) carries classification=TIMED_OUT for this exact dispatch id;
+# reconstruct_checkpoint_state must surface it, not just the checkpoint path.
+assert_eq TIMED_OUT "$CONTINUATION_PRIOR_CLASSIFICATION" \
+  "T13: reconstruct_checkpoint_state 6 also recovers the prior attempt's own classification (spec S20.6's 'prior classification' input)"
 
 # --- reconstruct_checkpoint_state: also reachable for an ITERATING phase
 # (7) when called WITH that round's own $ITERATION -- code review fix: the
@@ -970,7 +989,8 @@ phases = {
     "7": section(r"^## Phase 7 —", r"^## Phase 8 —"),
 }
 fns = ["ingest_findings ", "select_finding_batch", "record_convergence_signals",
-       "divergence_check", "dispositions_complete", "validate_artifact "]
+       "divergence_check", "dispositions_complete", "validate_artifact ",
+       "unset FINDING_IDS"]
 for phase, body in phases.items():
     for fn in fns:
         print(f"{phase}	{fn}	{body.count(fn)}")

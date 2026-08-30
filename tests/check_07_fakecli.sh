@@ -79,6 +79,8 @@ CONTINUATION_PATH=""
 DECLARED_FOREIGN_CHANGES=""
 RUNTIME_DIR="$FEATURE_FOLDER/.orchestration/runtime"
 APPLICABLE_OPTIONAL_SKILLS=""
+MODE=A
+CONTINUATION_PRIOR_CLASSIFICATION=""
 
 # --- Sanity check: render_prompt must succeed with these fixture values -----
 # If this fails, every assertion below fails for the wrong reason (an unset
@@ -833,25 +835,55 @@ unset STATUS_PATH  # do not leak into the launches that follow
 # the real argv, with the model GENERATED from role_model -- never a literal,
 # so the sub-subagent model cannot silently drift from the single source of
 # truth (Task 6 review fix #10: previously untested).
+#
+# Code review fix (round 1, finding 10): invoke_vendor now GATES EXTRA_VENDOR_
+# ARGS on the dispatching role's own may_spawn_children -- `implementer` is
+# the only role authorized to hold it (was `context-discovery` before this
+# gate existed, which is no longer a legal user of this mechanism).
 : > "$FAKE_ARGV_LOG"
 agents_json="$(jq -nc --arg m "$(role_model impl-worker)" \
   '{"impl-worker":{description:"d",prompt:"p",model:$m}}')"
 EXTRA_VENDOR_ARGS=(--agents "$agents_json")
-invoke_vendor context-discovery "$iv_prompt" "$WORK/agents.out" "$WORK/agents.err"
+invoke_vendor implementer "$iv_prompt" "$WORK/agents.out" "$WORK/agents.err"
 rc_agents=$?
-assert_rc 0 "$rc_agents" "invoke_vendor succeeds with EXTRA_VENDOR_ARGS set"
+assert_rc 0 "$rc_agents" "invoke_vendor succeeds with EXTRA_VENDOR_ARGS set for the one role authorized to hold it"
 assert_contains "--agents" "$FAKE_ARGV_LOG" \
   "invoke_vendor forwards EXTRA_VENDOR_ARGS (--agents) to claude"
 assert_contains "$(role_model impl-worker)" "$FAKE_ARGV_LOG" \
   "the --agents payload carries the REGISTRY's impl-worker model, proven via role_model, not a literal"
-# EXTRA_VENDOR_ARGS is left SET (not unset) across this next call -- the
-# claim under test is that codex ignores it (claude-only), which the array
-# being empty/unset would prove nothing about.
+
+# Negative (new, finding 10): a role whose OWN registry row does NOT declare
+# may_spawn_children=yes is rejected outright when EXTRA_VENDOR_ARGS is left
+# set -- e.g. leaked forward from the implementer dispatch above, exactly the
+# variable-leak class finding 1's ROLE_SCOPE_VIOLATION guard also targets.
+# EXTRA_VENDOR_ARGS is deliberately left SET (not unset) across this call.
 : > "$FAKE_ARGV_LOG"
-invoke_vendor preflight-codex "$iv_prompt" "$WORK/agents-codex.out" "$WORK/agents-codex.err"
+invoke_vendor preflight-codex "$iv_prompt" "$WORK/agents-codex.out" "$WORK/agents-codex.err" \
+  2>"$WORK/agents-codex.stderr"
+rc_unauth=$?
+assert_rc 95 "$rc_unauth" \
+  "invoke_vendor rejects a role not authorized to spawn children while EXTRA_VENDOR_ARGS is set"
+assert_contains "INVOKE_VENDOR_SPAWN_NOT_AUTHORIZED" "$WORK/agents-codex.stderr" \
+  "the rejection names itself"
+assert_eq 0 "$("$GREP_BIN" -c '^codex ' "$FAKE_ARGV_LOG" || true)" \
+  "the unauthorized dispatch never reaches the vendor CLI at all -- not even to silently drop the flag"
+
+# Positive control (preserves the ORIGINAL claim this test made before the
+# authorization gate existed): codex's own argv-building code never reads
+# EXTRA_VENDOR_ARGS, independent of authorization -- isolate that from the
+# gate above via a registry copy where preflight-codex is (hypothetically)
+# authorized, so a --agents leak into codex argv would be caught here even
+# if some future change relaxed the gate itself.
+mcol_spawn="$(tsv_column "$BUILD/roles.tsv" may_spawn_children)"
+awk -F'	' -v OFS='	' -v col="$mcol_spawn" \
+  'NR==1{print;next} { if ($1=="preflight-codex") $col="yes"; print }' \
+  "$BUILD/roles.tsv" > "$BUILD/roles-codex-authorized.tsv"
+: > "$FAKE_ARGV_LOG"
+ROLE_CONTRACTS_PATH="$BUILD/roles-codex-authorized.tsv" \
+  invoke_vendor preflight-codex "$iv_prompt" "$WORK/agents-codex2.out" "$WORK/agents-codex2.err"
 unset EXTRA_VENDOR_ARGS
 assert_eq 0 "$("$GREP_BIN" -c -- '--agents' "$FAKE_ARGV_LOG" || true)" \
-  "EXTRA_VENDOR_ARGS is claude-only and never reaches a codex launch, even when set"
+  "EXTRA_VENDOR_ARGS is claude-only and never reaches a codex launch's own argv, even when set and authorized"
 
 # --- 9.10 TERM-respecting and TERM-ignoring timeouts, with a real process check
 # Markers are scoped with $$ (this script's own PID) so a leftover from any
@@ -1048,6 +1080,109 @@ EOF
     && _ok "validate_artifact accepts a REAL dispatch_attempt's own STATUS.md and attempt directory" \
     || _fail "validate_artifact rejected a genuinely successful real dispatch_attempt"
 fi
+
+# --- Task 13: implementer mode contract + ROLE_SCOPE_VIOLATION -------------
+# Every invalid $MODE value is rejected before any vendor is invoked. `C` is
+# tried EXPLICITLY, not just an arbitrary `Q` -- a mutation re-legalizing the
+# retired Mode C (`A|B|D) : ;;` -> `A|B|C|D) : ;;`) must fail a real test,
+# not merely a doc grep for "### Mode C" (code review round 2, finding 2).
+_t13_bad_iter=88
+for _t13_bad_mode in C Q; do
+  : > "$FEATURE_FOLDER/RUN_LOG.md"
+  : > "$FAKE_ARGV_LOG"
+  MODE="$_t13_bad_mode" FAKE_MODE=complete dispatch_attempt 6 "$_t13_bad_iter" implementer >/dev/null 2>&1
+  assert_eq PRELAUNCH_FAILED "${DISPATCH_RESULT_CLASSIFICATION:-}" \
+    "T13: MODE=$_t13_bad_mode is rejected before launch"
+  assert_present 'DISPATCH_INVALID_MODE' "$FEATURE_FOLDER/RUN_LOG.md" \
+    "T13: MODE=$_t13_bad_mode's rejection names DISPATCH_INVALID_MODE specifically"
+  assert_eq 0 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
+    "T13: MODE=$_t13_bad_mode never reaches the vendor CLI"
+  _t13_bad_iter=$((_t13_bad_iter + 1))
+done
+
+# Each of the three legal modes passes prelaunch cleanly and reaches the
+# vendor CLI (Mode C, retired, is deliberately not in this list). implementer
+# is long_running=yes, so a real launch is the headroom probe PLUS the
+# substantive invocation -- two '^claude ' lines, per 9.3/9.8 above.
+_t13_mode_iter=91
+for _t13_mode in A B D; do
+  : > "$FEATURE_FOLDER/RUN_LOG.md"
+  : > "$FAKE_ARGV_LOG"
+  MODE="$_t13_mode" FAKE_MODE=complete dispatch_attempt 6 "$_t13_mode_iter" implementer >/dev/null 2>&1
+  assert_eq 2 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
+    "T13: MODE=$_t13_mode passes prelaunch and reaches the vendor CLI (headroom probe + launch)"
+  _t13_mode_iter=$((_t13_mode_iter + 1))
+done
+MODE=A  # restore the shared fixture default for every test below
+
+# A role that never declares finding_ids (the plain implementer) is rejected
+# as ROLE_SCOPE_VIOLATION when $FINDING_IDS is set -- the exact "implementer
+# tries to repair a code-review finding" scenario spec S17.3/S18.4 forbid:
+# only implementation-fixer may consume review findings.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+: > "$FAKE_ARGV_LOG"
+FINDING_IDS="finding-01" FAKE_MODE=complete dispatch_attempt 6 94 implementer >/dev/null 2>&1
+assert_eq PRELAUNCH_FAILED "${DISPATCH_RESULT_CLASSIFICATION:-}" \
+  "T13: the implementer is rejected before launch when asked to repair a review finding"
+assert_present 'ROLE_SCOPE_VIOLATION' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T13: the rejection names ROLE_SCOPE_VIOLATION"
+assert_eq 0 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
+  "T13: the implementer never launches when handed review-repair scope"
+
+# Positive control: implementation-fixer's OWN legitimate finding_ids input is
+# never scope-rejected -- proves the check above discriminates by role,
+# rather than blanket-rejecting FINDING_IDS whenever it happens to be set.
+ACCEPTED_PLAN="$PLAN_PATH"; REVIEWED_REVISION=deadbeef
+WRITE_LEASE="$ORCHESTRATION_DIR/write-lease.json"; FINDING_IDS="finding-01"
+RUN_LOG="$FEATURE_FOLDER/RUN_LOG.md"; RELEVANT_ARTIFACTS=""
+_dispatch_prelaunch 7 95 implementation-fixer
+assert_rc 0 $? \
+  "T13: implementation-fixer's own declared finding_ids input is never scope-rejected"
+
+# Code review fix (round 1, finding 3): the check above only proves the
+# CURRENT three fixer roles are exempt -- it cannot distinguish "reads
+# role_required_inputs from the registry" from "hardcodes spec-fixer|
+# plan-fixer|implementation-fixer in a case statement". Mutate a role that
+# has NOTHING to do with finding_ids (debugger) so ITS OWN registry row
+# declares finding_ids, with zero change to any cookbook code, and confirm
+# the scope guard follows the registry, not a role-name allowlist.
+mcol_req="$(tsv_column "$BUILD/roles.tsv" required_inputs)"
+awk -F'	' -v OFS='	' -v col="$mcol_req" \
+  'NR==1{print;next} { if ($1=="debugger") $col=$col";finding_ids"; print }' \
+  "$BUILD/roles.tsv" > "$BUILD/roles-debugger-findingids.tsv"
+ROLE_CONTRACTS_PATH="$BUILD/roles-debugger-findingids.tsv" \
+  _dispatch_prelaunch 6 98 debugger
+assert_rc 0 $? \
+  "T13: a SYNTHETIC registry row granting finding_ids to an unrelated role (debugger) is never scope-rejected -- the guard is registry-driven, not a hardcoded role-name allowlist"
+
+# Code review fix (round 1, finding 1): the REAL Phase 7 loop sets $FINDING_IDS
+# as a PLAIN shell variable (as above -- not a per-command VAR=val prefix,
+# which would scope it to one command and never reproduce the leak) before
+# dispatching implementation-fixer, then loops back to re-dispatch the
+# reviewers -- if the loop never clears it, the NEXT iteration's
+# code-reviewer-claude dispatch (which does not declare finding_ids) is
+# scope-rejected and the loop deadlocks. Drive that exact sequence in THIS
+# SAME shell, with $FINDING_IDS still set from the fixer dispatch above:
+# reproduce the deadlock first (proving the bug is real, not hypothetical),
+# then apply the SAME fix Phase 7's own prose now documents (`unset
+# FINDING_IDS` immediately after `dispositions_complete`) and confirm the
+# next iteration's reviewer dispatch is unblocked.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+: > "$FAKE_ARGV_LOG"
+FAKE_MODE=complete dispatch_attempt 7 96 code-reviewer-claude >/dev/null 2>&1
+assert_eq PRELAUNCH_FAILED "${DISPATCH_RESULT_CLASSIFICATION:-}" \
+  "T13: reproduced -- a stale \$FINDING_IDS left over from the fixer dispatch deadlocks the NEXT iteration's reviewer"
+assert_present 'ROLE_SCOPE_VIOLATION' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T13: reproduced deadlock is specifically ROLE_SCOPE_VIOLATION, not some other rejection"
+unset FINDING_IDS
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+: > "$FAKE_ARGV_LOG"
+FAKE_MODE=complete dispatch_attempt 7 97 code-reviewer-claude >/dev/null 2>&1
+# code-reviewer-claude is long_running=yes (timeout 60 >= the 60-minute
+# threshold): a real launch is the headroom probe PLUS the substantive
+# invocation, same accounting as the implementer mode loop above -- never zero.
+assert_eq 2 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
+  "T13: fixed -- once \$FINDING_IDS is cleared (as Phase 7's own loop now instructs), the next iteration's reviewer dispatch reaches the vendor CLI twice (headroom probe + launch)"
 
 # --- Task 8 Step 6: unauthorized mutation with NO lease held at all --------
 # A read-only role (mutates=no) never calls acquire_write_lease. If it still
