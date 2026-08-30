@@ -1031,4 +1031,137 @@ _t11_last_action_mentions="$("$GREP_BIN" -c 'is this reviewer-verified acceptanc
 assert_eq 3 "${_t11_last_action_mentions:-0}" \
   "T11: all three gates document that the last successful action is reviewer acceptance, never the fixer's own STATUS"
 
+# =============================================================================
+# Task 12: executable plans and explicit verification results
+# =============================================================================
+# Real call-site counting, scoped to each phase's own prose range -- the same
+# defense used for Task 11's functions above, so a phase that merely defines
+# these helpers without ever calling them still fails.
+_t12_range_report="$(python3 - "$PROCESS_DOC" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+
+def section(start_pat, end_pat):
+    m1 = re.search(start_pat, text, re.M)
+    m2 = re.search(end_pat, text, re.M)
+    assert m1 and m2 and m1.start() < m2.start(), (start_pat, end_pat)
+    return text[m1.end():m2.start()]
+
+phase5 = section(r"^## Phase 5 —", r"^## Phase 6 —")
+phase6 = section(r"^## Phase 6 —", r"^## Phase 7 —")
+checks = [
+    ("5", "validate_plan_tasks", phase5.count("validate_plan_tasks")),
+    ("5", "plan_review_stale_gate", phase5.count("plan_review_stale_gate")),
+    ("6", "plan_ready_for_implementation", phase6.count("plan_ready_for_implementation")),
+    ("6", "validate_verification_records", phase6.count("validate_verification_records")),
+]
+for phase, fn, count in checks:
+    print(f"{phase}\t{fn}\t{count}")
+PY
+)"
+[ -n "$_t12_range_report" ] && _ok "T12: phase-prose range extraction for 5/6 succeeded" \
+  || _fail "T12: phase-prose range extraction produced nothing"
+while IFS="$(printf '\t')" read -r _t12_phase _t12_fn _t12_count; do
+  [ -n "$_t12_phase" ] || continue
+  [ "${_t12_count:-0}" -ge 1 ] \
+    && _ok "T12: \`$_t12_fn\` has a real call site inside Phase $_t12_phase's own prose" \
+    || _fail "T12: \`$_t12_fn\` has NO call site inside Phase $_t12_phase's own prose (found ${_t12_count:-0})"
+done <<< "$_t12_range_report"
+
+# Once Phase 6 starts, later plan-review requests are marked STALE without a
+# vendor call -- exactly one dispatch-free code path may do this.
+_t12_stale_mentions="$(grep -c 'PLAN_REVIEW_STALE' "$PROCESS_DOC" || true)"
+[ "${_t12_stale_mentions:-0}" -ge 2 ] \
+  && _ok "T12: PLAN_REVIEW_STALE is both registered and used in Phase 5 prose" \
+  || _fail "T12: PLAN_REVIEW_STALE has fewer than 2 mentions (registry row + real call site)"
+
+# DONE_WITH_EXCLUSIONS is accepted end to end through the REAL extracted
+# role-contracts registry and the REAL validate_status validator -- not just
+# grepped as a string.
+python3 "$REPO_TOP/tests/lib/extract.py" roles > /dev/null
+_t12_roles="$BUILD/roles.tsv"
+_t12_status_dir="$BUILD/t12-status"; rm -rf "$_t12_status_dir"; mkdir -p "$_t12_status_dir"
+cat > "$_t12_status_dir/STATUS.md" <<'EOF'
+verdict: DONE_WITH_EXCLUSIONS
+reason: null
+verification: PASS
+EOF
+if ROLE_CONTRACTS_PATH="$_t12_roles" validate_status "$_t12_status_dir/STATUS.md" implementer \
+  >"$BUILD/t12-status.out" 2>&1; then
+  _ok "T12: validate_status accepts implementer verdict=DONE_WITH_EXCLUSIONS against the real registry"
+else
+  _fail "T12: validate_status rejected a legal DONE_WITH_EXCLUSIONS STATUS"
+  note "$(cat "$BUILD/t12-status.out")"
+fi
+
+# Code review fix (blocker 3): validate_artifact must ALSO accept
+# DONE_WITH_EXCLUSIONS as a terminal verdict directly (not merely
+# validate_status's verdict-membership check) -- Phase 7 iteration 1's
+# FIRST action is validate_artifact implementer ..., so a DONE_WITH_EXCLUSIONS
+# implementer that cannot pass validate_artifact can never reach code review.
+_t12_va_dir="$BUILD/t12-va"; rm -rf "$_t12_va_dir"
+mkdir -p "$_t12_va_dir/6-implementation/00/attempts/p06-i00-implementer-a01"
+_t12_va_summary="$_t12_va_dir/6-implementation/implementation-summary.md"
+printf '# Goal\n\npadding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding.\n' > "$_t12_va_summary"
+_t12_va_rev="$(sha256sum "$_t12_va_summary" | awk '{print $1}')"
+cat > "$_t12_va_dir/6-implementation/00/attempts/p06-i00-implementer-a01/STATUS.md" <<STATUSEOF
+verdict: DONE_WITH_EXCLUSIONS
+reason: null
+artifact_revision: $_t12_va_rev
+verification: PASS
+STATUSEOF
+if (
+  FEATURE_FOLDER="$_t12_va_dir" IMPLEMENTATION_SUMMARY_PATH="$_t12_va_summary" \
+    ROLE_CONTRACTS_PATH="$_t12_roles" REPO_ROOT="$_t12_va_dir" \
+    validate_artifact implementer p06-i00-implementer-a01
+) >"$BUILD/t12-va.out" 2>&1; then
+  _ok "T12: validate_artifact accepts a DONE_WITH_EXCLUSIONS implementer directly (Phase 7's own first gate)"
+else
+  _fail "T12: validate_artifact rejects a legal DONE_WITH_EXCLUSIONS implementer -- Phase 7 could never start"
+  note "$(cat "$BUILD/t12-va.out")"
+fi
+
+# append_verification_record's real call site is the implementer appendix
+# (both Mode A and Mode B) -- the write side of spec S19.2, a different
+# document region than the Phase 6 prose counted above.
+_t12_impl_appendix="$(python3 - "$PROCESS_DOC" <<'INNERPY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"<!-- BEGIN: implementer -->(.*?)<!-- END: implementer -->", text, re.S)
+print(m.group(1) if m else "")
+INNERPY
+)"
+case "$_t12_impl_appendix" in
+  *append_verification_record*) _ok "T12: implementer appendix calls append_verification_record" ;;
+  *) _fail "T12: implementer appendix has NO append_verification_record call site" ;;
+esac
+
+# Code review fix (major 6): "STALE without a vendor call" must be PROVEN,
+# not asserted by a grep count or a true/false unit test -- reuse Task 10's
+# own proof shape (build_minimal_path + FAKE_ARGV_LOG + _t10_dispatch_calls,
+# both still in scope from the Task 10 gate suite above): zero fake-CLI
+# invocations reach either fakebin CLI on the stale path, because
+# plan_review_stale_gate never calls dispatch_attempt/dispatch_parallel/
+# invoke_vendor on that path.
+T12_STALE_DIR="$BUILD/t12-stale"; rm -rf "$T12_STALE_DIR"; mkdir -p "$T12_STALE_DIR/ff"
+T12_STALE_PLAN="$T12_STALE_DIR/plan.md"
+printf '# Plan\n\nSome plan content.\n' > "$T12_STALE_PLAN"
+printf -- '--- 2026-01-01T00:00:00Z  event=IMPLEMENTATION_BASELINE\nbase_sha: deadbeef\nuncommitted_changes: no\n\n' \
+  > "$T12_STALE_DIR/ff/RUN_LOG.md"
+T12_STALE_ARGV="$T12_STALE_DIR/argv.log"; : > "$T12_STALE_ARGV"
+T12_STALE_OUT="$(
+  PATH="$T10_BIN_FULL"; FAKE_ARGV_LOG="$T12_STALE_ARGV"
+  export PATH FAKE_ARGV_LOG
+  FEATURE_FOLDER="$T12_STALE_DIR/ff" PLAN_PATH="$T12_STALE_PLAN"
+  plan_review_stale_gate
+)"
+assert_eq "stale" "$T12_STALE_OUT" \
+  "T12: plan_review_stale_gate prints 'stale' once Phase 6's baseline event is durable"
+assert_eq 0 "$(_t10_dispatch_calls "$T12_STALE_ARGV")" \
+  "T12: the STALE path reaches ZERO model-bound fake-CLI invocations -- proven, not merely claimed"
+assert_line_count 0 "$T12_STALE_ARGV" \
+  "T12: the STALE path's FAKE_ARGV_LOG is completely empty -- no vendor process launched at all"
+assert_present '^--- .*  event=PLAN_REVIEW_STALE$' "$T12_STALE_DIR/ff/RUN_LOG.md" \
+  "T12: plan_review_stale_gate durably records event=PLAN_REVIEW_STALE at zero vendor cost"
+
 finish

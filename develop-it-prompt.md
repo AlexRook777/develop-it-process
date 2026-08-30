@@ -257,7 +257,7 @@ this account and is used for the cheap `preflight-codex` probe;
 | plan-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
 | plan-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
 | plan-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;plan_path;finding_ids | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2;changed_paths;finding_dispositions | document-fixer | 5 |
-| implementer | claude | claude-opus-5 | — | 300 | yes | yes | yes | feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy | debugger_status_path;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | implementation_summary;status | DONE;FAILED;NEEDS_DEBUG;BLOCKED | common_v2;verification | implementation | 6 |
+| implementer | claude | claude-opus-5 | — | 300 | yes | yes | yes | feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy | debugger_status_path;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | implementation_summary;status | DONE;DONE_WITH_EXCLUSIONS;FAILED;NEEDS_DEBUG;BLOCKED | common_v2;verification | implementation | 6 |
 | impl-worker | claude | claude-sonnet-5 | — | 300 | yes | yes | no | task_brief | context7_policy | none | changed_paths | none | none | implementation | child |
 | debugger | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;plan_path;implementation_summary_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 6 |
 | code-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
@@ -3979,6 +3979,7 @@ here does not itself populate that document).
 | CONVERGENCE_RECORDED | phase_name;growth_pct;new_count;recurring_count;resolved_count;reopened_count;fix_regression_count;net_open_blockers_majors | no |
 | DIVERGENCE_DETECTED | phase_name;divergence_reason | yes |
 | DIVERGENT_ROUND_CAP_REACHED | phase_name;cap_value;divergent_rounds | yes |
+| PLAN_REVIEW_STALE | phase_name;plan_revision | no |
 
 `ATTEMPT_ALLOCATED` is one row beyond the spec's own 23-name list: it is the
 pre-existing attempt-identity event `allocate_attempt` has always written
@@ -4093,6 +4094,7 @@ event_required_fields() {
       printf '%s\n' "phase_name;growth_pct;new_count;recurring_count;resolved_count;reopened_count;fix_regression_count;net_open_blockers_majors" ;;
     DIVERGENCE_DETECTED)         printf '%s\n' "phase_name;divergence_reason" ;;
     DIVERGENT_ROUND_CAP_REACHED) printf '%s\n' "phase_name;cap_value;divergent_rounds" ;;
+    PLAN_REVIEW_STALE)           printf '%s\n' "phase_name;plan_revision" ;;
     *) echo "EVENT_TYPE_UNKNOWN:$1" >&2; return 1 ;;
   esac
 }
@@ -6501,7 +6503,13 @@ validate_artifact() {
 
   local verdict; verdict="$(status_field "$status_path" verdict)"
   case "$verdict" in
-    DONE) : ;;
+    # DONE_WITH_EXCLUSIONS (spec S19.2) is a second legitimate implementer
+    # terminal verdict -- the whole point of Step 6 is that Phase 7 can
+    # review an implementation that ends here just as it reviews a plain
+    # DONE. No other role's registry row legalizes this verdict (validate_status
+    # already rejects it there), so widening this case costs nothing for
+    # any other caller of validate_artifact.
+    DONE|DONE_WITH_EXCLUSIONS) : ;;
     *)
       _validate_artifact_phase_accepted "$artifact_path" \
         || { echo "VALIDATE_ARTIFACT_NOT_ACCEPTED:$verdict" >&2; return 1; }
@@ -7132,6 +7140,465 @@ divergence_check() {
 }
 ```
 
+## Plan Task Contract (spec §19.1)
+
+Every implementation-plan task is executable, not merely descriptive. Beyond the ordinary prose sections `superpowers:writing-plans` prescribes (title, TDD steps, exact file paths), the plan-writer emits ONE machine-checkable companion block: a `## Task Contract` heading immediately followed by a single fenced ` ```json ` block, one JSON object per non-blank line (the same JSONL-in-one-fence convention checkpoints and findings already use elsewhere in this document), covering every task the plan defines.
+
+Each task object declares exactly these fields:
+
+```text
+task_id            stable within this plan revision, unique
+objective           one-line goal
+files               exact target files/sections (array)
+prerequisites       task_ids this task depends on -- must reference EXISTING
+                    tasks and form a DAG (no cycles)
+actor=implementer|owner|CI|deployed_environment
+credential          the required capability/credential's NAME only (an
+                    env-var-style identifier), or null. No secret material:
+                    never a value, token, or connection string
+side_effects        external/destructive effects this task causes (array,
+                    empty only when the task truly has none)
+steps               ordered implementation steps (array)
+verification        one or more {command, environment, expected_result}
+                    objects -- see the Verification Record Contract below
+rollback            rollback/cleanup instructions, or null
+skills              optional task-relevant Superpowers skills (array)
+handoff             required, non-null follow-up behavior whenever
+                    actor != implementer; null when actor == implementer
+```
+
+A task whose declared `actor` is `owner`, `CI`, or `deployed_environment` is an explicit handoff item, never a surprise implementer failure: the plan names exactly what that actor must do and what happens once it is done.
+
+`validate_plan_tasks` (cookbook, below) is the orchestrator's own zero-token structural gate over this block. It never substitutes for the plan reviewers' semantic judgment (is the objective right, is this command actually safe) — only for mechanical checks a reviewer should never have to spend a model call on: a duplicate task_id, a missing required field, an actor outside the four-value enum, an unreachable prerequisite or a cyclic dependency (prerequisites must form a DAG), a credential whose NAME is not currently available in the orchestrator's own environment (checked by presence only — the value is never read or printed, satisfying the no-secret-material rule), an ambiguous verification command, a verification command that is really just a post-implementation-only review remedy rather than an executable check, and a step/verification command that implies an external/destructive effect the task's own `side_effects` field left undeclared.
+
+<!-- lint: cookbook -->
+```bash
+# Extract the plan's embedded machine-checkable task block (spec S19.1): a
+# single fenced ```json code block immediately following a "## Task
+# Contract" heading, one JSON object per non-blank line.
+_plan_task_block() {
+  # Usage: _plan_task_block PLAN_PATH
+  local plan_path="$1"
+  "$PYTHON_BIN" - "$plan_path" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+m = re.search(r'^##\s+Task Contract\s*$\n+```json\n(.*?)\n```', text, re.M | re.S)
+if not m:
+    sys.stderr.write("no '## Task Contract' fenced json block found\n")
+    sys.exit(1)
+sys.stdout.write(m.group(1))
+PY
+}
+
+# Validate every executable-task-contract field (spec S19.1): unique stable
+# task_id, every required field present (null/empty allowed only where the
+# schema says so), actor in the legal four-value enum, prerequisites form a
+# DAG over reachable tasks, a non-implementer actor carries a non-empty
+# handoff, no credential field carries inline secret material, every
+# credential NAME is available in the CURRENT environment (checked by
+# presence only -- the value is never read or printed), every verification
+# entry is genuinely executable (not ambiguous, not a bare
+# post-implementation-only review remedy), and no step/verification command
+# implies an external/destructive effect the task's own side_effects field
+# left undeclared. Prints one error per line to stderr; returns non-zero if
+# any task is invalid.
+validate_plan_tasks() {
+  # Usage: validate_plan_tasks PLAN_PATH
+  local plan_path="$1" block tmp rc
+  [ -f "$plan_path" ] || { echo "validate_plan_tasks: missing plan: $plan_path" >&2; return 1; }
+  block="$(_plan_task_block "$plan_path")" || return 1
+  tmp="$(mktemp)"
+  printf '%s\n' "$block" > "$tmp"
+  "$PYTHON_BIN" - "$tmp" <<'PY'
+import json, os, re, sys
+
+path = sys.argv[1]
+REQUIRED_NONEMPTY = ("task_id", "objective", "files", "actor", "steps", "verification")
+NULLABLE = ("credential", "rollback", "handoff")
+EMPTY_LIST_OK = ("prerequisites", "side_effects", "skills")
+ALL_FIELDS = REQUIRED_NONEMPTY + NULLABLE + EMPTY_LIST_OK
+ACTORS = {"implementer", "owner", "CI", "deployed_environment"}
+SECRET_RE = re.compile(r"[=:]\s*[^\s]{8,}|sk-[A-Za-z0-9]|AKIA[0-9A-Z]{16}")
+AMBIGUOUS_RE = re.compile(r"(?i)\b(tbd|todo|similar to|see above|as before|etc\.)\b")
+POST_IMPL_RE = re.compile(r"(?i)\bcode review\b|\bpost-?implementation review\b")
+# Two-tier destructive-effect detection (code review fix, major 5): a bare
+# verb match on "delete"/"deploy" false-positive-HALTed ordinary plans
+# ("Delete the temporary scratch file", "Run the deployment script test").
+# SPECIFIC patterns are inherently destructive regardless of context; the
+# two GENERIC verbs only count when they co-occur (anywhere in the same
+# task's haystack) with a word naming real destructive SCOPE.
+DESTRUCTIVE_VERBS_SPECIFIC = re.compile(
+    r"(?i)\brm -rf\b|\bdrop tables?\b|\bsend emails?\b|\bpush to prod\b|"
+    r"\btruncate\b|\bmigrate production\b")
+DESTRUCTIVE_VERBS_GENERIC = re.compile(r"(?i)\bdeploy\w*\b|\bdelete\w*\b")
+DESTRUCTIVE_SCOPE = re.compile(
+    r"(?i)\b(production|prod|database|table|customer|user|account|record|row)s?'?s?\b"
+    r"|\buser data\b")
+
+tasks, order, errors = {}, [], []
+with open(path) as f:
+    for lineno, line in enumerate(f, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            t = json.loads(line)
+        except json.JSONDecodeError as e:
+            errors.append(f"line {lineno}: invalid JSON: {e}")
+            continue
+        tid = t.get("task_id")
+        if not tid:
+            errors.append(f"line {lineno}: missing task_id")
+            continue
+        if tid in tasks:
+            errors.append(f"task {tid}: duplicate task_id")
+            continue
+        tasks[tid] = t
+        order.append(tid)
+
+# Declaration-order index for the "reachable PRIOR tasks" rule (spec S19.1,
+# code review fix medium 7): membership alone is not enough -- a
+# prerequisite existing somewhere in the block is not the same as it being
+# declared BEFORE the task that depends on it.
+tid_pos = {tid: i for i, tid in enumerate(order)}
+
+for tid, t in tasks.items():
+    for field in ALL_FIELDS:
+        if field not in t:
+            errors.append(f"task {tid}: missing {field}")
+            continue
+        if field in REQUIRED_NONEMPTY and t[field] in (None, "", [], {}):
+            errors.append(f"task {tid}: missing {field}")
+
+    actor = t.get("actor")
+    if actor is not None and actor not in ACTORS:
+        errors.append(f"task {tid}: actor '{actor}' is not in implementer|owner|CI|deployed_environment")
+    if actor and actor != "implementer" and not t.get("handoff"):
+        errors.append(f"task {tid}: actor={actor} requires non-empty handoff")
+
+    for dep in t.get("prerequisites") or []:
+        if dep not in tasks:
+            errors.append(f"task {tid}: prerequisite '{dep}' is unreachable")
+        elif tid_pos[dep] >= tid_pos[tid]:
+            errors.append(f"task {tid}: prerequisite '{dep}' is a forward reference (declared at or after {tid}, not a reachable PRIOR task)")
+
+    cred = t.get("credential")
+    if cred:
+        if SECRET_RE.search(str(cred)):
+            errors.append(f"task {tid}: credential field looks like it carries secret material")
+        # Availability is checked ONLY for actor=implementer. An owner/CI/
+        # deployed_environment task naming a credential is precisely the
+        # handoff case this schema exists to express -- the orchestrator
+        # by definition does not (and should not) hold that credential
+        # itself, so checking it here would HALT every legitimate handoff
+        # task. `in os.environ` (membership), not `.get()`, so this stays
+        # presence-only in fact, not just in the comment above it.
+        elif actor == "implementer" and cred not in os.environ:
+            errors.append(f"task {tid}: credential '{cred}' is not available in the current environment")
+
+    verifs = t.get("verification") or []
+    if not isinstance(verifs, list) or not verifs:
+        errors.append(f"task {tid}: verification must be a non-empty list")
+    else:
+        for i, v in enumerate(verifs):
+            if not isinstance(v, dict) or not v.get("command"):
+                errors.append(f"task {tid}: verification[{i}] missing command")
+                continue
+            if not v.get("environment"):
+                errors.append(f"task {tid}: verification[{i}] missing environment")
+            if not v.get("expected_result"):
+                errors.append(f"task {tid}: verification[{i}] missing expected_result")
+            cmd = str(v["command"])
+            if POST_IMPL_RE.search(cmd):
+                errors.append(f"task {tid}: verification[{i}] relies on a post-implementation-only review remedy, not an executable check")
+            elif AMBIGUOUS_RE.search(cmd):
+                errors.append(f"task {tid}: verification[{i}] command is ambiguous: {cmd!r}")
+
+    haystack = " ".join(t.get("steps") or []) + " " + " ".join(
+        v.get("command", "") for v in verifs if isinstance(v, dict))
+    _destructive = bool(DESTRUCTIVE_VERBS_SPECIFIC.search(haystack)) or (
+        bool(DESTRUCTIVE_VERBS_GENERIC.search(haystack)) and bool(DESTRUCTIVE_SCOPE.search(haystack)))
+    if _destructive and not (t.get("side_effects") or []):
+        errors.append(f"task {tid}: undeclared side effect -- steps/verification imply an external/destructive effect but side_effects is empty")
+
+# DAG / cycle check over the declared prerequisite graph.
+WHITE, GRAY, BLACK = 0, 1, 2
+color = {tid: WHITE for tid in tasks}
+
+def visit(tid, stack):
+    if color[tid] == BLACK:
+        return
+    if color[tid] == GRAY:
+        errors.append("cycle detected: " + " -> ".join(stack + [tid]))
+        return
+    color[tid] = GRAY
+    for dep in tasks[tid].get("prerequisites") or []:
+        if dep in tasks:
+            visit(dep, stack + [tid])
+    color[tid] = BLACK
+
+for tid in tasks:
+    if color[tid] == WHITE:
+        visit(tid, [])
+
+if errors:
+    for e in errors:
+        print(e, file=sys.stderr)
+    sys.exit(1)
+PY
+  rc=$?
+  rm -f "$tmp"
+  return $rc
+}
+```
+
+## Verification Record Contract (spec §19.2)
+
+The single verification scalar (`verification: PASS | FAIL | PARTIAL` on the
+implementer's own STATUS — kept as the phase-level rollup) is no longer the
+only evidence. Every command a plan task declares under `verification` is
+also recorded as one per-command JSON line with exactly these seven fields
+(plus its own `verification_id`, nine keys total):
+
+```text
+verification_id
+command
+environment
+result: PASS|FAIL|EXCLUDED|NOT_RUN
+exit_code
+evidence_path
+baseline_comparison
+reason
+followup_id
+```
+
+Rules — an empty result is never `PASS`:
+
+- `FAIL` alone enters debugging/fixing.
+- `EXCLUDED` is legal only with evidence that the command is pre-existing, environment-bound, actor-bound, or outside the change's capability. It cannot hide a new regression.
+- `NOT_RUN` names its actor/prerequisite in `reason` and becomes handoff/readiness work — never silently treated as PASS.
+- A performance verdict (a command whose text names a benchmark/latency/throughput measurement) requires a declared `environment: controlled` and a non-null `baseline_comparison` to assert `PASS`/`FAIL`; otherwise it is advisory/inconclusive and MUST be recorded as `NOT_RUN` instead. A claimed performance fix must remeasure under the same controlled conditions before it may assert `PASS` again.
+- The debugger consumes only genuine `FAIL` records; it never mutates a deployed environment or invents evidence to convert an `EXCLUDED`/`NOT_RUN` record into `PASS`.
+- Implementation overall may be `DONE_WITH_EXCLUSIONS` (a legal `implementer` verdict, see Role Contract Registry) only when every non-excluded required verification record is `PASS` and every `EXCLUDED` record's evidence is policy-valid per the rule above; `NOT_RUN` records remain visible as handoff/readiness work and do not, by themselves, block this verdict.
+
+`append_verification_record` is the sole writer, so no caller can invent a field order or smuggle an illegal result past validation. `validate_verification_records` is the read-side check the above rules compile into.
+
+<!-- lint: cookbook -->
+```bash
+# The only four legal verification-record result values (spec S19.2).
+# SKIPPED and empty are rejected -- never treated as a synonym for PASS.
+_verification_result_legal() {
+  case "$1" in PASS|FAIL|EXCLUDED|NOT_RUN) return 0 ;; *) return 1 ;; esac
+}
+
+# Append one verification record (spec S19.2) to a verification-records.jsonl
+# file. The sole writer, so every record carries the same nine fields in the
+# same order regardless of caller, gated by the same result-legality check
+# every reader relies on.
+append_verification_record() {
+  # Usage: append_verification_record RECORDS_JSONL VERIFICATION_ID COMMAND \
+  #   ENVIRONMENT RESULT EXIT_CODE EVIDENCE_PATH BASELINE_COMPARISON REASON FOLLOWUP_ID
+  local path="$1" vid="$2" command="$3" environment="$4" result="$5" \
+    exit_code="${6:-}" evidence_path="${7:-}" baseline_comparison="${8:-}" \
+    reason="${9:-}" followup_id="${10:-}"
+  _verification_result_legal "$result" \
+    || { echo "append_verification_record: illegal result '$result' (only PASS|FAIL|EXCLUDED|NOT_RUN are legal; SKIPPED and empty are rejected)" >&2; return 1; }
+  mkdir -p "$(dirname "$path")"
+  jq -nc --arg vid "$vid" --arg command "$command" --arg environment "$environment" \
+    --arg result "$result" --arg exit_code "$exit_code" --arg evidence_path "$evidence_path" \
+    --arg baseline_comparison "$baseline_comparison" --arg reason "$reason" --arg followup_id "$followup_id" \
+    '{verification_id:$vid, command:$command, environment:$environment, result:$result,
+      exit_code:(if $exit_code=="" then null else ($exit_code|tonumber? // $exit_code) end),
+      evidence_path:(if $evidence_path=="" then null else $evidence_path end),
+      baseline_comparison:(if $baseline_comparison=="" then null else $baseline_comparison end),
+      reason:(if $reason=="" then null else $reason end),
+      followup_id:(if $followup_id=="" then null else $followup_id end)}' >> "$path"
+}
+
+# Validate a verification-records.jsonl file against spec S19.2's seven
+# fields and per-result rules. Prints one error per line to stderr; returns
+# non-zero if any record is invalid.
+validate_verification_records() {
+  # Usage: validate_verification_records RECORDS_JSONL
+  local path="$1"
+  [ -f "$path" ] || { echo "validate_verification_records: missing file: $path" >&2; return 1; }
+  "$PYTHON_BIN" - "$path" <<'PY'
+import json, re, sys
+
+path = sys.argv[1]
+FIELDS = ("verification_id", "command", "environment", "result", "exit_code",
+          "evidence_path", "baseline_comparison", "reason", "followup_id")
+RESULTS = {"PASS", "FAIL", "EXCLUDED", "NOT_RUN"}
+EXCLUSION_MARKERS = ("pre-existing", "environment-bound", "actor-bound", "outside")
+# ponytail: keyword/tool-name matching on command text, not real semantic
+# intent detection (code review fix, low 10) -- a benchmark tool invoked
+# under a name not listed here (or wrapped in an unfamiliar script) still
+# slips through as an ordinary PASS/FAIL. Upgrade path if this bites: a
+# declared `x_measurement_kind: performance` field on the plan's own
+# verification entry, set by the plan-writer/reviewer, instead of guessing
+# from the command string.
+PERF_RE = re.compile(
+    r"(?i)\b(?:perf|benchmark|latency|throughput|hyperfine|wrk|jmeter|k6|"
+    r"locust|siege|autocannon|req/s|ops/sec|p9[0-9])\b")
+
+# Mode B (post-debug re-verification) APPENDS a fresh outcome under the
+# SAME verification_id rather than rewriting the file (code review fix,
+# low 11) -- an old FAIL sitting alongside a new PASS for the identical
+# check would otherwise make "every non-excluded record is PASS"
+# permanently unsatisfiable for any run that ever needed debugging.
+# LAST occurrence of a given verification_id wins; everything before it is
+# superseded history, validated as part of the file's structure (a parse
+# error is always reported) but never re-checked against the per-result
+# rules below -- only the CURRENT outcome of each check is evaluated.
+errors = []
+by_id = {}
+order_id = []
+with open(path) as f:
+    for lineno, line in enumerate(f, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError as e:
+            errors.append(f"line {lineno}: invalid JSON: {e}")
+            continue
+        vid = r.get("verification_id")
+        if vid not in by_id:
+            order_id.append(vid)
+        by_id[vid] = (lineno, r)
+
+for vid in order_id:
+    lineno, r = by_id[vid]
+    for field in FIELDS:
+        if field not in r:
+            errors.append(f"line {lineno}: missing field {field}")
+    result = r.get("result")
+    # An empty result is never PASS -- SKIPPED and empty are rejected;
+    # only PASS|FAIL|EXCLUDED|NOT_RUN are legal.
+    if result not in RESULTS:
+        errors.append(f"line {lineno} ({r.get('verification_id')}): result {result!r} is not one of PASS|FAIL|EXCLUDED|NOT_RUN")
+        continue
+    reason = (r.get("reason") or "").strip()
+    if result == "EXCLUDED":
+        # A reason KEYWORD alone is not evidence -- it is a claim with no
+        # artifact behind it (code review fix, medium 9). Require a real
+        # evidence_path too, so "cannot hide a new regression" is
+        # actually enforced, not merely asserted in a reason string.
+        if not any(m in reason.lower() for m in EXCLUSION_MARKERS):
+            errors.append(f"line {lineno} ({r['verification_id']}): EXCLUDED requires evidence it is pre-existing/environment-bound/actor-bound/outside the change's capability")
+        if not r.get("evidence_path"):
+            errors.append(f"line {lineno} ({r['verification_id']}): EXCLUDED requires a non-null evidence_path -- a reason keyword alone is a claim, not evidence")
+        # A non-null path is still only a claim: nothing in it distinguishes
+        # PRE-EXISTING from NEW. "cannot hide a new regression" is met only by
+        # a baseline showing the check already failed this way BEFORE the
+        # change. baseline_comparison is already in the schema; require it.
+        # Actor- and environment-bound exclusions are exempt: no baseline can
+        # exist for a check this actor/environment cannot run at all.
+        elif not any(m in reason.lower() for m in ("actor-bound", "environment-bound")):
+            if not r.get("baseline_comparison"):
+                errors.append(f"line {lineno} ({r['verification_id']}): EXCLUDED as pre-existing/outside-capability requires a non-null baseline_comparison proving the check failed the same way before this change")
+    if result == "NOT_RUN" and not reason:
+        errors.append(f"line {lineno} ({r['verification_id']}): NOT_RUN requires a named actor/prerequisite in reason")
+    if result in ("PASS", "FAIL") and PERF_RE.search(str(r.get("command", ""))):
+        env = r.get("environment") or ""
+        baseline = r.get("baseline_comparison")
+        if env != "controlled" or not baseline:
+            errors.append(f"line {lineno} ({r['verification_id']}): a performance verdict without a declared controlled environment and comparable baseline must be recorded as NOT_RUN (advisory/inconclusive), not {result}")
+
+if errors:
+    for e in errors:
+        print(e, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+```
+
+### Plan acceptance and the pre-implementation review window (spec §19.1/§20.5-§20.6)
+
+Implementation may start only from a plan revision whose latest plan-review verdict is accepted (the Phase 5 gate's own summarizer reports `DONE`) and whose open blocking finding count, across every plan-review iteration's own findings catalog, is zero. Once Phase 6 starts, the plan's pre-implementation review window is closed for the remainder of this run: a later plan-review request (a resumed or re-entered Phase 5) is marked `STALE` without a vendor call — no reviewer is dispatched, and no reviewer spend is incurred re-reviewing anchors implementation has already consumed.
+
+<!-- lint: cookbook -->
+```bash
+# True once Phase 6 has captured its implementation baseline -- the plan's
+# pre-implementation review window is closed for the remainder of THIS run
+# from that point on (spec S20.5/S20.6). Reads the SAME durable
+# IMPLEMENTATION_BASELINE event Step 6.0's capture_implementation_baseline
+# writes, so there is exactly one source of truth for "has Phase 6 started."
+plan_review_window_closed() {
+  # Usage: plan_review_window_closed
+  [ -f "$FEATURE_FOLDER/RUN_LOG.md" ] || return 1
+  "$GREP_BIN" -q '^--- .*  event=IMPLEMENTATION_BASELINE$' "$FEATURE_FOLDER/RUN_LOG.md"
+}
+
+# Phase 5's actual review-window pre-check (spec S19.1/S20.5-S20.6, code
+# review fix major 6): a REAL callable gate, not prose alone -- this is what
+# makes "STALE without a vendor call" a provable fact rather than a claim.
+# Prints exactly "stale" or "open" and NEVER calls dispatch_attempt,
+# dispatch_parallel, or invoke_vendor on either path -- callers branch on the
+# printed word; the STALE path costs zero vendor tokens by construction,
+# not merely by convention.
+plan_review_stale_gate() {
+  # Usage: plan_review_stale_gate
+  if plan_review_window_closed; then
+    record_event PLAN_REVIEW_STALE phase=5 phase_name=plan-review \
+      plan_revision="$(sha256sum "$PLAN_PATH" | awk '{print $1}')" \
+      reason="pre-implementation review window closed at Phase 6 start"
+    printf 'stale\n'
+  else
+    printf 'open\n'
+  fi
+}
+
+# Zero-token pre-implementation gate (spec S19.1/S20.5-S20.6): implementation
+# may only start from a plan revision whose latest plan-review verdict is
+# accepted (the gate's own summarizer reports DONE) and whose open blocking
+# finding count, across every plan-review iteration's own findings catalog,
+# is zero.
+plan_ready_for_implementation() {
+  # Usage: plan_ready_for_implementation
+  local status="$FEATURE_FOLDER/5-plan-review/summarizer-status.md"
+  [ -f "$status" ] \
+    || { echo "plan not ready: no plan-review summarizer status (5-plan-review/summarizer-status.md)" >&2; return 1; }
+  local verdict
+  verdict="$(status_field "$status" verdict)"
+  [ "$verdict" = DONE ] \
+    || { echo "plan not ready: plan-review summarizer verdict='$verdict', not DONE" >&2; return 1; }
+  local open_blockers=0 f n rc
+  for f in "$FEATURE_FOLDER"/5-plan-review/*/findings-catalog.jsonl; do
+    [ -f "$f" ] || continue
+    # "open" ALONE undercounts: ingest_findings marks a blocker "reopened"
+    # exactly when a fixer's 'fixed' disposition was re-reported by a later
+    # reviewer round -- the single most dangerous class this gate exists to
+    # catch. Match select_finding_batch's own open-set definition (open OR
+    # reopened), not a narrower one invented here.
+    #
+    # Fail CLOSED, not open: a jq parse failure or a non-integer result must
+    # refuse readiness, never silently count as zero blockers. The old
+    # `2>/dev/null` + `${n:-0}` combination let a malformed/corrupt catalog
+    # sail through as "0 open blockers."
+    n="$(jq -s '[.[] | select(.severity=="blocker" and (.status=="open" or .status=="reopened"))] | length' "$f")"
+    rc=$?
+    case "$rc:$n" in
+      0:*[!0-9]*|0:) 
+        echo "plan not ready: findings catalog $f produced a non-numeric count ('$n')" >&2
+        return 1 ;;
+      0:*) : ;;
+      *)
+        echo "plan not ready: could not evaluate findings catalog $f (jq exit $rc)" >&2
+        return 1 ;;
+    esac
+    open_blockers=$(( open_blockers + n ))
+  done
+  if [ "$open_blockers" -ne 0 ]; then
+    echo "plan not ready: $open_blockers open or reopened blocking finding(s) remain in plan review" >&2
+    return 1
+  fi
+  return 0
+}
+```
+
 ## Phase −1 — Preflight skill availability check
 
 Goal: confirm the environment is sound (binaries, CLI syntax, working tree) AND that both worker CLIs can load every Superpowers skill this orchestration depends on. If any preflight step fails, HALT with a clear remediation message — Phase 2 does not start.
@@ -7522,6 +7989,8 @@ You read only `plan-status.md`. On `DONE`, proceed to Phase 5.
 
 Same shape as Phase 3, applied to the plan.
 
+**Review-window check (spec §19.1/§20.5-§20.6), before ANY other Phase 5 work — including a resumed or re-entered Phase 5.** Call `plan_review_stale_gate` (cookbook) — never reconstruct this check by hand. It prints `stale` or `open` and never dispatches a reviewer itself on either path. On `stale`: the plan's pre-implementation review window is closed (Phase 6 already captured its implementation baseline this run); the function has already recorded `event=PLAN_REVIEW_STALE` at zero vendor cost — report the `STALE` outcome to the user and do not proceed to Step 5.0. On `open`, continue below.
+
 ### Step 5.0 — Per-phase preflight
 
 Before iter 01's first reviewer dispatch (the gate's first work dispatch — see "Terminology gloss" in Resumability), run the per-phase preflight:
@@ -7562,7 +8031,7 @@ The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this 
 
 For each iteration N (start at 1, hard cap `review_iteration_cap`):
 
-1. `mkdir -p <feature-folder>/5-plan-review/NN` (`$PHASE_DIR/$ITERATION`, never `iteration-NN`). Before dispatching this round's reviewers, validate the producer's revision: iteration 1 calls `validate_artifact plan-writer "$(_latest_attempt_id p04-i00-plan-writer)"` (the Phase 4 dispatch — Phase 4 only proceeds to Phase 5 on a `DONE` verdict, so its latest attempt is its successful one); iteration N>1 calls `validate_artifact plan-fixer "$LAST_FIXER_DISPATCH_ID"`. Capture `bytes_before="$(wc -c < "$PLAN_PATH")"`.
+1. `mkdir -p <feature-folder>/5-plan-review/NN` (`$PHASE_DIR/$ITERATION`, never `iteration-NN`). Before dispatching this round's reviewers, validate the producer's revision: iteration 1 calls `validate_artifact plan-writer "$(_latest_attempt_id p04-i00-plan-writer)"` (the Phase 4 dispatch — Phase 4 only proceeds to Phase 5 on a `DONE` verdict, so its latest attempt is its successful one); iteration N>1 calls `validate_artifact plan-fixer "$LAST_FIXER_DISPATCH_ID"`. Then call `validate_plan_tasks "$PLAN_PATH"` (cookbook, spec §19.1) — this is a zero-token structural gate over the plan's `## Task Contract` block, distinct from and in addition to `validate_artifact`'s own manifest check. On failure, do NOT dispatch this iteration's reviewers: surface the printed errors and HALT — an under-specified executable task contract must never reach a paid reviewer. Capture `bytes_before="$(wc -c < "$PLAN_PATH")"`.
 2. **Dispatch both reviewers in parallel using `dispatch_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=5, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 5.0) have completed.
    - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `plan-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Its real STATUS: `claude_status="$(role_attempt_dir plan-reviewer-claude "$(_latest_attempt_id p05-i$ITERATION-plan-reviewer-claude)")/STATUS.md"`. Findings: `5-plan-review/$ITERATION/claude-findings.jsonl`. This role's timeout comes from the Models table via `role_timeout`.
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `plan-reviewer-codex`. Its real STATUS: `codex_status="$(role_attempt_dir plan-reviewer-codex "$(_latest_attempt_id p05-i$ITERATION-plan-reviewer-codex)")/STATUS.md"`. Findings: `5-plan-review/$ITERATION/codex-findings.jsonl`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
@@ -7583,6 +8052,8 @@ For each iteration N (start at 1, hard cap `review_iteration_cap`):
 If iteration cap (`review_iteration_cap`) trips with any active reviewer still reporting an open BLOCKER, HALT and surface to user. A cap reached with `blockers=0` and every remaining major already dispositioned is NOT a HALT — it passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`). An undispositioned major at the cap HALTs like a blocker.
 
 ## Phase 6 — Implementation (delegated, single supervising subagent)
+
+**Plan acceptance gate (spec §19.1/§20.5-§20.6), before ANY other Phase 6 work — even the Codex preflight probe below.** Call `plan_ready_for_implementation` (cookbook). Implementation may start only from a plan revision whose latest plan-review verdict is accepted and whose open blocking finding count is zero; on failure, surface the printed reason and HALT — do not proceed to Step 6.−1. Once this gate passes and Step 6.0's `capture_implementation_baseline` durably records `event=IMPLEMENTATION_BASELINE`, the plan's pre-implementation review window is closed for the remainder of this run (`plan_review_window_closed` reads that same event; see Phase 5's review-window check above).
 
 ### Step 6.−1 — Per-phase preflight
 
@@ -7705,9 +8176,10 @@ unset EXTRA_VENDOR_ARGS
 
 Outputs (written by the implementer at the end):
 - `<feature-folder>/6-implementation/implementation-summary.md` — task count, commits, verification result, any DONE_WITH_CONCERNS notes.
-- `<feature-folder>/6-implementation/implementer-status.md` — STATUS with `verdict ∈ {DONE, FAILED, NEEDS_DEBUG, BLOCKED}` and `verification ∈ {PASS, FAIL, PARTIAL}`.
+- `<feature-folder>/6-implementation/verification-records.jsonl` — one `append_verification_record` line per plan-declared verification command (spec §19.2).
+- `<feature-folder>/6-implementation/implementer-status.md` — STATUS with `verdict ∈ {DONE, DONE_WITH_EXCLUSIONS, FAILED, NEEDS_DEBUG, BLOCKED}` and `verification ∈ {PASS, FAIL, PARTIAL}`.
 
-You read only `implementer-status.md`. On `DONE` with `verification=PASS`, proceed to Phase 7.
+You read only `implementer-status.md`. On `DONE` or `DONE_WITH_EXCLUSIONS` with `verification=PASS`, do NOT proceed on the implementer's word alone: call `validate_verification_records "$(status_field "$FEATURE_FOLDER/6-implementation/implementer-status.md" x_verification_records_path)"` (cookbook, spec §19.2) — the zero-token enforcement of every per-record rule the STATUS itself cannot self-certify (empty-is-never-PASS, EXCLUDED evidence, NOT_RUN reason, performance baseline). Only when that ALSO succeeds, proceed to Phase 7. A failure here is Mode 4 (malformed evidence) regardless of what the STATUS claimed — HALT and surface the printed errors; a `DONE_WITH_EXCLUSIONS` verdict whose own `EXCLUDED` records are not policy-valid must never reach Phase 7. `DONE_WITH_EXCLUSIONS` means every non-excluded required verification record passed and every `EXCLUDED` record's evidence was policy-valid; any `NOT_RUN` record is carried forward as handoff/readiness work, never silently dropped.
 
 ### Step 6.2 — Debugger pass and reconciliation (only if implementer reports NEEDS_DEBUG or verification != PASS)
 
@@ -7716,7 +8188,7 @@ debugger-status.md is ADVISORY: the canonical implementation status remains `imp
 1. Dispatch one `claude` subprocess for role `debugger`. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_SUMMARY_PATH`, `$IMPLEMENTATION_BASE_SHA`. The debugger loads `superpowers:systematic-debugging`. It edits source/tests as needed and writes `<feature-folder>/6-implementation/debugger-status.md`. This role's timeout comes from the Models table via `role_timeout`.
 2. On debugger `verdict=DONE`:
    - **Re-dispatch the implementer** (role `implementer`), additionally passing `$DEBUGGER_STATUS_PATH=<feature-folder>/6-implementation/debugger-status.md`. The implementer re-runs the plan's verification (it does NOT re-do task work), appends the post-debug verification result to `implementation-summary.md`, and atomically rewrites `implementer-status.md`. This is still the `implementer` role, so its timeout (from the Models table via `role_timeout`) exceeds a single Bash tool call — issue this re-dispatch as **one Bash tool call with `run_in_background: true`** as well.
-   - Read the rewritten `implementer-status.md`. Proceed to Phase 7 only when `verdict=DONE` and `verification=PASS`.
+   - Read the rewritten `implementer-status.md`. Proceed to Phase 7 only when `verdict` is `DONE` or `DONE_WITH_EXCLUSIONS`, `verification=PASS`, AND `validate_verification_records "$(status_field "$FEATURE_FOLDER/6-implementation/implementer-status.md" x_verification_records_path)"` (cookbook) also succeeds — the same zero-token gate Step 6.1 applies, re-run here because Mode B rewrote this same evidence file.
    - If the re-run still reports `verification != PASS`, loop back to Step 6.2 step 1 (debugger). Cap at 3 debugger→re-verify iterations; on cap, HALT.
 3. On debugger `verdict=BLOCKED`, HALT.
 
@@ -7724,7 +8196,7 @@ On `BLOCKED` directly from the implementer in Step 6.1, HALT.
 
 ### Step 6.3 — Dispatch summarizer-implementation
 
-After the implementer reports `DONE` with `verification=PASS` (Step 6.1 or, after debugger reconciliation, Step 6.2), dispatch one `claude` subprocess for role `summarizer-implementation`. Inputs: `$FEATURE_FOLDER`. The subagent reads phase=6 dispatches from `RUN_LOG.md` and appends a `## Usage` section to `6-implementation/implementation-summary.md` (the file already exists; the summarizer appends, does not rewrite). Outputs: `<feature-folder>/6-implementation/summarizer-status.md`. This role's timeout comes from the Models table via `role_timeout`.
+After the implementer reports `DONE` or `DONE_WITH_EXCLUSIONS` with `verification=PASS` (Step 6.1 or, after debugger reconciliation, Step 6.2), dispatch one `claude` subprocess for role `summarizer-implementation`. Inputs: `$FEATURE_FOLDER`. The subagent reads phase=6 dispatches from `RUN_LOG.md` and appends a `## Usage` section to `6-implementation/implementation-summary.md` (the file already exists; the summarizer appends, does not rewrite). Outputs: `<feature-folder>/6-implementation/summarizer-status.md`. This role's timeout comes from the Models table via `role_timeout`.
 
 Proceed to Phase 7 only after the summarizer reports `DONE`. If the summarizer fails (Mode 1/2/3/4/5), HALT — the readiness report depends on this `## Usage` section.
 
@@ -7953,7 +8425,7 @@ Every subagent must:
 - Write STATUS.md LAST, after all other outputs are flushed.
 - Write it atomically: write `STATUS.md.tmp` and rename to `STATUS.md`. You only ever read `STATUS.md`.
 - Include these keys (simple `key: value` lines, YAML-compatible):
-  - `verdict:` one of `PASS`, `CHANGES_REQUESTED`, `BLOCKED`, `READY`, `MISSING_SKILLS`, `DONE`, `FAILED`, `NEEDS_DEBUG`, `SKIPPED` (the subset that applies to the role).
+  - `verdict:` one of `PASS`, `CHANGES_REQUESTED`, `BLOCKED`, `READY`, `MISSING_SKILLS`, `DONE`, `DONE_WITH_EXCLUSIONS`, `FAILED`, `NEEDS_DEBUG`, `SKIPPED` (the subset that applies to the role).
   - `blockers:`, `majors:`, `minors:` — integers, reviewers only.
   - `reason:` — one-line, required when verdict is not `PASS`/`READY`/`DONE`.
   - `cost_hint:` — optional token-or-time estimate.
@@ -8030,7 +8502,7 @@ Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of `review_iteration
 `DEGRADED_REVIEW_ACCEPTED`, `PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE`,
 `LOCAL_CLI_CANARIES_PASSED`, `TARGET_DIRTY_TREE_GATE_PASSED`,
 `PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED`, `RUNTIME_AND_REGISTRIES_VERIFIED`,
-`VENDOR_PROVEN` (plus the reserved `CODEX_RE_ENABLED_BY_USER`).
+`VENDOR_PROVEN`, `PLAN_REVIEW_STALE` (plus the reserved `CODEX_RE_ENABLED_BY_USER`).
 Every type in this list beyond the legacy pre-schema-v2 names above has a row
 in the Event Contract Registry (below), which `record_event` validates
 against. An event entry NEVER substitutes for the `DISPATCH_COMPLETED` entry
@@ -8558,7 +9030,7 @@ This Develop-It SDLC step is complete only when ALL of the following hold:
 - Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `3-spec-review/spec-review-summary.md` exists.
 - Implementation plan was written by the `plan-writer` subagent (`4-plan-writing/plan-status.md` = `DONE`).
 - Plan review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `5-plan-review/plan-review-summary.md` exists.
-- Implementer subagent completed Phase 6 (`6-implementation/implementer-status.md` = `DONE`, `verification=PASS`); `6-implementation/implementation-summary.md` exists.
+- Implementer subagent completed Phase 6 (`6-implementation/implementer-status.md` = `DONE` or `DONE_WITH_EXCLUSIONS`, `verification=PASS`); `6-implementation/implementation-summary.md` exists.
 - No-secret checks ran (delegated to implementer/debugger; recorded in implementation summary) when the feature touches credentials, config, notebooks, examples, generated artifacts, or deployment files.
 - Credential-dependent checks ran or were safely skipped per the plan.
 - Code review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
@@ -9181,7 +9653,9 @@ Prefer `context7` over web search for library docs. Skip it only for: refactorin
    ```
 5. The plan must satisfy every "No Placeholders" rule from `superpowers:writing-plans` (no TBD, no "implement later", exact file paths, full code per step, etc.). Code snippets in the plan must reflect current library APIs as confirmed via `context7`, not training-data guesses.
 6. The plan must cover every requirement / acceptance criterion in the spec.
-7. Once every required section has passed structural validation, atomically publish `$PHASE_DIR/00/attempts/$DISPATCH_ID/artifact-complete.json` (exclusive `ln`-style creation, never overwritten) with `{"schema_version":2,"plan_path":"<absolute path to the plan file>","completed_at":"<UTC-ISO-8601>"}` — BEFORE any optional summary prose and before the terminal STATUS publish below.
+7. In addition to the ordinary prose sections, emit ONE `## Task Contract` heading followed by a single fenced ` ```json ` block (one JSON object per non-blank line, spec §19.1) covering EVERY task, with fields `task_id, objective, files, prerequisites, actor=implementer|owner|CI|deployed_environment, credential, side_effects, steps, verification, rollback, skills, handoff` (see "Plan Task Contract" above for the exact schema). Split tasks at reviewer-meaningful boundaries; name exact files/interfaces; give every `verification` entry a deterministic, unambiguous command, environment, and expected result; declare every external/destructive side effect; route only skills from `$APPLICABLE_OPTIONAL_SKILLS` that are actually relevant to that task; and give every non-`implementer` task a concrete, non-null `handoff`. `credential` is a NAME only — No secret material, ever. Dependencies must reference only tasks that exist in this same block and form a DAG (no cycles).
+8. Before publishing `artifact-complete.json`, call `validate_plan_tasks` (cookbook) against the absolute path of the plan file you just wrote and fix every reported error — a plan that fails this check must never reach Phase 5.
+9. Once every required section has passed structural validation, atomically publish `$PHASE_DIR/00/attempts/$DISPATCH_ID/artifact-complete.json` (exclusive `ln`-style creation, never overwritten) with `{"schema_version":2,"plan_path":"<absolute path to the plan file>","completed_at":"<UTC-ISO-8601>"}` — BEFORE any optional summary prose and before the terminal STATUS publish below.
 
 ## Publish STATUS
 
@@ -9251,7 +9725,9 @@ You are a plan reviewer invoked as a fresh subprocess. You have no shared contex
    - Frequent-commits cadence.
    - DRY/YAGNI: any over-engineering or unnecessary scope creep?
    - Placeholders: any TBD, "implement later", "similar to Task N", references to undefined symbols?
-   - Order: do dependencies between tasks reflect actual dependencies?
+   - Order: do dependencies between tasks reflect actual dependencies, and do they form a DAG (no cycles) over tasks that actually exist in the plan?
+   - Executable task contract (spec §19.1): does every task declare a valid `actor` (`implementer`, `owner`, `CI`, or `deployed_environment`)? Is every `prerequisites` entry reachable (an existing task_id)? Is every named `credential` an env-var-style NAME, never a value — flag anything that looks like inline secret material? Is every `verification` command deterministic and actually executable (not "similar to Task N", not vague prose)? Are declared exclusions/side-effects consistent with the steps? Is the plan's review-window freshness still current (no stale anchors from a prior accepted revision)? Are optional skills routed only where task-relevant? Does every non-`implementer` task carry a concrete, non-null `handoff` rather than becoming a surprise implementer failure?
+   - Post-implementation-only review remedy: flag any task whose only "verification" is deferring to code review or a later phase instead of an executable check now.
 3. Severity ladder: BLOCKER / MAJOR / MINOR — same definitions as the spec reviewer.
 
 Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/5-plan-review/$ITERATION/claude-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "plan-reviewer-claude"`, `vendor: "claude"`, `phase: "5"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path: "$PLAN_PATH"`, `artifact_revision`, `location`, `line`, `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
@@ -9357,7 +9833,9 @@ The plan must be self-contained per `superpowers:writing-plans` "no placeholders
    - Frequent-commits cadence.
    - DRY/YAGNI: any over-engineering or unnecessary scope creep?
    - Placeholders: any TBD, "implement later", "similar to Task N", references to undefined symbols?
-   - Order: do dependencies between tasks reflect actual dependencies?
+   - Order: do dependencies between tasks reflect actual dependencies, and do they form a DAG (no cycles) over tasks that actually exist in the plan?
+   - Executable task contract (spec §19.1): does every task declare a valid `actor` (`implementer`, `owner`, `CI`, or `deployed_environment`)? Is every `prerequisites` entry reachable (an existing task_id)? Is every named `credential` an env-var-style NAME, never a value — flag anything that looks like inline secret material? Is every `verification` command deterministic and actually executable (not "similar to Task N", not vague prose)? Are declared exclusions/side-effects consistent with the steps? Is the plan's review-window freshness still current (no stale anchors from a prior accepted revision)? Are optional skills routed only where task-relevant? Does every non-`implementer` task carry a concrete, non-null `handoff` rather than becoming a surprise implementer failure?
+   - Post-implementation-only review remedy: flag any task whose only "verification" is deferring to code review or a later phase instead of an executable check now.
 3. Classify every finding into exactly one severity. Do NOT label obvious correctness/coverage issues as MINOR.
 
 ## Findings budget
@@ -9439,7 +9917,7 @@ You are assigned at most `document_fixer_batch_size` finding IDs at a time.
 3. Patch the plan in place to address every BLOCKER and MAJOR among your assigned IDs — prefer simplifying, replacing, or deleting redundant text over appending another rule (spec §18.4).
 4. Address assigned MINOR findings opportunistically; otherwise dispose them `already_satisfied`.
 5. Where a finding requires user input, dispose it `blocked` and set `verdict=BLOCKED`.
-6. Preserve the plan's overall structure (header, file structure section, task numbering, TDD shape). Inspect adjacent sections/acceptance criteria for ripple effects.
+6. Preserve the plan's overall structure (header, file structure section, task numbering, TDD shape) and the `## Task Contract` block's schema (spec §19.1) — a field fix belongs in that JSON block, not only in the prose task description. Inspect adjacent sections/acceptance criteria for ripple effects.
 
 For EVERY assigned finding ID, record exactly one disposition (spec §17.3's six-value vocabulary: `fixed`, `subsumed_by:<finding_id>`, `already_satisfied`, `blocked`, `accepted_risk:<decision_id>`, `deferred:<followup_id>`) by calling `record_finding_disposition` — the generated runtime's own disposition writer:
 
@@ -9509,7 +9987,7 @@ You are the implementation supervisor for this feature, invoked as a fresh subpr
 - Required inputs: `feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy`
 - Optional inputs: `debugger_status_path;continuation_path;declared_foreign_changes`
 - Outputs: `implementation_summary;status`
-- Allowed verdicts: `DONE;FAILED;NEEDS_DEBUG;BLOCKED`
+- Allowed verdicts: `DONE;DONE_WITH_EXCLUSIONS;FAILED;NEEDS_DEBUG;BLOCKED`
 - Required status fields: `common_v2;verification`
 - Checkpoint kind: `implementation`
 - Phases: `6`
@@ -9581,7 +10059,28 @@ scope from the plan, per spec §17.3/§18.4.)
 0. If `$CONTINUATION_PATH` is set, read it first: it is a prior attempt's own `progress.jsonl`. Resume from the task its last record names as `next_unit` — never re-run a task already marked `completed`. Reconcile at most the one dirty (`state: partial`) task, if any, using `$DECLARED_FOREIGN_CHANGES` to recognize which currently-dirty paths are pre-existing, not yours.
 1. Read `$PLAN_PATH`.
 2. Execute the plan task-by-task using `subagent-driven-development`. Commit per task per the plan's TDD shape.
-3. Run the plan's verification at the end (and per the verification skill).
+3. Run every command the plan's `## Task Contract` block declares under `verification` (spec §19.2). For EACH command, call `append_verification_record` -- the generated runtime's own writer (never hand-write the JSON line yourself) -- to `$FEATURE_FOLDER/6-implementation/verification-records.jsonl` (truncate/start this file fresh in Mode A; Mode B appends to it instead, see below):
+
+   <!-- lint: snippet -->
+   ```bash
+   source "$RUNTIME_DIR/develop-it-runtime.sh"
+   append_verification_record "$FEATURE_FOLDER/6-implementation/verification-records.jsonl" \
+     "<verification_id, e.g. task-03-cmd-01>" "<the exact command>" "<environment>" \
+     "<PASS|FAIL|EXCLUDED|NOT_RUN>" "<exit code, or empty>" "<evidence path, or empty>" \
+     "<baseline comparison, or empty>" "<reason, required for EXCLUDED/NOT_RUN>" \
+     "<followup_id, or empty>"
+   ```
+
+   An empty result is never `PASS`. A genuine `FAIL` is left as `FAIL` -- do not
+   convert it into `EXCLUDED`/`NOT_RUN` to avoid a debugger pass. `EXCLUDED`
+   requires evidence the check is pre-existing, environment-bound,
+   actor-bound, or outside this change's capability -- never used to hide a
+   new regression. `NOT_RUN` names the blocking actor/prerequisite in
+   `reason` and becomes handoff/readiness work, not a silent pass. A
+   performance command (benchmark/latency/throughput) may only assert
+   `PASS`/`FAIL` under a declared `environment=controlled` with a non-null
+   `baseline_comparison`; otherwise record it `NOT_RUN` (advisory/inconclusive)
+   instead.
 4. Apply no-secret checks when the feature touches credentials, config, notebooks, examples, generated artifacts, or deployment files. Record the no-secret check result in the summary.
 5. Track per-task progress in `$FEATURE_FOLDER/6-implementation/subagent-logs/` (one file per task). After every committed task AND its review, call `checkpoint_append` -- the generated runtime's own checkpoint writer (never hand-write the JSON line yourself):
 
@@ -9601,9 +10100,9 @@ scope from the plan, per spec §17.3/§18.4.)
 You are being re-dispatched after the debugger has applied fixes. Your job is ONLY to re-validate, not to do new task work.
 
 1. Read `$DEBUGGER_STATUS_PATH`. Note the debugger's reported root cause and fix summary.
-2. Run the plan's verification commands in full. Run no-secret checks if applicable.
+2. Run the plan's verification commands in full and APPEND one new `append_verification_record` call per command to the SAME `$FEATURE_FOLDER/6-implementation/verification-records.jsonl` Mode A wrote (never truncate it here -- this is the post-debug re-verification, not a fresh run). Reuse the SAME `verification_id` Mode A used for each command -- `validate_verification_records` evaluates only the LATEST record per `verification_id`, so a fresh outcome under the same ID is how a post-debug PASS supersedes the pre-debug FAIL; a newly-invented ID for the same check would leave the old FAIL sitting alongside the new PASS as two unrelated, permanently-failing entries. Run no-secret checks if applicable.
 3. APPEND a new section to `$FEATURE_FOLDER/6-implementation/implementation-summary.md` headed "Post-debug verification (timestamp)" with: debugger root cause, debugger fix summary, the verification commands run, their results, any DONE_WITH_CONCERNS notes.
-4. Set the verdict for the post-debug state: `DONE` only if verification now passes; otherwise `NEEDS_DEBUG` (orchestrator will loop) or `BLOCKED`. Publish it in the one "Publish STATUS" step below — never write or rename the STATUS file yourself.
+4. Set the verdict for the post-debug state: `DONE` if every verification record now passes with no `EXCLUDED` records at all, `DONE_WITH_EXCLUSIONS` if every non-excluded required record passes and every `EXCLUDED` record's evidence is policy-valid (spec §19.2, same rule as Mode A); otherwise `NEEDS_DEBUG` (orchestrator will loop) or `BLOCKED`. Publish it in the one "Publish STATUS" step below — never write or rename the STATUS file yourself.
 
 Write the human-facing summary FIRST:
 
@@ -9646,7 +10145,7 @@ role: implementer
 phase: 6
 iteration: 00
 attempt: $ATTEMPT
-verdict: DONE | FAILED | NEEDS_DEBUG | BLOCKED
+verdict: DONE | DONE_WITH_EXCLUSIONS | FAILED | NEEDS_DEBUG | BLOCKED
 reason: <one line, or the literal word null>
 published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
 artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
@@ -9654,6 +10153,7 @@ output_count: 1
 output_01: <absolute path to implementation-summary.md>
 checkpoint_path: $PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl
 verification: PASS | FAIL | PARTIAL
+x_verification_records_path: $FEATURE_FOLDER/6-implementation/verification-records.jsonl
 x_tasks_completed: <int> / <total>
 x_commit_shas: [sha1, sha2, ...]
 x_sdd_original_path: <the SDD skill's own working directory, or the literal word null>
@@ -9661,8 +10161,9 @@ x_sdd_durable_path: $FEATURE_FOLDER/6-implementation/sdd/
 STATUS
 ```
 
-Verdict rules:
-- `DONE` requires `verification=PASS` and all plan tasks completed.
+Verdict rules (spec §19.2):
+- `DONE` requires `verification=PASS` and all plan tasks completed, with no `EXCLUDED` records at all.
+- `DONE_WITH_EXCLUSIONS` requires every non-excluded required verification record to be `PASS` and every `EXCLUDED` record's evidence to be policy-valid (pre-existing/environment-bound/actor-bound/outside-capability) -- report `verification=PASS` alongside it. Never use this verdict to hide a genuine `FAIL`; a single `FAIL` still requires `NEEDS_DEBUG`. Any `NOT_RUN` record remains visible as handoff/readiness work in the summary and does not, by itself, block this verdict.
 - `NEEDS_DEBUG` if verification failed and you believe a debugger pass can resolve it.
 - `FAILED` if a task failed for a reason that needs human attention.
 - `BLOCKED` if a task requires user input or an unavailable resource.
@@ -9714,10 +10215,10 @@ Your debugger-status.md is ADVISORY. The canonical implementation status is `imp
 ## Behavior
 
 1. Read the implementation summary to identify the failure signature.
-2. Read the plan's verification section to understand what should pass.
+2. Read the plan's verification section and `verification-records.jsonl` (spec §19.2) to understand what should pass. You consume only genuine `FAIL` records — never touch a record already `EXCLUDED` or `NOT_RUN`, and never mutate a deployed environment or invent evidence to convert one of those into `PASS` instead of fixing the actual code.
 3. If the failure touches an external library / framework / SDK, consult `context7` for the relevant API to confirm correct usage in the version the project pins.
 4. Apply systematic debugging: hypothesis → minimal repro → root cause → fix.
-5. Re-run the plan's verification commands to spot-check your fix (you may not have full coverage; the canonical re-verification is performed by the implementer re-dispatch after you).
+5. Re-run the plan's verification commands to spot-check your fix (you may not have full coverage; the canonical re-verification is performed by the implementer re-dispatch after you). If your fix targets a performance finding, remeasure under the SAME controlled conditions as the original measurement — a performance fix that is not remeasured under matching conditions is not verified.
 6. If the fix changes source/tests, commit per the project's git policy and the plan's TDD shape.
 
 You may use `$IMPLEMENTATION_BASE_SHA` to constrain `git log`/`git diff` scope to commits the implementer made (e.g. `git log $IMPLEMENTATION_BASE_SHA..HEAD`).

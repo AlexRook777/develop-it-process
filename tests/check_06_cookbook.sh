@@ -1793,6 +1793,7 @@ _t8_code_types="$(printf '%s\n' \
   PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE LOCAL_CLI_CANARIES_PASSED TARGET_DIRTY_TREE_GATE_PASSED \
   PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED RUNTIME_AND_REGISTRIES_VERIFIED VENDOR_PROVEN \
   CONVERGENCE_RECORDED DIVERGENCE_DETECTED DIVERGENT_ROUND_CAP_REACHED \
+  PLAN_REVIEW_STALE \
   | sort)"
 assert_eq "$_t8_code_types" "$_t8_registry_types" \
   "event_required_fields' own type list matches the Event Contract Registry exactly"
@@ -2809,5 +2810,328 @@ fi
 
 FEATURE_FOLDER="$T11_FEATURE_FOLDER"
 ORCHESTRATION_DIR="$T11_ORCHESTRATION_DIR"
+
+# =============================================================================
+# Task 12: executable plans and explicit verification results
+# =============================================================================
+T12_FEATURE_FOLDER="$FEATURE_FOLDER"
+T12_ORCHESTRATION_DIR="$ORCHESTRATION_DIR"
+
+if declare -F validate_plan_tasks >/dev/null; then
+  T12_DIR="$BUILD/t12"; rm -rf "$T12_DIR"; mkdir -p "$T12_DIR"
+
+  # ---- Step 1 fixtures: one plan defect at a time, exercised one at a time --
+  _t12_expect_fail() {
+    # Usage: _t12_expect_fail DEFECT SUBSTRING
+    local defect="$1" substr="$2" plan out rc
+    plan="$T12_DIR/plan-$defect.md"
+    write_plan_task_fixture "$plan" "$defect"
+    rc=0
+    out="$(validate_plan_tasks "$plan" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | "$GREP_BIN" -qi -- "$substr"; then
+      _ok "T12: validate_plan_tasks rejects '$defect' ($substr)"
+    else
+      _fail "T12: validate_plan_tasks did not reject '$defect' as expected (rc=$rc)"
+      note "$out"
+    fi
+  }
+
+  T12_PLAN_VALID="$T12_DIR/plan-valid.md"
+  write_plan_task_fixture "$T12_PLAN_VALID" valid
+  if validate_plan_tasks "$T12_PLAN_VALID" >"$T12_DIR/valid.out" 2>&1; then
+    _ok "T12: validate_plan_tasks accepts a structurally complete plan"
+  else
+    _fail "T12: validate_plan_tasks rejected the valid baseline plan"
+    note "$(cat "$T12_DIR/valid.out")"
+  fi
+
+  _t12_expect_fail duplicate_id                     "duplicate task_id"
+  _t12_expect_fail missing_objective                "missing objective"
+  _t12_expect_fail missing_files                    "missing files"
+  _t12_expect_fail missing_prerequisite_field       "missing prerequisites"
+  _t12_expect_fail missing_actor                    "missing actor"
+  _t12_expect_fail bad_actor                        "not in"
+  _t12_expect_fail unavailable_credential           "not available"
+  _t12_expect_fail secret_credential                "secret material"
+  _t12_expect_fail undeclared_side_effect           "undeclared side effect"
+  _t12_expect_fail ambiguous_verification           "ambiguous"
+  _t12_expect_fail missing_environment              "missing environment"
+  _t12_expect_fail missing_expected_result          "missing expected_result"
+  _t12_expect_fail missing_handoff                  "requires non-empty handoff"
+  _t12_expect_fail cyclic_dependency                "cycle detected"
+  _t12_expect_fail post_implementation_only_review  "post-implementation-only review"
+  _t12_expect_fail unreachable_prerequisite         "unreachable"
+  _t12_expect_fail forward_reference                "forward reference"
+  _t12_expect_fail self_reference                   "cycle detected"
+
+  # Code review fix (blocker 4): the credential-availability check must
+  # apply ONLY to actor=implementer. An owner-actor task naming a credential
+  # the orchestrator does not hold is the handoff case this schema exists
+  # to express, and must be ACCEPTED, not rejected.
+  T12_PLAN_OWNERCRED="$T12_DIR/plan-owner_credential_unavailable_is_ok.md"
+  write_plan_task_fixture "$T12_PLAN_OWNERCRED" owner_credential_unavailable_is_ok
+  if validate_plan_tasks "$T12_PLAN_OWNERCRED" >"$T12_DIR/ownercred.out" 2>&1; then
+    _ok "T12: validate_plan_tasks accepts an owner-actor task naming a credential the orchestrator does not hold"
+  else
+    _fail "T12: validate_plan_tasks wrongly rejected an owner-actor handoff credential"
+    note "$(cat "$T12_DIR/ownercred.out")"
+  fi
+
+  # Code review fix (major 5): the destructive-side-effect heuristic must
+  # NOT false-positive on ordinary "delete a temp file" / "test a deployment
+  # script" plans that name no real destructive scope.
+  T12_PLAN_DELTMP="$T12_DIR/plan-delete_temp_file_is_ok.md"
+  write_plan_task_fixture "$T12_PLAN_DELTMP" delete_temp_file_is_ok
+  if validate_plan_tasks "$T12_PLAN_DELTMP" >"$T12_DIR/deltmp.out" 2>&1; then
+    _ok "T12: validate_plan_tasks accepts deleting a temp/scratch file (no destructive scope named)"
+  else
+    _fail "T12: validate_plan_tasks wrongly flagged deleting a temp file as an undeclared side effect"
+    note "$(cat "$T12_DIR/deltmp.out")"
+  fi
+
+  T12_PLAN_DEPLOYTEST="$T12_DIR/plan-deploy_test_only_is_ok.md"
+  write_plan_task_fixture "$T12_PLAN_DEPLOYTEST" deploy_test_only_is_ok
+  if validate_plan_tasks "$T12_PLAN_DEPLOYTEST" >"$T12_DIR/deploytest.out" 2>&1; then
+    _ok "T12: validate_plan_tasks accepts testing a deployment script (no production/database scope named)"
+  else
+    _fail "T12: validate_plan_tasks wrongly flagged a deployment-script test as an undeclared side effect"
+    note "$(cat "$T12_DIR/deploytest.out")"
+  fi
+else
+  _fail "validate_plan_tasks is not defined"
+fi
+
+# ---- Step 5 fixtures: verification records in every allowed state, plus
+# the invalid state SKIPPED, plus an empty result, plus policy-invalid
+# EXCLUDED, plus an uncontrolled performance PASS -----------------------------
+if declare -F append_verification_record >/dev/null && declare -F validate_verification_records >/dev/null; then
+  T12_VR_B="$T12_DIR/verification-records-b.jsonl"
+T12_VR="$T12_DIR/verification-records.jsonl"; rm -f "$T12_VR"
+
+  append_verification_record "$T12_VR" v-pass  "pytest tests/test_widget.py" local PASS 0 \
+    "$T12_DIR/ev-pass.log" "" "" ""
+  append_verification_record "$T12_VR" v-fail  "pytest tests/test_widget.py" local FAIL 1 \
+    "$T12_DIR/ev-fail.log" "" "assertion failed on line 12" ""
+  append_verification_record "$T12_VR" v-excl  "pytest tests/test_legacy.py" local EXCLUDED 1 \
+    "$T12_DIR/ev-excl.log" "failed identically at the implementation baseline" \
+    "pre-existing failure, unrelated to this change" ""
+  append_verification_record "$T12_VR" v-notrun "manual UAT in staging" staging NOT_RUN "" \
+    "" "" "requires actor=owner; staging access not available to implementer" fu-01
+
+  if validate_verification_records "$T12_VR" >"$T12_DIR/vr.out" 2>&1; then
+    _ok "T12: validate_verification_records accepts PASS/FAIL/EXCLUDED/NOT_RUN"
+  else
+    _fail "T12: validate_verification_records rejected legal records"
+    note "$(cat "$T12_DIR/vr.out")"
+  fi
+
+  rc=0
+  append_verification_record "$T12_VR" v-skip "whatever" local SKIPPED "" "" "" "" "" \
+    2>"$T12_DIR/skip.err" || rc=$?
+  assert_rc 1 "$rc" "T12: append_verification_record refuses the illegal result SKIPPED"
+  assert_contains SKIPPED "$T12_DIR/skip.err" "T12: SKIPPED rejection names the offending value"
+
+  # An empty result is never PASS.
+  T12_VR_EMPTY="$T12_DIR/verification-records-empty.jsonl"
+  printf '{"verification_id":"v-empty","command":"x","environment":"local","result":"","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n' \
+    > "$T12_VR_EMPTY"
+  if validate_verification_records "$T12_VR_EMPTY" >/dev/null 2>&1; then
+    _fail "T12: validate_verification_records accepted an empty result as PASS"
+  else
+    _ok "T12: validate_verification_records rejects an empty result"
+  fi
+
+  # EXCLUDED without policy-valid evidence must be rejected -- it cannot
+  # hide a new regression behind a bare, unexplained exclusion.
+  T12_VR_BADEXCL="$T12_DIR/verification-records-badexcl.jsonl"
+  printf '{"verification_id":"v-bx","command":"x","environment":"local","result":"EXCLUDED","exit_code":1,"evidence_path":null,"baseline_comparison":null,"reason":"meh","followup_id":null}\n' \
+    > "$T12_VR_BADEXCL"
+  if validate_verification_records "$T12_VR_BADEXCL" >/dev/null 2>&1; then
+    _fail "T12: validate_verification_records accepted an EXCLUDED record with no policy-valid evidence"
+  else
+    _ok "T12: validate_verification_records rejects EXCLUDED without pre-existing/environment-bound/actor-bound/outside-capability evidence"
+
+# Step 5's load-bearing clause is "EXCLUDED cannot hide a new regression". An
+# evidence_path alone is a claim -- nothing in it distinguishes pre-existing
+# from new. Only a baseline showing the check already failed this way BEFORE
+# the change can establish that, so a pre-existing/outside-capability
+# exclusion must carry one. Actor- and environment-bound exclusions are exempt:
+# no baseline can exist for a check this actor/environment cannot run at all.
+: > "$T12_VR_B"
+append_verification_record "$T12_VR_B" v-nb "pytest tests/test_legacy.py" local EXCLUDED 1 \
+  "$T12_DIR/ev-excl.log" "" "pre-existing failure" "" >/dev/null 2>&1 || true
+t12_nb_rc=0; t12_nb_out="$(validate_verification_records "$T12_VR_B" 2>&1)" || t12_nb_rc=$?
+assert_rc 1 "$t12_nb_rc" "T12: EXCLUDED as pre-existing without a baseline_comparison is refused"
+case "$t12_nb_out" in
+  *baseline_comparison*) _ok "T12: the refusal names the missing baseline_comparison" ;;
+  *) _fail "T12: the refusal names the missing baseline_comparison"; note "got: $t12_nb_out" ;;
+esac
+
+: > "$T12_VR_B"
+append_verification_record "$T12_VR_B" v-ab "pytest tests/test_gpu.py" local EXCLUDED 1 \
+  "$T12_DIR/ev-excl.log" "" "actor-bound: the owner must run this" "" >/dev/null 2>&1 || true
+t12_ab_rc=0; validate_verification_records "$T12_VR_B" >/dev/null 2>&1 || t12_ab_rc=$?
+assert_rc 0 "$t12_ab_rc" "T12: an actor-bound EXCLUDED needs no baseline (none can exist)"
+  fi
+
+  # Code review fix (medium 9): a reason KEYWORD alone is a claim, not
+  # evidence -- a policy-valid reason string with a NULL evidence_path must
+  # ALSO be rejected, isolating this check from the keyword check above.
+  T12_VR_NOEVID="$T12_DIR/verification-records-noevid.jsonl"
+  printf '{"verification_id":"v-ne","command":"pytest tests/new_feature.py","environment":"local","result":"EXCLUDED","exit_code":1,"evidence_path":null,"baseline_comparison":null,"reason":"pre-existing failure, unrelated to this change","followup_id":null}\n' \
+    > "$T12_VR_NOEVID"
+  if validate_verification_records "$T12_VR_NOEVID" >/dev/null 2>&1; then
+    _fail "T12: validate_verification_records accepted an EXCLUDED record with a valid reason keyword but NO evidence_path"
+  else
+    _ok "T12: validate_verification_records rejects EXCLUDED with no evidence_path even when the reason keyword is policy-valid"
+  fi
+
+  # A performance verdict without a declared controlled environment and
+  # comparable baseline is advisory/inconclusive, never an authoritative PASS.
+  T12_VR_PERF="$T12_DIR/verification-records-perf.jsonl"
+  printf '{"verification_id":"v-perf","command":"run the benchmark suite","environment":"workstation","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n' \
+    > "$T12_VR_PERF"
+  if validate_verification_records "$T12_VR_PERF" >/dev/null 2>&1; then
+    _fail "T12: validate_verification_records accepted an uncontrolled performance PASS"
+  else
+    _ok "T12: validate_verification_records rejects a performance PASS without a controlled baseline"
+  fi
+
+  # Code review fix (low 10): a named benchmark TOOL (not just the bare
+  # word "benchmark") without a controlled baseline must also be caught.
+  T12_VR_PERF2="$T12_DIR/verification-records-perf2.jsonl"
+  printf '{"verification_id":"v-perf2","command":"hyperfine ./bin/app --warmup 3","environment":"workstation","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n' \
+    > "$T12_VR_PERF2"
+  if validate_verification_records "$T12_VR_PERF2" >/dev/null 2>&1; then
+    _fail "T12: validate_verification_records accepted an uncontrolled 'hyperfine' PASS"
+  else
+    _ok "T12: validate_verification_records recognizes a named benchmark tool (hyperfine), not just the word 'benchmark'"
+  fi
+
+  # And the negative: ordinary prose containing "above"/"table" etc. must
+  # NOT be misdetected as a performance command by the widened tool list.
+  T12_VR_NOTPERF="$T12_DIR/verification-records-notperf.jsonl"
+  printf '{"verification_id":"v-notperf","command":"Run the above migration against the users table","environment":"local","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n' \
+    > "$T12_VR_NOTPERF"
+  if validate_verification_records "$T12_VR_NOTPERF" >/dev/null 2>&1; then
+    _ok "T12: ordinary prose ('above', 'table') is not misdetected as a performance command"
+  else
+    _fail "T12: the widened PERF_RE false-positived on ordinary prose"
+  fi
+
+  # Code review fix (low 11): Mode B APPENDS a fresh outcome under the SAME
+  # verification_id after a debugger re-run -- an old, STRUCTURALLY INVALID
+  # pre-debug attempt (e.g. an empty result) sitting alongside a new, valid
+  # PASS for the identical check must not permanently reject the file. This
+  # is the ONLY scenario that actually discriminates dedup from "validate
+  # every line independently": a later invalid line fails either way, so
+  # only "earlier invalid, later valid" tells them apart.
+  T12_VR_DEDUP="$T12_DIR/verification-records-dedup.jsonl"
+  {
+    printf '{"verification_id":"v-dup","command":"pytest tests/test_widget.py","environment":"local","result":"","exit_code":1,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n'
+    printf '{"verification_id":"v-dup","command":"pytest tests/test_widget.py","environment":"local","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n'
+  } > "$T12_VR_DEDUP"
+  if validate_verification_records "$T12_VR_DEDUP" >"$T12_DIR/dedup.out" 2>&1; then
+    _ok "T12: validate_verification_records evaluates the LATEST record per verification_id (post-debug PASS supersedes a structurally-invalid pre-debug attempt)"
+  else
+    _fail "T12: validate_verification_records wrongly failed on a superseded pre-debug record sharing an ID with a later valid PASS"
+    note "$(cat "$T12_DIR/dedup.out")"
+  fi
+
+  # Same rescue pattern through a DIFFERENT rule (EXCLUDED-without-evidence,
+  # not just an empty result) -- proves dedup applies uniformly, not only
+  # to the one rule the first fixture happened to exercise.
+  T12_VR_DEDUP2="$T12_DIR/verification-records-dedup2.jsonl"
+  {
+    printf '{"verification_id":"v-dup2","command":"pytest tests/test_widget.py","environment":"local","result":"EXCLUDED","exit_code":1,"evidence_path":null,"baseline_comparison":null,"reason":"meh","followup_id":null}\n'
+    printf '{"verification_id":"v-dup2","command":"pytest tests/test_widget.py","environment":"local","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n'
+  } > "$T12_VR_DEDUP2"
+  if validate_verification_records "$T12_VR_DEDUP2" >"$T12_DIR/dedup2.out" 2>&1; then
+    _ok "T12: validate_verification_records supersedes a pre-debug policy-invalid EXCLUDED with a later valid PASS (dedup applies uniformly, not to one rule only)"
+  else
+    _fail "T12: validate_verification_records wrongly failed on a superseded policy-invalid EXCLUDED sharing an ID with a later valid PASS"
+    note "$(cat "$T12_DIR/dedup2.out")"
+  fi
+
+  # And the genuinely reverse direction: a LATER invalid record must still
+  # be caught even though an EARLIER line for the same ID was valid --
+  # proving this is "last wins," not "any valid record anywhere wins."
+  T12_VR_DEDUP3="$T12_DIR/verification-records-dedup3.jsonl"
+  {
+    printf '{"verification_id":"v-dup3","command":"pytest tests/test_widget.py","environment":"local","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n'
+    printf '{"verification_id":"v-dup3","command":"pytest tests/test_widget.py","environment":"local","result":"","exit_code":1,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n'
+  } > "$T12_VR_DEDUP3"
+  if validate_verification_records "$T12_VR_DEDUP3" >/dev/null 2>&1; then
+    _fail "T12: validate_verification_records ignored a later (empty-result) record in favor of an earlier PASS"
+  else
+    _ok "T12: validate_verification_records genuinely uses LAST-wins, not first-valid-wins"
+  fi
+else
+  _fail "append_verification_record / validate_verification_records are not defined"
+fi
+
+# ---- Step 6: plan acceptance gate + review-window closure ------------------
+if declare -F plan_review_window_closed >/dev/null && declare -F plan_ready_for_implementation >/dev/null; then
+  T12_PR="$BUILD/t12-planready"; rm -rf "$T12_PR"; mkdir -p "$T12_PR/5-plan-review/01"
+  FEATURE_FOLDER="$T12_PR"
+  : > "$T12_PR/RUN_LOG.md"
+
+  if plan_review_window_closed; then
+    _fail "T12: plan_review_window_closed is true before Phase 6 ever started"
+  else
+    _ok "T12: plan_review_window_closed is false before Phase 6 starts"
+  fi
+
+  rc=0
+  plan_ready_for_implementation >/dev/null 2>&1 || rc=$?
+  assert_rc 1 "$rc" "T12: plan_ready_for_implementation refuses with no plan-review summarizer status"
+
+  printf 'verdict: DONE\nreason: null\n' > "$T12_PR/5-plan-review/summarizer-status.md"
+  printf '{"finding_id":"f1","severity":"blocker","status":"open"}\n' > "$T12_PR/5-plan-review/01/findings-catalog.jsonl"
+  rc=0
+  plan_ready_for_implementation >/dev/null 2>&1 || rc=$?
+  assert_rc 1 "$rc" "T12: plan_ready_for_implementation refuses with an open blocking finding"
+
+  printf '{"finding_id":"f1","severity":"blocker","status":"fixed"}\n' > "$T12_PR/5-plan-review/01/findings-catalog.jsonl"
+  if plan_ready_for_implementation >"$T12_DIR/pr-ok.out" 2>&1; then
+    _ok "T12: plan_ready_for_implementation passes on an accepted verdict with zero open blockers"
+  else
+    _fail "T12: plan_ready_for_implementation still refuses after the blocker was fixed"
+    note "$(cat "$T12_DIR/pr-ok.out")"
+  fi
+
+  # Code review fix (blocker 2): "open" alone undercounts -- a REOPENED
+  # blocker (a fixer's 'fixed' disposition re-reported by a later reviewer,
+  # the single most dangerous class) must refuse readiness exactly like
+  # 'open' does.
+  printf '{"finding_id":"f1","severity":"blocker","status":"reopened"}\n' > "$T12_PR/5-plan-review/01/findings-catalog.jsonl"
+  rc=0
+  plan_ready_for_implementation >/dev/null 2>&1 || rc=$?
+  assert_rc 1 "$rc" "T12: plan_ready_for_implementation refuses on a REOPENED blocker, not just 'open'"
+
+  # Code review fix (blocker 2): a malformed/corrupt catalog must fail
+  # CLOSED (refuse), never silently count as zero open blockers.
+  printf 'not json at all\n' > "$T12_PR/5-plan-review/01/findings-catalog.jsonl"
+  rc=0
+  plan_ready_for_implementation >/dev/null 2>&1 || rc=$?
+  assert_rc 1 "$rc" "T12: plan_ready_for_implementation fails CLOSED on a malformed findings catalog (never treats a jq error as zero blockers)"
+
+  # Restore a clean catalog so the ONE test below this (readiness/window
+  # closure) is unaffected by the malformed-catalog fixture just written.
+  printf '{"finding_id":"f1","severity":"blocker","status":"fixed"}\n' > "$T12_PR/5-plan-review/01/findings-catalog.jsonl"
+
+  printf -- '--- 2026-01-01T00:00:00Z  event=IMPLEMENTATION_BASELINE\nbase_sha: deadbeef\nuncommitted_changes: no\n\n' \
+    >> "$T12_PR/RUN_LOG.md"
+  if plan_review_window_closed; then
+    _ok "T12: plan_review_window_closed is true once Phase 6's baseline event is durable"
+  else
+    _fail "T12: plan_review_window_closed did not observe the IMPLEMENTATION_BASELINE event"
+  fi
+else
+  _fail "plan_review_window_closed / plan_ready_for_implementation are not defined"
+fi
+
+FEATURE_FOLDER="$T12_FEATURE_FOLDER"
+ORCHESTRATION_DIR="$T12_ORCHESTRATION_DIR"
 
 finish

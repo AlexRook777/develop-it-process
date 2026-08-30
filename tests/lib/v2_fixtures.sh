@@ -258,3 +258,130 @@ EOF
   FINDING_FIXTURE_LINE_O1="$("$GREP_BIN" -n 'Repeated issue text' "$dir/doc-v3.md" | sed -n 1p | cut -d: -f1)"
   FINDING_FIXTURE_LINE_O2="$("$GREP_BIN" -n 'Repeated issue text' "$dir/doc-v3.md" | sed -n 2p | cut -d: -f1)"
 }
+
+# ---- write_plan_task_fixture (Task 12) --------------------------------------
+# Writes a plan Markdown file at PLAN_PATH with a "## Task Contract" fenced
+# ```json (one task object per line) block exercising validate_plan_tasks'
+# spec S19.1 checks against a single broken field at a time. The baseline is
+# two otherwise-valid tasks: task-01 (actor=implementer) and task-02
+# (actor=owner, depends on task-01, carries a handoff) -- DEFECT selects
+# which one field is mutated away from that clean baseline; "valid" emits it
+# unmodified. Every DEFECT name matches a distinct fixture named in Task 12
+# Step 1 (plus "unreachable_prerequisite", spec S19.1's own extra scenario
+# beyond the plan's four named-field cases).
+#
+# Usage: write_plan_task_fixture PLAN_PATH DEFECT
+write_plan_task_fixture() {
+  local path="$1" defect="$2"
+  "$PYTHON_BIN" - "$path" "$defect" <<'PY'
+import json, sys
+
+path, defect = sys.argv[1], sys.argv[2]
+
+t1 = {
+    "task_id": "task-01", "objective": "Add the widget module",
+    "files": ["src/widget.py"], "prerequisites": [], "actor": "implementer",
+    "credential": None, "side_effects": [],
+    "steps": ["Write failing test", "Implement widget()", "Run tests"],
+    "verification": [{"command": "pytest tests/test_widget.py", "environment": "local",
+                       "expected_result": "all tests pass"}],
+    "rollback": "git revert the task commit", "skills": [], "handoff": None,
+}
+t2 = {
+    "task_id": "task-02", "objective": "Rotate the deploy credential",
+    "files": ["deploy/config.yaml"], "prerequisites": ["task-01"], "actor": "owner",
+    # credential is null in the clean baseline -- the unavailable_credential/
+    # secret_credential defects each set a concrete value themselves, and a
+    # baseline value here would need a real env var set in every caller's
+    # environment just to keep the "valid" fixture passing.
+    "credential": None, "side_effects": ["rotates a production credential"],
+    "steps": ["Owner rotates DEPLOY_TOKEN in the vault"],
+    "verification": [{"command": "curl -sf https://deploy.example/health", "environment": "staging",
+                       "expected_result": "HTTP 200"}],
+    "rollback": "revert to the previous credential version", "skills": [],
+    "handoff": "Owner rotates DEPLOY_TOKEN and confirms staging health before task-03 proceeds",
+}
+
+if defect == "valid":
+    pass
+elif defect == "duplicate_id":
+    t2["task_id"] = "task-01"
+elif defect == "missing_objective":
+    del t1["objective"]
+elif defect == "missing_files":
+    del t1["files"]
+elif defect == "missing_prerequisite_field":
+    del t2["prerequisites"]
+elif defect == "missing_actor":
+    del t1["actor"]
+elif defect == "bad_actor":
+    t1["actor"] = "robot"
+elif defect == "unavailable_credential":
+    # Availability is checked ONLY for actor=implementer (code review fix,
+    # blocker 4) -- an owner/CI/deployed_environment task naming a
+    # credential the orchestrator does not hold is the handoff case the
+    # schema exists to express, not a defect. So this negative fixture must
+    # target task-01 (actor=implementer), not task-02 (actor=owner).
+    t1["credential"] = "SOME_CRED_DEVELOP_IT_TESTS_NEVER_SET_XYZ"
+elif defect == "secret_credential":
+    t2["credential"] = "DEPLOY_TOKEN=sk-liveSECRETVALUE1234567890"
+elif defect == "owner_credential_unavailable_is_ok":
+    # POSITIVE case (code review fix, blocker 4): an owner-actor task naming
+    # a credential the orchestrator itself does NOT hold must NOT be
+    # rejected -- that is exactly the handoff this schema exists to
+    # express. Caller asserts this ACCEPTS, unlike every other DEFECT name.
+    t2["credential"] = "SOME_OWNER_ONLY_CRED_DEVELOP_IT_TESTS_NEVER_SET_XYZ"
+elif defect == "undeclared_side_effect":
+    t2["side_effects"] = []
+    t2["steps"] = ["Deploy directly to production and drop the old table"]
+elif defect == "delete_temp_file_is_ok":
+    # POSITIVE case (code review fix, major 5): deleting a temp/scratch
+    # artifact is ordinary cleanup, not an undeclared destructive effect --
+    # the heuristic must require real destructive SCOPE (production/
+    # database/table/...), not merely the word "delete".
+    t1["steps"] = ["Write failing test", "Implement widget()",
+                   "Delete the temporary scratch file after the test run"]
+elif defect == "deploy_test_only_is_ok":
+    # POSITIVE case (code review fix, major 5): a task that merely tests a
+    # deployment SCRIPT, naming no production/database scope, must not be
+    # flagged as an undeclared destructive effect.
+    t1["steps"] = ["Write failing test", "Run the deployment script test"]
+elif defect == "ambiguous_verification":
+    t1["verification"] = [{"command": "similar to task-01 above", "environment": "local",
+                            "expected_result": "all tests pass"}]
+elif defect == "missing_environment":
+    del t1["verification"][0]["environment"]
+elif defect == "missing_expected_result":
+    del t1["verification"][0]["expected_result"]
+elif defect == "missing_handoff":
+    t2["handoff"] = None
+elif defect == "cyclic_dependency":
+    t1["prerequisites"] = ["task-02"]
+elif defect == "post_implementation_only_review":
+    t1["verification"] = [{"command": "will be verified during code review", "environment": "local",
+                            "expected_result": "reviewer approves"}]
+elif defect == "unreachable_prerequisite":
+    t2["prerequisites"] = ["task-99"]
+elif defect == "forward_reference":
+    # Code review fix (medium 7): a prerequisite that EXISTS but is
+    # declared LATER in the plan is not a "reachable PRIOR task" (spec
+    # S19.1) -- membership in the block is not enough; order matters too.
+    # Acyclic on purpose (task-02 depends on nothing), so only the
+    # forward-reference rule -- never the DAG/cycle rule -- can catch this.
+    t1["prerequisites"] = ["task-02"]
+    t2["prerequisites"] = []
+elif defect == "self_reference":
+    # Code review fix (medium 7): a task cannot be its own prerequisite --
+    # this is a degenerate 1-node cycle, so the SAME cycle-detection code
+    # path the two-task mutual cycle already exercises must also catch it.
+    t1["prerequisites"] = ["task-01"]
+else:
+    sys.exit(f"write_plan_task_fixture: unknown defect: {defect}")
+
+lines = [json.dumps(t1), json.dumps(t2)]
+with open(path, "w") as f:
+    f.write("# Fixture plan\n\n## Task Contract\n\n```json\n")
+    f.write("\n".join(lines) + "\n")
+    f.write("```\n")
+PY
+}

@@ -334,4 +334,44 @@ done
 # compounds like "token/iteration-marker".
 assert_absent '[0-9]-[a-z-]+/iteration-' "$D"   "T11: no phase-dir + iteration- path convention survives anywhere (spec-review/plan-review/code-review all use \$PHASE_DIR/\$ITERATION)"
 
+# --- Task 12: executable plans and explicit verification results -----------
+assert_present '^## Plan Task Contract \(spec §19\.1\)' "$D" \
+  "T12: Plan Task Contract heading present"
+assert_present '^## Verification Record Contract \(spec §19\.2\)' "$D" \
+  "T12: Verification Record Contract heading present"
+
+for _t12_fn in validate_plan_tasks _plan_task_block validate_verification_records \
+  _verification_result_legal append_verification_record plan_review_window_closed \
+  plan_ready_for_implementation; do
+  assert_present "^${_t12_fn}\(\) \{" "$D" "T12: $_t12_fn is a real cookbook function"
+done
+
+# The four-state verification result enum is exact: PASS, FAIL, EXCLUDED,
+# NOT_RUN. SKIPPED is never a legal value.
+assert_present 'PASS\|FAIL\|EXCLUDED\|NOT_RUN' "$D" \
+  "T12: the verification result enum is documented as PASS|FAIL|EXCLUDED|NOT_RUN"
+assert_present 'SKIPPED and empty are rejected' "$D" \
+  "T12: the verification-record validator explicitly documents rejecting SKIPPED and empty results"
+
+# actor enum, no-secret rule, and DAG requirement are documented in the
+# executable task contract prose, not only in the validator's own code.
+assert_present 'actor=implementer\|owner\|CI\|deployed_environment' "$D" \
+  "T12: the four-actor enum is documented"
+assert_present 'No secret material' "$D" "T12: the no-secret-material rule is documented"
+assert_present 'form a DAG' "$D" "T12: dependencies forming a DAG is documented"
+
+# Once Phase 6 starts, the plan's pre-implementation review window closes.
+assert_present '^\| PLAN_REVIEW_STALE \|' "$D" \
+  "T12: PLAN_REVIEW_STALE has an Event Contract Registry row"
+assert_present 'pre-implementation review window is closed' "$D" \
+  "T12: the plan-review window closure rule is documented"
+assert_present 'marked `STALE` without a vendor call' "$D" \
+  "T12: later plan-review requests are marked STALE without a vendor call"
+
+# DONE_WITH_EXCLUSIONS is a real implementer verdict, wired into the
+# Role Contract Registry row and the Phase 6 gating prose, not just prose.
+assert_present '\| implementer \|.*DONE;DONE_WITH_EXCLUSIONS;FAILED;NEEDS_DEBUG;BLOCKED' "$D" \
+  "T12: implementer's registry row declares DONE_WITH_EXCLUSIONS as a legal verdict"
+assert_present 'DONE_WITH_EXCLUSIONS' "$D" "T12: DONE_WITH_EXCLUSIONS is documented"
+
 finish
