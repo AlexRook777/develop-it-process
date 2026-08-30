@@ -77,4 +77,33 @@ assert_eq "" "$drift" "every appendix contract declaration matches its registry 
 assert_absent 'BEGIN: impl-worker' "$PROCESS_DOC" \
   "T13: impl-worker (child-only role) has no top-level appendix marker"
 
+# --- Task 14: the phase renumbering must move BOTH the registry row and the
+# appendix's own declared Phases field to the SAME new value -- contract_drift
+# above only proves they agree with EACH OTHER, not that they hold the
+# CORRECT target number. A stale pair (both still "10") would pass the drift
+# loop but must fail here.
+readiness_body="$(python3 - "$PROCESS_DOC" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"<!-- BEGIN: readiness-writer -->(.*?)<!-- END: readiness-writer -->", text, re.S)
+print(m.group(1) if m else "")
+PY
+)"
+case "$readiness_body" in
+  *'Phases: `11`'*) _ok "T14: readiness-writer's own appendix declares Phases: 11" ;;
+  *) _fail "T14: readiness-writer's own appendix does NOT declare Phases: 11" ;;
+esac
+
+doc_writer_body="$(python3 - "$PROCESS_DOC" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"<!-- BEGIN: documentation-writer -->(.*?)<!-- END: documentation-writer -->", text, re.S)
+print(m.group(1) if m else "")
+PY
+)"
+case "$doc_writer_body" in
+  *'Phases: `9`'*) _ok "T14: documentation-writer's own appendix still declares Phases: 9" ;;
+  *) _fail "T14: documentation-writer's own appendix does NOT declare Phases: 9" ;;
+esac
+
 finish

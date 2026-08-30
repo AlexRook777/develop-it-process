@@ -457,4 +457,189 @@ for _t13_consumed_field in x_baseline_sha x_final_sha x_remaining_handoffs; do
   esac
 done
 
+# =============================================================================
+# Task 14: documentation, handoff, and orchestrator finalization phases
+# =============================================================================
+
+# The normative phase tail is exactly this, in this order -- the highest-risk
+# operation in the whole plan, so pin every heading literally.
+assert_present '^## Phase 8 — All tests' "$D" "T14: Phase 8 heading is 'All tests'"
+assert_present '^## Phase 9 — Documentation and handoff' "$D" \
+  "T14: Phase 9 heading is 'Documentation and handoff' (no longer git finalization)"
+assert_present '^## Phase 10 — Local git finalization' "$D" \
+  "T14: Phase 10 heading is 'Local git finalization' (no longer the readiness report)"
+assert_present '^## Phase 11 — Readiness and completion' "$D" \
+  "T14: Phase 11 heading is 'Readiness and completion'"
+assert_absent '^## Phase 9 — Git finalization' "$D" \
+  "T14: the old 'Phase 9 — Git finalization' heading is gone"
+assert_absent '^## Phase 10 — Final readiness report' "$D" \
+  "T14: the old 'Phase 10 — Final readiness report' heading is gone"
+
+# The phase-token mapping (_phase_name) must agree with the new tail --
+# this is the single riskiest hand-edit in the renumbering (PHASE_DIR
+# construction reads it for every dispatch).
+assert_present '9\)    echo documentation ;;' "$D" \
+  "T14: _phase_name maps phase 9 to 'documentation'"
+assert_present '10\)   echo git-finalization ;;' "$D" \
+  "T14: _phase_name maps phase 10 to 'git-finalization'"
+assert_present '11\)   echo readiness-report ;;' "$D" \
+  "T14: _phase_name maps phase 11 to 'readiness-report'"
+
+# append_followup: a real cookbook function, with its own contract section,
+# and the follow-up ledger is documented as orchestrator-only.
+assert_present '^append_followup\(\) \{' "$D" "T14: append_followup is a real cookbook function"
+assert_present '^## Follow-up Ledger Contract' "$D" "T14: Follow-up Ledger Contract heading present"
+assert_present 'called ONLY by the' "$D" \
+  "T14: the follow-up ledger is documented as orchestrator-only, never a role's own write"
+assert_present 'A role never writes this file' "$D" \
+  "T14: roles never write followups.jsonl directly -- documented explicitly"
+
+# GIT_FINALIZATION_RESULT gained its real fields (Task 8 left a placeholder
+# base_sha;candidate_sha;outcome triple with no call site) and its first real
+# call site, directly in Phase 10's own prose.
+assert_present '\| GIT_FINALIZATION_RESULT \| base_sha;final_sha;staged_paths;commit_sha;push_performed;outcome \|' "$D" \
+  "T14: GIT_FINALIZATION_RESULT's registry row carries all six spec fields"
+assert_present 'GIT_FINALIZATION_RESULT\)     printf .%s.*"base_sha;final_sha;staged_paths;commit_sha;push_performed;outcome"' "$D" \
+  "T14: event_required_fields's GIT_FINALIZATION_RESULT case matches the registry row exactly"
+assert_present 'record_event GIT_FINALIZATION_RESULT reason=\$REASON base_sha=\$BASE_SHA' "$D" \
+  "T14: Phase 10's own prose has a real record_event GIT_FINALIZATION_RESULT call site, with reason set on EVERY branch (record_event refuses an empty reason)"
+
+# Phase 10 is a direct orchestrator operation -- no dispatch, no subagent,
+# push is always forbidden.
+assert_present 'Phase 10 is executed \*\*directly by the orchestrator' "$D" \
+  "T14: Phase 10 is documented as a direct orchestrator operation"
+assert_absent 'Dispatch one `claude` subprocess for role `finishing-branch`' "$D" \
+  "T14: Phase 10 no longer dispatches finishing-branch"
+assert_present 'MUST NOT push' "$D" "T14: Phase 10 explicitly forbids pushing"
+assert_present 'push_performed.*always .no.' "$D" \
+  "T14: push_performed is documented as always 'no'"
+
+# Phase 8's all-tests gate reuses Task 12's verification-record contract --
+# never a phase-level rollup standing in for per-command evidence.
+_t14_phase8_range="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m1 = re.search(r"^## Phase 8 —", text, re.M)
+m2 = re.search(r"^## Phase 9 —", text, re.M)
+print(text[m1.end():m2.start()])
+PY
+)"
+case "$_t14_phase8_range" in
+  *append_verification_record*) _ok "T14: Phase 8's own prose calls append_verification_record" ;;
+  *) _fail "T14: Phase 8's own prose has NO append_verification_record call site" ;;
+esac
+case "$_t14_phase8_range" in
+  *validate_verification_records*) _ok "T14: Phase 8's own prose calls validate_verification_records" ;;
+  *) _fail "T14: Phase 8's own prose has NO validate_verification_records call site" ;;
+esac
+
+# Phase 9's own prose calls append_followup (never inside documentation-writer's
+# own appendix, which is a DIFFERENT document region than the phase loop).
+_t14_phase9_range="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m1 = re.search(r"^## Phase 9 —", text, re.M)
+m2 = re.search(r"^## Phase 10 —", text, re.M)
+print(text[m1.end():m2.start()])
+PY
+)"
+case "$_t14_phase9_range" in
+  *append_followup*) _ok "T14: Phase 9's own prose calls append_followup" ;;
+  *) _fail "T14: Phase 9's own prose has NO append_followup call site" ;;
+esac
+
+# Phase 10's own prose calls acquire_write_lease/release_write_lease directly
+# (never dispatch_attempt/dispatch_parallel -- there is no role to dispatch).
+_t14_phase10_range="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m1 = re.search(r"^## Phase 10 —", text, re.M)
+m2 = re.search(r"^## Phase 11 —", text, re.M)
+print(text[m1.end():m2.start()])
+PY
+)"
+for _t14_fn in acquire_write_lease release_write_lease; do
+  case "$_t14_phase10_range" in
+    *"$_t14_fn"*) _ok "T14: Phase 10's own prose calls $_t14_fn" ;;
+    *) _fail "T14: Phase 10's own prose has NO $_t14_fn call site" ;;
+  esac
+done
+case "$_t14_phase10_range" in
+  *dispatch_attempt*|*dispatch_parallel*)
+    _fail "T14: Phase 10's own prose calls dispatch_attempt/dispatch_parallel -- it must never dispatch a role" ;;
+  *) _ok "T14: Phase 10's own prose never calls dispatch_attempt/dispatch_parallel" ;;
+esac
+
+# The documentation-writer appendix carries the full UAT structure, including
+# the distinct "Not yet executed" section, and the follow-up-candidate rule.
+_t14_docwriter_body="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"<!-- BEGIN: documentation-writer -->(.*?)<!-- END: documentation-writer -->", text, re.S)
+print(m.group(1) if m else "")
+PY
+)"
+for _t14_uat_kw in Prerequisites Actions "Expected results" "Smoke checks" "Rollback" "Not yet executed"; do
+  case "$_t14_docwriter_body" in
+    *"$_t14_uat_kw"*) _ok "T14: documentation-writer's own appendix requires a '$_t14_uat_kw' UAT section" ;;
+    *) _fail "T14: documentation-writer's own appendix does NOT mention '$_t14_uat_kw'" ;;
+  esac
+done
+# Code review finding #8: the loop above is substring-anywhere-in-a-130-line
+# appendix, so deleting the "Not yet executed" BULLET from the writer's own
+# section-order list (step 4) still passes on an incidental mention
+# elsewhere (step 5's validation clause). Isolate the ACTUAL step-4 bulleted
+# list itself and require the six headers in the documented ORDER, back to
+# back -- a mutation that removes or reorders one bullet breaks this even
+# though other prose still says the words.
+_t14_uat_list_block="$(printf '%s' "$_t14_docwriter_body" | python3 -c "
+import re, sys
+body = sys.stdin.read()
+m = re.search(r'Write \`uat\.md\` with these sections, in this order:(.*?)\n[0-9]+\. Validate', body, re.S)
+print(m.group(1) if m else '')
+")"
+if [ -n "$_t14_uat_list_block" ]; then
+  _ok "T14: documentation-writer's own step-4 UAT section-order list was isolated"
+else
+  _fail "T14: could not isolate documentation-writer's step-4 UAT section-order list"
+fi
+if printf '%s' "$_t14_uat_list_block" | "$GREP_BIN" -Pzo '(?s)Prerequisites.*Actions.*Expected results.*Smoke checks.*Rollback.*Not yet executed' >/dev/null 2>&1; then
+  _ok "T14: the six UAT sections appear in the documented order, back to back, in the writer's own step-4 list"
+else
+  _fail "T14: the writer's own step-4 list is missing a UAT section or has them out of order"
+fi
+case "$_t14_docwriter_body" in
+  *'never write `followups.jsonl` yourself'*) _ok "T14: documentation-writer's own appendix states it never writes followups.jsonl directly" ;;
+  *) _fail "T14: documentation-writer's own appendix does NOT state the no-direct-write rule for followups.jsonl" ;;
+esac
+case "$_t14_docwriter_body" in
+  *x_followup_candidates*) _ok "T14: documentation-writer's own STATUS template carries x_followup_candidates" ;;
+  *) _fail "T14: documentation-writer's own STATUS template does NOT carry x_followup_candidates" ;;
+esac
+
+# Code review finding #7: no role appendix may itself write followups.jsonl
+# -- append_followup is orchestrator-only (Phase 9's own prose is its ONLY
+# real call site, per the earlier phase-range-scoped check). Scan EVERY
+# appendix body for the writer's own name or a hand-rolled redirect into
+# the file -- this is a real, distinct scanner (not the same substring
+# checks already used above), and it covers every role, not only
+# documentation-writer.
+_t14_direct_write_offenders="$(python3 - "$D" <<'PYSCAN'
+import re, sys
+text = open(sys.argv[1]).read()
+for m in re.finditer(r"<!-- BEGIN: ([a-z0-9-]+) -->(.*?)<!-- END: \1 -->", text, re.S):
+    role, body = m.group(1), m.group(2)
+    # Only real, executable snippet code counts as "writing it yourself" --
+    # a prose sentence explaining the orchestrator-only rule (which legally
+    # names append_followup/followups.jsonl to state the rule) must not
+    # trip this. Fenced ```bash blocks are the only place an appendix's own
+    # runnable instructions live.
+    code_blocks = "\n".join(re.findall(r"```bash\n(.*?)```", body, re.S))
+    if "append_followup" in code_blocks or re.search(r"[>]{1,2}[^\n]*followups\.jsonl", code_blocks):
+        print(role)
+PYSCAN
+)"
+assert_eq "" "$_t14_direct_write_offenders" \
+  "T14: no role appendix calls append_followup or redirects into followups.jsonl directly"
+
 finish

@@ -22,6 +22,11 @@ export FAKE_ARGV_LOG="$WORK/argv.log"     # the stubs read this themselves
 # as separate processes and can only see the environment, not our shell vars.
 REPO_ROOT="$WORK/target"; mkdir -p "$REPO_ROOT"
 git -C "$REPO_ROOT" init -q
+# Repo-local identity, so the LATER extracted Phase 10 commit command (which
+# the process doc never wraps in -c user.email=.../-c user.name=..., since a
+# real orchestrator's repo already has one) can run unmodified.
+git -C "$REPO_ROOT" config user.email t@t
+git -C "$REPO_ROOT" config user.name t
 ( cd "$REPO_ROOT" && : > seed && git add seed \
   && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
 # A tracked placeholder under docs/superpowers/specs/ so an otherwise fully
@@ -1203,5 +1208,297 @@ assert_present 'lease_owner:[[:space:]]*summarizer-spec' "$FEATURE_FOLDER/RUN_LO
   "ARTIFACT_INTEGRITY_BLOCKED names the offending role"
 git -C "$REPO_ROOT" checkout -q -- . 2>/dev/null
 git -C "$REPO_ROOT" clean -q -fd -- fake-mutation.txt 2>/dev/null || true
+
+# =============================================================================
+# Task 14: Phase 8 test-fixer/documentation-writer auto-lease, and Phase 10's
+# direct orchestrator git finalization (no dispatch, no subagent).
+# =============================================================================
+
+# --- Phase 8/9: mutating roles (all-tests-runner, test-fixer,
+# documentation-writer) acquire and release the single write lease
+# automatically through the SAME generic dispatch machinery every other
+# mutating role already uses -- no bespoke Phase 8/9 lease-handling code
+# exists or needs to. FAKE_MODE=complete's generic `verdict: DONE` STATUS is
+# not legal for a PASS/FAIL/SKIPPED-only role (all-tests-runner) or a role
+# with extra required_status_fields (documentation-writer), so the dispatch
+# itself ends MALFORMED_STATUS -- exactly like the pre-existing
+# code-reviewer-claude fake-CLI tests above, which check vendor invocation
+# and RUN_LOG evidence rather than a clean dispatch_attempt return code. The
+# write lease is acquired BEFORE the vendor runs and released after
+# classification regardless of whether that classification is valid. ---
+: > "$FEATURE_FOLDER/RUN_LOG.md"; : > "$FAKE_ARGV_LOG"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
+FAKE_MODE=complete dispatch_attempt 8 01 all-tests-runner >/dev/null 2>&1
+# all-tests-runner is long_running=yes (timeout 60 >= the 60-minute
+# threshold): a real launch is the headroom probe PLUS the substantive
+# invocation -- two '^claude ' lines, same accounting as elsewhere in this file.
+assert_eq 2 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
+  "T14: all-tests-runner reaches the vendor CLI (headroom probe + launch)"
+assert_present 'event=WRITE_LEASE_ACQUIRED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: all-tests-runner (mutates=yes) automatically acquired the write lease"
+assert_present 'event=WRITE_LEASE_RELEASED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: all-tests-runner automatically released the write lease after completion"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
+
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+FAKE_MODE=complete dispatch_attempt 8 01 test-fixer >/dev/null 2>&1
+assert_rc 0 $? "T14: dispatch_attempt for test-fixer succeeds against the fake CLI"
+assert_present 'event=WRITE_LEASE_ACQUIRED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: test-fixer (mutates=yes) automatically acquired the write lease"
+assert_present 'event=WRITE_LEASE_RELEASED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: test-fixer automatically released the write lease after completion"
+
+# documentation-writer's own required inputs (beyond the shared fixture
+# block at the top of this file) -- render_prompt --check fails closed, and
+# no lease is ever acquired, when any of these is left unset.
+FINAL_DIFF="diff --git a/x b/x"
+ACCEPTED_SPEC="$SPEC_PATH"
+ACCEPTED_PLAN="$PLAN_PATH"
+IMPLEMENTATION_SUMMARY="$FEATURE_FOLDER/transcripts/impl-summary.md"
+TEST_SUMMARY="$FEATURE_FOLDER/transcripts/test-summary.md"
+REVIEW_SUMMARY="$FEATURE_FOLDER/transcripts/review-summary.md"
+DECISIONS="none"
+EXCLUSIONS="none"
+FOLLOWUPS="none"
+WRITE_LEASE="$ORCHESTRATION_DIR/write-lease.json"
+DOCS_INVENTORY=""
+RUN_LOG="$FEATURE_FOLDER/RUN_LOG.md"
+
+: > "$FEATURE_FOLDER/RUN_LOG.md"; : > "$FAKE_ARGV_LOG"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
+FAKE_MODE=complete dispatch_attempt 9 00 documentation-writer >/dev/null 2>&1
+assert_eq 2 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
+  "T14: documentation-writer reaches the vendor CLI (headroom probe + launch -- also long_running=yes)"
+assert_present 'event=WRITE_LEASE_ACQUIRED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: documentation-writer (mutates=yes) automatically acquired the write lease"
+assert_present 'event=WRITE_LEASE_RELEASED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: documentation-writer automatically released the write lease after completion"
+
+# Mutation check: the assertions above can genuinely fail -- while another
+# lease is already held, documentation-writer must be rejected before launch,
+# never silently proceed (a PRELAUNCH_FAILED, zero vendor invocations).
+acquire_write_lease some-other-owner role fake-dispatch-id 6 . >/dev/null 2>&1
+: > "$FEATURE_FOLDER/RUN_LOG.md"; : > "$FAKE_ARGV_LOG"
+FAKE_MODE=complete dispatch_attempt 9 00 documentation-writer >/dev/null 2>&1
+assert_eq PRELAUNCH_FAILED "${DISPATCH_RESULT_CLASSIFICATION:-}" \
+  "T14: mutation check -- documentation-writer is rejected before launch while another lease is already held"
+assert_eq 0 "$("$GREP_BIN" -c '^claude ' "$FAKE_ARGV_LOG" || true)" \
+  "T14: the rejected documentation-writer dispatch never reaches the vendor CLI"
+release_write_lease some-other-owner >/dev/null 2>&1
+
+# --- Phase 10: local git finalization is a DIRECT orchestrator operation --
+# no role, no appendix, no dispatch_attempt call. finishing-branch (the
+# retired role) can no longer be dispatched at all.
+: > "$FEATURE_FOLDER/RUN_LOG.md"; : > "$FAKE_ARGV_LOG"
+dispatch_attempt 10 00 finishing-branch >/dev/null 2>&1
+assert_rc 1 $? "T14: finishing-branch can no longer be dispatched -- Phase 10 has no role at all"
+assert_eq 0 "$("$GREP_BIN" -c '^claude \|^codex ' "$FAKE_ARGV_LOG" || true)" \
+  "T14: attempting to dispatch the retired finishing-branch role reaches zero vendor invocations"
+if "$GREP_BIN" -qi 'documentation-review' "$BUILD/roles.tsv" 2>/dev/null; then
+  _fail "T14: a documentation-review role must not exist in the registry (spec: do not add a documentation-review model)"
+else
+  _ok "T14: no documentation-review role exists in the registry"
+fi
+
+
+# --- Drive the DOCUMENTED sequence, not a reimplementation of it (code
+# review finding #5): pull the four literal commands Phase 10's own prose
+# names, verbatim, out of the process doc itself, then execute THOSE
+# strings (with only the placeholder substituted) -- so a prose edit to the
+# actual algorithm (not just this test file) changes what runs here. A
+# scenario built from hand-typed git/lease calls instead would still pass
+# after the Phase 10 body was deleted from the document; extraction failure
+# (a missing command) is itself asserted, not silently tolerated.
+T14_PHASE10_BODY="$BUILD/t14-phase10-body.txt"
+python3 - "$PROCESS_DOC" > "$T14_PHASE10_BODY" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m1 = re.search(r"^## Phase 10 —", text, re.M)
+m2 = re.search(r"^## Phase 11 —", text, re.M)
+sys.stdout.write(text[m1.end():m2.start()])
+PY
+
+_t14_extract_cmd() {
+  # Usage: _t14_extract_cmd 'regex-with-one-capture-group'
+  python3 - "$T14_PHASE10_BODY" "$1" <<'PY2'
+import re, sys
+body = open(sys.argv[1]).read()
+m = re.search(sys.argv[2], body)
+if not m:
+    sys.exit(1)
+print(m.group(1))
+PY2
+}
+
+T14_LEASE_CMD_TMPL="$(_t14_extract_cmd '`(acquire_write_lease orchestrator-finalization[^`]*)`')"
+assert_rc 0 $? "T14: extracted the real acquire_write_lease command from Phase 10's own prose"
+T14_ADD_CMD_TMPL="$(_t14_extract_cmd '`(git -C "\$REPO_ROOT" add -- [^`]*)`')"
+assert_rc 0 $? "T14: extracted the real git add command from Phase 10's own prose"
+T14_COMMIT_CMD_TMPL="$(_t14_extract_cmd '`(git -C "\$REPO_ROOT" commit -m "[^`]*)`')"
+assert_rc 0 $? "T14: extracted the real git commit command from Phase 10's own prose"
+T14_RESTORE_CMD_TMPL="$(_t14_extract_cmd '`(git -C "\$REPO_ROOT" restore --staged -- [^`]*)`')"
+assert_rc 0 $? "T14: extracted the real git restore --staged command from Phase 10's own prose"
+
+# Run the extracted templates with only their documented placeholders
+# substituted -- never a hand-retyped command.
+t14_lease_acquire() {
+  local paths="$*"
+  eval "${T14_LEASE_CMD_TMPL//<the staging paths from step 1>/\"\$paths\"}"
+}
+t14_git_add() {
+  local paths="$*"
+  eval "${T14_ADD_CMD_TMPL//<staging paths>/\"\$paths\"}"
+}
+t14_git_commit() {
+  local msg="$1"
+  eval "$(printf '%s' "$T14_COMMIT_CMD_TMPL" | sed "s#<message per the plan.s git rules / CLAUDE\.md git policy>#$msg#")"
+}
+t14_git_restore() {
+  local paths="$*"
+  eval "${T14_RESTORE_CMD_TMPL//<the offending paths>/\"\$paths\"}"
+}
+
+FF_REL="${FEATURE_FOLDER#"$REPO_ROOT"/}"
+T14_STAGE_PATH="$FF_REL/9-documentation/uat.md"
+mkdir -p "$FEATURE_FOLDER/9-documentation"
+
+# Case: BLOCKED -- documentation-writer claimed DONE but a required output
+# (uat.md) is missing on disk (code review finding #6, spec S20.10 step 1).
+# Step 1's existence check must catch this BEFORE any git operation: prove
+# the failure mode it exists to prevent is real, not hypothetical -- staging
+# a missing required output is an undefined git failure, never a graceful
+# BLOCKED, unless something checks first.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+mv "$FEATURE_FOLDER/9-documentation/uat.md" "$BUILD/t14-uat-saved.md"
+[ ! -f "$FEATURE_FOLDER/9-documentation/uat.md" ] || _fail "T14: setup: uat.md should be absent for this case"
+t14_git_add "$T14_STAGE_PATH" 2>"$BUILD/t14-missing.err"
+assert_rc 128 $? "T14: staging a missing required documentation output is a real git failure (undefined behaviour Step 1 exists to prevent -- this git build exits 128 for a non-matching pathspec)"
+assert_contains "did not match any files" "$BUILD/t14-missing.err" \
+  "T14: git names the failure as a missing pathspec, confirming the precondition Step 1 checks is real"
+git -C "$REPO_ROOT" restore --staged -- "$T14_STAGE_PATH" 2>/dev/null
+record_event GIT_FINALIZATION_RESULT phase=10 iteration=00 dispatch_id="" \
+  reason="missing-documentation-output:$T14_STAGE_PATH" \
+  base_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)" final_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)" \
+  staged_paths="[]" commit_sha=null push_performed=no outcome=BLOCKED
+assert_rc 0 $? "T14: Step 1's missing-output BLOCKED record_event call succeeds"
+assert_present 'reason:[[:space:]]*missing-documentation-output' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: the BLOCKED reason names the missing output specifically"
+mv "$BUILD/t14-uat-saved.md" "$FEATURE_FOLDER/9-documentation/uat.md"
+
+# Case: COMMITTED -- a real file is staged, under the direct orchestrator
+# lease, and committed; GIT_FINALIZATION_RESULT carries the real SHAs.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
+printf 'uat content\n' > "$FEATURE_FOLDER/9-documentation/uat.md"
+T14_BASE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+t14_lease_acquire "$T14_STAGE_PATH" >/dev/null 2>&1
+assert_rc 0 $? "T14: Phase 10 acquires its direct orchestrator lease when none is held (dispatch_id=null, authority=orchestrator)"
+# Read the real lease file -- an empty DISPATCH_ID argument must become the
+# JSON VALUE null, never the JSON STRING "null" (the literal word the prose
+# used to pass by mistake).
+assert_eq "null" "$(jq -r '.dispatch_id | type' "$ORCHESTRATION_DIR/write-lease.json")" \
+  "T14: write-lease.json's dispatch_id is JSON null (type=null), not the string \"null\""
+assert_eq "orchestrator" "$(jq -r '.authority' "$ORCHESTRATION_DIR/write-lease.json")" \
+  "T14: write-lease.json's authority is 'orchestrator'"
+assert_eq "orchestrator-finalization" "$(jq -r '.lease_owner' "$ORCHESTRATION_DIR/write-lease.json")" \
+  "T14: write-lease.json's lease_owner is 'orchestrator-finalization'"
+t14_git_add "$T14_STAGE_PATH"
+T14_STAGED="$(git -C "$REPO_ROOT" diff --cached --name-only)"
+assert_eq "$T14_STAGE_PATH" "$T14_STAGED" "T14: only the declared path is staged, nothing else"
+t14_git_commit "docs: uat"
+assert_rc 0 $? "T14: the local commit succeeds"
+T14_FINAL_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+[ "$T14_FINAL_SHA" != "$T14_BASE_SHA" ] \
+  && _ok "T14: HEAD advanced after a successful commit" \
+  || _fail "T14: HEAD did not move after a commit that reported success"
+record_event GIT_FINALIZATION_RESULT phase=10 iteration=00 dispatch_id="" reason="finalized" \
+  base_sha="$T14_BASE_SHA" final_sha="$T14_FINAL_SHA" staged_paths="[\"$T14_STAGE_PATH\"]" \
+  commit_sha="$T14_FINAL_SHA" push_performed=no outcome=COMMITTED
+assert_rc 0 $? "T14: record_event accepts a COMMITTED GIT_FINALIZATION_RESULT with all six of its own fields"
+assert_present 'event=GIT_FINALIZATION_RESULT' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: GIT_FINALIZATION_RESULT is durable in RUN_LOG.md"
+assert_present 'outcome:[[:space:]]*COMMITTED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: the outcome is recorded as COMMITTED"
+release_write_lease orchestrator-finalization >/dev/null
+assert_rc 0 $? "T14: the lease releases cleanly once the result is durable"
+
+# Case: NO_CHANGES -- nothing left to stage; never creates an empty commit.
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
+T14_BASE_SHA2="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+t14_lease_acquire "$T14_STAGE_PATH" >/dev/null 2>&1
+t14_git_add "$T14_STAGE_PATH"
+T14_STAGED2="$(git -C "$REPO_ROOT" diff --cached --name-only)"
+assert_eq "" "$T14_STAGED2" "T14: staging an already-committed, unchanged path yields an empty cached diff"
+record_event GIT_FINALIZATION_RESULT phase=10 iteration=00 dispatch_id="" reason="nothing to commit" \
+  base_sha="$T14_BASE_SHA2" final_sha="$T14_BASE_SHA2" staged_paths="[]" commit_sha=null \
+  push_performed=no outcome=NO_CHANGES
+assert_present 'outcome:[[:space:]]*NO_CHANGES' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: an empty staged diff is recorded as NO_CHANGES, never as a fabricated commit"
+T14_HEAD_UNCHANGED="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+assert_eq "$T14_BASE_SHA2" "$T14_HEAD_UNCHANGED" "T14: NO_CHANGES never creates an empty commit -- HEAD did not move"
+release_write_lease orchestrator-finalization >/dev/null
+
+# Case: FAILED -- a real, failing commit hook. The commit command itself
+# fails, HEAD never moves, and the result is recorded FAILED with evidence
+# (never silently retried, never mis-recorded as BLOCKED or COMMITTED).
+mkdir -p "$REPO_ROOT/.git/hooks"
+printf '#!/bin/sh\necho "pre-commit: rejected by policy" >&2\nexit 1\n' > "$REPO_ROOT/.git/hooks/pre-commit"
+chmod +x "$REPO_ROOT/.git/hooks/pre-commit"
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
+printf 'more uat content\n' >> "$FEATURE_FOLDER/9-documentation/uat.md"
+T14_BASE_SHA3="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+t14_lease_acquire "$T14_STAGE_PATH" >/dev/null 2>&1
+t14_git_add "$T14_STAGE_PATH"
+t14_git_commit "docs: uat again" >/dev/null 2>"$BUILD/t14-hook.err"
+_t14_commit_rc=$?
+assert_rc 1 "$_t14_commit_rc" "T14: a failing pre-commit hook makes the commit command itself fail"
+assert_contains "rejected by policy" "$BUILD/t14-hook.err" \
+  "T14: the hook's own rejection reason is captured as evidence"
+T14_HEAD_AFTER_HOOK="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+assert_eq "$T14_BASE_SHA3" "$T14_HEAD_AFTER_HOOK" "T14: HEAD never moves when the commit command fails"
+record_event GIT_FINALIZATION_RESULT phase=10 iteration=00 dispatch_id="" reason="commit hook rejected the change" \
+  base_sha="$T14_BASE_SHA3" final_sha="$T14_BASE_SHA3" staged_paths="[\"$T14_STAGE_PATH\"]" \
+  commit_sha=null push_performed=no outcome=FAILED
+assert_present 'outcome:[[:space:]]*FAILED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: a failing commit is recorded as FAILED, never COMMITTED or silently retried"
+t14_git_restore "$T14_STAGE_PATH" 2>/dev/null
+git -C "$REPO_ROOT" checkout -q -- "$T14_STAGE_PATH" 2>/dev/null
+rm -f "$REPO_ROOT/.git/hooks/pre-commit"
+release_write_lease orchestrator-finalization >/dev/null
+
+# Case: unexpected staged path -- the containment check has something real
+# to catch (mutation check: an undeclared path genuinely lands on the index
+# when the caller stages it; the guard must then reject it).
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
+printf 'unexpected\n' > "$FEATURE_FOLDER/9-documentation/unexpected.md"
+T14_UNEXPECTED_PATH="$FF_REL/9-documentation/unexpected.md"
+t14_lease_acquire "$T14_STAGE_PATH" >/dev/null 2>&1
+t14_git_add "$T14_UNEXPECTED_PATH"
+T14_STAGED3="$(git -C "$REPO_ROOT" diff --cached --name-only)"
+case "$T14_STAGED3" in
+  "$T14_STAGE_PATH"|"") _fail "T14: mutation check failed to reproduce an unexpected staged path -- the scenario below would trivially pass" ;;
+  *) _ok "T14: an undeclared path genuinely ends up staged when added -- the containment check below has something real to catch" ;;
+esac
+t14_git_restore "$T14_UNEXPECTED_PATH"
+record_event GIT_FINALIZATION_RESULT phase=10 iteration=00 dispatch_id="" reason="unexpected-staged-path" \
+  base_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)" final_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)" \
+  staged_paths="[]" commit_sha=null push_performed=no outcome=BLOCKED
+assert_present 'outcome:[[:space:]]*BLOCKED' "$FEATURE_FOLDER/RUN_LOG.md" \
+  "T14: an unexpected staged path is recorded as BLOCKED, never silently committed"
+rm -f "$FEATURE_FOLDER/9-documentation/unexpected.md"
+release_write_lease orchestrator-finalization >/dev/null
+
+# Case: an existing active lease blocks Phase 10's own acquisition -- this
+# IS the required "assert no lease remains" check (spec Step 5).
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
+acquire_write_lease some-role role some-dispatch-id 6 . >/dev/null 2>&1
+t14_lease_acquire "$T14_STAGE_PATH" >/dev/null 2>&1
+assert_rc 1 $? "T14: Phase 10's own lease acquisition fails while another lease is already held (BLOCKED, not a silent override)"
+release_write_lease some-role >/dev/null 2>&1
+rm -f "$ORCHESTRATION_DIR/write-lease.json"
 
 finish

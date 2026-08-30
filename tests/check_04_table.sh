@@ -109,4 +109,29 @@ _t13_spawn_offenders="$(awk -F '\t' 'NR>1 && $1!="implementer" && $8=="yes" {pri
 assert_eq "" "$_t13_spawn_offenders" \
   "T13: no role OTHER than implementer says may_spawn_children=yes anywhere in the registry"
 
+# --- Task 14: phase renumbering -- documentation-writer stays phase 9,
+# readiness-writer moves from 10 to 11. No new role is added for Phase 10
+# (local git finalization): it is a direct orchestrator operation, never a
+# dispatched role, so the registry stays at 25 rows / 24 top-level roles.
+assert_tsv_field "$BUILD/roles.tsv" documentation-writer phases 9
+assert_tsv_field "$BUILD/roles.tsv" readiness-writer phases 11
+assert_eq 0 "$(awk -F '\t' 'NR>1 && $16=="10" {n++} END {print n+0}' "$BUILD/roles.tsv")" \
+  "T14: no role in the registry claims phase 10 -- local git finalization dispatches no role"
+assert_absent 'documentation-review' "$BUILD/roles.tsv" \
+  "T14: no documentation-review role was added (spec: do not add a documentation-review model)"
+
+# The invariant, not a hardcoded list: every DISTINCT phase token any role's
+# `phases` cell actually uses must be legal per the real _legal_phase_token
+# function -- this is what a stale token allowlist (e.g. one that stops at
+# 10 while a role has moved to 11) fails, instead of a bare grep for "11".
+_t14_distinct_tokens="$(tail -n +2 "$BUILD/roles.tsv" | cut -f16 | tr ';' '
+' | sort -u)"
+_t14_bad_tokens=""
+while IFS= read -r _t14_tok; do
+  [ -n "$_t14_tok" ] || continue
+  _legal_phase_token "$_t14_tok" || _t14_bad_tokens="$_t14_bad_tokens $_t14_tok"
+done <<<"$_t14_distinct_tokens"
+assert_eq "" "$_t14_bad_tokens" \
+  "T14: every distinct phases token in the registry is accepted by _legal_phase_token"
+
 finish

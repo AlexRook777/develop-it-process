@@ -1184,4 +1184,108 @@ assert_line_count 0 "$T12_STALE_ARGV" \
 assert_present '^--- .*  event=PLAN_REVIEW_STALE$' "$T12_STALE_DIR/ff/RUN_LOG.md" \
   "T12: plan_review_stale_gate durably records event=PLAN_REVIEW_STALE at zero vendor cost"
 
+# =============================================================================
+# Task 14: documentation, handoff, and orchestrator finalization phases
+# =============================================================================
+
+# --- _phase_name: the phase-token mapping actually resolves to the NEW
+# target names, not just a grep of the case statement's source text (the
+# behavioural counterpart to check_05_contract.sh's textual assertion). ---
+assert_eq "documentation"    "$(_phase_name 9)"  "T14: _phase_name 9 resolves to 'documentation'"
+assert_eq "git-finalization" "$(_phase_name 10)" "T14: _phase_name 10 resolves to 'git-finalization'"
+assert_eq "readiness-report" "$(_phase_name 11)" "T14: _phase_name 11 resolves to 'readiness-report'"
+assert_eq "all-tests"        "$(_phase_name 8)"  "T14: _phase_name 8 is unchanged ('all-tests')"
+
+# --- the canonical `phase` -> `phase_name` RUN_LOG table (spec S15's own
+# "use these canonical names exactly") must agree with _phase_name for EVERY
+# row -- not just the three touched by this task. A table left stale for one
+# phase while _phase_name was fixed (or vice versa) silently splits that
+# phase's RUN_LOG rollup in two; this catches either direction.
+_t14_canon_table="$(python3 - "$PROCESS_DOC" <<'PY2'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"canonical names exactly:\n\n\| `phase` \| `phase_name` \|\n\|---\|---\|\n((?:\|.*\|\n)+)", text)
+for line in m.group(1).splitlines():
+    cells = [c.strip(" `") for c in line.strip("|").split("|")]
+    print(f"{cells[0]}\t{cells[1]}")
+PY2
+)"
+[ -n "$_t14_canon_table" ] && _ok "T14: canonical phase/phase_name table extracted" \
+  || _fail "T14: canonical phase/phase_name table extraction produced nothing"
+while IFS="$(printf '\t')" read -r _t14_n _t14_name; do
+  [ -n "$_t14_n" ] || continue
+  assert_eq "$_t14_name" "$(_phase_name "$_t14_n")" \
+    "T14: canonical table row phase=$_t14_n ('$_t14_name') matches _phase_name's real output"
+done <<<"$_t14_canon_table"
+
+# --- the normative phase tail appears in strictly increasing document order:
+# 8, 9, 10, 11 -- catches a reorder/duplication mistake a plain grep-presence
+# check (check_05_contract.sh) cannot, since presence alone says nothing
+# about ORDER.
+_t14_phase_positions="$(python3 - "$PROCESS_DOC" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+for n in (8, 9, 10, 11):
+    m = re.search(rf"^## Phase {n} —", text, re.M)
+    print(m.start() if m else -1)
+PY
+)"
+read -r _t14_p8 _t14_p9 _t14_p10 _t14_p11 <<<"$(printf '%s' "$_t14_phase_positions" | tr '\n' ' ')"
+if [ "${_t14_p8:--1}" -ge 0 ] && [ "${_t14_p9:--1}" -gt "$_t14_p8" ] \
+  && [ "${_t14_p10:--1}" -gt "$_t14_p9" ] && [ "${_t14_p11:--1}" -gt "$_t14_p10" ]; then
+  _ok "T14: Phase 8, 9, 10, 11 headings appear in strictly increasing document order"
+else
+  _fail "T14: the phase-8..11 headings are missing or out of order (positions: $_t14_phase_positions)"
+fi
+
+# --- append_followup: a real, validated, append-only writer, exercised
+# directly (not merely grepped for) -- the same rigor Task 12's
+# append_verification_record/validate_verification_records already got. ---
+if declare -F append_followup >/dev/null; then
+  FEATURE_FOLDER="$BUILD/t14-ff"; rm -rf "$FEATURE_FOLDER"; mkdir -p "$FEATURE_FOLDER"
+  rc=0; append_followup fu-01 9 null "document the new flag" owner "none" low open null || rc=$?
+  assert_rc 0 "$rc" "T14: append_followup accepts a legal record"
+  assert_exists "$FEATURE_FOLDER/followups.jsonl" "T14: append_followup creates followups.jsonl under \$FEATURE_FOLDER"
+  assert_line_count 1 "$FEATURE_FOLDER/followups.jsonl" "T14: exactly one record was appended"
+  jq -e '.id == "fu-01" and .status == "open" and .origin_finding == null' \
+    "$FEATURE_FOLDER/followups.jsonl" >/dev/null \
+    && _ok "T14: the appended record carries the exact fields passed in, with origin_finding normalized to JSON null" \
+    || _fail "T14: the appended followup record's fields do not match what was passed"
+
+  rc=0; append_followup fu-01 9 null "duplicate id" owner "none" low open null >/dev/null 2>&1 || rc=$?
+  assert_rc 1 "$rc" "T14: append_followup refuses a duplicate id -- the ledger is append-only"
+  assert_line_count 1 "$FEATURE_FOLDER/followups.jsonl" \
+    "T14: the duplicate attempt did not add a second line"
+
+  rc=0; append_followup fu-02 9 null "bad status" owner "none" low SKIPPED null >/dev/null 2>&1 || rc=$?
+  assert_rc 1 "$rc" "T14: append_followup refuses an illegal status ('SKIPPED' is not open|deferred|accepted_risk|resolved)"
+  assert_line_count 1 "$FEATURE_FOLDER/followups.jsonl" \
+    "T14: the illegal-status attempt did not add a second line either"
+
+  rc=0; append_followup fu-03 7 "finding-01" "a real second record" implementer "none" medium deferred "ev.md" || rc=$?
+  assert_rc 0 "$rc" "T14: a second, distinct legal id is accepted"
+  assert_line_count 2 "$FEATURE_FOLDER/followups.jsonl" "T14: the ledger now carries two records"
+else
+  _fail "T14: append_followup is not defined -- cannot exercise it"
+fi
+
+# --- record_event GIT_FINALIZATION_RESULT: the documented COMMITTED and
+# NO_CHANGES call shapes (Phase 10 step 6) must actually succeed -- reason
+# is a common-envelope field record_event refuses to leave empty, and
+# COMMITTED/NO_CHANGES are exactly the two branches that name a reason
+# LEAST obviously (BLOCKED/FAILED already read as needing one). ---
+: > "$FEATURE_FOLDER/RUN_LOG.md"
+rc=0
+record_event GIT_FINALIZATION_RESULT phase=10 iteration=00 dispatch_id="" reason=finalized \
+  base_sha=deadbeef final_sha=cafef00d staged_paths='["9-documentation/uat.md"]' \
+  commit_sha=cafef00d push_performed=no outcome=COMMITTED || rc=$?
+assert_rc 0 "$rc" "T14: the documented COMMITTED record_event call (with reason=finalized) succeeds"
+assert_present 'outcome:[[:space:]]*COMMITTED' "$FEATURE_FOLDER/RUN_LOG.md" "T14: the COMMITTED event is durable"
+
+record_event GIT_FINALIZATION_RESULT phase=10 iteration=00 dispatch_id="" reason=no-in-scope-changes \
+  base_sha=deadbeef final_sha=deadbeef staged_paths='[]' commit_sha=null push_performed=no \
+  outcome=NO_CHANGES || rc=$?
+record_event GIT_FINALIZATION_RESULT phase=10 iteration=00 dispatch_id="" reason=no-in-scope-changes   base_sha=deadbeef final_sha=deadbeef staged_paths='[]' commit_sha=null push_performed=no   outcome=NO_CHANGES || rc=$?
+assert_rc 0 "$rc" "T14: the documented NO_CHANGES record_event call (with reason=no-in-scope-changes) succeeds"
+
 finish

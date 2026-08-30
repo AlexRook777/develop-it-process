@@ -10,7 +10,7 @@ If you find yourself reading an artifact, drafting review feedback, editing the 
 
 - An already-written draft spec at `docs/superpowers/specs/<YYYY-MM-DD>-<slug>-design.md` (or the user provides another path).
 - Both `claude` and `codex` CLIs available on PATH.
-- A git repository (most actions are tolerant of non-git; Phase 9 is skipped when not in a repo).
+- A git repository (most actions are tolerant of non-git; Phase 10 records `outcome=BLOCKED` and performs no commit when not in a repo).
 
 Process schema `2` (see the Process Policy Registry below) applies to every newly created run's `RUN_LOG.md`, STATUS, checkpoint, and event records. It is not retroactive: historical feature-folder artifacts written by a prior version of this prompt are left exactly as they are, and no compatibility reader or migration path is provided for them.
 
@@ -271,7 +271,7 @@ this account and is used for the cheap `preflight-codex` probe;
 | summarizer-code-review | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 7 |
 | summarizer-all-tests | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 8 |
 | documentation-writer | claude | claude-sonnet-5 | — | 60 | yes | yes | no | final_diff;accepted_spec;accepted_plan;implementation_summary;test_summary;review_summary;decisions;exclusions;followups;write_lease | docs_inventory;run_log;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | uat.md;planned-vs-realized.md;documentation-validation.md;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;documentation_validation | document | 9 |
-| readiness-writer | claude | claude-opus-5 | — | 20 | no | no | no | feature_folder;spec_path;plan_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | report;status | DONE | common_v2 | none | 10 |
+| readiness-writer | claude | claude-opus-5 | — | 20 | no | no | no | feature_folder;spec_path;plan_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | report;status | DONE | common_v2 | none | 11 |
 
 This table is the ONLY place a model, effort, timeout, contract shape, or
 legal verdict is stated for any role. The `role_*` helpers in the Runtime
@@ -387,7 +387,8 @@ Mandatory mapping (encoded into the appendices — you do not override):
 - Debugging on verification failure: debugger subagent loads `superpowers:systematic-debugging` and additionally `context7` whenever the failure signature points at an external library or framework — verify against authoritative current docs rather than relying on training-data recollections.
 - Web/browser deliverables: implementer additionally loads `dogfood` (or equivalent) if the plan requires browser QA.
 - All tests (Phase 8): the `all-tests-runner` appendix is the entire instruction set (no skill). The `test-fixer` loads `superpowers:systematic-debugging` and additionally `context7` whenever the failure signature points at an external library or framework.
-- Git finalization (Phase 9): subagent loads `superpowers:finishing-a-development-branch`.
+- Documentation and handoff (Phase 9): the `documentation-writer` appendix is the entire instruction set (no skill).
+- Local git finalization (Phase 10): no subagent and no skill — the orchestrator performs this directly (see Phase 10 below).
 
 You never load any of these skills yourself. You only dispatch subagents whose appendices instruct them to load the relevant skill.
 
@@ -497,16 +498,24 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     code-review-summary.md
     summarizer-status.md
   8-all-tests/
-    round-01/
+    01/                                    # $PHASE_DIR/$ITERATION -- round number, same convention as Phase 3/5/7
+      verification-records.jsonl           # append_verification_record, one line per command
       test-report.md
-      test-runner-status.md
-      test-fixer-status.md               # present only when a fix round ran
-    round-02/
+      attempts/
+        p08-i01-all-tests-runner-a01/STATUS.md
+        p08-i01-test-fixer-a01/STATUS.md   # present only when a fix round ran
+    02/
       …
     all-test-summary.md
     summarizer-status.md
-  9-git-finalization/
-    git-status.md
+  9-documentation/
+    uat.md
+    planned-vs-realized.md
+    documentation-validation.md
+    00/                                    # non-iterative phase -- iteration is always 00
+      attempts/
+        p09-i00-documentation-writer-a01/STATUS.md
+  followups.jsonl                          # orchestrator-owned; append_followup is its sole writer
   final-readiness-report.md
   readiness-status.md
   transcripts/
@@ -534,7 +543,7 @@ verdict lives in its own attempt-scoped `STATUS.md` under
 findings into one per-iteration `findings-catalog.jsonl`). A filename must
 not assert a model, or it starts lying the moment the Models table changes.
 
-Phase 10 (`readiness-report`) intentionally has no `10-readiness-report/` folder: its two outputs (`final-readiness-report.md`, `readiness-status.md`) are cross-cutting feature-folder artifacts consumed by the user at the top level, not phase-internal scratch. The same rationale applies to `RUN_LOG.md`, `full_log.md`, `transcripts/`, and the optional `process-improvement-proposition.md`, which also live at the feature-folder root without a numeric prefix.
+Phase 10 (`git-finalization`, Local Git Finalization) intentionally has no `10-git-finalization/` folder: it is a direct orchestrator operation with no dispatched role and no attempt directory of its own — its only durable trace is the single `event=GIT_FINALIZATION_RESULT` entry it records in `RUN_LOG.md` (spec §20.10). Phase 11 (`readiness-report`) likewise has no `11-readiness-report/` folder: its two outputs (`final-readiness-report.md`, `readiness-status.md`) are cross-cutting feature-folder artifacts consumed by the user at the top level, not phase-internal scratch. The same rationale applies to `RUN_LOG.md`, `full_log.md`, `transcripts/`, `followups.jsonl`, and the optional `process-improvement-proposition.md`, which also live at the feature-folder root without a numeric prefix.
 
 ### Files that stay outside the feature folder
 
@@ -2014,10 +2023,11 @@ Before any attempt is logged as launched, `render_prompt --check <role>` validat
 ```bash
 # A role's `phases` cell is a semicolon-delimited set of legal phase tokens.
 # `child` is legal only for a child-only contract (e.g. impl-worker); every
-# other legal token is -1 (the preflight/canary stage) or 1 through 10.
+# other legal token is -1 (the preflight/canary stage) or 1 through 11
+# (readiness-writer, Phase 11, is the current highest).
 _legal_phase_token() {
   case "$1" in
-    -1|1|2|3|4|5|6|7|8|9|10|child) return 0 ;;
+    -1|1|2|3|4|5|6|7|8|9|10|11|child) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2478,8 +2488,9 @@ _phase_name() {
     6)    echo implementation ;;
     7)    echo code-review ;;
     8)    echo all-tests ;;
-    9)    echo git-finalization ;;
-    10)   echo readiness-report ;;
+    9)    echo documentation ;;
+    10)   echo git-finalization ;;
+    11)   echo readiness-report ;;
     *)    echo "unknown phase: $1" >&2; return 1 ;;
   esac
 }
@@ -4003,7 +4014,7 @@ here does not itself populate that document).
 | WRITE_LEASE_ACQUIRED | lease_owner;lease_authority | no |
 | WRITE_LEASE_RELEASED | lease_owner | no |
 | ARTIFACT_INTEGRITY_BLOCKED | lease_owner | yes |
-| GIT_FINALIZATION_RESULT | base_sha;candidate_sha;outcome | no |
+| GIT_FINALIZATION_RESULT | base_sha;final_sha;staged_paths;commit_sha;push_performed;outcome | no |
 | ITERATION_CAP_REACHED | phase_name;iteration_cap | yes |
 | ITERATION_CAP_OVERRIDE | phase_name;iteration_cap | yes |
 | PROCESS_DEVIATION |  | yes |
@@ -4115,7 +4126,7 @@ event_required_fields() {
     WRITE_LEASE_ACQUIRED)        printf '%s\n' "lease_owner;lease_authority" ;;
     WRITE_LEASE_RELEASED)        printf '%s\n' "lease_owner" ;;
     ARTIFACT_INTEGRITY_BLOCKED)  printf '%s\n' "lease_owner" ;;
-    GIT_FINALIZATION_RESULT)     printf '%s\n' "base_sha;candidate_sha;outcome" ;;
+    GIT_FINALIZATION_RESULT)     printf '%s\n' "base_sha;final_sha;staged_paths;commit_sha;push_performed;outcome" ;;
     ITERATION_CAP_REACHED|ITERATION_CAP_OVERRIDE)
       printf '%s\n' "phase_name;iteration_cap" ;;
     PROCESS_DEVIATION)           printf '%s\n' "" ;;
@@ -4265,13 +4276,16 @@ real cookbook function before this task (`allocate_attempt`'s
 allowed` additionally now emits `RECOVERY_AUTHORIZED` on the path that grants
 a retry (the counterpart this document never previously logged, only its
 `RECOVERY_CAP_REACHED` denial). The decision types (`OWNER_DECISION`,
-`RISK_ACCEPTED`, `PHASE_ACCEPTED`, `EVENT_CORRECTED`) and `GIT_FINALIZATION_
-RESULT` have no live call site yet — no phase in this document currently
-narrates an owner decision or a Phase 10 finalization commit as literal
-cookbook code, only as prose — so this task defines their full contract
-(registry row, `event_required_fields` case, `record_event` compatibility)
-and leaves wiring an actual call site to whichever later task implements
-that phase behavior in code. The many pre-existing PROSE mentions of
+`RISK_ACCEPTED`, `PHASE_ACCEPTED`, `EVENT_CORRECTED`) have no live call site
+yet — no phase in this document currently narrates an owner decision as
+literal cookbook code, only as prose — so this task defines their full
+contract (registry row, `event_required_fields` case, `record_event`
+compatibility) and leaves wiring an actual call site to whichever later task
+implements that behavior in code. `GIT_FINALIZATION_RESULT` gained its own
+registry row and `event_required_fields` case here in Task 8, with the same
+"no call site yet" status; Task 14's Phase 10 (Local Git Finalization) is
+what later gives it a real, direct `record_event GIT_FINALIZATION_RESULT`
+call site — see Phase 10 below. The many pre-existing PROSE mentions of
 `event=HALT`/`event=CODEX_UNAVAILABLE`/`event=MODEL_REJECTED`/etc. elsewhere
 in this document (instructions to the live orchestrator, not cookbook
 functions this test harness executes) are unchanged by this task; `HALT`
@@ -5384,7 +5398,7 @@ deliberately stops rather than recovering:
 | `role_mutates` | Action on `UNFINISHED` |
 |---|---|
 | `no` — reviewers, summarizers, `context-discovery`, preflight, `readiness-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: no`, `action: redispatched`, and re-dispatch once. These roles only read and write their own STATUS and findings, so a repeat is idempotent. **Exception:** if the run-scoped `claude_spend_exhausted` / `codex_spend_exhausted` flag is set for this role's vendor (Mode 5b), do NOT re-dispatch — log `action: halted` with `reason: vendor spend ceiling`, and halt. Idempotence makes a repeat *safe*, not *useful*; under a ceiling it cannot succeed, and it buries the real cause under a second identical failure. |
-| `yes` — `implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `finishing-branch` | log `event=DISPATCH_ORPHANED` with `role_mutates: yes`, `action: halted`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, the `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch or keep the partial work. **Never auto-retry.** After the fact nothing can distinguish "the task ran once" from "the task ran twice", and a re-run implementer duplicates commits and re-applies edits. |
+| `yes` — `implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `documentation-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: yes`, `action: halted`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, the `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch or keep the partial work. **Never auto-retry.** After the fact nothing can distinguish "the task ran once" from "the task ran twice", and a re-run implementer duplicates commits and re-applies edits. |
 
 The ordered classifier that fully replaces this hand-rolled three-state read
 (ambiguity between "never launched" and "launched, crashed, no evidence at
@@ -5713,7 +5727,7 @@ Run this twice:
 
 ### Gitignore guard for the artifacts folder
 
-The feature folder accumulates orchestration state (`RUN_LOG.md`, STATUS files, transcripts). If these files are tracked, they pollute the Phase 6 dirty check and the Phase 9 staging scope. The orchestrator does NOT auto-edit `.gitignore`, but at Phase 1 it MUST verify one of the following is true:
+The feature folder accumulates orchestration state (`RUN_LOG.md`, STATUS files, transcripts). If these files are tracked, they pollute the Phase 6 dirty check and the Phase 10 staging scope. The orchestrator does NOT auto-edit `.gitignore`, but at Phase 1 it MUST verify one of the following is true:
 
 - `docs/superpowers/specs/*-artifacts/` (or the equivalent pattern matching `$FEATURE_FOLDER`) is ignored by `.gitignore`, **or**
 - The orchestrator explicitly excludes `$FEATURE_FOLDER` from the Phase 6 dirty check (already true via `dirty_tree_check`'s allow-list).
@@ -7599,6 +7613,84 @@ PY
 }
 ```
 
+## Follow-up Ledger Contract (spec §20.9)
+
+`$FEATURE_FOLDER/followups.jsonl` has exactly one writer across the entire
+run: `append_followup` (cookbook, below), and it is called ONLY by the
+orchestrator itself, from Phase 9's own prose (see Phase 9 below) — never
+from inside a dispatched role's own appendix. A role never writes this file
+directly; a role only RETURNS follow-up candidates through its own validated
+STATUS (an `x_followup_candidates` field, a JSON array — empty when the role
+has none), which the orchestrator reads AFTER that dispatch's classification
+is already durable, then converts into canonical records one at a time. This
+mirrors `append_verification_record`/`RUN_LOG.md` itself: a shared ledger
+gets exactly one writer so no caller can invent a field order or bypass
+validation, and "the orchestrator is the sole writer" here is the same rule
+spec §15.1 already states for `RUN_LOG.md`, applied to a second shared
+ledger.
+
+Each record carries exactly these eight fields:
+
+```text
+id
+origin_phase
+origin_finding
+description
+actor
+prerequisite
+risk
+status
+evidence
+```
+
+`id` must be unique across the file (a duplicate is rejected, never
+silently overwritten — the ledger is append-only, matching `RUN_LOG.md`'s
+own append-only discipline). `status` is one of `open`, `deferred`,
+`accepted_risk`, or `resolved`. `origin_finding` and `evidence` may be the
+literal word `null` when a follow-up did not originate from a specific
+finding ID or has no evidence yet; every other field is required non-empty
+text.
+
+<!-- lint: cookbook -->
+```bash
+# The four legal follow-up status values (spec S20.9). Never SKIPPED,
+# never empty -- a follow-up with no status is not yet a follow-up.
+_followup_status_legal() {
+  case "$1" in open|deferred|accepted_risk|resolved) return 0 ;; *) return 1 ;; esac
+}
+
+# Append one canonical follow-up record (spec S20.9) to followups.jsonl.
+# The sole writer: only the orchestrator calls this, only after a role's own
+# dispatch classification is durable, and only from candidates that role
+# RETURNED through its own STATUS -- never a path a role's own appendix
+# writes to directly. Refuses a duplicate id (append-only, like RUN_LOG.md)
+# and an illegal status before anything is written.
+append_followup() {
+  # Usage: append_followup ID ORIGIN_PHASE ORIGIN_FINDING DESCRIPTION ACTOR \
+  #   PREREQUISITE RISK STATUS EVIDENCE
+  local id="$1" origin_phase="$2" origin_finding="$3" description="$4" \
+    actor="$5" prerequisite="$6" risk="$7" status="$8" evidence="${9:-}"
+  local path="${FEATURE_FOLDER:?}/followups.jsonl"
+  mkdir -p "${FEATURE_FOLDER:?}"
+  [ -n "$id" ] || { echo "append_followup: missing id" >&2; return 1; }
+  _followup_status_legal "$status" \
+    || { echo "append_followup: illegal status '$status' (only open|deferred|accepted_risk|resolved are legal)" >&2; return 1; }
+  if [ -f "$path" ] && jq -e --arg id "$id" 'select(.id == $id)' "$path" >/dev/null 2>&1; then
+    echo "append_followup: duplicate id '$id' (the ledger is append-only; ids may not be reused)" >&2
+    return 1
+  fi
+  jq -nc --arg id "$id" --arg origin_phase "$origin_phase" \
+    --arg origin_finding "$origin_finding" --arg description "$description" \
+    --arg actor "$actor" --arg prerequisite "$prerequisite" --arg risk "$risk" \
+    --arg status "$status" --arg evidence "$evidence" \
+    '{id:$id, origin_phase:$origin_phase,
+      origin_finding:(if $origin_finding=="" or $origin_finding=="null" then null else $origin_finding end),
+      description:$description, actor:$actor, prerequisite:$prerequisite, risk:$risk,
+      status:$status,
+      evidence:(if $evidence=="" or $evidence=="null" then null else $evidence end)}' >> "$path"
+}
+```
+
 ### Plan acceptance and the pre-implementation review window (spec §19.1/§20.5-§20.6)
 
 Implementation may start only from a plan revision whose latest plan-review verdict is accepted (the Phase 5 gate's own summarizer reports `DONE`) and whose open blocking finding count, across every plan-review iteration's own findings catalog, is zero. Once Phase 6 starts, the plan's pre-implementation review window is closed for the remainder of this run: a later plan-review request (a resumed or re-entered Phase 5) is marked `STALE` without a vendor call — no reviewer is dispatched, and no reviewer spend is incurred re-reviewing anchors implementation has already consumed.
@@ -8217,13 +8309,13 @@ capture_implementation_baseline() {
 }
 ```
 
-Call `capture_implementation_baseline` here. On a non-zero return, HALT and surface the offender list — already printed to stderr by `dirty_tree_check` — to the user. Pre-existing uncommitted changes outside the implementation slice would pollute the Phase 6 diff scope and the Phase 9 staging scope (the finalizer cannot reliably distinguish "implementer-produced uncommitted changes" from "user's pre-existing uncommitted changes" without external knowledge). The user must resolve before proceeding by committing or stashing. The orchestrator does NOT auto-stash and does NOT accept "proceed anyway" — re-run this step after the working tree is clean of out-of-scope changes.
+Call `capture_implementation_baseline` here. On a non-zero return, HALT and surface the offender list — already printed to stderr by `dirty_tree_check` — to the user. Pre-existing uncommitted changes outside the implementation slice would pollute the Phase 6 diff scope and the Phase 10 staging scope (the finalizer cannot reliably distinguish "implementer-produced uncommitted changes" from "user's pre-existing uncommitted changes" without external knowledge). The user must resolve before proceeding by committing or stashing. The orchestrator does NOT auto-stash and does NOT accept "proceed anyway" — re-run this step after the working tree is clean of out-of-scope changes.
 
 Files INSIDE `$FEATURE_FOLDER` (RUN_LOG, STATUS files, transcripts) are expected to be untracked. They are excluded from the dirty check via `dirty_tree_check`'s allow-list. If `.gitignore` does not yet ignore the `*-artifacts/` pattern, the user was warned in Phase 1; the runtime exclusion above keeps the run unblocked regardless.
 
 The `event=IMPLEMENTATION_BASELINE` entry is a **multi-line block** matching the RUN_LOG grammar (a `--- <timestamp>  event=...` header line followed by `key: value` fields and a trailing blank line) — not the previous single-line form, which the summarizers and the readiness writer could not parse. On a dirty-tree halt, only the advisory `event=IMPLEMENTATION_BASELINE_BLOCKED` block is written (see schema above) — the consumable `event=IMPLEMENTATION_BASELINE` event is never written on that path, so a blocked attempt can never be mistaken for a consumable baseline. Downstream consumers must read the LATEST `event=IMPLEMENTATION_BASELINE` entry in `RUN_LOG.md` (in case a prior failed/aborted run left one or the user resumes), ignoring any `IMPLEMENTATION_BASELINE_BLOCKED` entries.
 
-If `IMPLEMENTATION_BASE_SHA=non-git`, Phase 9 will be SKIPPED and the code reviewers inspect the working tree directly. Pass `non-git` as the input value to downstream subagents that expect this variable. The baseline event is still written with `base_sha=non-git, uncommitted_changes=no` so consumers have a single source.
+If `IMPLEMENTATION_BASE_SHA=non-git`, Phase 10 will record `outcome=BLOCKED` (reason=not-a-git-repo) and perform no commit; the code reviewers inspect the working tree directly. Pass `non-git` as the input value to downstream subagents that expect this variable. The baseline event is still written with `base_sha=non-git, uncommitted_changes=no` so consumers have a single source.
 
 ### Step 6.1 — Dispatch implementer
 
@@ -8369,43 +8461,71 @@ Runs after the Phase 7 code-review gate passes. Non-gated phase: no per-phase pr
 
 ### Step 8.1 — Test rounds
 
-For each round N (start at 1, hard cap at 4 — the initial run plus at most 3 fix→re-run rounds):
+For each round N (start at 1, hard cap at 4 — the initial run plus at most 3 fix→re-run rounds), `$PHASE_DIR/$ITERATION` is `8-all-tests/NN` (`$ROUND`, never `round-NN`):
 
-1. `mkdir -p <feature-folder>/8-all-tests/round-NN`.
-2. Dispatch one `claude` subprocess for role `all-tests-runner`. Inputs: `$FEATURE_FOLDER`, `$REPO_ROOT`, `$ROUND=NN`. This role's timeout comes from the Models table via `role_timeout`. The runner:
+1. `mkdir -p <feature-folder>/8-all-tests/NN`.
+2. Dispatch one `claude` subprocess for role `all-tests-runner` (`dispatch_attempt 8 $ROUND all-tests-runner`). Inputs: `$FEATURE_FOLDER`, `$REPO_ROOT`, `$ROUND=NN`. This role's timeout comes from the Models table via `role_timeout`. Its real STATUS: `runner_status="$(role_attempt_dir all-tests-runner "$(_latest_attempt_id p08-i$ROUND-all-tests-runner)")/STATUS.md"`. **All test commands run in the foreground under print-mode rules (spec §12.2) — never backgrounded.** The runner:
+   - Runs every command the accepted plan's `## Task Contract` blocks declared under `verification` (spec §19.2) PLUS the repository's authoritative full suite (below). For EACH command, calls `append_verification_record` (cookbook) to append to `8-all-tests/NN/verification-records.jsonl` — fresh in round 1, appended to in later rounds (the same Mode A/Mode B convention the implementer's own `verification-records.jsonl` already uses) — one record per command, never a single phase-level rollup standing in for per-command evidence.
    - `start-all-tests.sh` is a project-specific convention, not a universal one; fall through to discovery when it is absent. If `$REPO_ROOT/start-all-tests.sh` exists, runs it (the canonical full-suite entry point for repos that define one).
    - Otherwise discovers every test suite present in the repo (`uv run pytest` for Python suites — plain `pytest` is not installed standalone in this environment, `package.json` test scripts, etc.) and runs each.
-   - If neither the script nor any test suite exists, reports `verdict=SKIPPED, reason=no-tests-found`.
-   - Writes the detailed per-round report `8-all-tests/round-NN/test-report.md`, rewrites the cumulative `8-all-tests/all-test-summary.md`, then writes STATUS `8-all-tests/round-NN/test-runner-status.md` LAST.
-3. Read only `test-runner-status.md`. Append the RUN_LOG dispatch entry (`phase: 8`, `phase_name: all-tests`, `iteration: NN`, `role: all-tests-runner`).
-4. Branch on the verdict:
+   - If neither the script nor any test suite exists AND the plan declared no verification commands of its own, reports `verdict=SKIPPED, reason=no-tests-found`.
+   - Writes the detailed per-round report `8-all-tests/NN/test-report.md`, rewrites the cumulative `8-all-tests/all-test-summary.md`, then publishes STATUS LAST.
+3. Read only the runner's own STATUS.md. `dispatch_attempt` already appended the RUN_LOG dispatch entry (`phase: 8`, `phase_name: all-tests`, `iteration: NN`, `role: all-tests-runner`).
+4. Call `validate_verification_records "8-all-tests/NN/verification-records.jsonl"` (cookbook, spec §19.2) — the zero-token enforcement of every per-record rule (empty-is-never-PASS, EXCLUDED evidence, NOT_RUN reason, controlled performance baseline) the runner's own STATUS cannot self-certify. A validation failure is Mode 4 (malformed evidence) regardless of what the runner claimed. `EXCLUDED` and `NOT_RUN` records are policy-valid evidence, never silently promoted to `PASS` — both flow through to Phase 9/Phase 11 exactly as recorded, never becoming PASS by exhausting the fix cap below.
+5. Branch on the runner's verdict:
    - **`PASS` or `SKIPPED`** → proceed to Step 8.2.
-   - **`FAIL` with fix rounds used < 3:** dispatch one `claude` subprocess for role `test-fixer`. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$ROUND=NN`, `$TEST_REPORT_PATH` (= `8-all-tests/round-NN/test-report.md`), `$IMPLEMENTATION_BASE_SHA`. This role's timeout comes from the Models table via `role_timeout`. STATUS: `8-all-tests/round-NN/test-fixer-status.md`. On `verdict=DONE`, increment N and loop from step 1. On `verdict=BLOCKED`, stop the fix loop early — do NOT HALT; proceed to Step 8.2 with the round's failures as residual.
-   - **`FAIL` with fix rounds exhausted (3 used):** do NOT HALT. Proceed to Step 8.2 — the final test verdict is `FAILED`, and `all-test-summary.md` MUST carry the detailed residual-failure record (failing test names, error excerpts, suspected causes, and what each fix round attempted).
+   - **A genuine `FAIL`, with fix rounds used < 3:** dispatch one `claude` subprocess for role `test-fixer` (`dispatch_attempt 8 $ROUND test-fixer` — `mutates=yes`, so this dispatch automatically acquires the single write lease and its before/after mutation snapshot before launch; `test-fixer` never runs without holding it). Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$ROUND=NN`, `$TEST_REPORT_PATH` (= `8-all-tests/NN/test-report.md`), `$IMPLEMENTATION_BASE_SHA`. This role's timeout comes from the Models table via `role_timeout`. On `verdict=DONE`, increment N and loop from step 1 — this is the review-back rule: the fixer's own `DONE` claim is never trusted on its own word; the NEXT round's runner, re-verifying every command from scratch under the same lease/snapshot/checkpoint discipline, is the canonical re-verification authority (the fixer's own appendix already states this). On `verdict=BLOCKED`, stop the fix loop early — do NOT HALT; proceed to Step 8.2 with the round's failures as residual.
+   - **A genuine `FAIL`, with fix rounds exhausted (3 used):** do NOT HALT. Proceed to Step 8.2 — the final test verdict is `FAILED`, and `all-test-summary.md` MUST carry the detailed residual-failure record (failing test names, error excerpts, suspected causes, and what each fix round attempted).
 
 ### Step 8.2 — Summarizer
 
-Dispatch one `claude` subprocess for role `summarizer-all-tests`. Inputs: `$FEATURE_FOLDER`. The summarizer APPENDS the `## Usage` section to `8-all-tests/all-test-summary.md` (the runner already wrote the content) and writes `8-all-tests/summarizer-status.md` carrying `final_test_verdict: PASS | FAILED | SKIPPED`. This role's timeout comes from the Models table via `role_timeout`.
+Dispatch one `claude` subprocess for role `summarizer-all-tests`. Inputs: `$FEATURE_FOLDER`. The summarizer APPENDS the `## Usage` section to `8-all-tests/all-test-summary.md` (the runner already wrote the content) and writes its own STATUS carrying `final_test_verdict: PASS | FAILED | SKIPPED`. This role's timeout comes from the Models table via `role_timeout`.
 
-You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 9 — regardless of `final_test_verdict`. A `FAILED` final test verdict never halts the run; it is recorded in detail in `all-test-summary.md` and forces the final readiness verdict to `NOT_READY` (see the readiness-writer appendix).
+You read only the summarizer's own STATUS.md. On `verdict=DONE`, proceed to Phase 9 — regardless of `final_test_verdict`. A `FAILED` final test verdict never halts the run; it is recorded in detail in `all-test-summary.md` and forces the final readiness verdict to `NOT_READY` (see the readiness-writer appendix).
 
-## Phase 9 — Git finalization (delegated)
+## Phase 9 — Documentation and handoff (delegated)
 
-Skip this phase entirely if the working directory is not a git repository (detected via `git status` exit code != 0). In that case, write `<feature-folder>/9-git-finalization/git-status.md` with `verdict=SKIPPED` and `reason=not-a-git-repo` by dispatching a one-shot `claude` subprocess for role `finishing-branch` — the appendix detects the no-git case and writes SKIPPED itself.
+Runs after Phase 8 reaches its policy-valid terminal result (`summarizer-all-tests`'s own STATUS `verdict=DONE` — regardless of `final_test_verdict`; a `FAILED`/`SKIPPED` test outcome is still a policy-valid terminal state for Phase 8, never confused with Phase 8 itself failing to complete). Non-gated, non-iterative phase: iteration is always `00`; `$PHASE_DIR` is `9-documentation`.
 
-Otherwise:
+Phase 9 owns:
 
-Dispatch one `claude` subprocess for role `finishing-branch`. Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. The subagent loads `superpowers:finishing-a-development-branch`, reviews the diff against the captured baseline, stages only intended files (no `.env`, secrets, or large binaries; nothing outside the implementation slice), and commits per the plan's git rules and the project's `CLAUDE.md` git policy.
+```text
+$FEATURE_FOLDER/9-documentation/
+  00/attempts/<dispatch-id>/STATUS.md
+  uat.md
+  planned-vs-realized.md
+  documentation-validation.md
+$FEATURE_FOLDER/followups.jsonl
+```
 
-Output: `<feature-folder>/9-git-finalization/git-status.md` with `verdict ∈ {DONE, SKIPPED, FAILED}`, `implementation_base_sha`, plus commit SHAs (if any). This role's timeout comes from the Models table via `role_timeout`.
+1. Dispatch one `claude` subprocess for role `documentation-writer` (`dispatch_attempt 9 00 documentation-writer` — `mutates=yes`, so this automatically acquires the single write lease and its before/after snapshot before launch; `documentation-writer` never runs without holding it). Inputs (see the `documentation-writer` appendix's own Inputs section for the full description of each): `$FINAL_DIFF`, `$ACCEPTED_SPEC` (= `$SPEC_PATH`), `$ACCEPTED_PLAN` (= `$PLAN_PATH`), `$IMPLEMENTATION_SUMMARY` (= `6-implementation/implementation-summary.md`), `$TEST_SUMMARY` (= `8-all-tests/all-test-summary.md`), `$REVIEW_SUMMARY` (= `7-code-review/code-review-summary.md`), `$DECISIONS`, `$EXCLUSIONS`, `$FOLLOWUPS` (the current `followups.jsonl`, or empty if it does not exist yet), `$WRITE_LEASE`. This role's timeout comes from the Models table via `role_timeout`.
+2. Read only the writer's own STATUS.md. `dispatch_attempt` already appended the RUN_LOG dispatch entry (`phase: 9`, `phase_name: documentation`, `iteration: 00`, `role: documentation-writer`).
+3. **Follow-up ingestion — orchestrator-only, never the role's own write.** After the dispatch's classification is durable, read `x_followup_candidates` from the writer's STATUS (a JSON array; empty when none). For EACH candidate, call `append_followup` (cookbook, spec §20.9) with that candidate's fields to append one canonical record to `$FEATURE_FOLDER/followups.jsonl`. This is the ONLY code path that ever creates or appends to that file — `documentation-writer`'s own appendix reads `$FOLLOWUPS` as an input but never opens the file for writing.
+4. Branch on the verdict:
+   - **`DONE` or `PARTIAL`** → proceed to Phase 10, regardless of `documentation_validation`. A `documentation_validation` of anything other than `PASS` (a residual structural gap surviving up to `policy_value documentation_fix_cap` self-correction rounds) does not block progression — it is recorded in `documentation-validation.md` and forces the final readiness verdict to at least `READY_WITH_NOTES` (see the readiness-writer appendix), the exact same "never a silent PASS" discipline Phase 8's `EXCLUDED`/`NOT_RUN` records already follow.
+   - **`BLOCKED`** (write-lease not held) is an orchestration bug — HALT with a reconciliation report, the same rule every other mutating role's no-lease `BLOCKED` case follows.
 
-You read only `git-status.md`.
+You read only the writer's own STATUS.md and `documentation-validation.md`.
 
-## Phase 10 — Final readiness report (delegated)
+## Phase 10 — Local git finalization (direct orchestrator operation, no dispatch)
 
-Dispatch one `claude` subprocess for role `readiness-writer`. Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`, `$PLAN_PATH`. The subagent reads every per-phase summary file inside the feature folder (preflight statuses, phase-0 status, spec-review summary, plan-review summary, implementation summary, code-review summary, all-test summary, git status) and writes:
+Git finalization moves after documentation so the final local commit can include all intended product documentation changes (`9-documentation/uat.md`, `planned-vs-realized.md`, `documentation-validation.md`, `followups.jsonl`, plus any other path `documentation-writer`'s own STATUS `changed_paths` field names). Phase 10 is executed **directly by the orchestrator. It MUST NOT dispatch `finishing-branch` or any other subagent/model role** — `finishing-branch` is retired (see the Role Contract Registry note above). This is the one phase, besides the orchestrator's existing `RUN_LOG.md`/`full_log.md`/`process-improvement-proposition.md`/`transcripts/` writes, where the orchestrator itself is permitted to mutate the repository (see the "Running red flags" exception above).
 
-- `<feature-folder>/final-readiness-report.md` — the human-facing report covering: artifacts, reviewer verdicts (including `partial_review` flag if Codex was unavailable), implementation result, verification result, git result, skipped optional steps, residual MINOR/NIT items, and overall readiness verdict.
+1. Compute the exact candidate staging paths: `9-documentation/uat.md`, `9-documentation/planned-vs-realized.md`, `9-documentation/documentation-validation.md`, `followups.jsonl`, plus every path listed in `documentation-writer`'s own STATUS `changed_paths` field (repo-relative, deduplicated). Assert every one of `documentation-writer`'s three REQUIRED outputs (`uat.md`, `planned-vs-realized.md`, `documentation-validation.md`) actually exists on disk — a `DONE`/`PARTIAL` STATUS whose accepted output is nonetheless missing is invalid/incomplete documentation, spec §20.10 step 1's own gate. If any is missing: go to step 6 with `REASON=missing-documentation-output:<path>`, `outcome=BLOCKED`, `base_sha`/`final_sha` = the current `git -C "$REPO_ROOT" rev-parse HEAD`, `staged_paths=[]`, `commit_sha=null` — no lease is ever acquired.
+2. If `$IMPLEMENTATION_BASE_SHA=non-git` (captured at Phase 6, spec §16.2), skip straight to step 6 with `REASON=not-a-git-repo`, `outcome=BLOCKED`, `base_sha=non-git`, `final_sha=non-git`, `staged_paths=[]`, `commit_sha=null` — no lease is ever acquired; there is nothing a lease could protect.
+3. Otherwise call `acquire_write_lease orchestrator-finalization orchestrator "" 10 <the staging paths from step 1>` (cookbook, spec §11.1/§20.10) — the third argument (`DISPATCH_ID`) is an EMPTY string, never the literal word `null`: the cookbook's own contract records an empty `DISPATCH_ID` as JSON `null` in `write-lease.json`, but a non-empty string `"null"` would be recorded as the JSON STRING `"null"`, not the JSON value `null` spec §20.10 requires. This single call itself IS the required "assert no lease remains" check — `acquire_write_lease` already refuses an active, malformed, stale, or ambiguous existing lease and returns non-zero without staging anything. On failure, go to step 6 with `REASON=<the refusal>`, `outcome=BLOCKED`, `base_sha`/`final_sha` = the pre-attempt `git -C "$REPO_ROOT" rev-parse HEAD` (nothing changed), `staged_paths=[]`, `commit_sha=null`.
+4. On success, `BASE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"`. Before staging, verify `git -C "$REPO_ROOT" diff --cached --name-only` is empty — a non-empty pre-existing staged diff is an unexplained dirty-tree-ownership conflict, not this phase's own doing. If non-empty: go to step 6 with `REASON=unexpected-pre-staged-paths`, `outcome=BLOCKED`, `final_sha=$BASE_SHA`, `commit_sha=null`, then release the lease (step 7). Otherwise stage ONLY the declared paths (`git -C "$REPO_ROOT" add -- <staging paths>`), then re-check `git diff --cached --name-only`: every staged path MUST be a member of the declared set — reject any path that is not (`git -C "$REPO_ROOT" restore --staged -- <the offending paths>`, then step 6 with `REASON=unexpected-staged-path`, `outcome=BLOCKED`).
+5. If the (now-verified) staged diff is empty, no in-scope path actually changed: go to step 6 with `REASON=no-in-scope-changes`, `outcome=NO_CHANGES`, `final_sha=$BASE_SHA`, `commit_sha=null` — a no-change result is valid and never creates an empty commit. Otherwise create the commit (`git -C "$REPO_ROOT" commit -m "<message per the plan's git rules / CLAUDE.md git policy>"`). On a non-zero exit (e.g. a failing commit hook), go to step 6 with `REASON=<the commit command's own exit code/stderr tail>`, `outcome=FAILED`, `final_sha=$BASE_SHA` (the commit never landed), `commit_sha=null` — do not retry blindly. On success, `FINAL_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"` and go to step 6 with `REASON=finalized`, `outcome=COMMITTED`, `commit_sha=$FINAL_SHA`.
+6. Record exactly one `record_event GIT_FINALIZATION_RESULT reason=$REASON base_sha=$BASE_SHA final_sha=$FINAL_SHA staged_paths=<JSON array of the staged-path manifest> commit_sha=<the commit SHA, or the literal word null> push_performed=no outcome=<COMMITTED|NO_CHANGES|BLOCKED|FAILED>` (spec §20.10 step 4). `reason` (the common envelope's own required field, never empty) is set by whichever branch above reached this step — COMMITTED and NO_CHANGES carry a plain descriptive reason exactly like every BLOCKED/FAILED branch already must, since `record_event` itself refuses any event with an empty `reason`. This is the ONLY durable record Phase 10 produces — there is no `git-status.md` and no per-phase folder (see "Folder layout" above); Phase 11 reads this event straight out of `RUN_LOG.md`.
+7. If a lease was acquired in step 3, release it now (`release_write_lease orchestrator-finalization`) — only after step 6's result is durable (spec §20.10 step 5). If no lease was ever acquired (the step 1, 2, or 3 early exits), there is nothing to release.
+
+Phase 10 MUST NOT push, open a pull request, merge, publish, deploy, or rewrite shared history — `push_performed` is always `no`. Such work requires a new, separately scoped owner action outside this process run.
+
+## Phase 11 — Readiness and completion (delegated)
+
+Dispatch one `claude` subprocess for role `readiness-writer` (`dispatch_attempt 11 00 readiness-writer`). Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`, `$PLAN_PATH`. The subagent reads every per-phase summary file inside the feature folder (preflight statuses, phase-2 status, spec-review summary, plan-review summary, implementation summary, code-review summary, all-test summary, `9-documentation/documentation-validation.md`, `followups.jsonl`, and the LATEST `event=GIT_FINALIZATION_RESULT` entry in `RUN_LOG.md` — never a `git-status.md` file, which no longer exists) and writes:
+
+- `<feature-folder>/final-readiness-report.md` — the human-facing report covering: artifacts, reviewer verdicts (including `partial_review` flag if Codex was unavailable), implementation result, verification result, documentation/UAT status, git result, skipped optional steps, residual MINOR/NIT items, follow-ups (from `followups.jsonl`, grouped by actor), and overall readiness verdict.
 - `<feature-folder>/readiness-status.md` — STATUS with `verdict=DONE` and `report_path=<absolute>`.
 
 This role's timeout comes from the Models table via `role_timeout`.
@@ -8419,8 +8539,10 @@ Print to the user a concise message containing the following paths:
 - `<feature-folder>/6-implementation/implementation-summary.md`
 - `<feature-folder>/7-code-review/code-review-summary.md`
 - `<feature-folder>/8-all-tests/all-test-summary.md`
+- `<feature-folder>/9-documentation/uat.md`
+- `<feature-folder>/followups.jsonl` (if present)
 - Canonical spec path and plan path
-- Test summary (final test verdict + residual failures if any), git summary, skipped optional steps, `partial_review` flag if any, overall readiness verdict.
+- Test summary (final test verdict + residual failures if any), documentation/UAT status, git summary, skipped optional steps, `partial_review` flag if any, overall readiness verdict.
 
 That message is the user-facing end of a successful run.
 
@@ -8721,8 +8843,9 @@ Existing entries written by prior versions of this process file MAY lack the nin
 | 6 | `implementation` |
 | 7 | `code-review` |
 | 8 | `all-tests` |
-| 9 | `git-finalization` |
-| 10 | `readiness-report` |
+| 9 | `documentation` |
+| 10 | `git-finalization` |
+| 11 | `readiness-report` |
 
 `phase_name` applies to every `DISPATCH_STARTED`/`DISPATCH_COMPLETED`/`DISPATCH_NOT_LAUNCHED`/`ATTEMPT_FAILED` entry and to every other event entry that carries `phase:` (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE`). Events that do not carry `phase:` (`IMPLEMENTATION_BASELINE`, `IMPLEMENTATION_BASELINE_BLOCKED`) do not need `phase_name`. Existing entries in already-written RUN_LOGs are not back-filled — readers MUST tolerate entries that lack `phase_name`.
 
@@ -8915,7 +9038,7 @@ On re-run of this prompt against the same feature folder:
 5. Branch by the phase being resumed into:
    - **Resuming before Phase 2** (no phases have started yet — RUN_LOG contains no dispatch entries past Phase 1, or RUN_LOG is empty / has only Phase 1 entries with no `READY` verdict): run Phase 1 in full as if a fresh invocation. Phase 1 itself is not "gated" by per-phase preflight — the Phase 1 logic *is* the preflight. The Step 1.2 relocation runs again on success.
    - **Resuming into Phase N where N ∈ {3, 5, 6, 7}** (a gated phase): the orchestrator runs (or re-runs) Phase N's per-phase preflight before the **next dispatch in the session** (defined as the next dispatch after the process resume, even if Phase N's first work dispatch already executed in a prior session), regardless of whether Phase N's preflight ran in the pre-resume session, and regardless of whether the resume happens before Phase N's first dispatch, between iterations, during a fixer dispatch, or immediately after one. Re-run STATUS files OVERWRITE the prior session's `<phase>/preflight/<vendor>-check-status.md` artifacts — overwrite (not versioned filenames) is the intentional policy: the per-phase preflight verdict is the **current** truth. Pre-resume preflight history is preserved indirectly via the RUN_LOG dispatch entries (each retains `develop_it_git_sha`, timestamp, and verdict). After the resume preflight completes, the per-phase cache applies normally for any further iterations in that session until the next phase transition or halt.
-   - **Resuming into a non-gated phase** (Phase 2, 4, 8, 9, 10, or any future phase not in {3, 5, 6, 7}): no preflight runs on resume. The orchestrator picks up where it left off using the most recent applicable preflight verdict from RUN_LOG (Phase 1 for Phases 2 and 4, or the most recent per-phase preflight for Phase 8, 9, or 10 (and analogously for any future non-gated phase)) and any in-scope flags such as `codex_disabled_by_user`. This is a direct consequence of the "gated set is exactly {3, 5, 6, 7}" rule, not a violation of it.
+   - **Resuming into a non-gated phase** (Phase 2, 4, 8, 9, 11, or any future phase not in {3, 5, 6, 7}): no preflight runs on resume. The orchestrator picks up where it left off using the most recent applicable preflight verdict from RUN_LOG (Phase 1 for Phases 2 and 4, or the most recent per-phase preflight for Phase 8 or 9 (and analogously for any future non-gated phase)) and any in-scope flags such as `codex_disabled_by_user`. This is a direct consequence of the "gated set is exactly {3, 5, 6, 7}" rule, not a violation of it. Phase 10 is a direct orchestrator operation with no dispatch and no preflight of its own — on resume into Phase 10, the orchestrator simply re-evaluates the lease/staging state exactly as Step 5 below describes; Phase 11 (readiness) likewise dispatches only `readiness-writer`, a non-gated role.
 6. Resume from the next un-completed step.
 
 Resume reads `RUN_LOG.md` for the last completed step **and** calls
@@ -8962,7 +9085,7 @@ If you (the orchestrator) catch yourself doing any of the following, STOP immedi
 
 ### Running red flags
 - Invoking `pytest`, `ruff`, `npm`, `make`, the application, or any build/test tool directly.
-- Running `git add`, `git commit`, `git checkout`. These belong to the Phase 9 subagent (and to the implementer / debugger / test-fixer subagents for their own fix commits).
+- Running `git add`, `git commit`, `git checkout` yourself outside Phase 10. These belong to the implementer / debugger / test-fixer / documentation-writer subagents for their own fix/doc commits. The sole exception is Phase 10's own direct local finalization commit (spec §20.10), performed by the orchestrator itself under its own write lease, staging and committing only the declared in-scope paths.
 - Read-only git is allowed: `git status`, `git log`, `git diff --stat`, `git rev-parse HEAD` (the last is used to record the `$PROCESS_PATH` git SHA in RUN_LOG; the file's content SHA-256 is recorded separately — see the dispatch entry shape in the orchestration contract).
 
 ### Reasoning leaks
@@ -9012,7 +9135,7 @@ The orchestrator **MUST append an entry** on each of these events:
 
 1. Any `event=CODEX_UNAVAILABLE` (regardless of phase or failure_mode).
 2. Any `event=CLAUDE_FAILED`.
-3. Any retry of a dispatch within the same iteration (e.g. Mode 4 retry-once policy after a transient failure). Normal next-iteration progression of an iteration loop (spec-review, plan-review, code-review) or next-round progression of the Phase 8 all-tests loop is NOT a "retry" for this purpose — iteration number is already recorded in `RUN_LOG.md` and need not be re-logged here unless the orchestrator has a specific observation to record. The iteration-cap trigger (#5) covers the terminal case. Concretely: a "retry within iteration" is identified in `RUN_LOG.md` by a second `dispatch` entry whose `iteration:` field is unchanged from the immediately preceding failed dispatch in the same `phase:` AND whose `role:` matches that preceding failed dispatch; the completion-check uses this pair as the countable event. Phases without an iteration loop (preflight, context-discovery, plan-writing, implementation, git-finalization, readiness-report) only trigger this rule when the same `role:` is dispatched a second time within the same `phase:` after a failed first dispatch — the `iteration:` field, if present at all in those phases, is treated as trivially satisfied and the `role:` equality check is the load-bearing condition. **Example exclusion:** a `debugger` dispatch after a failed `implementer` dispatch in Phase 6 is NOT a retry — different roles, so trigger #3 does not fire (this is structured remediation, not a retry). A second `implementer` dispatch after a failed `implementer` dispatch in Phase 6 IS a retry and DOES fire trigger #3. Likewise, a `test-fixer` dispatch after a FAIL test round in Phase 8 is NOT a retry (different roles — structured remediation), but a second `all-tests-runner` dispatch with an unchanged `iteration:` after a failed first one IS. The same logic applies to Phase 9 (`finishing-branch`): trigger #3 fires only on a second `finishing-branch` dispatch after a failed first one.
+3. Any retry of a dispatch within the same iteration (e.g. Mode 4 retry-once policy after a transient failure). Normal next-iteration progression of an iteration loop (spec-review, plan-review, code-review) or next-round progression of the Phase 8 all-tests loop is NOT a "retry" for this purpose — iteration number is already recorded in `RUN_LOG.md` and need not be re-logged here unless the orchestrator has a specific observation to record. The iteration-cap trigger (#5) covers the terminal case. Concretely: a "retry within iteration" is identified in `RUN_LOG.md` by a second `dispatch` entry whose `iteration:` field is unchanged from the immediately preceding failed dispatch in the same `phase:` AND whose `role:` matches that preceding failed dispatch; the completion-check uses this pair as the countable event. Phases without an iteration loop (preflight, context-discovery, plan-writing, implementation, documentation, readiness-report) only trigger this rule when the same `role:` is dispatched a second time within the same `phase:` after a failed first dispatch — the `iteration:` field, if present at all in those phases, is treated as trivially satisfied and the `role:` equality check is the load-bearing condition. **Example exclusion:** a `debugger` dispatch after a failed `implementer` dispatch in Phase 6 is NOT a retry — different roles, so trigger #3 does not fire (this is structured remediation, not a retry). A second `implementer` dispatch after a failed `implementer` dispatch in Phase 6 IS a retry and DOES fire trigger #3. Likewise, a `test-fixer` dispatch after a FAIL test round in Phase 8 is NOT a retry (different roles — structured remediation), but a second `all-tests-runner` dispatch with an unchanged `iteration:` after a failed first one IS. A second `documentation-writer` dispatch in Phase 9 after a failed first one IS a retry by the same rule (only one role exists in that phase, so the role-equality check trivially holds). Phase 10 has no dispatch at all — it is a direct orchestrator operation — so trigger #3 never applies there.
 
    **Say which kind of re-dispatch it was.** The shape test above is purely
    structural, so it cannot tell an *automatic* retry (the Mode-4 retry-once
@@ -9105,7 +9228,7 @@ To enforce "writing here cannot influence current execution":
 
 - The orchestrator MUST NOT read `process-improvement-proposition.md` during the run that wrote it. The reading-red-flags section above lists this as a forbidden action.
 - The file content does NOT contribute to any verdict, summary, gate decision, or readiness classification.
-- The readiness-writer subagent (Phase 10) lists the file in the **Artifacts** section of `final-readiness-report.md` (so the user knows the file exists), but does NOT read its content for verdict purposes. If the file does not exist at Phase 10 (no mandatory triggers fired and no spontaneous entries were emitted), readiness-writer lists it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
+- The readiness-writer subagent (Phase 11) lists the file in the **Artifacts** section of `final-readiness-report.md` (so the user knows the file exists), but does NOT read its content for verdict purposes. If the file does not exist at Phase 11 (no mandatory triggers fired and no spontaneous entries were emitted), readiness-writer lists it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
 - The orchestrator MUST NOT cite the file's content in any other `RUN_LOG.md` entry, STATUS file, or user-facing message.
 
 ### Privacy / anti-leak
@@ -9127,8 +9250,9 @@ This Develop-It SDLC step is complete only when ALL of the following hold:
 - Credential-dependent checks ran or were safely skipped per the plan.
 - Code review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
 - Phase 8 all-tests completed: `8-all-tests/summarizer-status.md` = `DONE` and `8-all-tests/all-test-summary.md` exists. A `final_test_verdict` of `FAILED` (residual failures after the 3-fix-round cap) does NOT block completion — the run completes with the detailed residual-failure record in the summary and the readiness verdict forced to `NOT_READY`. `SKIPPED` (`no-tests-found`) does not block.
-- Phase 9 git result is `DONE` or `SKIPPED` with a clear reason; `9-git-finalization/git-status.md` exists.
-- Phase 10 readiness report exists (`<feature-folder>/final-readiness-report.md`) and `<feature-folder>/readiness-status.md` = `DONE`.
+- Phase 9 documentation and handoff completed: `documentation-writer`'s STATUS is `DONE` or `PARTIAL` (a `BLOCKED` verdict — write-lease not held — is an orchestration bug and does not complete); `9-documentation/uat.md`, `9-documentation/planned-vs-realized.md`, and `9-documentation/documentation-validation.md` exist. A `documentation_validation` of anything other than `PASS` does NOT block completion — the residual gap is recorded and the readiness verdict is forced to at least `READY_WITH_NOTES`.
+- Phase 10 local git finalization recorded exactly one `event=GIT_FINALIZATION_RESULT` in `RUN_LOG.md` with `outcome ∈ {COMMITTED, NO_CHANGES, BLOCKED, FAILED}`. No push, PR, merge, or remote configuration was ever performed (`push_performed: no` always).
+- Phase 11 readiness report exists (`<feature-folder>/final-readiness-report.md`) and `<feature-folder>/readiness-status.md` = `DONE`.
 - The final user-facing message lists all artifact paths, the test summary, git summary, skipped optional steps, `partial_review` flag if any, and readiness verdict.
 - Every dispatch entry in `RUN_LOG.md` carries the nine usage-telemetry fields (`model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`, `usage_status`).
 - Every phase summary file (`spec-review-summary.md`, `plan-review-summary.md`, `implementation-summary.md`, `code-review-summary.md`, `all-test-summary.md`) ends with a `## Usage` section containing phase total, per-vendor, and per-role × iteration tables.
@@ -10730,13 +10854,17 @@ You are a test runner invoked as a fresh subprocess by the develop-it orchestrat
 
 ## Behavior
 
+**All test commands run in the foreground under print-mode rules (spec §12.2) — never backgrounded.**
+
 1. Determine the execution mode. `start-all-tests.sh` is a project-specific convention; fall through to discovery when absent.
    - If `$REPO_ROOT/start-all-tests.sh` exists, the mode is `script`: run it from `$REPO_ROOT` (`bash start-all-tests.sh`), capturing stdout+stderr.
    - Otherwise the mode is `discovery`: enumerate every test suite present in the repo — e.g. Python suites (`uv run pytest`, honoring `pyproject.toml` / `pytest.ini` configuration — plain `pytest` is not installed standalone in this environment), JS/TS `package.json` `test` scripts (run per package), and any other runner the repo's config files declare. Run each suite, capturing output.
-   - If the script does not exist AND no test suite is discovered, the round verdict is `SKIPPED` with `reason=no-tests-found`.
-2. Do NOT fix anything. You only run tests and report — fixing belongs to the `test-fixer` role.
-3. Write `$FEATURE_FOLDER/8-all-tests/round-$ROUND/test-report.md` — the detailed per-round report: execution mode, exact commands, per-suite pass/fail counts, every failing test's name, the relevant error excerpt (assertion/traceback tail, not the full log).
-4. Rewrite `$FEATURE_FOLDER/8-all-tests/all-test-summary.md` (full overwrite, cumulative across rounds — re-read earlier rounds' `test-report.md` / `test-runner-status.md` / `test-fixer-status.md` files) with:
+   - Also run every command the accepted plan's own `## Task Contract` blocks declared under `verification` (spec §19.2), even when it duplicates a suite already covered by the script/discovery mode above — the plan's own declared commands are first-class evidence, not merely covered by the repository-wide run.
+   - If the script does not exist, no test suite is discovered, AND the plan declared no verification commands of its own, the round verdict is `SKIPPED` with `reason=no-tests-found`.
+2. For EACH command run in step 1 (the full-suite script/discovery run counts as one command; each plan-declared verification command counts as its own), call `append_verification_record` (cookbook, spec §19.2) to append one record to `$FEATURE_FOLDER/8-all-tests/$ROUND/verification-records.jsonl` — `result: PASS|FAIL|EXCLUDED|NOT_RUN` per that command's own outcome, never a single rollup standing in for every command. Round 1 starts the file fresh; a later fix round APPENDS to the SAME file (never truncates it), reusing the SAME `verification_id` for a command re-run after a fix, so the latest record supersedes the earlier one (the same Mode A/Mode B convention the implementer's own verification records already use).
+3. Do NOT fix anything. You only run tests and report — fixing belongs to the `test-fixer` role.
+4. Write `$FEATURE_FOLDER/8-all-tests/$ROUND/test-report.md` — the detailed per-round report: execution mode, exact commands, per-suite pass/fail counts, every failing test's name, the relevant error excerpt (assertion/traceback tail, not the full log).
+5. Rewrite `$FEATURE_FOLDER/8-all-tests/all-test-summary.md` (full overwrite, cumulative across rounds — re-read earlier rounds' `test-report.md` and their attempt-scoped STATUS.md files) with:
    - Execution mode (`script` / `discovery`) and the commands used.
    - Per-round results table: round, suites run, total / passed / failed.
    - Current verdict after this round.
@@ -10769,13 +10897,14 @@ reason: <one line, or the literal word null>
 published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
 artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
 output_count: 1
-output_01: <absolute path to round-$ROUND/test-report.md>
+output_01: <absolute path to $ROUND/test-report.md>
 checkpoint_path: null
 x_mode: script | discovery
 x_suites_run: <int>
 x_tests_total: <int>
 x_tests_passed: <int>
 x_tests_failed: <int>
+x_verification_records_path: <absolute path to $ROUND/verification-records.jsonl>
 STATUS
 ```
 
@@ -11242,7 +11371,7 @@ You are a phase summarizer invoked as a fresh subprocess by the develop-it orche
 
 ## Behavior
 
-1. Read every `8-all-tests/round-*/test-runner-status.md` (and `test-fixer-status.md` where present). Determine: `final_test_verdict` (`PASS` if the last round passed; `SKIPPED` if the runner reported no tests; `FAILED` if failures remain after the fix loop ended — cap exhausted or fixer `BLOCKED`), rounds used, fix rounds dispatched, residual failure count.
+1. Read every round's own attempt-scoped STATUS (`8-all-tests/*/attempts/*-all-tests-runner-*/STATUS.md`, and `8-all-tests/*/attempts/*-test-fixer-*/STATUS.md` where present — never the retired `round-*/test-runner-status.md` alias). Determine: `final_test_verdict` (`PASS` if the last round passed; `SKIPPED` if the runner reported no tests; `FAILED` if failures remain after the fix loop ended — cap exhausted or fixer `BLOCKED`), rounds used, fix rounds dispatched, residual failure count.
 2. Verify `all-test-summary.md` carries the **Residual failures** detail section whenever `final_test_verdict=FAILED`; if the runner's last write is missing detail that exists in the round reports, fold it in (edit the summary in place) — the summary must be self-sufficient for the readiness writer and the user.
 3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter dispatch entries (NOT event entries) where `phase=8`. Compute the same Usage aggregation as `summarizer-implementation` (phase total, per-vendor subtotal, per-role × round detail; rows with `usage_status=unavailable` are skipped from the detail table but counted in a footnote).
 4. APPEND the `## Usage` section to `$FEATURE_FOLDER/8-all-tests/all-test-summary.md` with the three standard tables (same columns and formatting rules as `summarizer-implementation`).
@@ -11323,11 +11452,18 @@ You are the Phase 9 documentation/handoff writer, invoked as a fresh subprocess 
 
 1. Confirm you hold `$WRITE_LEASE`. If absent or expired, write STATUS with `verdict=BLOCKED, reason=write-lease-not-held` and exit 0.
 2. If `$CONTINUATION_PATH` is set, read it first: resume from the document its last record names as `next_unit`, reconcile at most the one dirty (`state: partial`) document using `$DECLARED_FOREIGN_CHANGES`, and never re-draft a document already marked `completed`.
-3. Cross-reference `$ACCEPTED_SPEC` and `$ACCEPTED_PLAN` against `$FINAL_DIFF` to write `planned-vs-realized.md`: what was planned, what actually shipped, and any material deviation.
-4. Write `uat.md`: concrete, reproducible user-acceptance steps for the shipped behavior.
-5. Validate structurally: every path named in `planned-vs-realized.md` and `uat.md` must exist in `$FINAL_DIFF` or the repository; every claim must trace to `$IMPLEMENTATION_SUMMARY`, `$TEST_SUMMARY`, or `$REVIEW_SUMMARY`. Record the result in `documentation-validation.md`.
-6. Self-correct: if structural validation fails, fix the document and re-validate, up to the `documentation_fix_cap` policy limit. Do not loop past it — record residual gaps instead.
+3. Cross-reference `$ACCEPTED_SPEC` and `$ACCEPTED_PLAN` against `$FINAL_DIFF` to write `planned-vs-realized.md`: what was planned, what actually shipped, and any material deviation. Update README/architecture/progress/operational docs named in `$DOCS_INVENTORY` ONLY when `$FINAL_DIFF` made them stale — never a speculative rewrite of a doc the change did not touch.
+4. Write `uat.md` with these sections, in this order:
+   - **Prerequisites** — environment, accounts, feature flags, or data the user needs before starting.
+   - **Actions** — concrete, numbered, reproducible steps a user follows to exercise the shipped behavior.
+   - **Expected results** — what each action should produce, specific enough to fail loudly if wrong.
+   - **Smoke checks** — the smallest set of checks that confirm the change did not break adjacent behavior.
+   - **Rollback / cleanup** — how to undo or clean up any state the UAT steps themselves created.
+   - **Not yet executed** — a distinct, separately headed section (never folded into Actions or a footnote) naming every UAT step above that YOU did not personally execute or observe, and why (e.g. requires a credential/environment this dispatch does not have, requires a human decision, requires a deployed environment). An empty section still needs the heading, with a line stating nothing is outstanding — the heading's ABSENCE is what `documentation-validation.md`'s structural check treats as a defect, not an empty list under it.
+5. Validate structurally and non-destructively: every path named in `planned-vs-realized.md` and `uat.md` must exist in `$FINAL_DIFF` or the repository; every finding/follow-up ID referenced (from `$FOLLOWUPS` or `$EXCLUSIONS`) must resolve to a real entry; every claim must trace to `$IMPLEMENTATION_SUMMARY`, `$TEST_SUMMARY`, or `$REVIEW_SUMMARY`; `uat.md` must carry the "Not yet executed" heading. Any local command you validate (e.g. checking a CLI's `--help` output, a syntax check) MUST be non-destructive and read-only — never a command that mutates the repository, a database, or a deployed environment; a command you cannot safely validate this way is itself listed under "Not yet executed", not silently assumed to work. Record the result in `documentation-validation.md` as `documentation_validation: PASS | PARTIAL | FAILED` plus the specific gaps found (if any).
+6. Self-correct: if structural validation fails, fix the document and re-validate, up to the `documentation_fix_cap` policy limit. Do not loop past it — record residual gaps in `documentation-validation.md` instead of looping forever.
 7. Do not touch source or test files — this role produces documentation artifacts only.
+8. **Follow-up candidates — never write `followups.jsonl` yourself.** If you notice a new follow-up worth tracking (a residual documentation gap, an unrelated opportunity, anything the orchestrator's `append_followup` should record — spec §20.9), do not open or write that file: it has exactly one writer, the orchestrator, and this role has no path to it in its own Outputs. Instead, list each candidate as one object (`description`, `actor`, `prerequisite`, `risk`, `origin_finding` — or the literal word `null`) in the `x_followup_candidates` STATUS field below. The orchestrator reads this field after your dispatch completes and converts each candidate into a canonical `followups.jsonl` record itself.
 
 After each document is drafted/validated, and after each self-correction round, call `checkpoint_append` -- the generated runtime's own checkpoint writer (never hand-write the JSON line yourself):
 
@@ -11373,6 +11509,7 @@ output_03: <absolute path to documentation-validation.md>
 checkpoint_path: $PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl
 changed_paths: [path, ...]
 documentation_validation: PASS | PARTIAL | FAILED
+x_followup_candidates: [{"description":<str>,"actor":<str>,"prerequisite":<str>,"risk":<str>,"origin_finding":<str-or-null>}, ...] | []
 STATUS
 ```
 
@@ -11392,7 +11529,7 @@ You are the final readiness reporter. You have no shared context.
 - Allowed verdicts: `DONE`
 - Required status fields: `common_v2`
 - Checkpoint kind: `none`
-- Phases: `10`
+- Phases: `11`
 
 ## Inputs
 
@@ -11416,8 +11553,8 @@ You are the final readiness reporter. You have no shared context.
    - `6-implementation/implementer-status.md`
    - `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`
    - `8-all-tests/all-test-summary.md` and `8-all-tests/summarizer-status.md` (for `final_test_verdict`, rounds used, and residual failures)
-   - `9-git-finalization/git-status.md` (for `implementation_base_sha` and commit SHAs)
-   - `RUN_LOG.md` (for failure events, resume history, the LATEST `event=IMPLEMENTATION_BASELINE` — ignore any `IMPLEMENTATION_BASELINE_BLOCKED` advisory entries — every `event=CODEX_DISABLED_BY_USER_CONSENT`, `event=CODEX_SKIPPED_BY_USER_CONSENT`, and `event=CODEX_UNAVAILABLE` entry, indexed by `(phase, iteration)`, AND every dispatch entry's nine usage-telemetry fields for the `## Usage rollup` section).
+   - `9-documentation/uat.md`, `9-documentation/planned-vs-realized.md`, and `9-documentation/documentation-validation.md` (for documentation/UAT status — read the LATEST `documentation-writer` STATUS's `documentation_validation` field for the validation classification), plus `followups.jsonl` (if present) grouped by `actor` for the report's follow-ups section.
+   - `RUN_LOG.md` (for failure events, resume history, the LATEST `event=IMPLEMENTATION_BASELINE` — ignore any `IMPLEMENTATION_BASELINE_BLOCKED` advisory entries — every `event=CODEX_DISABLED_BY_USER_CONSENT`, `event=CODEX_SKIPPED_BY_USER_CONSENT`, and `event=CODEX_UNAVAILABLE` entry, indexed by `(phase, iteration)`, the LATEST `event=GIT_FINALIZATION_RESULT` entry (for `base_sha`/`final_sha`/`staged_paths`/`commit_sha`/`push_performed`/`outcome` — there is no `git-status.md` file; Phase 10 is a direct orchestrator operation whose only durable trace is this event), AND every dispatch entry's nine usage-telemetry fields for the `## Usage rollup` section).
 
    Also scan `RUN_LOG.md` for `event=CONTEXT7_UNAVAILABLE`,
    `event=DISPATCH_ORPHANED`, and `event=MODEL_REJECTED`. Each present event gets a
@@ -11437,18 +11574,20 @@ You are the final readiness reporter. You have no shared context.
 
    The classification per `(phase, vendor)` is reported in the new "Preflight verdicts" section (see step 3 below).
 3. Compose `$FEATURE_FOLDER/final-readiness-report.md` with these sections:
-   - **Artifacts** — paths to canonical spec, canonical plan, all summary files, AND `<feature-folder>/process-improvement-proposition.md`. The proposition file is listed by path only — its content is NOT read for verdict purposes. If the file does not exist at Phase 10 (no mandatory triggers fired and no spontaneous entries were emitted), list it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
+   - **Artifacts** — paths to canonical spec, canonical plan, all summary files, AND `<feature-folder>/process-improvement-proposition.md`. The proposition file is listed by path only — its content is NOT read for verdict purposes. If the file does not exist at Phase 11 (no mandatory triggers fired and no spontaneous entries were emitted), list it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
    - **Preflight verdicts** — per `(phase, vendor)` table for phases in {1, 3, 5, 6, 7}: each row reports `phase`, `vendor`, classification (`READY` / `SKIPPED` / `FAILED` / `INVALID_ORCHESTRATION`), and `failure_mode` (if `FAILED`) or skip-reason (if `SKIPPED`). Phase 1 rows are read from `1-preflight/phase-1/`; per-phase rows from `<phase-dir>/preflight/`. Any `INVALID_ORCHESTRATION` row forces the overall readiness verdict to `NOT_READY`.
    - **Reviewer verdicts** — per-gate iteration counts, final verdicts, `partial_review` flag with per-gate `codex_unavailable_reason` if any.
-   - **Implementation result** — task count, commits, `implementation_base_sha`, verification, no-secret check, browser-QA result if applicable. If a post-debug re-verification occurred, note it. Read `implementer-status.md`'s own `x_baseline_sha`/`x_final_sha` (cross-check `x_baseline_sha` against `9-git-finalization/git-status.md`'s `implementation_base_sha` — a mismatch is itself a degradation worth a Degradations line) and `x_remaining_handoffs` (surfaced as its own bulleted list under this section when non-null — this is where a Mode D continuation's own leftover follow-ups become visible to the user, not silently dropped).
+   - **Implementation result** — task count, commits, `implementation_base_sha`, verification, no-secret check, browser-QA result if applicable. If a post-debug re-verification occurred, note it. Read `implementer-status.md`'s own `x_baseline_sha`/`x_final_sha` (cross-check `x_baseline_sha` against the LATEST `event=GIT_FINALIZATION_RESULT` entry's own `base_sha` field in `RUN_LOG.md` — a mismatch is itself a degradation worth a Degradations line) and `x_remaining_handoffs` (surfaced as its own bulleted list under this section when non-null — this is where a Mode D continuation's own leftover follow-ups become visible to the user, not silently dropped).
    - **Test results** — `final_test_verdict` (`PASS` / `FAILED` / `SKIPPED`), execution mode (`start-all-tests.sh` — a project-specific convention — vs discovered suites), rounds used, fix rounds dispatched, and — when `FAILED` — the residual-failure detail carried over from `all-test-summary.md` (failing test names, error excerpts, what each fix round attempted).
-   - **Git result** — commit SHAs or `SKIPPED` reason.
+   - **Documentation/UAT status** — `documentation_validation` (`PASS` / `PARTIAL` / `FAILED`) from `9-documentation/documentation-validation.md`, whether `uat.md` includes its required "Not yet executed" section, and a link to `uat.md`. A `documentation_validation` other than `PASS` forces the readiness verdict to at least `READY_WITH_NOTES`.
+   - **Follow-ups** — every record in `followups.jsonl` (if present), grouped by `actor`, each showing `id`, `description`, `status`, and `prerequisite`. Absent when the file does not exist.
+   - **Git result** — the LATEST `event=GIT_FINALIZATION_RESULT` entry's `outcome` (`COMMITTED` / `NO_CHANGES` / `BLOCKED` / `FAILED`), `commit_sha` (or `null`), and `push_performed` (always `no` — Phase 10 never pushes). A `BLOCKED` or `FAILED` outcome is reported here, not silently treated as a successful finalization.
    - **Degradations** — one line per `event=CONTEXT7_UNAVAILABLE`, `event=DISPATCH_ORPHANED`, `event=MODEL_REJECTED`, or `event=DEGRADED_REVIEW_ACCEPTED` entry found in `RUN_LOG.md`, naming the affected roles (for `DEGRADED_REVIEW_ACCEPTED`, the `scope` field). Omit this section only when RUN_LOG contains none of these events. Any degradation present forces the readiness verdict to at least `READY_WITH_NOTES` — never a silent `READY`.
    - **Skipped optional steps** — list anything bypassed and why.
    - **Deferred MAJOR items** — total count + per-gate breakdown of MAJOR findings open when a gate passed under the relaxed rule (iterations 3 and up, `blockers=0`, every open major carrying an explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>` disposition per spec §17.3); each WAS re-reviewed — the dispositioning fixer dispatch was followed by another full reviewer round per spec §18.2, never an unreviewed final fix. Read from each gate's summary file (the summarizer records deferred majors there). Present this section only when at least one gate carried deferred majors. NOTE: this section's presence is NOT the trigger for `READY_WITH_NOTES` — a relaxed-tier pass forces `READY_WITH_NOTES` on its own (see the readiness-verdict rule), so a clean relaxed pass produces `READY_WITH_NOTES` with this section absent.
    - **Residual MINOR/NIT items** — total count + per-gate breakdown.
    - **Run history** — number of resumes, vendor failover events from RUN_LOG, baseline SHA capture.
-   - **Readiness verdict** — `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, the all-tests `final_test_verdict` is `PASS` or `SKIPPED`, every preflight verdict is `READY` or `SKIPPED`, AND the "Degradations" section is empty (no `CONTEXT7_UNAVAILABLE` / `DISPATCH_ORPHANED` / `MODEL_REJECTED` / `DEGRADED_REVIEW_ACCEPTED` events) — a run cannot be reported `READY` with any degradation present, regardless of how the rest of the run went; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain, OR (c) the "Degradations" section is non-empty and none of the `NOT_READY` conditions below apply; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including an all-tests `final_test_verdict` of `FAILED` (residual test failures after the fix cap — `NOT_READY` even when everything else passed; the "Test results" section carries the detail), any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), or any claude preflight that is not `READY`.
+   - **Readiness verdict** — `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, the all-tests `final_test_verdict` is `PASS` or `SKIPPED`, every preflight verdict is `READY` or `SKIPPED`, AND the "Degradations" section is empty (no `CONTEXT7_UNAVAILABLE` / `DISPATCH_ORPHANED` / `MODEL_REJECTED` / `DEGRADED_REVIEW_ACCEPTED` events) — a run cannot be reported `READY` with any degradation present, regardless of how the rest of the run went; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain, OR (c) the "Degradations" section is non-empty and none of the `NOT_READY` conditions below apply; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including an all-tests `final_test_verdict` of `FAILED` (residual test failures after the fix cap — `NOT_READY` even when everything else passed; the "Test results" section carries the detail), any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), any claude preflight that is not `READY`, or a git finalization `outcome` of `FAILED` (the intended local commit never landed). A `documentation_validation` other than `PASS`, or a git finalization `outcome` of `BLOCKED` (including the non-git and lease-conflict cases), do not by themselves force `NOT_READY` — they force at least `READY_WITH_NOTES`, per the Documentation/UAT status and Git result sections above.
    - **Usage rollup** — emit a final `## Usage rollup` section containing four parts in this order:
      1. **Grand total** (one row) — columns: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration`. Sum across every dispatch entry in `RUN_LOG.md`.
      2. **Per-phase table** — one row per phase that ran (use `phase_name` for the row label). Same columns as grand total, plus a leading `Phase` column. Include a final `TOTAL` row that matches the grand total.
@@ -11468,14 +11607,14 @@ generated publisher exactly once -- it is the ONLY sanctioned writer:
 $STATUS_PUBLISHER_PATH \
   --contracts $ROLE_CONTRACTS_PATH --role readiness-writer \
   --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 10 --iteration 00 --attempt $ATTEMPT \
+  --phase 11 --iteration 00 --attempt $ATTEMPT \
   --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
   --allowed-root $FEATURE_FOLDER <<'STATUS'
 schema_version: 2
 dispatch_id: $DISPATCH_ID
 logical_dispatch_id: $LOGICAL_DISPATCH_ID
 role: readiness-writer
-phase: 10
+phase: 11
 iteration: 00
 attempt: $ATTEMPT
 verdict: DONE
