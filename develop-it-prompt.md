@@ -69,7 +69,7 @@ For every step that produces or modifies an artifact:
 
 3. The subagent writes its artifact and a short `STATUS.md` to a pre-agreed path inside the feature folder. STATUS.md is written LAST and atomically (the subagent writes `STATUS.md.tmp` and renames).
 4. You read ONLY `STATUS.md` (and, for the final readiness writer, the per-phase summary files referenced by STATUS.md). You do not open the artifact, the findings file, or the transcripts. The only exception is surfacing a transcript path to the user when a failure halts the run.
-5. Branch on the verdict. For review gates this follows the **iteration-dependent gate** (see "Review-gate severity policy"): through iteration 2, any `blockers + majors > 0` re-dispatches the relevant fixer subagent with the reviewer findings paths as input; from iteration 3 onward, only `blockers > 0` re-dispatches the fix→re-review loop (a `CHANGES_REQUESTED` carrying majors-only at iteration ≥ 3 triggers one **final fix pass** — the fixer runs once with that iteration's findings, reviewers are NOT re-dispatched — then the gate passes, with the majors recorded as deferred (fixed, not re-reviewed)). If `BLOCKED`, halt and surface to the user.
+5. Branch on the verdict. For review gates this follows the **iteration-dependent gate** (see "Review-gate severity policy"): through iteration 2, any `blockers + majors > 0` re-dispatches the relevant bounded fixer subagent with a batch of canonical finding IDs (`select_finding_batch`) as input; from iteration 3 onward, `blockers > 0` OR any open major still lacking an explicit disposition re-dispatches the fix→re-review loop — every fixer dispatch, at every iteration including the cap, is followed by another full reviewer round via `ingest_findings` before the gate can pass (spec §18.2's "no unreviewed final fix"; the retired one-shot unreviewed fix no longer exists anywhere in this document). If `BLOCKED`, halt and surface to the user.
 6. `dispatch_attempt`/`dispatch_parallel` append the `RUN_LOG.md` block for you — one `DISPATCH_STARTED` plus `DISPATCH_COMPLETED` pair per attempt (see **Resumability** below for the full grammar — blocks are separated by blank lines and start with `--- <ISO-timestamp>  event=<NAME>`; the grammar's block shapes are exhaustive — never hand-compose abbreviated entries). Every completion block includes the nine usage-telemetry fields produced by `parse_usage`, which the dispatch helper calls internally immediately after the subprocess returns. On parse failure it returns `usage_status=unavailable` with zeros; those are written into the block unchanged — telemetry parsing failure NEVER blocks dispatch logging. Do not call `parse_usage` or append a RUN_LOG block by hand at a phase step.
 
    ```
@@ -133,18 +133,53 @@ for one phase. What remains forbidden is combining two numbered phases into one 
 Every reviewer subagent classifies each finding into exactly one severity:
 
 - **BLOCKER** — correctness or safety defect. Always blocks the gate, at every iteration.
-- **MAJOR** — missing requirement, internal contradiction, ambiguity that would cause an implementer to guess, or risk that surfaces late if not fixed now. Blocks the gate through iteration 2; from iteration 3 onward it no longer triggers another review round — it is fixed once in the **final fix pass** (no re-review) and recorded as a *deferred major* (fixed, not re-reviewed) — see the iteration-dependent gate below.
+- **MAJOR** — missing requirement, internal contradiction, ambiguity that would cause an implementer to guess, or risk that surfaces late if not fixed now. Blocks the gate through iteration 2; from iteration 3 onward it no longer by itself triggers another round PROVIDED it carries an explicit disposition (below) — it is never silently dropped.
 - **MINOR / NIT** — wording, formatting, micro-improvement, style preference, optional enhancement. Gate is permitted to pass with these recorded but unaddressed, at any iteration.
 
-**Iteration-dependent gate.** Review gates run a fix→re-review loop with a hard cap of 10 iterations and a pass threshold that relaxes after the 2nd iteration:
+**Iteration-dependent gate (spec §18.1).** Review gates run one gate-loop
+controller (Runtime cookbook's `ingest_findings`/`select_finding_batch`/
+`record_finding_disposition`/`dispositions_complete`, plus
+`validate_artifact` before every review dispatch) with a hard cap of
+`review_iteration_cap` iterations and a pass threshold that relaxes after
+the 2nd iteration. **No iteration ever authorizes an unreviewed final fix
+(spec §18.2)**: every fixer dispatch, at any iteration including the last
+one the cap allows, is followed by another structural validation and
+another full reviewer round before the gate can be declared passed — the
+retired "final fix pass, no re-review" shortcut never appears again in this
+document.
 
-- **Iterations 1–2 (strict gate):** the gate passes only when zero BLOCKER and zero MAJOR findings remain across all active reviewers. If `blockers + majors > 0` from any active reviewer, re-dispatch the appropriate fixer subagent (spec-fixer / plan-fixer / implementer), then re-dispatch all active reviewers.
-- **Iterations 3–10 (relaxed gate):** the gate passes when zero BLOCKER findings remain across all active reviewers, regardless of MAJOR count. If any MAJOR findings are still open at the passing iteration, dispatch the appropriate fixer subagent (spec-fixer / plan-fixer / implementer) ONCE with that iteration's findings paths — the **final fix pass** — and then stop the review loop: reviewers are NOT re-dispatched to verify the fix. The majors are recorded as **deferred majors** (fixed in the final fix pass, not re-reviewed) in the gate's summary file and carried into the readiness report; they do NOT block progression. Only `blockers > 0` from an active reviewer triggers another fix→re-review round at this stage — majors alone never do. A final fix pass that returns `BLOCKED` halts per the standard BLOCKED rule.
-- **Cap (iteration 10):** if any active reviewer still reports `blockers > 0` after iteration 10, HALT and surface residual findings paths plus the artifact path. MAJOR-only residue at the cap is NOT a HALT — it gets the same final fix pass and then passes as a deferred-majors gate.
+- **Iterations 1–2 (strict gate):** the gate passes only when the
+  post-`ingest_findings` catalog shows zero open/reopened BLOCKER and zero
+  open/reopened MAJOR findings across all active reviewers. Otherwise:
+  `select_finding_batch` picks up to `document_fixer_batch_size` open
+  blocker+major finding IDs, the appropriate fixer subagent (spec-fixer /
+  plan-fixer / implementation-fixer) is dispatched with exactly that batch,
+  `dispositions_complete` confirms every assigned ID has a disposition,
+  `validate_artifact` re-validates the new revision, and all active
+  reviewers are re-dispatched against it.
+- **Iterations 3 and up (relaxed gate):** the gate passes when zero open/
+  reopened BLOCKER findings remain AND every open MAJOR finding carries an
+  explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>`
+  disposition (never silently ignored, never merely "addressed" without a
+  disposition record) — regardless of how many such majors remain. Any
+  BLOCKER, or any MAJOR with no disposition yet, re-dispatches the fixer
+  with the next bounded batch and then, unconditionally, re-dispatches all
+  active reviewers — the same loop as iterations 1–2, never a special
+  unreviewed exit. `record_convergence_signals` runs after every cycle and
+  `divergence_check` may redirect the loop into the one bounded
+  consolidation pass described under "Convergence signals and divergence"
+  in Phase 3's iteration loop, below.
+- **Cap (`review_iteration_cap`, currently 10):** if any active reviewer
+  still reports an open BLOCKER after the cap, HALT and surface residual
+  findings paths plus the artifact path — `event=ITERATION_CAP_REACHED`.
+  MAJOR-only residue at the cap is NOT a HALT provided every remaining major
+  already carries a disposition from the capping iteration's own fixer
+  batch; an UNDISPOSED major at the cap HALTs exactly like a blocker (a cap
+  never manufactures a disposition that was never recorded).
 
 MINOR/NIT findings are recorded in the gate's summary file and never block progression, at any iteration.
 
-You read `STATUS.md` for each reviewer subprocess. STATUS.md must declare both an overall verdict (`PASS` or `CHANGES_REQUESTED`) and severity counts (`blockers=N, majors=N, minors=N`). The orchestrator's gate decision is driven by the **severity counts under the iteration-dependent rule above**, NOT by the reviewer's `PASS`/`CHANGES_REQUESTED` string: a reviewer correctly reports `CHANGES_REQUESTED` whenever majors remain, and from iteration 3 the orchestrator may still pass the gate over that verdict when `blockers=0` (after running the final fix pass when majors remain).
+You read `STATUS.md` for each reviewer subprocess. STATUS.md must declare both an overall verdict (`PASS` or `CHANGES_REQUESTED`) and severity counts (`blockers=N, majors=N, minors=N`) — the reviewer's OWN self-reported tally from its own findings alone. The orchestrator's actual gate decision reads the POST-`ingest_findings` catalog counts instead (the union across every active reviewer, with fixer-verified findings already suppressed) — never the raw per-reviewer STATUS counts summed by hand, and never the reviewer's `PASS`/`CHANGES_REQUESTED` string. A reviewer correctly reports `CHANGES_REQUESTED` whenever majors remain even after iteration 3, since the relaxation is a gate-decision policy, never a reviewer self-assessment rule.
 
 Reviewer appendices in this file instruct reviewers to use this severity ladder explicitly and to refuse to label an obvious correctness issue as MINOR. Reviewers always report majors honestly — their own `PASS` verdict still requires `blockers=0 AND majors=0`; the relaxation lives ONLY in the orchestrator's gate decision and the readiness verdict, never in a reviewer's self-assessment.
 
@@ -217,12 +252,12 @@ this account and is used for the cheap `preflight-codex` probe;
 | context-discovery | claude | claude-sonnet-5 | — | 30 | no | no | no | feature_folder;resolved_models | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | READY;BLOCKED | common_v2;relevant_skills;relevant_skills_reasons | none | 2 |
 | spec-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
 | spec-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
-| spec-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;spec_path;findings_paths | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2 | document-fixer | 3 |
+| spec-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;spec_path;finding_ids | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2;changed_paths;finding_dispositions | document-fixer | 3 |
 | plan-writer | claude | claude-opus-5 | — | 120 | yes | yes | no | feature_folder;spec_path;context7_policy | continuation_path;declared_foreign_changes;applicable_optional_skills | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;plan_path;progress.jsonl | DONE;BLOCKED | common_v2 | plan | 4 |
 | plan-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
 | plan-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
-| plan-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;plan_path;findings_paths | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2 | document-fixer | 5 |
-| implementer | claude | claude-opus-5 | — | 300 | yes | yes | yes | feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy | findings_paths;debugger_status_path;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | implementation_summary;status | DONE;FAILED;NEEDS_DEBUG;BLOCKED | common_v2;verification | implementation | 6 |
+| plan-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;plan_path;finding_ids | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2;changed_paths;finding_dispositions | document-fixer | 5 |
+| implementer | claude | claude-opus-5 | — | 300 | yes | yes | yes | feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy | debugger_status_path;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | implementation_summary;status | DONE;FAILED;NEEDS_DEBUG;BLOCKED | common_v2;verification | implementation | 6 |
 | impl-worker | claude | claude-sonnet-5 | — | 300 | yes | yes | no | task_brief | context7_policy | none | changed_paths | none | none | implementation | child |
 | debugger | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;plan_path;implementation_summary_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 6 |
 | code-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
@@ -245,6 +280,39 @@ cookbook (backed by `role_contract_field`) implement every column, and
 drift. `finishing-branch` is retired: Phase 10 finalization is now an
 orchestrator-owned local operation, not a vendor dispatch. `impl-worker`'s
 timeout matches the implementer's because it runs inside that dispatch.
+
+## Structural Artifact Manifest Registry (spec §17.1)
+
+Before an expensive review gate (Phases 3, 5, 7) dispatches its reviewers
+against a producer's output, `validate_artifact` (Runtime cookbook, below)
+checks the producer's own claim rather than trusting a large file's mere
+presence. Each producer role below declares: which render-time variable
+names its canonical output path, the minimum non-whitespace byte count, any
+top-level headings the artifact must contain (`;`-separated; empty means
+none required — spec/plan headings vary too much by project to enforce
+generically), any forbidden truncation marker (`;`-separated; presence of
+ANY one fails validation), how its revision is calculated (`sha256` of the
+file, or `git_sha` read from the producer's own declared
+`artifact_revision` STATUS field — used for the implementer/
+implementation-fixer, whose "revision" is a commit, not a file hash), and
+whether a sibling `artifact-complete.json` marker is required (spec §10.2 —
+currently only `plan-writer`, written at
+`$PHASE_DIR/00/attempts/$DISPATCH_ID/artifact-complete.json`).
+
+| Role | Output variable | Min bytes | Required headings | Forbidden markers | Revision calc | Requires complete marker |
+|---|---|---:|---|---|---|---|
+| plan-writer | PLAN_PATH | 200 | Goal;File Structure and Responsibilities | TBD;\<placeholder\>;TODO: fill in | sha256 | yes |
+| spec-fixer | SPEC_PATH | 100 |  | ...(truncated);\<!-- TRUNCATED --\> | sha256 | no |
+| plan-fixer | PLAN_PATH | 200 |  | ...(truncated);\<!-- TRUNCATED --\> | sha256 | no |
+| implementer | IMPLEMENTATION_SUMMARY_PATH | 100 |  | ...(truncated);\<!-- TRUNCATED --\> | git_sha | no |
+| implementation-fixer | IMPLEMENTATION_SUMMARY_PATH | 100 |  | ...(truncated);\<!-- TRUNCATED --\> | git_sha | no |
+
+`tests/check_05_contract.sh` asserts this table is present with these exact
+rows; `_artifact_manifest_field` (Runtime cookbook, below) is the hand-coded
+runtime mirror, cross-checked by `tests/check_06_cookbook.sh` the same way
+`recovery_action`'s rows are cross-checked against `extract.py recovery` —
+editing a cell here has zero runtime effect until `_artifact_manifest_field`
+is edited to match.
 
 ## Process Policy Registry
 
@@ -389,12 +457,15 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     preflight/                          # Phase 3 per-phase preflight (Step 3.0)
       claude-check-status.md
       codex-check-status.md
-    iteration-01/
-      claude-verdict.md
-      codex-verdict.md
-      claude-findings.md
-      codex-findings.md
-    iteration-02/
+    01/                                  # $PHASE_DIR/$ITERATION -- never "iteration-01"
+      claude-findings.jsonl
+      codex-findings.jsonl
+      findings-catalog.jsonl             # ingest_findings' merged, canonical catalog
+      attempts/
+        p03-i01-spec-reviewer-claude-a01/STATUS.md
+        p03-i01-spec-reviewer-codex-a01/STATUS.md
+        p03-i01-spec-fixer-a01/STATUS.md  # present once a fix round ran
+    02/
       …
     spec-review-summary.md
     summarizer-status.md
@@ -404,7 +475,7 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     preflight/                          # Phase 5 per-phase preflight (Step 5.0)
       claude-check-status.md
       codex-check-status.md
-    iteration-01/
+    01/
       …
     plan-review-summary.md
     summarizer-status.md
@@ -421,7 +492,7 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     preflight/                          # Phase 7 per-phase preflight (Step 7.0)
       claude-check-status.md
       codex-check-status.md
-    iteration-01/
+    01/
       …
     code-review-summary.md
     summarizer-status.md
@@ -455,8 +526,12 @@ would be overwritten three times. Earlier revisions of this document used three
 different schemes, which left the readiness writer unable to locate transcripts
 reliably.
 
-Reviewer artifacts are named by **vendor**, not model: `claude-verdict.md`,
-`claude-findings.md`, `codex-verdict.md`, `codex-findings.md`. A filename must
+Reviewer findings are named by **vendor**, not model: `claude-findings.jsonl`,
+`codex-findings.jsonl` (spec §17.2's canonical JSONL records — never the
+retired `*-verdict.md`/`*-findings.md` Markdown pair; a reviewer's actual
+verdict lives in its own attempt-scoped `STATUS.md` under
+`attempts/<dispatch-id>/`, and `ingest_findings` merges both reviewers'
+findings into one per-iteration `findings-catalog.jsonl`). A filename must
 not assert a model, or it starts lying the moment the Models table changes.
 
 Phase 10 (`readiness-report`) intentionally has no `10-readiness-report/` folder: its two outputs (`final-readiness-report.md`, `readiness-status.md`) are cross-cutting feature-folder artifacts consumed by the user at the top level, not phase-internal scratch. The same rationale applies to `RUN_LOG.md`, `full_log.md`, `transcripts/`, and the optional `process-improvement-proposition.md`, which also live at the feature-folder root without a numeric prefix.
@@ -1826,12 +1901,12 @@ misread as a CLI usage error.
 
 ### Appendix substitution helper (handles multi-line values)
 
-`sed` is fine for single-line scalars (`$ITERATION`, `$SPEC_PATH`, `$PLAN_PATH`). It breaks or silently mangles output for multi-line values like `$FINDINGS_PATHS` (a newline-separated list). For any role that consumes a list-shaped variable, use this `render_prompt` helper instead:
+`sed` is fine for single-line scalars (`$ITERATION`, `$SPEC_PATH`, `$PLAN_PATH`). It breaks or silently mangles output for multi-line values like `$RELEVANT_ARTIFACTS` (a newline-separated list). For any role that consumes a list-shaped variable, use this `render_prompt` helper instead:
 
 <!-- lint: cookbook -->
 ```bash
 # Extract one appendix and substitute orchestration variables into it.
-# `sed` is NOT an alternative: multi-line values such as $FINDINGS_PATHS break
+# `sed` is NOT an alternative: multi-line values such as $RELEVANT_ARTIFACTS break
 # it, and path values collide with any delimiter chosen.
 # Every variable any appendix may reference. Declared by render_keys() rather
 # than a top-level assignment, because the cookbook must be definitions-only:
@@ -1928,7 +2003,7 @@ PY
 }
 ```
 
-Set each orchestration variable the appendix expects as an ordinary shell assignment — no `export` required, since `render_prompt` reads them through `${!k}` — then call `render_prompt <name>` and check its exit status: it fails loudly and names any variable it could not resolve, so a non-zero exit must halt dispatch rather than pipe a half-rendered prompt forward. `sed` is not an alternative for this substitution: multi-line values like `$FINDINGS_PATHS` break it.
+Set each orchestration variable the appendix expects as an ordinary shell assignment — no `export` required, since `render_prompt` reads them through `${!k}` — then call `render_prompt <name>` and check its exit status: it fails loudly and names any variable it could not resolve, so a non-zero exit must halt dispatch rather than pipe a half-rendered prompt forward. `sed` is not an alternative for this substitution: multi-line values like `$RELEVANT_ARTIFACTS` break it.
 
 ### Pre-launch role check — `render_prompt --check`
 
@@ -3901,6 +3976,9 @@ here does not itself populate that document).
 | PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED | develop_it_dirty;develop_it_dirty_reason | no |
 | RUNTIME_AND_REGISTRIES_VERIFIED | bootstrap_result | no |
 | VENDOR_PROVEN | role;vendor | no |
+| CONVERGENCE_RECORDED | phase_name;growth_pct;new_count;recurring_count;resolved_count;reopened_count;fix_regression_count;net_open_blockers_majors | no |
+| DIVERGENCE_DETECTED | phase_name;divergence_reason | yes |
+| DIVERGENT_ROUND_CAP_REACHED | phase_name;cap_value;divergent_rounds | yes |
 
 `ATTEMPT_ALLOCATED` is one row beyond the spec's own 23-name list: it is the
 pre-existing attempt-identity event `allocate_attempt` has always written
@@ -3930,6 +4008,25 @@ successfully; see "Evidence-based capability: `vendor_proven`" below for the
 reader that answers whether a vendor is currently proven. None of the six
 is `proposition_required` — they are routine successful-gate evidence, not
 failures or deviations.
+
+**The three rows after `VENDOR_PROVEN` are Task 11's review-convergence
+evidence** (spec §18.3). `CONVERGENCE_RECORDED` is written by
+`record_convergence_signals` after every review/fix cycle at a review gate
+(Phases 3, 5, 7) — routine evidence, not `proposition_required`.
+`DIVERGENCE_DETECTED` is written by `divergence_check` the moment any of the
+four divergence conditions holds for the current round; it is
+`proposition_required` because a convergence loop going sideways is exactly
+the kind of process signal the improvement-proposition ledger exists to
+capture. `DIVERGENT_ROUND_CAP_REACHED` is written when `divergent_round_cap`
+consecutive divergent rounds are reached and automatic additive fixing stops
+in favor of the one bounded consolidation pass (spec §18.3) — also
+`proposition_required`. A canonical-finding-ID collision with conflicting
+content (spec §17.2) is reported through the EXISTING `EVENT_CORRECTED` row
+above, not a new type: `ingest_findings` calls it with
+`corrected_event_id="finding:<finding_id>"` (a finding-scoped identifier,
+since no prior RUN_LOG event exists to correct — findings live in the
+per-iteration `findings-catalog.jsonl`, never in `RUN_LOG.md` itself) and
+`replacement_classification=finding_collision`.
 
 <!-- lint: cookbook -->
 ```bash
@@ -3992,6 +4089,10 @@ event_required_fields() {
       printf '%s\n' "develop_it_dirty;develop_it_dirty_reason" ;;
     RUNTIME_AND_REGISTRIES_VERIFIED) printf '%s\n' "bootstrap_result" ;;
     VENDOR_PROVEN)               printf '%s\n' "role;vendor" ;;
+    CONVERGENCE_RECORDED)
+      printf '%s\n' "phase_name;growth_pct;new_count;recurring_count;resolved_count;reopened_count;fix_regression_count;net_open_blockers_majors" ;;
+    DIVERGENCE_DETECTED)         printf '%s\n' "phase_name;divergence_reason" ;;
+    DIVERGENT_ROUND_CAP_REACHED) printf '%s\n' "phase_name;cap_value;divergent_rounds" ;;
     *) echo "EVENT_TYPE_UNKNOWN:$1" >&2; return 1 ;;
   esac
 }
@@ -6272,6 +6373,765 @@ Justification for the mapping: spec review (Phase 3) has no code to cross-check 
 
 Enforcement layering: the appendix preamble is the primary control. The per-dispatch command budget is the secondary control. Codex's `-s workspace-write` sandbox is NOT a layer here — it does not restrict reads outside the workspace. Acceptance criterion #4 in the design spec verifies enforcement empirically by grepping for skill-directory reads in transcripts.
 
+### Finding ingestion, artifact validation, and review convergence (spec §17, §18)
+
+Every review gate (Phases 3, 5, 7) shares one machinery from here on, replacing
+the ad hoc "final fix pass, never re-reviewed" shortcut the pre-Task-11 gate
+loops used: `validate_artifact` gates entry into an expensive review,
+`ingest_findings` turns each reviewer's raw JSONL output into the single
+canonical per-iteration catalog, `select_finding_batch`/
+`record_finding_disposition`/`dispositions_complete` bound and track one
+fixer dispatch, and `record_convergence_signals`/`divergence_check` decide
+whether the loop is still converging. None of these ever authorizes an
+unreviewed revision (spec §18.2) — the gate loop steps in Phases 3/5/7,
+below, are what actually enforce that; these functions only supply the
+evidence the gate loop reasons from.
+
+`_artifact_manifest_field` is the hand-coded runtime mirror of the
+Structural Artifact Manifest Registry above — same cross-checked-table
+pattern as `recovery_action`/`extract.py recovery` and
+`event_required_fields`/`extract.py events`.
+
+<!-- lint: cookbook -->
+```bash
+# ---- Structural artifact manifest (spec §17.1) -----------------------------
+_artifact_manifest_field() {
+  # Usage: _artifact_manifest_field ROLE FIELD
+  # FIELD in: output_var, min_bytes, required_headings, forbidden_markers,
+  # revision_calc, requires_complete_marker.
+  case "$1:$2" in
+    plan-writer:output_var)                  echo PLAN_PATH ;;
+    plan-writer:min_bytes)                    echo 200 ;;
+    plan-writer:required_headings)            echo "Goal;File Structure and Responsibilities" ;;
+    plan-writer:forbidden_markers)            echo 'TBD;<placeholder>;TODO: fill in' ;;
+    plan-writer:revision_calc)                echo sha256 ;;
+    plan-writer:requires_complete_marker)     echo yes ;;
+
+    spec-fixer:output_var)                    echo SPEC_PATH ;;
+    spec-fixer:min_bytes)                     echo 100 ;;
+    spec-fixer:required_headings)             echo "" ;;
+    spec-fixer:forbidden_markers)             echo '...(truncated);<!-- TRUNCATED -->' ;;
+    spec-fixer:revision_calc)                 echo sha256 ;;
+    spec-fixer:requires_complete_marker)      echo no ;;
+
+    plan-fixer:output_var)                    echo PLAN_PATH ;;
+    plan-fixer:min_bytes)                      echo 200 ;;
+    plan-fixer:required_headings)             echo "" ;;
+    plan-fixer:forbidden_markers)             echo '...(truncated);<!-- TRUNCATED -->' ;;
+    plan-fixer:revision_calc)                 echo sha256 ;;
+    plan-fixer:requires_complete_marker)      echo no ;;
+
+    implementer:output_var)                   echo IMPLEMENTATION_SUMMARY_PATH ;;
+    implementer:min_bytes)                    echo 100 ;;
+    implementer:required_headings)            echo "" ;;
+    implementer:forbidden_markers)            echo '...(truncated);<!-- TRUNCATED -->' ;;
+    implementer:revision_calc)                echo git_sha ;;
+    implementer:requires_complete_marker)     echo no ;;
+
+    implementation-fixer:output_var)               echo IMPLEMENTATION_SUMMARY_PATH ;;
+    implementation-fixer:min_bytes)                echo 100 ;;
+    implementation-fixer:required_headings)        echo "" ;;
+    implementation-fixer:forbidden_markers)        echo '...(truncated);<!-- TRUNCATED -->' ;;
+    implementation-fixer:revision_calc)            echo git_sha ;;
+    implementation-fixer:requires_complete_marker) echo no ;;
+
+    *) echo "ARTIFACT_MANIFEST_UNKNOWN:$1:$2" >&2; return 1 ;;
+  esac
+}
+
+# `validate_artifact ROLE DISPATCH_ID` (spec §17.1) -- runs before
+# dispatching a review gate's reviewers against a producer's revision. The
+# attempt directory (and so the STATUS path) is derived from DISPATCH_ID's
+# OWN encoded phase/iteration tokens via `role_attempt_dir` -- never from
+# ambient $PHASE_DIR/$ITERATION, which would name the wrong directory at
+# the two cross-phase call sites this task introduces (Phase 5 validating
+# Phase 4's plan-writer; Phase 7 validating Phase 6's implementer run with
+# the CALLING phase's own ambient values, not the producer's). Requires an
+# accepted verdict (`DONE`, or an explicit
+# RUN_LOG `event=PHASE_ACCEPTED` decision naming this exact artifact_path --
+# spec §17.1's "explicit accepted partial-artifact decision" for a producer
+# whose own STATUS was never DONE; no role's registry ever lists
+# PHASE_ACCEPTED as a legal STATUS verdict, so this is read from RUN_LOG,
+# never from the producer's own STATUS file), requires the manifest's output
+# path to resolve inside $FEATURE_FOLDER or $REPO_ROOT, requires the
+# manifest to pass (size, headings, forbidden markers, revision, completion
+# marker), and prints "revision=<value>" on success. Size or marker presence
+# ALONE never authorizes review -- every check below must pass, not just one.
+_validate_artifact_phase_accepted() {
+  # Usage: _validate_artifact_phase_accepted ARTIFACT_PATH
+  # True iff RUN_LOG.md carries a durable event=PHASE_ACCEPTED block whose
+  # OWN artifact_path field names this exact artifact.
+  local artifact_path="$1" log="${FEATURE_FOLDER:-}/RUN_LOG.md" tag="" match=no want got
+  [ -f "$log" ] || return 1
+  want="$(printf '%s' "$artifact_path" | tr -d '[:space:]')"
+  while IFS= read -r line; do
+    case "$line" in
+      "--- "*"  event=PHASE_ACCEPTED") tag=PHASE_ACCEPTED ;;
+      "--- "*) tag="" ;;
+      "artifact_path:"*)
+        if [ "$tag" = PHASE_ACCEPTED ]; then
+          got="$(printf '%s' "${line#artifact_path:}" | tr -d '[:space:]')"
+          [ "$got" = "$want" ] && match=yes
+        fi
+        ;;
+    esac
+  done < "$log"
+  [ "$match" = yes ]
+}
+
+validate_artifact() {
+  local role="$1" dispatch_id="$2"
+  local attempt_dir status_path
+  attempt_dir="$(role_attempt_dir "$role" "$dispatch_id")" \
+    || { echo "VALIDATE_ARTIFACT_BAD_DISPATCH_ID:$dispatch_id" >&2; return 1; }
+  status_path="$attempt_dir/STATUS.md"
+  [ -f "$status_path" ] || { echo "VALIDATE_ARTIFACT_NO_STATUS:$status_path" >&2; return 1; }
+  validate_status "$status_path" "$role" || { echo "VALIDATE_ARTIFACT_BAD_STATUS" >&2; return 1; }
+
+  local output_var min_bytes headings_csv forbidden_csv revision_calc needs_marker
+  output_var="$(_artifact_manifest_field "$role" output_var)" || return 1
+  min_bytes="$(_artifact_manifest_field "$role" min_bytes)" || return 1
+  headings_csv="$(_artifact_manifest_field "$role" required_headings)" || return 1
+  forbidden_csv="$(_artifact_manifest_field "$role" forbidden_markers)" || return 1
+  revision_calc="$(_artifact_manifest_field "$role" revision_calc)" || return 1
+  needs_marker="$(_artifact_manifest_field "$role" requires_complete_marker)" || return 1
+
+  local artifact_path="${!output_var:-}"
+  [ -n "$artifact_path" ] || { echo "VALIDATE_ARTIFACT_NO_PATH_VAR:$output_var" >&2; return 1; }
+
+  local verdict; verdict="$(status_field "$status_path" verdict)"
+  case "$verdict" in
+    DONE) : ;;
+    *)
+      _validate_artifact_phase_accepted "$artifact_path" \
+        || { echo "VALIDATE_ARTIFACT_NOT_ACCEPTED:$verdict" >&2; return 1; }
+      ;;
+  esac
+
+  [ -f "$artifact_path" ] || { echo "VALIDATE_ARTIFACT_MISSING_FILE:$artifact_path" >&2; return 1; }
+
+  local resolved in_root=no root
+  resolved="$(realpath -m -- "$artifact_path" 2>/dev/null)" || resolved="$artifact_path"
+  for root in "$FEATURE_FOLDER" "${REPO_ROOT:-}"; do
+    [ -n "$root" ] || continue
+    root="$(realpath -m -- "$root" 2>/dev/null)" || continue
+    path_in_tree "$resolved" "$root" && { in_root=yes; break; }
+  done
+  [ "$in_root" = yes ] || { echo "VALIDATE_ARTIFACT_OUTSIDE_ROOT:$artifact_path" >&2; return 1; }
+
+  local nonblank_bytes
+  nonblank_bytes="$(tr -d '[:space:]' < "$artifact_path" | wc -c)"
+  if [ "$nonblank_bytes" -lt "$min_bytes" ]; then
+    echo "VALIDATE_ARTIFACT_TOO_SMALL:$nonblank_bytes<$min_bytes" >&2; return 1
+  fi
+
+  if [ -n "$headings_csv" ]; then
+    local -a _va_h; IFS=';' read -r -a _va_h <<<"$headings_csv"
+    local h
+    for h in "${_va_h[@]}"; do
+      [ -n "$h" ] || continue
+      # Heading-anchored: a required heading "Goal" must appear as an ACTUAL
+      # ATX heading line (optionally followed by more words -- "## Goal
+      # Statement" counts), never merely as a substring anywhere in the file
+      # (a plain grep -F would let "## Non-Goals" satisfy a "Goal"
+      # requirement).
+      "$GREP_BIN" -qE -- "^#{1,6}[[:space:]]+${h}([[:space:]]|\$)" "$artifact_path" \
+        || { echo "VALIDATE_ARTIFACT_MISSING_HEADING:$h" >&2; return 1; }
+    done
+  fi
+
+  if [ -n "$forbidden_csv" ]; then
+    local -a _va_f; IFS=';' read -r -a _va_f <<<"$forbidden_csv"
+    local m
+    for m in "${_va_f[@]}"; do
+      [ -n "$m" ] || continue
+      "$GREP_BIN" -qF -- "$m" "$artifact_path" \
+        && { echo "VALIDATE_ARTIFACT_FORBIDDEN_MARKER:$m" >&2; return 1; }
+    done
+  fi
+
+  local revision declared
+  declared="$(status_field "$status_path" artifact_revision)"
+  case "$revision_calc" in
+    sha256)
+      revision="$(sha256sum "$artifact_path" | awk '{print $1}')"
+      if [ -n "$declared" ] && [ "$declared" != null ] && [ "$declared" != "$revision" ]; then
+        echo "VALIDATE_ARTIFACT_REVISION_MISMATCH:declared=$declared computed=$revision" >&2
+        return 1
+      fi
+      ;;
+    git_sha)
+      [ -n "$declared" ] && [ "$declared" != null ] \
+        || { echo "VALIDATE_ARTIFACT_NO_DECLARED_REVISION" >&2; return 1; }
+      revision="$declared"
+      ;;
+    *) echo "VALIDATE_ARTIFACT_BAD_REVISION_CALC:$revision_calc" >&2; return 1 ;;
+  esac
+
+  if [ "$needs_marker" = yes ]; then
+    local marker="$attempt_dir/artifact-complete.json"
+    [ -f "$marker" ] || { echo "VALIDATE_ARTIFACT_MISSING_COMPLETE_MARKER:$marker" >&2; return 1; }
+  fi
+
+  printf 'revision=%s\n' "$revision"
+}
+```
+
+**Finding record and canonical ID derivation (spec §17.2).** Reviewer
+appendices emit one JSONL record per finding (never Markdown "Finding N"
+prose — the switch this task makes across every reviewer appendix) with:
+`source_finding_id, reviewer_role, vendor, phase, iteration, severity
+(blocker|major|minor), artifact_path, artifact_revision, location (a human
+excerpt: heading text or "L<N>"), line (the 1-based evidence line number),
+issue_key (a short stable slug), summary, evidence, required_change,
+provenance, related_finding_ids`. The reviewer never computes
+`normalized_location`, `normalized_issue_key`, or `finding_id` itself —
+`ingest_findings` derives all three deterministically and rejects a
+model-supplied `finding_id` that disagrees (spec: "models do not invent the
+canonical hash themselves").
+
+For a Markdown `artifact_path`, `normalized_location` is the heading
+breadcrumb (normalized heading text, NFKC + case-fold + collapsed
+whitespace, `+1` occurrence per repeated sibling heading under the same
+parent) of the section enclosing `line`, plus the block kind of that exact
+line (`heading|table|list-item|blockquote|paragraph|blank`) and either the
+heading's own explicit `{#anchor}` (when present) or a content fingerprint
+of that single line's normalized text — **never the line number itself**,
+which is why inserting paragraphs earlier in the document, or a pure
+line-number drift, never changes an unrelated finding's `finding_id` (Step 1
+of this task's acceptance test). For a code `artifact_path`, it is the
+repository-relative path plus the enclosing Python `ast` function/class (a
+genuine AST lookup) or, for every other language, the nearest preceding
+declaration-shaped line (`function|def|class|func|fn NAME`); with neither,
+it falls back to `path::line:<N>` and the record is flagged
+`weak_location=true`.
+
+`finding_id = sha256(artifact_kind + "\0" + normalized_location + "\0" +
+normalized_issue_key)`, hex digest. Wording legitimately varies round to
+round (fresh reviewer subprocesses write their own `summary`/
+`required_change` prose), so that alone is never a collision. A conflicting
+**severity** classification for the same canonical ID IS the conflicting
+content spec §17.2 means, and is never silently guessed at: the MORE severe
+of the two classifications is kept (never merely whichever arrived first or
+last — dropping the more severe one would itself be a guess), and
+`record_event EVENT_CORRECTED` durably records the collision either way
+(see the Event Contract Registry note above).
+
+`ingest_findings` merges into one catalog per iteration,
+`<phase-dir>/<iteration-dir>/findings-catalog.jsonl`, derived from
+`STATUS_FILE`'s own directory (`.../attempts/<dispatch-id>/STATUS.md` is
+always three directories below the iteration directory). Every active
+reviewer's `OUTPUT_JSONL` is ingested into the SAME catalog file — this is
+what makes the union spec §16.5 requires ("one reviewer's PASS never
+cancels the other's blocker") automatic: a reviewer reporting nothing
+removes nothing another reviewer already reported. A catalog entry a fixer
+marked `fixed` is promoted to `verified` ONLY when a later reviewer round
+does not re-report it — never by the fixer's own disposition (spec §18.1's
+"a fixer cannot close its own findings"); if the SAME reviewer round
+re-reports it, the entry becomes `reopened` and its `recur_count`
+increments, feeding `divergence_check` below.
+
+<!-- lint: cookbook -->
+```bash
+# ---- Finding ingestion (spec §17.2) -----------------------------------------
+_iteration_dir_from_status() {
+  # Usage: _iteration_dir_from_status STATUS_PATH
+  # STATUS_PATH is always <iteration-dir>/attempts/<dispatch-id>/STATUS.md.
+  dirname "$(dirname "$(dirname "$1")")"
+}
+
+# Usage: ingest_findings ROLE STATUS_FILE OUTPUT_JSONL
+# Prints "blockers=N", "majors=N", "minors=N" (post-merge, catalog-wide, open/
+# reopened counts only) on success.
+ingest_findings() {
+  local role="$1" status_file="$2" output_jsonl="$3"
+  [ -f "$status_file" ] || { echo "INGEST_FINDINGS_NO_STATUS:$status_file" >&2; return 1; }
+  [ -f "$output_jsonl" ] || { echo "INGEST_FINDINGS_NO_OUTPUT:$output_jsonl" >&2; return 1; }
+  validate_status "$status_file" "$role" || { echo "INGEST_FINDINGS_BAD_STATUS" >&2; return 1; }
+
+  local iter_dir catalog tmp existing out rc
+  iter_dir="$(_iteration_dir_from_status "$status_file")"
+  catalog="$iter_dir/findings-catalog.jsonl"
+  mkdir -p "$iter_dir"
+  tmp="$catalog.tmp.$$"
+  existing="/dev/null"
+  [ -f "$catalog" ] && existing="$catalog"
+
+  out="$("$PYTHON_BIN" - "$existing" "$output_jsonl" "$tmp" <<'PY'
+import sys, json, re, unicodedata, hashlib, ast, os, difflib
+
+existing_path, input_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def norm_text(s):
+    s = unicodedata.normalize("NFKC", s or "").strip().lower()
+    s = re.sub(r'[`*_]+', '', s)
+    s = re.sub(r'\\(.)', r'\1', s)
+    s = re.sub(r'\s+', ' ', s)
+    return s
+
+def norm_issue_key(s):
+    s = unicodedata.normalize("NFKC", s or "").strip().lower()
+    s = re.sub(r'[_\s]+', '-', s)
+    s = re.sub(r'-{2,}', '-', s)
+    return s.strip('-')
+
+HEADING_RE = re.compile(r'^(#{1,6})\s+(.*)$')
+FENCE_RE = re.compile(r'^(```|~~~)')
+TABLE_RE = re.compile(r'^\s*\|')
+LIST_RE = re.compile(r'^\s*([-*+]|\d+\.)\s+')
+QUOTE_RE = re.compile(r'^\s*>')
+ANCHOR_RE = re.compile(r'\{#([A-Za-z0-9_-]+)\}\s*$')
+
+def markdown_location(path, line_no, weak_out):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        weak_out["weak"] = True
+        return f"UNREADABLE:{path}"
+
+    stack = []
+    root_counts = {}
+    breadcrumbs = [None] * (len(lines) + 2)
+    for i, raw in enumerate(lines, start=1):
+        m = HEADING_RE.match(raw)
+        if m:
+            level = len(m.group(1))
+            text = m.group(2)
+            am = ANCHOR_RE.search(text)
+            anchor = am.group(1) if am else None
+            text = ANCHOR_RE.sub('', text).strip()
+            while stack and stack[-1]["level"] >= level:
+                stack.pop()
+            parent_counts = stack[-1]["counts"] if stack else root_counts
+            key = (level, norm_text(text))
+            parent_counts[key] = parent_counts.get(key, 0) + 1
+            stack.append({"level": level, "text": norm_text(text),
+                          "occurrence": parent_counts[key], "counts": {},
+                          "anchor": anchor})
+        breadcrumbs[i] = list(stack)
+
+    idx = max(1, min(line_no, len(lines))) if lines else 1
+    bc = breadcrumbs[idx] or []
+    raw_line = lines[idx - 1] if 0 <= idx - 1 < len(lines) else ""
+
+    if HEADING_RE.match(raw_line):
+        kind = "heading"
+    elif TABLE_RE.match(raw_line):
+        kind = "table"
+    elif LIST_RE.match(raw_line):
+        kind = "list-item"
+    elif QUOTE_RE.match(raw_line):
+        kind = "blockquote"
+    elif FENCE_RE.match(raw_line):
+        kind = "code-fence"
+    elif raw_line.strip() == "":
+        kind = "blank"
+    else:
+        kind = "paragraph"
+
+    fingerprint = hashlib.sha256(norm_text(raw_line).encode("utf-8")).hexdigest()[:16]
+    anchor = bc[-1]["anchor"] if bc and bc[-1].get("anchor") else None
+    # An explicit anchor is a SECTION-level id, constant for every line in
+    # that section -- it must never REPLACE the per-line fingerprint (that
+    # would collapse every distinct finding in an anchored section onto one
+    # locator) or ADD to it (spec S17.2's disambiguator).
+    tail = f"{anchor}:{fingerprint}" if anchor else fingerprint
+    crumb = "/".join(f"{n['text']}#{n['occurrence']}" for n in bc)
+    return f"{crumb}::{kind}:{tail}"
+
+def code_location(path, line_no, weak_out):
+    if path.endswith(".py"):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                src = f.read()
+            tree = ast.parse(src)
+            best = None
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    lo = node.lineno
+                    hi = getattr(node, "end_lineno", lo)
+                    if lo <= line_no <= hi and (best is None or (hi - lo) < (best[1] - best[0])):
+                        best = (lo, hi, node.name)
+            if best:
+                return f"{path}::{best[2]}"
+        except (OSError, SyntaxError):
+            pass
+    else:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.read().split("\n")
+            decl_re = re.compile(
+                r'^\s*(?:export\s+)?(?:async\s+)?(?:function|def|class|func|fn)\s+([A-Za-z_][A-Za-z0-9_]*)')
+            for i in range(min(line_no, len(lines)), 0, -1):
+                m = decl_re.match(lines[i - 1] or '')
+                if m:
+                    return f"{path}::{m.group(1)}"
+        except OSError:
+            pass
+    weak_out["weak"] = True
+    return f"{path}::line:{line_no}"
+
+def load_jsonl(path):
+    records = []
+    if path in ("/dev/null", "", None) or not os.path.exists(path):
+        return records
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+REQUIRED = ["source_finding_id", "reviewer_role", "vendor", "phase", "iteration",
+            "severity", "artifact_path", "issue_key"]
+
+catalog = {}
+for rec in load_jsonl(existing_path):
+    catalog[rec["finding_id"]] = rec
+
+collisions = []
+seen_this_round = set()
+
+for rec in load_jsonl(input_path):
+    missing = [k for k in REQUIRED if not rec.get(k)]
+    if missing:
+        print(f"REJECTED:{rec.get('source_finding_id','?')}:missing={','.join(missing)}", file=sys.stderr)
+        sys.exit(3)
+    if rec["severity"] not in ("blocker", "major", "minor"):
+        print(f"REJECTED:{rec['source_finding_id']}:bad-severity", file=sys.stderr)
+        sys.exit(3)
+
+    artifact_kind = rec.get("artifact_kind") or (
+        "markdown" if rec["artifact_path"].endswith(".md") else "code")
+    weak = {"weak": False}
+    line_no = int(rec.get("line") or 0)
+    if artifact_kind == "markdown":
+        normalized_location = markdown_location(rec["artifact_path"], line_no, weak)
+    else:
+        normalized_location = code_location(rec["artifact_path"], line_no, weak)
+    normalized_issue_key = norm_issue_key(rec["issue_key"])
+
+    finding_id = hashlib.sha256(
+        (artifact_kind + "\0" + normalized_location + "\0" + normalized_issue_key)
+        .encode("utf-8")).hexdigest()
+
+    supplied = rec.get("finding_id")
+    if supplied and supplied != finding_id:
+        print(f"MISMATCH:{rec['source_finding_id']}:{supplied}!={finding_id}", file=sys.stderr)
+        sys.exit(4)
+
+    severity = rec["severity"]
+    prior = catalog.get(finding_id)
+    provenance = rec.get("provenance") or "unknown"
+    origin_iteration = rec.get("origin_iteration") or rec["iteration"]
+    status = "open"
+    recur_count = 0
+    if prior:
+        recur_count = prior.get("recur_count", 0)
+        origin_iteration = prior.get("origin_iteration", origin_iteration)
+        prior_severity = prior.get("severity")
+        # Two records for the SAME (artifact_kind, normalized_location,
+        # normalized_issue_key) legitimately vary in wording round to round
+        # (fresh reviewer subprocesses write their own prose) -- that alone
+        # is never a reason to DROP the re-report (code review fix: an
+        # earlier version `continue`d here, which skipped the reopen logic
+        # below entirely and let a fixer's stale fixed/verified claim
+        # survive an unresolved re-report -- the same failure class as the
+        # original wording-based bug, reached via severity instead). Any
+        # content difference (severity, summary, or required_change) is
+        # still recorded via `collisions` as an EVENT_CORRECTED audit
+        # signal -- but it NEVER changes which record wins or skips the
+        # reopen/promotion logic below.
+        # Fresh reviewer subprocesses write their OWN prose every round --
+        # an ordinary re-report of the SAME issue routinely rewords its
+        # summary/required_change and must NOT be treated as a collision
+        # (that was the actual round-1 wording bug's root cause). Only fire
+        # the EVENT_CORRECTED audit signal when the classification itself
+        # conflicts (severity mismatch), or the content is so different it
+        # reads as a genuinely different finding, not a reword -- difflib's
+        # stdlib similarity ratio is the cheap, dependency-free proxy for
+        # "large content divergence" (ponytail: one crude global threshold,
+        # not per-domain tuned; revisit if a real run's false-positive/
+        # negative rate on it ever matters).
+        def _diverges(a, b):
+            return difflib.SequenceMatcher(None, a or "", b or "").ratio() < 0.5
+        if (prior_severity and prior_severity != severity) or (
+                _diverges(prior.get("summary", ""), rec.get("summary", ""))
+                or _diverges(prior.get("required_change", ""), rec.get("required_change", ""))):
+            collisions.append(finding_id)
+        if prior_severity and prior_severity != severity:
+            sev_rank = {"blocker": 0, "major": 1, "minor": 2}
+            if sev_rank.get(prior_severity, 9) < sev_rank.get(severity, 9):
+                # prior is already the more severe classification -- keep
+                # THAT severity (never silently downgrade), but still fall
+                # through to the reopen logic below using the freshly
+                # reported record's own content otherwise.
+                severity = prior_severity
+                rec = dict(rec)
+                rec["severity"] = severity
+        if prior.get("status") in ("fixed", "verified"):
+            provenance = "fix_regression"
+            status = "reopened"
+            recur_count = prior.get("recur_count", 0) + 1
+        else:
+            status = prior.get("status", "open")
+            if status in ("accepted_risk", "deferred", "superseded"):
+                status = "reopened"
+
+    merged = dict(rec)
+    merged["finding_id"] = finding_id
+    merged["normalized_location"] = normalized_location
+    merged["normalized_issue_key"] = normalized_issue_key
+    merged["provenance"] = provenance
+    merged["origin_iteration"] = origin_iteration
+    merged["status"] = status
+    merged["recur_count"] = recur_count
+    merged["weak_location"] = bool(weak["weak"])
+    merged.setdefault("related_finding_ids", [])
+    catalog[finding_id] = merged
+    seen_this_round.add(finding_id)
+
+# ponytail: promotion is keyed on "not re-reported THIS ingestion call",
+# not on "the reviewer whose ingestion this is actually covers this
+# finding's artifact/section" -- a reviewer role that structurally cannot
+# see a given artifact_path (e.g. a spec-only reviewer silently clean on a
+# code finding) would incorrectly promote it. Every real call site in this
+# document ingests exactly the reviewer round that DOES cover the artifact
+# under review at that gate, so this does not misfire in practice; add an
+# artifact_path/reviewer-scope filter here if a future gate ever ingests
+# multiple unrelated artifacts through the same iteration catalog.
+for fid, rec in catalog.items():
+    if fid in seen_this_round:
+        continue
+    if rec.get("status") == "fixed":
+        rec["status"] = "verified"
+
+with open(out_path, "w", encoding="utf-8") as f:
+    for fid in sorted(catalog):
+        f.write(json.dumps(catalog[fid], sort_keys=True) + "\n")
+
+OPEN_STATUSES = ("open", "reopened")
+blockers = sum(1 for r in catalog.values() if r["severity"] == "blocker" and r["status"] in OPEN_STATUSES)
+majors = sum(1 for r in catalog.values() if r["severity"] == "major" and r["status"] in OPEN_STATUSES)
+minors = sum(1 for r in catalog.values() if r["severity"] == "minor" and r["status"] in OPEN_STATUSES)
+print(f"blockers={blockers}")
+print(f"majors={majors}")
+print(f"minors={minors}")
+print(f"collisions={','.join(collisions)}")
+PY
+)"
+  rc=$?
+  case $rc in
+    0) : ;;
+    3) echo "INGEST_FINDINGS_INVALID_RECORD" >&2; echo "$out" >&2; return 1 ;;
+    4) echo "INGEST_FINDINGS_ID_MISMATCH" >&2; echo "$out" >&2; return 1 ;;
+    *) echo "INGEST_FINDINGS_INTERNAL_ERROR:$rc" >&2; echo "$out" >&2; return 1 ;;
+  esac
+
+  mv "$tmp" "$catalog"
+
+  local collisions_csv
+  collisions_csv="$(printf '%s\n' "$out" | "$GREP_BIN" '^collisions=' | cut -d= -f2-)"
+  if [ -n "$collisions_csv" ]; then
+    local -a _if_coll; IFS=',' read -r -a _if_coll <<<"$collisions_csv"
+    local fid
+    for fid in "${_if_coll[@]}"; do
+      [ -n "$fid" ] || continue
+      record_event EVENT_CORRECTED corrected_event_id="finding:$fid" \
+        replacement_classification=finding_collision \
+        evidence="canonical id collision: conflicting severity classification" \
+        downstream_effect=kept_more_severe_classification \
+        phase="$(status_field "$status_file" phase)" \
+        iteration="$(status_field "$status_file" iteration)" \
+        reason="ingest_findings: colliding finding severity for $fid" >/dev/null \
+        || { echo "INGEST_FINDINGS_EVENT_CORRECTED_FAILED:$fid" >&2; return 1; }
+    done
+  fi
+
+  printf '%s\n' "$out" | "$GREP_BIN" -E '^(blockers|majors|minors)='
+}
+
+# ---- Bounded fixer batching and disposition ledger (spec §17.3, §18.4) -----
+# Usage: select_finding_batch CATALOG_PATH
+# Prints a SPACE-separated list of at most `document_fixer_batch_size` open/
+# reopened blocker+major finding IDs (blockers first, then oldest
+# origin_iteration first) -- never minors, which fixers address
+# opportunistically, not as part of a bounded batch. Space-separated (not
+# comma-separated) so an unquoted `$FINDING_IDS` expansion word-splits into
+# separate positional args wherever a caller (dispositions_complete, a
+# fixer's own per-ID loop) needs that -- a hex sha256 finding_id can never
+# itself contain whitespace, so this is a safe delimiter choice.
+select_finding_batch() {
+  local catalog="$1" cap
+  cap="$(policy_value document_fixer_batch_size)" || return 1
+  [ -f "$catalog" ] || { printf '\n'; return 0; }
+  jq -s -r --argjson cap "$cap" '
+    map(select((.status=="open" or .status=="reopened")
+               and (.severity=="blocker" or .severity=="major")))
+    | sort_by([(if .severity=="blocker" then 0 else 1 end), .origin_iteration])
+    | .[0:$cap]
+    | map(.finding_id)
+    | join(" ")
+  ' "$catalog"
+}
+
+# Usage: record_finding_disposition CATALOG_PATH FINDING_ID DISPOSITION [EVIDENCE]
+# DISPOSITION is exactly one of: fixed, already_satisfied, blocked,
+# subsumed_by:<finding_id>, accepted_risk:<decision_id>, deferred:<followup_id>
+# (spec §17.3). These map onto the catalog's own mandated `status` vocabulary
+# (spec §17.2: open|fixed|verified|accepted_risk|deferred|superseded) -- NEVER
+# the raw disposition token itself, which is why `blocked`/`already_satisfied`/
+# `subsumed_by` are not catalog-status values: `blocked` stays "open" (a fixer
+# admitting it could NOT act must never close the gate -- it also sets the
+# fixer's own dispatch verdict=BLOCKED, which HALTs separately);
+# `already_satisfied` maps to "fixed" (the SAME fixer-can't-close-its-own-
+# finding rule as an actual fix: only a subsequent reviewer round not
+# re-reporting it promotes it to "verified"); `subsumed_by:*` maps to
+# "superseded". This vocabulary deliberately has NO "verified" value -- only
+# ingest_findings (driven by a FRESH reviewer round) can ever promote a
+# catalog entry to "verified"; a fixer calling this function can never close
+# its own finding (spec §18.1's proof). The full disposition string (with its
+# `:<id>` suffix) is preserved verbatim in `.disposition`, separate from the
+# mapped `.status`.
+record_finding_disposition() {
+  local catalog="$1" fid="$2" disposition="$3" evidence="${4:-}"
+  [ -f "$catalog" ] || { echo "DISPOSITION_NO_CATALOG:$catalog" >&2; return 1; }
+  local base
+  case "$disposition" in
+    fixed|already_satisfied) base="fixed" ;;
+    blocked)                 base="open" ;;
+    subsumed_by:*)   base="superseded" ;;
+    accepted_risk:*) base="accepted_risk" ;;
+    deferred:*)      base="deferred" ;;
+    *) echo "DISPOSITION_BAD_VALUE:$disposition" >&2; return 1 ;;
+  esac
+  jq -e --arg id "$fid" 'select(.finding_id==$id)' "$catalog" >/dev/null 2>&1 \
+    || { echo "DISPOSITION_UNKNOWN_FINDING:$fid" >&2; return 1; }
+
+  local lockfile="$catalog.lock"
+  _run_log_lock_acquire "$lockfile" || return 1
+  local tmp="$catalog.tmp.$$"
+  if ! jq -c --arg id "$fid" --arg base "$base" --arg disp "$disposition" \
+        --arg ev "$evidence" --arg ts "$(iso_now)" '
+    if .finding_id == $id
+    then .status = $base | .disposition = $disp | .disposition_evidence = $ev
+         | .disposition_by = "fixer" | .disposition_at = $ts
+    else . end' "$catalog" > "$tmp"
+  then
+    rm -f "$tmp"; _run_log_lock_release "$lockfile"
+    echo "DISPOSITION_WRITE_FAILED" >&2; return 1
+  fi
+  mv "$tmp" "$catalog"
+  _run_log_lock_release "$lockfile"
+}
+
+# Usage: dispositions_complete CATALOG_PATH FINDING_ID...
+# 0 iff every named finding's catalog status is no longer open/reopened --
+# NOT simply "has a disposition recorded": `blocked` IS one of the six
+# legal dispositions (spec S17.3) but deliberately maps to status=open (it
+# must never close the gate), so a finding disposed `blocked` still reports
+# missing here. Harmless in practice -- a `blocked` disposition also sets
+# the fixer's own dispatch verdict=BLOCKED, which HALTs before this would
+# ever matter -- but the check is genuinely "is the gate unblocked", not
+# "did every ID get touched".
+dispositions_complete() {
+  local catalog="$1"; shift
+  local -a missing=()
+  local fid st
+  for fid in "$@"; do
+    [ -n "$fid" ] || continue
+    st="$(jq -r --arg id "$fid" 'select(.finding_id==$id) | .status' "$catalog" 2>/dev/null | tail -n1)"
+    case "$st" in open|reopened|"") missing+=("$fid") ;; esac
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    local IFS=,
+    echo "DISPOSITIONS_MISSING:${missing[*]}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# ---- Convergence signals and divergence detection (spec §18.3) -------------
+# Usage: record_convergence_signals PHASE ITERATION BYTES_BEFORE BYTES_AFTER \
+#   NEW_COUNT RECURRING_COUNT RESOLVED_COUNT REOPENED_COUNT FIX_REGRESSION_COUNT NET_OPEN
+record_convergence_signals() {
+  local phase="$1" iteration="$2" before="$3" after="$4" new_c="$5" recurring="$6" \
+        resolved="$7" reopened="$8" fix_regression="$9" net_open="${10}"
+  local growth_pct=0
+  if [ "$before" -gt 0 ] 2>/dev/null; then
+    growth_pct=$(( ((after - before) * 100) / before ))
+  fi
+  local phase_name; phase_name="$(_phase_name "$phase")" || return 1
+  record_event CONVERGENCE_RECORDED phase="$phase" iteration="$iteration" \
+    phase_name="$phase_name" growth_pct="$growth_pct" new_count="$new_c" \
+    recurring_count="$recurring" resolved_count="$resolved" reopened_count="$reopened" \
+    fix_regression_count="$fix_regression" net_open_blockers_majors="$net_open" \
+    reason="review/fix cycle convergence signals" >/dev/null || return 1
+  mkdir -p "$PHASE_DIR"
+  jq -cn --arg iteration "$iteration" --argjson growth_pct "$growth_pct" \
+    --argjson new_count "$new_c" --argjson recurring_count "$recurring" \
+    --argjson resolved_count "$resolved" --argjson reopened_count "$reopened" \
+    --argjson fix_regression_count "$fix_regression" --argjson net_open "$net_open" \
+    '{iteration:$iteration, growth_pct:$growth_pct, new_count:$new_count,
+      recurring_count:$recurring_count, resolved_count:$resolved_count,
+      reopened_count:$reopened_count, fix_regression_count:$fix_regression_count,
+      net_open:$net_open}' >> "$PHASE_DIR/convergence.jsonl"
+}
+
+# Usage: divergence_check PHASE ITERATION CATALOG_PATH
+# Prints "yes:<reason>" or "no". Reads $PHASE_DIR/convergence.jsonl (the last
+# two recorded rounds, for rules 3/4 below) and CATALOG_PATH (the current
+# iteration's own catalog, for rules 1/2 -- ponytail note: rule 2's "two
+# consecutive rounds" is approximated as "still open >=1 iteration after it
+# first appeared as a fix regression", which needs only this one iteration's
+# catalog rather than a second historical snapshot; upgrade to an exact
+# per-round diff if that approximation ever proves too coarse).
+divergence_check() {
+  local phase="$1" iteration="$2" catalog="$3"
+  local ledger="$PHASE_DIR/convergence.jsonl"
+  local threshold; threshold="$(policy_value artifact_growth_warning_pct)" || return 1
+  local iter_num
+  iter_num=$((10#$iteration))
+
+  if [ -f "$catalog" ]; then
+    local recur_hit fixregress_hit
+    recur_hit="$(jq -s '[.[] | select((.recur_count // 0) >= 2)] | length' "$catalog" 2>/dev/null)"
+    if [ "${recur_hit:-0}" -gt 0 ] 2>/dev/null; then
+      echo "yes:finding_recurred_twice"; return 0
+    fi
+    fixregress_hit="$(jq -s --argjson iter "$iter_num" '
+      [.[] | select(.provenance=="fix_regression" and .severity=="blocker"
+        and (.status=="open" or .status=="reopened")
+        and (($iter - (.origin_iteration|tonumber)) >= 1))] | length
+    ' "$catalog" 2>/dev/null)"
+    if [ "${fixregress_hit:-0}" -gt 0 ] 2>/dev/null; then
+      echo "yes:fix_regression_persists"; return 0
+    fi
+  fi
+
+  if [ -f "$ledger" ] && [ "$(wc -l < "$ledger")" -ge 2 ]; then
+    local last2 g1 g2 net1 net2 reopened1 reopened2 resolved1 resolved2
+    last2="$(tail -n2 "$ledger")"
+    g1="$(printf '%s\n' "$last2" | sed -n 1p | jq -r '.growth_pct')"
+    g2="$(printf '%s\n' "$last2" | sed -n 2p | jq -r '.growth_pct')"
+    net1="$(printf '%s\n' "$last2" | sed -n 1p | jq -r '.net_open')"
+    net2="$(printf '%s\n' "$last2" | sed -n 2p | jq -r '.net_open')"
+    reopened1="$(printf '%s\n' "$last2" | sed -n 1p | jq -r '.reopened_count')"
+    reopened2="$(printf '%s\n' "$last2" | sed -n 2p | jq -r '.reopened_count')"
+    resolved1="$(printf '%s\n' "$last2" | sed -n 1p | jq -r '.resolved_count')"
+    resolved2="$(printf '%s\n' "$last2" | sed -n 2p | jq -r '.resolved_count')"
+    if [ "$g1" -gt "$threshold" ] && [ "$g2" -gt "$threshold" ] && [ "$net2" -ge "$net1" ]; then
+      echo "yes:growth_without_reduction"; return 0
+    fi
+    if [ "$reopened1" -gt "$resolved1" ] && [ "$reopened2" -gt "$resolved2" ]; then
+      echo "yes:fixer_reopens_more_than_resolved"; return 0
+    fi
+  fi
+  echo "no"
+}
+```
+
 ## Phase −1 — Preflight skill availability check
 
 Goal: confirm the environment is sound (binaries, CLI syntax, working tree) AND that both worker CLIs can load every Superpowers skill this orchestration depends on. If any preflight step fails, HALT with a clear remediation message — Phase 2 does not start.
@@ -6618,26 +7478,29 @@ Per the design's "File policy for non-READY paths" section, the orchestrator's c
 - **Codex STATUS file present but malformed (Mode 4 after the one allowed retry)** → expected; the move step still runs because the file exists. Downstream consumers treat it as `FAILED` (mode 4).
 - **Codex STATUS file missing with no corresponding `CODEX_SKIPPED_BY_USER_CONSENT` or `CODEX_UNAVAILABLE` event for that `(phase, iteration)`** → orchestration bug; readiness writer reports `INVALID_ORCHESTRATION` and fails the readiness check.
 
-### Step 3.1 — Iteration loop
+### Step 3.1 — Iteration loop (spec §18.1–§18.3; the canonical gate-loop procedure — Phases 5 and 7 below cite this one rather than repeating it)
 
-For each iteration N (start at 1, hard cap at 10):
+For each iteration N (start at 1, hard cap `review_iteration_cap`):
 
-1. `mkdir -p <feature-folder>/3-spec-review/iteration-NN`.
+1. `mkdir -p <feature-folder>/3-spec-review/NN` (`$PHASE_DIR/$ITERATION`, never `iteration-NN`). Before dispatching this round's reviewers, if a fixer produced this revision (N > 1), call `validate_artifact spec-fixer "$LAST_FIXER_DISPATCH_ID"` — a producer's revision never enters review on size or marker presence alone. Capture `bytes_before="$(wc -c < "$SPEC_PATH")"` for this round's convergence signal.
 2. **Dispatch both reviewers in parallel using `dispatch_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=3, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 3.0) have completed.
-   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `spec-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Outputs: `3-spec-review/iteration-NN/claude-verdict.md` (STATUS) and `claude-findings.md` (findings). This role's timeout comes from the Models table via `role_timeout`.
-   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `spec-reviewer-codex`. Outputs: `3-spec-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 3.0 — do not dispatch and do not log a new event here.
+   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `spec-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`. Its real STATUS lives at its own attempt directory (never a phase-level alias): `claude_status="$(role_attempt_dir spec-reviewer-claude "$(_latest_attempt_id p03-i$ITERATION-spec-reviewer-claude)")/STATUS.md"`. Findings: `3-spec-review/$ITERATION/claude-findings.jsonl` (one canonical-schema JSON record per line — spec §17.2). This role's timeout comes from the Models table via `role_timeout`.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `spec-reviewer-codex`. Its real STATUS: `codex_status="$(role_attempt_dir spec-reviewer-codex "$(_latest_attempt_id p03-i$ITERATION-spec-reviewer-codex)")/STATUS.md"`. Findings: `3-spec-review/$ITERATION/codex-findings.jsonl`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 3.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
-3. Read only the verdict files.
-4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
+3. Read only the verdict files, then ingest findings: `ingest_findings spec-reviewer-claude "$claude_status" "3-spec-review/$ITERATION/claude-findings.jsonl"`, and — only when `codex_available = true` — `ingest_findings spec-reviewer-codex "$codex_status" "3-spec-review/$ITERATION/codex-findings.jsonl"`. Both calls merge into the SAME `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (`ingest_findings` derives this from each STATUS_FILE's own attempt directory — `dirname` three levels up — so it lands here regardless of which reviewer's STATUS_FILE was passed; union — spec §16.5). Read `blockers`/`majors`/`minors` from the LAST call's own printed summary (the catalog is shared state; either call's summary reflects the union so far, but wait for both before deciding the gate).
+4. Apply the iteration-dependent gate (see "Review-gate severity policy") against the catalog counts from step 3 — **iterations 1–2:** re-dispatch when `blockers + majors > 0`; **iterations 3 and up:** re-dispatch when `blockers > 0` OR any open major still lacks a disposition (`dispositions_complete` against the catalog's own open-major IDs returns nonzero):
    - Call `reconstruct_checkpoint_state 3 "$ITERATION"` first (spec-fixer is checkpointed, "Checkpoint contract" above) so `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_CHANGES` reflect this exact iteration's own prior attempt, if any, before rendering the appendix.
-   - Dispatch one `claude` subprocess for role `spec-fixer`. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (newline-separated list of findings files from this iteration). The fixer edits the canonical spec in place. This role's timeout comes from the Models table via `role_timeout`.
-   - Increment N. Loop from step 1.
-5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
-   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** dispatch one `claude` subprocess for role `spec-fixer`. Inputs: `$SPEC_PATH`, `$FINDINGS_PATHS` (findings files from the passing iteration). Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). If the fixer returns `BLOCKED`, HALT and surface to the user.
-   - Dispatch one `claude` subprocess for role `summarizer-spec`. Inputs: `$FEATURE_FOLDER`. Outputs: `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md`. The summarizer records any deferred majors in the summary file.
-   - You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 4.
+   - `FINDING_IDS="$(select_finding_batch "$PHASE_DIR/$ITERATION/findings-catalog.jsonl")"` (bounded to `document_fixer_batch_size`, blockers first) — the SAME path the spec-fixer appendix itself reads (`$PHASE_DIR/$ITERATION/findings-catalog.jsonl`), never a phase-relative alias.
+   - Dispatch one `claude` subprocess for role `spec-fixer`. Inputs: `$SPEC_PATH`, `$FINDING_IDS`. The fixer edits the canonical spec in place and calls `record_finding_disposition` for every assigned ID (spec §17.3's six-value vocabulary — never a bare "fixed the majors" with no per-ID record). This role's timeout comes from the Models table via `role_timeout`.
+   - `dispositions_complete "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" $FINDING_IDS` — a fixer returning `DONE` with an undispositioned assigned ID is an orchestration bug (spec §17.3's "no assigned finding may disappear"); treat it as `CLAUDE_FAILED`/Mode 4.
+   - Capture `bytes_after="$(wc -c < "$SPEC_PATH")"`, tally this round's new/recurring/resolved/reopened/fix-regression counts from the catalog, and call `record_convergence_signals 3 "$ITERATION" "$bytes_before" "$bytes_after" ...`.
+   - Call `divergence_check 3 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"`. On `yes:<reason>`: `record_event DIVERGENCE_DETECTED phase_name=spec-review divergence_reason=<reason> ...`; if this is the `divergent_round_cap`-th consecutive divergent round, `record_event DIVERGENT_ROUND_CAP_REACHED ...` and dispatch exactly ONE consolidation-priority `spec-fixer` batch (same dispatch mechanism, prioritizing deletion/replacement/contradiction-removal/provenance-repair per spec §18.3 over addressing new findings) instead of the ordinary batch above — it is still bounded and still followed by step 1's `validate_artifact` and a full re-review; do not silently return to unlimited additive fixing.
+   - Increment N. Loop from step 1 — the reviewers ALWAYS run again against the fixer's new revision; there is no iteration, including the cap, at which a fixer's own STATUS substitutes for a subsequent reviewer verdict (spec §18.2).
+5. When the gate passes — `blockers=0` and (iterations 1–2: `majors=0`) or (iterations 3+: every open major dispositioned):
+   - Dispatch one `claude` subprocess for role `summarizer-spec`. Inputs: `$FEATURE_FOLDER`. Outputs: `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md`. The summarizer records any deferred/accepted-risk majors (read from the final catalog) in the summary file.
+   - You read only `summarizer-status.md`. On `verdict=DONE`, proceed to Phase 4. **The last successful gate action before Phase 4 is this reviewer-verified acceptance — never a fixer's own STATUS** (spec §18.1's final proof).
 
-If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT and surface to user with residual findings paths and the spec path. A cap reached with `blockers=0` but majors outstanding is NOT a HALT — it gets the final fix pass and then passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
+If iteration cap (`review_iteration_cap`) trips with any active reviewer still reporting an open BLOCKER, HALT and surface to user with residual findings paths and the spec path (`event=ITERATION_CAP_REACHED`). A cap reached with `blockers=0` but every remaining major already dispositioned is NOT a HALT — it passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`). A cap reached with an UNDISPOSITIONED major HALTs exactly like a blocker — the cap never manufactures a disposition nobody recorded.
 
 ## Phase 4 — Plan writing (delegated)
 
@@ -6695,26 +7558,29 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 
 The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this gate.
 
-### Step 5.1 — Iteration loop
+### Step 5.1 — Iteration loop (same convergence procedure as Step 3.1, substituting `$PLAN_PATH`/`plan-writer`/`plan-fixer`/`plan-reviewer-*`)
 
-For each iteration N (start at 1, hard cap at 10):
+For each iteration N (start at 1, hard cap `review_iteration_cap`):
 
-1. `mkdir -p <feature-folder>/5-plan-review/iteration-NN`.
+1. `mkdir -p <feature-folder>/5-plan-review/NN` (`$PHASE_DIR/$ITERATION`, never `iteration-NN`). Before dispatching this round's reviewers, validate the producer's revision: iteration 1 calls `validate_artifact plan-writer "$(_latest_attempt_id p04-i00-plan-writer)"` (the Phase 4 dispatch — Phase 4 only proceeds to Phase 5 on a `DONE` verdict, so its latest attempt is its successful one); iteration N>1 calls `validate_artifact plan-fixer "$LAST_FIXER_DISPATCH_ID"`. Capture `bytes_before="$(wc -c < "$PLAN_PATH")"`.
 2. **Dispatch both reviewers in parallel using `dispatch_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=5, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 5.0) have completed.
-   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `plan-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Outputs: `5-plan-review/iteration-NN/claude-verdict.md` and `claude-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
-   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `plan-reviewer-codex`. Outputs: `5-plan-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
+   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `plan-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$PLAN_PATH` (read from `4-plan-writing/plan-status.md`), `$SPEC_PATH`. Its real STATUS: `claude_status="$(role_attempt_dir plan-reviewer-claude "$(_latest_attempt_id p05-i$ITERATION-plan-reviewer-claude)")/STATUS.md"`. Findings: `5-plan-review/$ITERATION/claude-findings.jsonl`. This role's timeout comes from the Models table via `role_timeout`.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `plan-reviewer-codex`. Its real STATUS: `codex_status="$(role_attempt_dir plan-reviewer-codex "$(_latest_attempt_id p05-i$ITERATION-plan-reviewer-codex)")/STATUS.md"`. Findings: `5-plan-review/$ITERATION/codex-findings.jsonl`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
-3. Read only verdict files.
-4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
+3. Read only verdict files, then `ingest_findings plan-reviewer-claude "$claude_status" "5-plan-review/$ITERATION/claude-findings.jsonl"` and, when active, the codex counterpart — both merge into `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (derived from each STATUS_FILE's own attempt directory, never a phase-relative alias).
+4. Apply the iteration-dependent gate against the catalog counts — **iterations 1–2:** re-dispatch when `blockers + majors > 0`; **iterations 3 and up:** re-dispatch when `blockers > 0` OR any open major still lacks a disposition:
    - Call `reconstruct_checkpoint_state 5 "$ITERATION"` first (plan-fixer is checkpointed, "Checkpoint contract" above) so `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_CHANGES` reflect this exact iteration's own prior attempt, if any, before rendering the appendix.
-   - Dispatch one `claude` subprocess for role `plan-fixer`. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS`. This role's timeout comes from the Models table via `role_timeout`.
-   - Increment N. Loop.
-5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
-   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** dispatch one `claude` subprocess for role `plan-fixer`. Inputs: `$PLAN_PATH`, `$FINDINGS_PATHS` (findings files from the passing iteration). Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). If the fixer returns `BLOCKED`, HALT and surface to the user.
-   - Dispatch one `claude` subprocess for role `summarizer-plan`. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. The summarizer records any deferred majors in the summary file.
-   - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 6.
+   - `FINDING_IDS="$(select_finding_batch "$PHASE_DIR/$ITERATION/findings-catalog.jsonl")"` — the SAME path the plan-fixer appendix itself reads.
+   - Dispatch one `claude` subprocess for role `plan-fixer`. Inputs: `$PLAN_PATH`, `$FINDING_IDS`. The fixer calls `record_finding_disposition` for every assigned ID. This role's timeout comes from the Models table via `role_timeout`.
+   - `dispositions_complete "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" $FINDING_IDS`; treat a gap as Mode 4.
+   - Capture `bytes_after`, tally this round's counts, and call `record_convergence_signals 5 "$ITERATION" ...`.
+   - Call `divergence_check 5 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"` and apply the SAME divergence handling as Step 3.1 (record the event(s); at `divergent_round_cap` dispatch one consolidation-priority `plan-fixer` batch instead of the ordinary one).
+   - Increment N. Loop from step 1 — reviewers ALWAYS run again; no cap-adjacent fixer dispatch ever substitutes for the next reviewer round.
+5. When the gate passes:
+   - Dispatch one `claude` subprocess for role `summarizer-plan`. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. The summarizer records any deferred/accepted-risk majors (from the final catalog) in the summary file.
+   - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 6. The last successful gate action before Phase 6 is this reviewer-verified acceptance, never the fixer's own STATUS.
 
-If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT and surface to user. A cap reached with `blockers=0` but majors outstanding is NOT a HALT — it gets the final fix pass and then passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
+If iteration cap (`review_iteration_cap`) trips with any active reviewer still reporting an open BLOCKER, HALT and surface to user. A cap reached with `blockers=0` and every remaining major already dispositioned is NOT a HALT — it passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`). An undispositioned major at the cap HALTs like a blocker.
 
 ## Phase 6 — Implementation (delegated, single supervising subagent)
 
@@ -6904,31 +7770,34 @@ The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this 
 
 **Dual-vendor finding union (spec §16.5).** When both reviewers ran this iteration, their findings are the UNION, never a replacement: a `PASS` from one reviewer never cancels or supersedes a `blockers`/`majors` finding the OTHER reviewer reported for the same iteration. The iteration-dependent gate (see "Review-gate severity policy") already sums `blockers + majors` ACROSS every active reviewer for this reason — an implementation that reads only the "worse" of the two verdicts, or short-circuits once either reviewer reports PASS, silently drops the other reviewer's findings and must not be generated.
 
-### Step 7.1 — Iteration loop
+### Step 7.1 — Iteration loop (same convergence procedure as Step 3.1; the bounded fixer is `implementation-fixer`, NOT the full `implementer` — Phase 6's role never re-runs the plan's task loop for a review finding)
 
-For each iteration N (start at 1, hard cap at 10):
+For each iteration N (start at 1, hard cap `review_iteration_cap`):
 
-1. `mkdir -p <feature-folder>/7-code-review/iteration-NN`.
+1. `mkdir -p <feature-folder>/7-code-review/NN` (`$PHASE_DIR/$ITERATION`, never `iteration-NN`). `IMPLEMENTATION_SUMMARY_PATH="$FEATURE_FOLDER/6-implementation/implementation-summary.md"`. Before dispatching this round's reviewers, validate the producer's revision: iteration 1 calls `validate_artifact implementer "$(_latest_attempt_id p06-i00-implementer)"` (the Phase 6 dispatch); iteration N>1 calls `validate_artifact implementation-fixer "$LAST_FIXER_DISPATCH_ID"`. Capture `REVIEWED_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)"` — this round's reviewers evaluate exactly this immutable commit.
 2. **Dispatch both reviewers in parallel using `dispatch_parallel`** (see "Reviewer parallelization" cookbook). This is **mandatory** — generating bash that dispatches only the Claude reviewer without a corresponding `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` RUN_LOG event for this `(phase=7, iteration=NN)` is an **orchestration bug**. Do not proceed past this step until both subprocesses (or Claude-only when Codex was declared unavailable in Step 7.0) have completed.
-   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `code-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/claude-verdict.md` and `claude-findings.md`. This role's timeout comes from the Models table via `role_timeout`.
-   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `code-reviewer-codex`. Inputs include `$IMPLEMENTATION_BASE_SHA`. Outputs: `7-code-review/iteration-NN/codex-verdict.md` and `codex-findings.md`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
+   - **Claude subprocess (always dispatched):** dispatch one `claude` subprocess for role `code-reviewer-claude`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$PLAN_PATH`, `$IMPLEMENTATION_BASE_SHA`. Its real STATUS: `claude_status="$(role_attempt_dir code-reviewer-claude "$(_latest_attempt_id p07-i$ITERATION-code-reviewer-claude)")/STATUS.md"`. Findings: `7-code-review/$ITERATION/claude-findings.jsonl`. This role's timeout comes from the Models table via `role_timeout`.
+   - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `code-reviewer-codex`. Inputs include `$IMPLEMENTATION_BASE_SHA`. Its real STATUS: `codex_status="$(role_attempt_dir code-reviewer-codex "$(_latest_attempt_id p07-i$ITERATION-code-reviewer-codex)")/STATUS.md"`. Findings: `7-code-review/$ITERATION/codex-findings.jsonl`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 7.0 — do not dispatch and do not log a new event here.
    `code-reviewer-codex`'s timeout (see the Models table, via `role_timeout`) exceeds
    a single Bash tool call, so this step's `dispatch_parallel` call must
    itself be issued as **one Bash tool call with `run_in_background: true`** — the
    whole call waits on both children, so it inherits the longer of the two roles'
    timeouts.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
-3. Read only verdict files.
-4. Apply the iteration-dependent gate (see "Review-gate severity policy"). Re-dispatch when the loop condition holds for any active reviewer — **iterations 1–2:** `blockers + majors > 0`; **iterations 3–10:** `blockers > 0` (majors alone do NOT trigger another round — they are fixed by the final fix pass in step 5 and recorded as deferred majors):
-   - Call `reconstruct_checkpoint_state 6` first (the re-dispatched `implementer` publishes under its own fixed phase-6/iteration-00 identity regardless of which gate triggers the re-dispatch, "Checkpoint contract" above) so `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_CHANGES` reflect its own prior attempt, if any, before rendering the appendix.
-   - Re-dispatch the implementer subagent (role `implementer`, Phase 6 appendix) with `$FINDINGS_PATHS` so it patches the implementation. This role's timeout (from the Models table via `role_timeout`) exceeds a single Bash tool call, so issue this re-dispatch as **one Bash tool call with `run_in_background: true`**.
-   - Increment N. Loop.
-5. When the gate passes — `blockers=0, majors=0` (iterations 1–2) OR `blockers=0` (iterations 3–10):
-   - **Final fix pass (iterations 3–10 only, when `majors > 0` at the passing iteration):** call `reconstruct_checkpoint_state 6` first (same reason as step 4 above), then re-dispatch the implementer subagent (role `implementer`, Phase 6 appendix) with `$FINDINGS_PATHS` (findings files from the passing iteration) so it patches the implementation, again as **one Bash tool call with `run_in_background: true`**. Do NOT re-dispatch reviewers afterwards — the review loop stops here; the addressed majors are recorded as deferred majors (fixed, not re-reviewed). The implementer's own verification must still PASS; if it reports `BLOCKED` or verification fails, HALT and surface to the user.
-   - Dispatch one `claude` subprocess for role `summarizer-code-review`. Outputs: `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`. The summarizer records any deferred majors in the summary file.
-   - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 8.
+3. Read only verdict files, then `ingest_findings code-reviewer-claude "$claude_status" "7-code-review/$ITERATION/claude-findings.jsonl"` and, when active, the codex counterpart — both merge into `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (derived from each STATUS_FILE's own attempt directory, never a phase-relative alias).
+4. Apply the iteration-dependent gate against the catalog counts — **iterations 1–2:** re-dispatch when `blockers + majors > 0`; **iterations 3 and up:** re-dispatch when `blockers > 0` OR any open major still lacks a disposition:
+   - Call `reconstruct_checkpoint_state 7 "$ITERATION"` (`implementation-fixer` is Phase 7's own checkpointed role — see the `reconstruct_checkpoint_state` case table above — so this reads `p07-i$ITERATION-implementation-fixer`'s own prior attempt, never Phase 6's) so `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_CHANGES` reflect this exact iteration's own prior attempt, if any, before rendering the appendix.
+   - `FINDING_IDS="$(select_finding_batch "$PHASE_DIR/$ITERATION/findings-catalog.jsonl")"` — the SAME path implementation-fixer itself reads; `ACCEPTED_PLAN="$PLAN_PATH"`; `WRITE_LEASE="$ORCHESTRATION_DIR/write-lease.json"`.
+   - Dispatch one `claude` subprocess for role `implementation-fixer` (NOT `implementer` — that role's Mode C is retired; a bounded per-finding fixer that never re-derives scope from the plan is what spec §17.3/§18.4 require). Inputs: `$ACCEPTED_PLAN`, `$REVIEWED_REVISION`, `$FINDING_IDS`, `$WRITE_LEASE`. This role's timeout (from the Models table via `role_timeout`) exceeds a single Bash tool call, so issue this dispatch as **one Bash tool call with `run_in_background: true`**.
+   - `dispositions_complete "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" $FINDING_IDS`; a `DONE` verdict with a gap is Mode 4/`CLAUDE_FAILED`. `PARTIAL` is continuable progress (spec §17.3) — treat exactly like an in-cap continuation, never a gate pass.
+   - Capture this round's byte/section counts and finding-transition tallies from the catalog and call `record_convergence_signals 7 "$ITERATION" ...`.
+   - Call `divergence_check 7 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"` and apply the SAME divergence handling as Step 3.1.
+   - Increment N. Loop from step 1 — reviewers ALWAYS run again against the fixer's new commit; the retired "final fix pass, no re-review" text no longer exists in this phase.
+5. When the gate passes:
+   - Dispatch one `claude` subprocess for role `summarizer-code-review`. Outputs: `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`. The summarizer records any deferred/accepted-risk majors (from the final catalog) in the summary file.
+   - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 8. The last successful gate action before Phase 8 is this reviewer-verified acceptance, never `implementation-fixer`'s own STATUS.
 
-If iteration cap (10) trips with any active reviewer still reporting `blockers > 0`, HALT. A cap reached with `blockers=0` but majors outstanding is NOT a HALT — it gets the final fix pass and then passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`).
+If iteration cap (`review_iteration_cap`) trips with any active reviewer still reporting an open BLOCKER, HALT. A cap reached with `blockers=0` and every remaining major already dispositioned is NOT a HALT — it passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`). An undispositioned major at the cap HALTs like a blocker.
 
 ## Phase 8 — All tests (delegated, test→fix loop)
 
@@ -7141,7 +8010,7 @@ The "Codex subprocess" column below applies AT A PER-PHASE GATE (Phases 3, 5, 6,
 
 ### Iteration cap
 
-Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of 10 fix→re-review iterations with a pass threshold that relaxes after iteration 2 (see "Review-gate severity policy"). Through iteration 2, any active reviewer reporting `blockers > 0` OR `majors > 0` triggers another round. From iteration 3 onward, ONLY `blockers > 0` triggers another round — majors no longer trigger re-review; they are fixed once in the final fix pass and downgraded to deferred majors (fixed, not re-reviewed). After 10 iterations with any active reviewer still reporting `blockers > 0`, HALT and surface residual findings paths plus the artifact path. The user decides: override (accept and proceed) or take the work back. A gate that reaches iteration 3 or beyond (including the cap) with `blockers = 0` but majors outstanding runs the final fix pass, passes the gate, and sets the readiness verdict to `READY_WITH_NOTES`.
+Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of `review_iteration_cap` (currently 10) fix→re-review iterations with a pass threshold that relaxes after iteration 2 (see "Review-gate severity policy"). Through iteration 2, any active reviewer reporting `blockers > 0` OR `majors > 0` triggers another round. From iteration 3 onward, a BLOCKER always triggers another round, and a MAJOR triggers another round only until it carries an explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>` disposition — once every open major is dispositioned, the gate passes with those majors carried as deferred/accepted-risk in the readiness report. Every fixer dispatch, at any iteration including the cap, is followed by another full reviewer round (spec §18.2); there is no iteration at which a fixer's own STATUS substitutes for that round. After the cap with any active reviewer still reporting `blockers > 0`, HALT and surface residual findings paths plus the artifact path. The user decides: override (accept and proceed) or take the work back. A gate that reaches iteration 3 or beyond (including the cap) with `blockers = 0` and every open major already dispositioned passes the gate and sets the readiness verdict to `READY_WITH_NOTES`.
 
 ### Resumability
 
@@ -7686,13 +8555,13 @@ This Develop-It SDLC step is complete only when ALL of the following hold:
 - Phase 1 preflight passed: `1-preflight/phase-1/claude-check-status.md` is `READY`, AND the readiness writer's classification for the Phase 1 codex slot is one of: (a) `READY` (codex STATUS present with `verdict: READY`), (b) `SKIPPED` consented via `event=CODEX_DISABLED_BY_USER_CONSENT` (codex STATUS absent), or (c) `FAILED` with a present codex STATUS file carrying `verdict: FAILED` / non-`READY` (Mode 4 malformed STATUS may legitimately remain at the relocated path). A Phase 1 codex classification of `INVALID_ORCHESTRATION` blocks completion — this includes both (i) STATUS absent with NO corresponding event, AND (ii) STATUS absent with `event=CODEX_UNAVAILABLE` but no `event=CODEX_DISABLED_BY_USER_CONSENT` (per spec, Phase 1 Mode 0 HALTs unconditionally and Modes 1–5 require user consent — reaching completion without one of those events is an orchestration violation). The Phase 1 path is stricter than per-phase gates: an unavailable codex at Phase 1 is passable ONLY with recorded user consent.
 - Per-phase preflight passed for every phase in {3, 5, 6, 7}: `<phase-dir>/preflight/claude-check-status.md` is `READY`, AND the readiness writer's classification for that phase's codex slot is `READY`, `SKIPPED` (matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for `(phase=<P>, iteration=00)`), or `FAILED` (matching `event=CODEX_UNAVAILABLE` for `(phase=<P>, iteration=00)`, OR a present codex STATUS file with `verdict: FAILED` / non-`READY` — Mode 4 malformed STATUS may legitimately remain). Only an `INVALID_ORCHESTRATION` classification blocks completion. `FAILED` codex per-phase verdicts surface in the readiness report's `partial_review` / `codex_unavailable_reason` notes but do not gate completion. For Phase 6 specifically, this is explicit: Phase 6 codex probe failure is non-blocking by design — see Step 6.−1. Unlike Phase 1, per-phase gates do not require user consent for codex degradation; the per-phase preflight model trades that prompt for fast automatic degradation since the user has already opted into the run.
 - Phase 2 context discovery passed (`2-context-discovery/status.md` = `READY`).
-- Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining majors fixed via the final fix pass and recorded as deferred)); `3-spec-review/spec-review-summary.md` exists.
+- Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `3-spec-review/spec-review-summary.md` exists.
 - Implementation plan was written by the `plan-writer` subagent (`4-plan-writing/plan-status.md` = `DONE`).
-- Plan review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining majors fixed via the final fix pass and recorded as deferred)); `5-plan-review/plan-review-summary.md` exists.
+- Plan review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `5-plan-review/plan-review-summary.md` exists.
 - Implementer subagent completed Phase 6 (`6-implementation/implementer-status.md` = `DONE`, `verification=PASS`); `6-implementation/implementation-summary.md` exists.
 - No-secret checks ran (delegated to implementer/debugger; recorded in implementation summary) when the feature touches credentials, config, notebooks, examples, generated artifacts, or deployment files.
 - Credential-dependent checks ran or were safely skipped per the plan.
-- Code review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining majors fixed via the final fix pass and recorded as deferred)); `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
+- Code review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
 - Phase 8 all-tests completed: `8-all-tests/summarizer-status.md` = `DONE` and `8-all-tests/all-test-summary.md` exists. A `final_test_verdict` of `FAILED` (residual failures after the 3-fix-round cap) does NOT block completion — the run completes with the detailed residual-failure record in the summary and the readiness verdict forced to `NOT_READY`. `SKIPPED` (`no-tests-found`) does not block.
 - Phase 9 git result is `DONE` or `SKIPPED` with a clear reason; `9-git-finalization/git-status.md` exists.
 - Phase 10 readiness report exists (`<feature-folder>/final-readiness-report.md`) and `<feature-folder>/readiness-status.md` = `DONE`.
@@ -8006,23 +8875,15 @@ You are a spec reviewer invoked as a fresh subprocess by the develop-it orchestr
    - **MAJOR** — missing requirement, internal contradiction, ambiguity that would cause an implementer to guess, or late-surfacing risk.
    - **MINOR / NIT** — wording, formatting, optional enhancement, style.
    Do NOT label obvious correctness/coverage issues as MINOR. If the spec is acceptable for the next SDLC step but has nits, set `verdict=PASS` with `blockers=0, majors=0, minors=N`.
-4. Write the full findings file:
+4. Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above for the exact field list and how `finding_id`/`normalized_location`/`normalized_issue_key` are derived; you supply everything EXCEPT those three, which `ingest_findings` computes deterministically — never invent or guess them yourself):
 
 ```
-Path: $FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/claude-findings.md
+Path: $FEATURE_FOLDER/3-spec-review/$ITERATION/claude-findings.jsonl
 ```
 
-Format for each finding:
+One JSON object per line, each with: `source_finding_id` (your own short local ID, e.g. `F1`), `reviewer_role: "spec-reviewer-claude"`, `vendor: "claude"`, `phase: "3"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path: "$SPEC_PATH"`, `artifact_revision` (the spec's current sha256 or git sha), `location` (a human excerpt: heading text or `"L<N>"`), `line` (the 1-based line number your finding concerns), `issue_key` (a short stable slug for the underlying issue, e.g. `"missing-non-goals"`), `summary`, `evidence` (the exact excerpt), `required_change`, `provenance: "unknown"` (the ingestion helper refines this against prior rounds), `related_finding_ids: []`.
 
-```
-### Finding N — <one-line summary>
-- **Severity:** BLOCKER | MAJOR | MINOR
-- **Location:** <spec section / heading / line range>
-- **Issue:** <description>
-- **Recommendation:** <concrete change suggested>
-```
-
-Findings: `$FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/claude-findings.md` (written per step 4 above).
+Findings: `$FEATURE_FOLDER/3-spec-review/$ITERATION/claude-findings.jsonl` (written per step 4 above).
 
 ## Publish STATUS
 
@@ -8050,12 +8911,12 @@ reason: <one line, or the literal word null>
 published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
 artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
 output_count: 1
-output_01: <absolute path to the findings file you wrote>
+output_01: <absolute path to the findings.jsonl file you wrote>
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
 blockers: <int>
 majors: <int>
 minors: <int>
-findings: <path to the findings file you wrote, or none>
+findings: <path to the findings.jsonl file you wrote, or none>
 STATUS
 ```
 
@@ -8094,7 +8955,7 @@ You are a cross-vendor spec reviewer (the "second opinion") invoked as a fresh s
 
 ## Mode
 
-`scoped` mode (spec-only). Filesystem allow-list: `$SPEC_PATH` plus your own output files inside `$FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/`. Command budget: max 4 shell or read commands per dispatch.
+`scoped` mode (spec-only). Filesystem allow-list: `$SPEC_PATH` plus your own output files inside `$FEATURE_FOLDER/3-spec-review/$ITERATION/`. Command budget: max 4 shell or read commands per dispatch.
 
 ## Forbidden reads
 
@@ -8128,15 +8989,7 @@ If the spec references existing implementation that you cannot verify under this
 
 Report every BLOCKER and MAJOR you find; cap MINOR findings at 10; keep each finding under 150 words.
 
-Findings: `$FEATURE_FOLDER/3-spec-review/iteration-$ITERATION/codex-findings.md`. Format per finding:
-
-```
-### Finding N — <one-line summary>
-- **Severity:** BLOCKER | MAJOR | MINOR
-- **Location:** <spec section / heading / line range>
-- **Issue:** <description>
-- **Recommendation:** <concrete change suggested>
-```
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above for the exact field list; you supply everything except `finding_id`/`normalized_location`/`normalized_issue_key`, which `ingest_findings` derives deterministically). Findings: `$FEATURE_FOLDER/3-spec-review/$ITERATION/codex-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "spec-reviewer-codex"`, `vendor: "codex"`, `phase: "3"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path: "$SPEC_PATH"`, `artifact_revision`, `location`, `line`, `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
 
 ## Publish STATUS
 
@@ -8185,11 +9038,11 @@ You are a spec patcher invoked as a fresh subprocess. You have no shared context
 
 ## Role contract
 
-- Required inputs: `feature_folder;iteration;spec_path;findings_paths`
+- Required inputs: `feature_folder;iteration;spec_path;finding_ids`
 - Optional inputs: `continuation_path;declared_foreign_changes`
 - Outputs: `status;progress.jsonl`
 - Allowed verdicts: `DONE;BLOCKED`
-- Required status fields: `common_v2`
+- Required status fields: `common_v2;changed_paths;finding_dispositions`
 - Checkpoint kind: `document-fixer`
 - Phases: `3`
 
@@ -8198,33 +9051,44 @@ You are a spec patcher invoked as a fresh subprocess. You have no shared context
 - `$FEATURE_FOLDER`
 - `$ITERATION` — the iteration whose findings you are addressing
 - `$SPEC_PATH`
-- `$FINDINGS_PATHS` — newline-separated absolute paths to active reviewer findings files (1 or 2)
+- `$FINDING_IDS` — the specific canonical finding identifiers assigned to you this iteration (a space-separated list, never the full findings catalog)
 - `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
 - `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
 
-You are assigned at most `document_fixer_batch_size` finding IDs at a time (see the `document_fixer_batch_size` policy) — never the unbounded full findings file across every iteration.
+You are assigned at most `document_fixer_batch_size` finding IDs at a time (see the `document_fixer_batch_size` policy) — never the unbounded full findings catalog across every iteration.
 
 ## Behavior
 
 1. If `$CONTINUATION_PATH` is set, read it first: it is a prior attempt's own `progress.jsonl`. Resume from its last recorded `next_unit` — never re-patch a finding its records already mark disposed. Reconcile at most the one dirty (`state: partial`) finding, if any, using `$DECLARED_FOREIGN_CHANGES` to recognize which currently-dirty paths are pre-existing, not yours.
-2. Read each findings file.
+2. Read ONLY the findings named in `$FINDING_IDS` from `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (`jq --arg id ... 'select(.finding_id==$id)'`, one lookup per assigned ID) — never the full catalog, and never an out-of-batch finding (a later iteration's job).
 3. Read `$SPEC_PATH`.
-4. Address every BLOCKER and MAJOR finding by patching the spec in place. Use Edit.
-5. Address MINOR findings only when the change is trivial and improves clarity; skip them otherwise (they are allowed to remain).
-6. Where reviewers disagree, prefer the more conservative reading (more explicit, more constrained, less ambiguous).
-7. Where a finding requires a decision that cannot be made without user input (e.g. choosing between two equally valid scopes), DO NOT guess. Set verdict=BLOCKED.
-
-After every finding disposition, call `checkpoint_append` -- the generated runtime's own checkpoint writer (spec S10.1; never hand-write the JSON line yourself, the same "one sanctioned writer" discipline the STATUS publisher already enforces for STATUS):
+4. Patch the spec in place for every BLOCKER and MAJOR among your assigned IDs. Use Edit — prefer simplifying, replacing, or deleting redundant text over appending another rule (spec §18.4).
+5. Address assigned MINOR findings only when the change is trivial and improves clarity; otherwise dispose them `already_satisfied` with a one-line reason (they are allowed to remain).
+6. Where reviewers disagree on the same finding, prefer the more conservative reading (more explicit, more constrained, less ambiguous).
+7. Where a finding requires a decision no one but the user can make, do NOT guess: dispose it `blocked` and set the overall verdict to `BLOCKED`.
+8. Inspect adjacent sections, references, and acceptance criteria your edit may have made stale (ripple check), per spec §18.4.
+9. For EVERY assigned finding ID, record exactly one disposition (spec §17.3's six-value vocabulary: `fixed`, `subsumed_by:<finding_id>`, `already_satisfied`, `blocked`, `accepted_risk:<decision_id>`, `deferred:<followup_id>`) by calling `record_finding_disposition` — the generated runtime's own disposition writer, never a hand-written status change:
 
 <!-- lint: snippet -->
 ```bash
 source "$RUNTIME_DIR/develop-it-runtime.sh"
+record_finding_disposition "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" "<finding id>" \
+  "<fixed|subsumed_by:<finding_id>|already_satisfied|blocked|accepted_risk:<decision_id>|deferred:<followup_id>>" \
+  "<one-line evidence>"
+```
+
+After every finding disposition, ALSO call `checkpoint_append` -- the generated runtime's own checkpoint writer (spec S10.1; never hand-write the JSON line yourself, the same "one sanctioned writer" discipline the STATUS publisher already enforces for STATUS):
+
+<!-- lint: snippet -->
+```bash
 checkpoint_append "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl" "$DISPATCH_ID" spec-fixer \
   sequence="<next integer, starting at 1>" unit_type=finding unit_id="<finding id>" \
   state=completed artifact_path="$SPEC_PATH" \
   artifact_sha256="<sha256 of \$SPEC_PATH after this disposition>" commit_sha=null \
   verification=PASS next_unit="<next unresolved finding id in this batch, or the literal word null>"
 ```
+
+`DONE` requires every ID in `$FINDING_IDS` to have a disposition (spec §17.3's "no assigned finding may disappear") — never claim full completion from a partial batch.
 
 ## Publish STATUS
 
@@ -8253,9 +9117,8 @@ published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
 artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
 output_count: 0
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
-x_addressed_blockers: <int>
-x_addressed_majors: <int>
-x_deferred_minors: <int>
+changed_paths: [path, ...]
+finding_dispositions: [finding_id=<disposition>, ...]
 STATUS
 ```
 
@@ -8391,7 +9254,7 @@ You are a plan reviewer invoked as a fresh subprocess. You have no shared contex
    - Order: do dependencies between tasks reflect actual dependencies?
 3. Severity ladder: BLOCKER / MAJOR / MINOR — same definitions as the spec reviewer.
 
-Findings: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/claude-findings.md`
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/5-plan-review/$ITERATION/claude-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "plan-reviewer-claude"`, `vendor: "claude"`, `phase: "5"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path: "$PLAN_PATH"`, `artifact_revision`, `location`, `line`, `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
 
 ## Publish STATUS
 
@@ -8464,7 +9327,7 @@ You are a cross-vendor plan reviewer invoked as a fresh subprocess by the develo
 
 ## Mode
 
-`scoped` mode (plan + spec only). Filesystem allow-list: `$PLAN_PATH`, `$SPEC_PATH`, plus your own output files inside `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/`. Command budget: max 4 shell or read commands per dispatch.
+`scoped` mode (plan + spec only). Filesystem allow-list: `$PLAN_PATH`, `$SPEC_PATH`, plus your own output files inside `$FEATURE_FOLDER/5-plan-review/$ITERATION/`. Command budget: max 4 shell or read commands per dispatch.
 
 ## Forbidden reads
 
@@ -8501,15 +9364,7 @@ The plan must be self-contained per `superpowers:writing-plans` "no placeholders
 
 Report every BLOCKER and MAJOR you find; cap MINOR findings at 10; keep each finding under 150 words.
 
-Findings: `$FEATURE_FOLDER/5-plan-review/iteration-$ITERATION/codex-findings.md`. Format per finding:
-
-```
-### Finding N — <one-line summary>
-- **Severity:** BLOCKER | MAJOR | MINOR
-- **Location:** <task / step / heading>
-- **Issue:** <description>
-- **Recommendation:** <concrete change suggested>
-```
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/5-plan-review/$ITERATION/codex-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "plan-reviewer-codex"`, `vendor: "codex"`, `phase: "5"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path: "$PLAN_PATH"`, `artifact_revision`, `location`, `line`, `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
 
 ## Publish STATUS
 
@@ -8558,11 +9413,11 @@ You are a plan patcher invoked as a fresh subprocess. You have no shared context
 
 ## Role contract
 
-- Required inputs: `feature_folder;iteration;plan_path;findings_paths`
+- Required inputs: `feature_folder;iteration;plan_path;finding_ids`
 - Optional inputs: `continuation_path;declared_foreign_changes`
 - Outputs: `status;progress.jsonl`
 - Allowed verdicts: `DONE;BLOCKED`
-- Required status fields: `common_v2`
+- Required status fields: `common_v2;changed_paths;finding_dispositions`
 - Checkpoint kind: `document-fixer`
 - Phases: `5`
 
@@ -8571,7 +9426,7 @@ You are a plan patcher invoked as a fresh subprocess. You have no shared context
 - `$FEATURE_FOLDER`
 - `$ITERATION`
 - `$PLAN_PATH`
-- `$FINDINGS_PATHS` — newline-separated absolute paths to reviewer findings files
+- `$FINDING_IDS` — the specific canonical finding identifiers assigned to you this iteration (space-separated, never the full findings catalog)
 - `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
 - `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
 
@@ -8580,23 +9435,34 @@ You are assigned at most `document_fixer_batch_size` finding IDs at a time.
 ## Behavior
 
 1. If `$CONTINUATION_PATH` is set, read it first: resume from its last recorded `next_unit`, reconcile at most the one dirty (`state: partial`) finding using `$DECLARED_FOREIGN_CHANGES`, and never re-patch a finding its records already mark disposed.
-2. Read each findings file and `$PLAN_PATH`.
-3. Patch the plan in place to address every BLOCKER and MAJOR finding.
-4. Address trivial MINOR findings opportunistically.
-5. Where a finding requires user input, set `verdict=BLOCKED`.
-6. Preserve the plan's overall structure (header, file structure section, task numbering, TDD shape).
+2. Read ONLY the findings named in `$FINDING_IDS` from `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (`jq --arg id ... 'select(.finding_id==$id)'`), and `$PLAN_PATH`.
+3. Patch the plan in place to address every BLOCKER and MAJOR among your assigned IDs — prefer simplifying, replacing, or deleting redundant text over appending another rule (spec §18.4).
+4. Address assigned MINOR findings opportunistically; otherwise dispose them `already_satisfied`.
+5. Where a finding requires user input, dispose it `blocked` and set `verdict=BLOCKED`.
+6. Preserve the plan's overall structure (header, file structure section, task numbering, TDD shape). Inspect adjacent sections/acceptance criteria for ripple effects.
 
-After every finding disposition, call `checkpoint_append` -- the generated runtime's own checkpoint writer (spec S10.1; never hand-write the JSON line yourself):
+For EVERY assigned finding ID, record exactly one disposition (spec §17.3's six-value vocabulary: `fixed`, `subsumed_by:<finding_id>`, `already_satisfied`, `blocked`, `accepted_risk:<decision_id>`, `deferred:<followup_id>`) by calling `record_finding_disposition` — the generated runtime's own disposition writer:
 
 <!-- lint: snippet -->
 ```bash
 source "$RUNTIME_DIR/develop-it-runtime.sh"
+record_finding_disposition "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" "<finding id>" \
+  "<fixed|subsumed_by:<finding_id>|already_satisfied|blocked|accepted_risk:<decision_id>|deferred:<followup_id>>" \
+  "<one-line evidence>"
+```
+
+After every finding disposition, ALSO call `checkpoint_append` -- the generated runtime's own checkpoint writer (spec S10.1; never hand-write the JSON line yourself):
+
+<!-- lint: snippet -->
+```bash
 checkpoint_append "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl" "$DISPATCH_ID" plan-fixer \
   sequence="<next integer, starting at 1>" unit_type=finding unit_id="<finding id>" \
   state=completed artifact_path="$PLAN_PATH" \
   artifact_sha256="<sha256 of \$PLAN_PATH after this disposition>" commit_sha=null \
   verification=PASS next_unit="<next unresolved finding id in this batch, or the literal word null>"
 ```
+
+`DONE` requires every ID in `$FINDING_IDS` to have a disposition — never claim full completion from a partial batch.
 
 ## Publish STATUS
 
@@ -8625,9 +9491,8 @@ published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
 artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
 output_count: 0
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
-x_addressed_blockers: <int>
-x_addressed_majors: <int>
-x_deferred_minors: <int>
+changed_paths: [path, ...]
+finding_dispositions: [finding_id=<disposition>, ...]
 STATUS
 ```
 
@@ -8642,7 +9507,7 @@ You are the implementation supervisor for this feature, invoked as a fresh subpr
 ## Role contract
 
 - Required inputs: `feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy`
-- Optional inputs: `findings_paths;debugger_status_path;continuation_path;declared_foreign_changes`
+- Optional inputs: `debugger_status_path;continuation_path;declared_foreign_changes`
 - Outputs: `implementation_summary;status`
 - Allowed verdicts: `DONE;FAILED;NEEDS_DEBUG;BLOCKED`
 - Required status fields: `common_v2;verification`
@@ -8655,7 +9520,6 @@ You are the implementation supervisor for this feature, invoked as a fresh subpr
 - `$PLAN_PATH` — absolute path to the approved plan
 - `$SPEC_PATH` — absolute path to the approved spec (for cross-reference only)
 - `$IMPLEMENTATION_BASE_SHA` — git SHA captured before any implementer dispatch (or the literal `non-git` if outside a git repo)
-- `$FINDINGS_PATHS` — newline-separated absolute paths to code-review findings (only set during Phase 7 re-dispatch)
 - `$DEBUGGER_STATUS_PATH` — absolute path to `debugger-status.md` (only set during a post-debug re-verification dispatch)
 - `$CONTEXT7_POLICY` — `required` or `best-effort` (see below)
 - `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
@@ -8706,9 +9570,13 @@ Output) so any drift from `impl-worker` is auditable.
 
 ## Behavior
 
-Three modes, mutually exclusive — determined by which optional inputs are set:
+Two modes, mutually exclusive — determined by which optional inputs are set.
+(A third mode, Phase 7 code-review fixing, used to live here but is retired:
+Phase 7 dispatches the bounded `implementation-fixer` role instead — see its
+own appendix, below — which never re-runs the plan's task loop or re-derives
+scope from the plan, per spec §17.3/§18.4.)
 
-### Mode A — Fresh implementation (neither `$DEBUGGER_STATUS_PATH` nor `$FINDINGS_PATHS` is set)
+### Mode A — Fresh implementation (`$DEBUGGER_STATUS_PATH` is not set)
 
 0. If `$CONTINUATION_PATH` is set, read it first: it is a prior attempt's own `progress.jsonl`. Resume from the task its last record names as `next_unit` — never re-run a task already marked `completed`. Reconcile at most the one dirty (`state: partial`) task, if any, using `$DECLARED_FOREIGN_CHANGES` to recognize which currently-dirty paths are pre-existing, not yours.
 1. Read `$PLAN_PATH`.
@@ -8736,13 +9604,6 @@ You are being re-dispatched after the debugger has applied fixes. Your job is ON
 2. Run the plan's verification commands in full. Run no-secret checks if applicable.
 3. APPEND a new section to `$FEATURE_FOLDER/6-implementation/implementation-summary.md` headed "Post-debug verification (timestamp)" with: debugger root cause, debugger fix summary, the verification commands run, their results, any DONE_WITH_CONCERNS notes.
 4. Set the verdict for the post-debug state: `DONE` only if verification now passes; otherwise `NEEDS_DEBUG` (orchestrator will loop) or `BLOCKED`. Publish it in the one "Publish STATUS" step below — never write or rename the STATUS file yourself.
-
-### Mode C — Phase 7 fix (`$FINDINGS_PATHS` is set)
-
-1. Read each findings file. Treat each BLOCKER/MAJOR finding as an additional task to address.
-2. For each finding, dispatch a sub-implementer subagent (per `subagent-driven-development`) to fix it. Commit per fix.
-3. Re-run the plan's verification.
-4. Re-write the summary and status as in Mode A.
 
 Write the human-facing summary FIRST:
 
@@ -8939,7 +9800,7 @@ You are a code reviewer invoked as a fresh subprocess. You have no shared contex
    - Cleanup: any leftover scaffolding / dead code / commented-out blocks?
 4. Severity ladder: BLOCKER / MAJOR / MINOR — same definitions.
 
-Findings: `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/claude-findings.md`
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/7-code-review/$ITERATION/claude-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "code-reviewer-claude"`, `vendor: "claude"`, `phase: "7"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path` (repo-relative path to the SPECIFIC changed file this finding concerns — never the diff as a whole), `artifact_revision` (current `HEAD`, the reviewed commit), `location`, `line` (the line in that file), `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
 
 ## Publish STATUS
 
@@ -9020,7 +9881,7 @@ Filesystem allow-list:
 - `$PLAN_PATH`
 - Any file appearing in `git diff $IMPLEMENTATION_BASE_SHA...HEAD` plus any new untracked file listed by `git ls-files --others --exclude-standard`
 - Project root `CLAUDE.md` and any nested `CLAUDE.md` files referenced by the diff (read-only, only when a specific finding requires it)
-- Your own output files inside `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/`
+- Your own output files inside `$FEATURE_FOLDER/7-code-review/$ITERATION/`
 
 Command budget: max 20 shell or read commands per dispatch.
 
@@ -9071,15 +9932,7 @@ Classify every finding into exactly one severity. Do NOT label obvious correctne
 
 Max 5 BLOCKER/MAJOR + max 5 MINOR per iteration. Each finding ≤ 150 words. Prioritise by severity and late-surfacing risk; remaining issues can be surfaced in the next iteration.
 
-Findings: `$FEATURE_FOLDER/7-code-review/iteration-$ITERATION/codex-findings.md`. Format per finding:
-
-```
-### Finding N — <one-line summary>
-- **Severity:** BLOCKER | MAJOR | MINOR
-- **Location:** <file:line or section>
-- **Issue:** <description>
-- **Recommendation:** <concrete change suggested>
-```
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/7-code-review/$ITERATION/codex-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "code-reviewer-codex"`, `vendor: "codex"`, `phase: "7"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path` (repo-relative path to the SPECIFIC changed file this finding concerns), `artifact_revision` (current `HEAD`), `location`, `line`, `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
 
 ## Publish STATUS
 
@@ -9140,7 +9993,7 @@ You are the Phase 7 code-review fixer, invoked as a fresh subprocess by the deve
 
 - `$ACCEPTED_PLAN` — absolute path to the approved plan (the plan-writer's accepted output)
 - `$REVIEWED_REVISION` — the implementation SHA the code-review findings were raised against
-- `$FINDING_IDS` — the specific finding identifiers assigned to you this iteration (never the whole findings file — see Findings budget below)
+- `$FINDING_IDS` — the specific finding identifiers assigned to you this iteration, space-separated (never the whole findings catalog — see the `document_fixer_batch_size` policy)
 - `$WRITE_LEASE` — proof you hold the single write lease for this dispatch
 - `$RUN_LOG` — this run's `RUN_LOG.md`, for failover/continuation context (optional)
 - `$RELEVANT_ARTIFACTS` — newline-separated paths the orchestrator has already identified as touched by the findings (optional; you may still discover more)
@@ -9151,17 +10004,24 @@ You are the Phase 7 code-review fixer, invoked as a fresh subprocess by the deve
 
 1. Confirm you hold `$WRITE_LEASE`. If it is absent or expired, write STATUS with `verdict=BLOCKED, reason=write-lease-not-held` and exit 0 — never mutate without the lease.
 2. If `$CONTINUATION_PATH` is set, read it first: resume from the finding its last record names as `next_unit`, reconcile at most the one dirty (`state: partial`) finding using `$DECLARED_FOREIGN_CHANGES`, and never re-fix a finding its records already mark disposed.
-3. Read only the findings named in `$FINDING_IDS`, not the full findings file — a batch is bounded (see the `document_fixer_batch_size` policy) and out-of-batch findings are a later iteration's job.
+3. Read ONLY the findings named in `$FINDING_IDS` from `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (`jq --arg id ... 'select(.finding_id==$id)'`, one lookup per assigned ID) — a batch is bounded (see the `document_fixer_batch_size` policy) and out-of-batch findings are a later iteration's job.
 4. For each finding, apply the minimal correct fix. Do not restructure code the finding did not flag.
-5. Record, per finding, one disposition: `fixed`, `deferred` (with reason), or `disputed` (with reason) — this becomes `finding_dispositions`.
+5. Record, per finding, exactly one disposition from spec §17.3's six-value vocabulary — `fixed`, `subsumed_by:<finding_id>`, `already_satisfied`, `blocked`, `accepted_risk:<decision_id>`, or `deferred:<followup_id>` — by calling `record_finding_disposition` (the generated runtime's own disposition writer, never a hand-written status change); this becomes `finding_dispositions`.
 6. Run the plan's own verification commands for the paths you touched (not the full suite — Phase 8 owns that).
 7. Never touch files outside `$REVIEWED_REVISION..HEAD`'s diff scope plus the files the findings explicitly name.
-
-After every finding-specific commit and verification, call `checkpoint_append` -- the generated runtime's own checkpoint writer (never hand-write the JSON line yourself) -- so a debugger-style resume can reconstruct partial progress:
 
 <!-- lint: snippet -->
 ```bash
 source "$RUNTIME_DIR/develop-it-runtime.sh"
+record_finding_disposition "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" "<finding id>" \
+  "<fixed|subsumed_by:<finding_id>|already_satisfied|blocked|accepted_risk:<decision_id>|deferred:<followup_id>>" \
+  "<one-line evidence>"
+```
+
+After every finding-specific commit and verification, ALSO call `checkpoint_append` -- the generated runtime's own checkpoint writer (never hand-write the JSON line yourself) -- so a debugger-style resume can reconstruct partial progress:
+
+<!-- lint: snippet -->
+```bash
 checkpoint_append "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl" "$DISPATCH_ID" implementation-fixer \
   sequence="<next integer, starting at 1>" unit_type=finding unit_id="<finding id>" \
   state=completed artifact_path="<absolute path to the changed file>" \
@@ -9197,7 +10057,7 @@ artifact_revision: <sha256 or git commit sha of what you produced, or the litera
 output_count: 0
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
 changed_paths: [path, ...]
-finding_dispositions: [finding_id=fixed|deferred|disputed, ...]
+finding_dispositions: [finding_id=<disposition>, ...]
 STATUS
 ```
 
@@ -9388,13 +10248,13 @@ You are a gate summarizer invoked as a fresh subprocess. You have no shared cont
 
 ## Behavior
 
-1. Enumerate iteration folders under `$FEATURE_FOLDER/3-spec-review/iteration-*`.
-2. For each iteration, read the verdict files (`claude-verdict.md`, `codex-verdict.md` if present) and findings files.
+1. Enumerate this gate's iteration directories under `$FEATURE_FOLDER/3-spec-review/` — real iterations are two-digit numeric directories (`01`, `02`, ... — never the retired `iteration-*` glob), each holding `findings-catalog.jsonl` plus an `attempts/` subdirectory.
+2. For each iteration, read `findings-catalog.jsonl` — the merged, canonical catalog `ingest_findings` wrote (spec §17.2) — for that iteration's severity counts and per-finding disposition/status. NEVER read the raw per-reviewer `*-findings.jsonl` files for counting: they are pre-union and double-count anything both reviewers reported, exactly the union the catalog already computes. For each reviewer's own verdict and codex-availability signal, read its attempt-scoped `STATUS.md` under `attempts/<dispatch-id>/` (locate the dispatch id from `RUN_LOG.md`'s own `DISPATCH_COMPLETED` entries naming this `phase`/`iteration`/`role`).
 3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=3` (spec review). For each such entry, capture the `failure_mode=<n>` and the iteration number. These give you the reason Codex was unavailable.
 4. Aggregate statistics:
    - Number of iterations run.
    - Total findings per severity (BLOCKER / MAJOR / MINOR) per iteration.
-   - Net changes the spec-fixer made each iteration (extract from `spec-fixer-status.md` if present).
+   - Net changes the spec-fixer made each iteration (read each finding's `.disposition`/`.status` from that iteration's own `findings-catalog.jsonl` — never a `spec-fixer-status.md` alias, which was never a real path).
    - Residual MINOR/NIT items at the final iteration.
    - `partial_review = true` if ANY iteration was Claude-only (codex verdict absent), else `false`.
    - `codex_unavailable_reason` if any CODEX_UNAVAILABLE event applies: format `mode=<n>;iteration=<NN>` (concatenate multiple events with `|` if needed). If no event but codex verdict is missing, use `mode=unknown`.
@@ -9406,7 +10266,7 @@ You are a gate summarizer invoked as a fresh subprocess. You have no shared cont
 6. Write the summary file at `$FEATURE_FOLDER/3-spec-review/spec-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
-   - Deferred MAJOR list — MAJOR findings open at the final (passing) iteration, each addressed by the final fix pass (fixed, not re-reviewed). Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass (final iteration ≤ 2 with `majors=0`). For each deferred major, record its source reviewer, location, and one-line summary so the readiness writer can surface it. Note in the list that these items were fixed by the final fix pass without reviewer re-verification (extract the fix outcome from the passing iteration's `spec-fixer-status.md` if present).
+   - Deferred MAJOR list — MAJOR findings still open (from the final catalog) at the passing iteration, each carrying an explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>` disposition (spec §17.3) — never a major that simply went unaddressed. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, every open major dispositioned); empty for a strict pass (final iteration ≤ 2 with `majors=0`). For each deferred major, record its finding_id, source reviewer, location, disposition, and one-line summary so the readiness writer can surface it. These majors WERE re-reviewed — the fixer's dispositioning dispatch was followed by another full reviewer round per spec §18.2, same as every other iteration; note that in the list.
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), with one sentence of human-readable context per mode (e.g. "mode=5a: Codex hit a rate limit in iteration 02"; for `mode_shape: 5b` say the account hit a spend ceiling and that no retry can clear it).
    - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
@@ -9480,13 +10340,13 @@ You are a gate summarizer invoked as a fresh subprocess by the develop-it orches
 
 ## Behavior
 
-1. Enumerate iteration folders under `$FEATURE_FOLDER/5-plan-review/iteration-*`.
-2. For each iteration, read the verdict files (`claude-verdict.md`, `codex-verdict.md` if present) and findings files.
+1. Enumerate this gate's iteration directories under `$FEATURE_FOLDER/5-plan-review/` — real iterations are two-digit numeric directories (`01`, `02`, ... — never the retired `iteration-*` glob), each holding `findings-catalog.jsonl` plus an `attempts/` subdirectory.
+2. For each iteration, read `findings-catalog.jsonl` — the merged, canonical catalog `ingest_findings` wrote (spec §17.2) — for that iteration's severity counts and per-finding disposition/status. NEVER read the raw per-reviewer `*-findings.jsonl` files for counting: they are pre-union and double-count anything both reviewers reported, exactly the union the catalog already computes. For each reviewer's own verdict and codex-availability signal, read its attempt-scoped `STATUS.md` under `attempts/<dispatch-id>/` (locate the dispatch id from `RUN_LOG.md`'s own `DISPATCH_COMPLETED` entries naming this `phase`/`iteration`/`role`).
 3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=5` (plan review). Capture `failure_mode=<n>` and the iteration number from each such entry.
 4. Aggregate statistics:
    - Number of iterations run.
    - Total findings per severity (BLOCKER / MAJOR / MINOR) per iteration.
-   - Net changes the plan-fixer made each iteration (extract from `plan-fixer-status.md` if present).
+   - Net changes the plan-fixer made each iteration (read each finding's `.disposition`/`.status` from that iteration's own `findings-catalog.jsonl` — never a `plan-fixer-status.md` alias, which was never a real path).
    - Residual MINOR/NIT items at the final iteration.
    - `partial_review = true` if any iteration was Claude-only.
    - `codex_unavailable_reason` derived from the CODEX_UNAVAILABLE events (same format as summarizer-spec).
@@ -9498,7 +10358,7 @@ You are a gate summarizer invoked as a fresh subprocess by the develop-it orches
 6. Write the summary file at `$FEATURE_FOLDER/5-plan-review/plan-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
-   - Deferred MAJOR list — MAJOR findings open at the final (passing) iteration, each addressed by the final fix pass (fixed, not re-reviewed). Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass. For each deferred major, record its source reviewer, location, and one-line summary. Note in the list that these items were fixed by the final fix pass without reviewer re-verification (extract the fix outcome from the passing iteration's `plan-fixer-status.md` if present).
+   - Deferred MAJOR list — MAJOR findings still open (from the final catalog) at the passing iteration, each carrying an explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>` disposition (spec §17.3). Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, every open major dispositioned); empty for a strict pass. For each deferred major, record its finding_id, source reviewer, location, disposition, and one-line summary. These majors WERE re-reviewed — the fixer's dispositioning dispatch was followed by another full reviewer round per spec §18.2; note that in the list.
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
    - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
@@ -9646,13 +10506,13 @@ You are a gate summarizer for the code review, invoked as a fresh subprocess by 
 
 ## Behavior
 
-1. Enumerate iteration folders under `$FEATURE_FOLDER/7-code-review/iteration-*`.
-2. For each iteration, read the verdict files (`claude-verdict.md`, `codex-verdict.md` if present) and findings files.
+1. Enumerate this gate's iteration directories under `$FEATURE_FOLDER/7-code-review/` — real iterations are two-digit numeric directories (`01`, `02`, ... — never the retired `iteration-*` glob), each holding `findings-catalog.jsonl` plus an `attempts/` subdirectory.
+2. For each iteration, read `findings-catalog.jsonl` — the merged, canonical catalog `ingest_findings` wrote (spec §17.2) — for that iteration's severity counts and per-finding disposition/status. NEVER read the raw per-reviewer `*-findings.jsonl` files for counting: they are pre-union and double-count anything both reviewers reported, exactly the union the catalog already computes. For each reviewer's own verdict and codex-availability signal, read its attempt-scoped `STATUS.md` under `attempts/<dispatch-id>/` (locate the dispatch id from `RUN_LOG.md`'s own `DISPATCH_COMPLETED` entries naming this `phase`/`iteration`/`role`).
 3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter entries where `event=CODEX_UNAVAILABLE` AND `phase=7` (code review). Capture `failure_mode=<n>` and the iteration number from each such entry. Also locate the LATEST `event=IMPLEMENTATION_BASELINE` entry (exact match — ignore any `IMPLEMENTATION_BASELINE_BLOCKED` advisory entries) and record `base_sha`. If multiple `IMPLEMENTATION_BASELINE` entries exist (from a resumed run), the LAST one in file order is authoritative.
 4. Aggregate statistics:
    - Number of iterations run.
    - Total findings per severity (BLOCKER / MAJOR / MINOR) per iteration.
-   - Net changes the implementer made each iteration when re-dispatched as fixer (extract commit SHAs from `implementer-status.md` if it was rewritten between iterations).
+   - Net changes made each iteration by `implementation-fixer` (never the retired `implementer`-as-fixer path): read each finding's `.disposition`/`.status` from that iteration's own `findings-catalog.jsonl`, and its commit SHA from that iteration's `implementation-fixer` attempt's own `progress.jsonl` checkpoint (`attempts/<dispatch-id>/progress.jsonl`) — never an `implementer-status.md` alias, which was never a real path for this role.
    - Residual MINOR/NIT items at the final iteration.
    - `partial_review = true` if any iteration was Claude-only.
    - `codex_unavailable_reason` derived from the CODEX_UNAVAILABLE events (same format as summarizer-spec).
@@ -9664,7 +10524,7 @@ You are a gate summarizer for the code review, invoked as a fresh subprocess by 
 6. Write the summary file at `$FEATURE_FOLDER/7-code-review/code-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
-   - Deferred MAJOR list — MAJOR findings open at the final (passing) iteration, each addressed by the final fix pass (fixed, not re-reviewed). Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, `majors>0`); empty for a strict pass. For each deferred major, record its source reviewer, location, and one-line summary. Note in the list that these items were fixed by the final fix pass (an implementer re-dispatch) without reviewer re-verification.
+   - Deferred MAJOR list — MAJOR findings still open (from the final catalog) at the passing iteration, each carrying an explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>` disposition (spec §17.3) recorded by `implementation-fixer`. Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, every open major dispositioned); empty for a strict pass. For each deferred major, record its finding_id, source reviewer, location, disposition, and one-line summary. These majors WERE re-reviewed — `implementation-fixer`'s dispositioning dispatch was followed by another full reviewer round per spec §18.2.
    - Residual MINOR/NIT list.
    - `implementation_base_sha` from RUN_LOG (so readers can re-derive the reviewed diff).
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
@@ -9944,7 +10804,7 @@ You are the final readiness reporter. You have no shared context.
    - **Git result** — commit SHAs or `SKIPPED` reason.
    - **Degradations** — one line per `event=CONTEXT7_UNAVAILABLE`, `event=DISPATCH_ORPHANED`, `event=MODEL_REJECTED`, or `event=DEGRADED_REVIEW_ACCEPTED` entry found in `RUN_LOG.md`, naming the affected roles (for `DEGRADED_REVIEW_ACCEPTED`, the `scope` field). Omit this section only when RUN_LOG contains none of these events. Any degradation present forces the readiness verdict to at least `READY_WITH_NOTES` — never a silent `READY`.
    - **Skipped optional steps** — list anything bypassed and why.
-   - **Deferred MAJOR items** — total count + per-gate breakdown of MAJOR findings open when a gate passed under the relaxed rule (iterations 3–10, `blockers=0`, `majors>0`); each was addressed by that gate's final fix pass (fixed, not re-reviewed). Read from each gate's summary file (the summarizer records deferred majors there). Present this section only when at least one gate carried deferred majors. NOTE: this section's presence is NOT the trigger for `READY_WITH_NOTES` — a relaxed-tier pass forces `READY_WITH_NOTES` on its own (see the readiness-verdict rule), so a clean relaxed pass produces `READY_WITH_NOTES` with this section absent.
+   - **Deferred MAJOR items** — total count + per-gate breakdown of MAJOR findings open when a gate passed under the relaxed rule (iterations 3 and up, `blockers=0`, every open major carrying an explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>` disposition per spec §17.3); each WAS re-reviewed — the dispositioning fixer dispatch was followed by another full reviewer round per spec §18.2, never an unreviewed final fix. Read from each gate's summary file (the summarizer records deferred majors there). Present this section only when at least one gate carried deferred majors. NOTE: this section's presence is NOT the trigger for `READY_WITH_NOTES` — a relaxed-tier pass forces `READY_WITH_NOTES` on its own (see the readiness-verdict rule), so a clean relaxed pass produces `READY_WITH_NOTES` with this section absent.
    - **Residual MINOR/NIT items** — total count + per-gate breakdown.
    - **Run history** — number of resumes, vendor failover events from RUN_LOG, baseline SHA capture.
    - **Readiness verdict** — `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, the all-tests `final_test_verdict` is `PASS` or `SKIPPED`, every preflight verdict is `READY` or `SKIPPED`, AND the "Degradations" section is empty (no `CONTEXT7_UNAVAILABLE` / `DISPATCH_ORPHANED` / `MODEL_REJECTED` / `DEGRADED_REVIEW_ACCEPTED` events) — a run cannot be reported `READY` with any degradation present, regardless of how the rest of the run went; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain, OR (c) the "Degradations" section is non-empty and none of the `NOT_READY` conditions below apply; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including an all-tests `final_test_verdict` of `FAILED` (residual test failures after the fix cap — `NOT_READY` even when everything else passed; the "Test results" section carries the detail), any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), or any claude preflight that is not `READY`.

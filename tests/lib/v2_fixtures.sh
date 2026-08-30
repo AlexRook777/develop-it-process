@@ -185,3 +185,76 @@ write_fake_checkpoint() {
       commit_sha:$commit_sha, finding_ids:$finding_ids, verification:$verification,
       next_unit:$next_unit, timestamp:$timestamp}' >> "$path"
 }
+
+# ---- write_finding_location_fixtures (Task 11) ------------------------------
+# Writes three Markdown documents into DIR, exercising Step 1's four
+# location-stability assertions for ingest_findings' normalized_location
+# derivation:
+#   doc-v1.md / doc-v2.md -- v2 inserts two paragraphs BEFORE an unchanged
+#     "## Details" (2nd occurrence) section, so the flagged paragraph's line
+#     number shifts but its AST node (heading breadcrumb + occurrence +
+#     content) does not -- assertions #1 and #4.
+#   doc-v3.md -- the identical issue text appears under two SIBLING
+#     "## Details" headings (occurrence 1 and 2) -- assertion #2.
+#   (assertion #3, a changed issue key at the same node, needs no separate
+#   fixture -- any caller reuses doc-v1.md with two different issue_key
+#   values at the same line.)
+#
+# Usage: write_finding_location_fixtures DIR
+# Sets (caller-visible): FINDING_FIXTURE_LINE_V1, FINDING_FIXTURE_LINE_V2
+# (the 1-based line number of the flagged paragraph in each document),
+# FINDING_FIXTURE_LINE_O1, FINDING_FIXTURE_LINE_O2 (the two occurrences of
+# the repeated issue text in doc-v3.md).
+write_finding_location_fixtures() {
+  local dir="$1"
+  mkdir -p "$dir"
+  cat > "$dir/doc-v1.md" <<'EOF'
+# Root
+
+## Intro
+
+Some intro text.
+
+## Details
+
+First details section text.
+
+## Details
+
+Second details paragraph is the flagged issue.
+EOF
+  cat > "$dir/doc-v2.md" <<'EOF'
+# Root
+
+## Intro
+
+Some intro text.
+
+Extra inserted paragraph one.
+
+Extra inserted paragraph two.
+
+## Details
+
+First details section text.
+
+## Details
+
+Second details paragraph is the flagged issue.
+EOF
+  cat > "$dir/doc-v3.md" <<'EOF'
+# Root
+
+## Details
+
+Repeated issue text.
+
+## Details
+
+Repeated issue text.
+EOF
+  FINDING_FIXTURE_LINE_V1="$("$GREP_BIN" -n 'Second details paragraph' "$dir/doc-v1.md" | cut -d: -f1)"
+  FINDING_FIXTURE_LINE_V2="$("$GREP_BIN" -n 'Second details paragraph' "$dir/doc-v2.md" | cut -d: -f1)"
+  FINDING_FIXTURE_LINE_O1="$("$GREP_BIN" -n 'Repeated issue text' "$dir/doc-v3.md" | sed -n 1p | cut -d: -f1)"
+  FINDING_FIXTURE_LINE_O2="$("$GREP_BIN" -n 'Repeated issue text' "$dir/doc-v3.md" | sed -n 2p | cut -d: -f1)"
+}

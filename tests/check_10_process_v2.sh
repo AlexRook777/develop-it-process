@@ -937,4 +937,98 @@ assert_eq "event=PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE event=LOCAL_CLI_CANARIES_PASS
 assert_eq 0 "$(_t10_dispatch_calls "$T10_ARGVS")" \
   "all five gates pass: still zero MODEL-BOUND invocations -- preflight_zero_token_gates itself never dispatches probe_models or a skill probe (that is Phase -1's own subsequent step)"
 
+# =============================================================================
+# Task 11: review convergence is wired into ALL THREE gates, not just one.
+#
+# A named function existing in the cookbook proves nothing about whether a
+# real phase actually calls it (the recurring "helper with no real call
+# site" defect named in prior task reviews). Count real call sites in the
+# normative phase prose rather than a bare presence grep, which would be
+# trivially true even if only Phase 3 were ever wired up.
+# =============================================================================
+# A bare whole-document occurrence count is defeated by the cookbook's OWN
+# definition/comments (a mutation test scrubbing every REAL Phase 3/5/7
+# prose call site left the old whole-document count comfortably above
+# threshold on the strength of the cookbook text alone). Extract each
+# phase's OWN procedural prose range and require every function to have a
+# real call site INSIDE that range specifically -- scrubbing the phase
+# prose now drops the phase's own count to zero, which the range-scoped
+# check catches even though the cookbook definition/comments are untouched.
+_t11_range_report="$(python3 - "$PROCESS_DOC" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+
+def section(start_pat, end_pat):
+    m1 = re.search(start_pat, text, re.M)
+    m2 = re.search(end_pat, text, re.M)
+    assert m1 and m2 and m1.start() < m2.start(), (start_pat, end_pat)
+    return text[m1.end():m2.start()]
+
+phases = {
+    "3": section(r"^## Phase 3 —", r"^## Phase 4 —"),
+    "5": section(r"^## Phase 5 —", r"^## Phase 6 —"),
+    "7": section(r"^## Phase 7 —", r"^## Phase 8 —"),
+}
+fns = ["ingest_findings ", "select_finding_batch", "record_convergence_signals",
+       "divergence_check", "dispositions_complete", "validate_artifact "]
+for phase, body in phases.items():
+    for fn in fns:
+        print(f"{phase}	{fn}	{body.count(fn)}")
+PY
+)"
+[ -n "$_t11_range_report" ]   && _ok "T11: phase-prose range extraction for 3/5/7 succeeded"   || _fail "T11: phase-prose range extraction produced nothing"
+while IFS="$(printf '	')" read -r _t11_phase _t11_fn _t11_count; do
+  [ -n "$_t11_phase" ] || continue
+  [ "${_t11_count:-0}" -ge 1 ]     && _ok "T11: \`$_t11_fn\` has a real call site inside Phase $_t11_phase's own prose"     || _fail "T11: \`$_t11_fn\` has NO call site inside Phase $_t11_phase's own prose (found ${_t11_count:-0})"
+done <<< "$_t11_range_report"
+
+# record_finding_disposition's real call sites are the three FIXER
+# appendices (spec-fixer, plan-fixer, implementation-fixer) -- a different
+# document region than the phase-loop prose above -- never called by the
+# orchestrator directly.
+for _t11_fixer in spec-fixer plan-fixer implementation-fixer; do
+  _t11_appendix="$(python3 - "$PROCESS_DOC" "$_t11_fixer" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+role = sys.argv[2]
+m = re.search(rf"<!-- BEGIN: {re.escape(role)} -->(.*?)<!-- END: {re.escape(role)} -->", text, re.S)
+print(m.group(1) if m else "")
+PY
+)"
+  case "$_t11_appendix" in
+    *record_finding_disposition*) _ok "T11: \`$_t11_fixer\` appendix calls record_finding_disposition" ;;
+    *) _fail "T11: \`$_t11_fixer\` appendix has NO record_finding_disposition call site" ;;
+  esac
+done
+
+# Phase 7 must dispatch implementation-fixer, never implementer, to fix code
+# review findings -- exactly one occurrence of the retired dispatch phrase
+# (zero, really) and at least one of the new one.
+_t11_implfixer_dispatch="$("$GREP_BIN" -c 'Dispatch one `claude` subprocess for role `implementation-fixer`' "$PROCESS_DOC" || true)"
+assert_eq 1 "${_t11_implfixer_dispatch:-0}" \
+  "T11: Phase 7 dispatches implementation-fixer for code-review fixes exactly once"
+
+# review_iteration_cap is the ONLY hard cap named across all three gates --
+# the tenth iteration is allowed, an eleventh is not (spec S18.1/Step9 proof).
+_t11_cap_mentions="$("$GREP_BIN" -c 'hard cap `review_iteration_cap`' "$PROCESS_DOC" || true)"
+assert_eq 3 "${_t11_cap_mentions:-0}" \
+  "T11: all three review gates (3, 5, 7) bound their iteration loop by the SAME review_iteration_cap policy, not a hardcoded 10"
+# NOTE (code review round 2, item 9 -- accepted, not fixed): this only
+# asserts the registry's OWN row against itself. review_iteration_cap has
+# NO runnable enforcement anywhere in this offline suite -- the gate loop
+# is orchestrator prose an LLM executes, and the plan's fixed-interface
+# list has no gate-controller function to call, so a genuine behavioural
+# "10th allowed, 11th not" test would mean inventing an interface later
+# tasks would then have to consume verbatim. Do not mistake a GREEN here
+# for coverage of the cap itself: a document with the iteration loop's cap
+# logic deleted entirely would still pass this line.
+assert_contains '| review_iteration_cap | 10 |' "$PROCESS_DOC" \
+  "T11: review_iteration_cap's value is exactly 10 (the tenth iteration is allowed, an eleventh is not)"
+
+# The last successful gate action before each downstream phase is the
+# reviewer-verified acceptance, never a fixer's own STATUS (Step9 proof).
+_t11_last_action_mentions="$("$GREP_BIN" -c 'is this reviewer-verified acceptance' "$PROCESS_DOC" || true)"
+assert_eq 3 "${_t11_last_action_mentions:-0}" \
+  "T11: all three gates document that the last successful action is reviewer acceptance, never the fixer's own STATUS"
+
 finish

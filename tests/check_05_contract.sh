@@ -238,4 +238,100 @@ assert_present '\| plan-writer \|.*applicable_optional_skills' "$D" \
 assert_absent '\$\{?RELEVANT_SKILLS' "$D" \
   "T10 review: no dangling \$RELEVANT_SKILLS reference remains"
 
+# --- Task 11: stable findings and review convergence ------------------------
+assert_present '^## Structural Artifact Manifest Registry' "$D" \
+  "T11: Structural Artifact Manifest Registry heading present"
+assert_present '^\| plan-writer \| PLAN_PATH \|' "$D" \
+  "T11: plan-writer's structural manifest row is present"
+assert_present '^\| spec-fixer \| SPEC_PATH \|' "$D" \
+  "T11: spec-fixer's structural manifest row is present"
+assert_present '^\| plan-fixer \| PLAN_PATH \|' "$D" \
+  "T11: plan-fixer's structural manifest row is present"
+assert_present '^\| implementation-fixer \| IMPLEMENTATION_SUMMARY_PATH \|' "$D" \
+  "T11: implementation-fixer's structural manifest row is present"
+
+for _t11_fn in _artifact_manifest_field validate_artifact ingest_findings \
+  select_finding_batch record_finding_disposition dispositions_complete \
+  record_convergence_signals divergence_check; do
+  assert_present "^${_t11_fn}\(\) \{" "$D" "T11: $_t11_fn is a real cookbook function"
+done
+
+for _t11_evt in CONVERGENCE_RECORDED DIVERGENCE_DETECTED DIVERGENT_ROUND_CAP_REACHED; do
+  assert_present "^\| ${_t11_evt} \|" "$D" \
+    "T11: $_t11_evt has an Event Contract Registry row"
+done
+
+# The retired "final fix pass, no re-review" shortcut must not survive
+# anywhere in the document -- spec S18.2's "no unreviewed final fix" is the
+# whole point of this task; a single surviving mention would mean a gate
+# still authorizes an unreviewed revision somewhere.
+assert_absent 'Do NOT re-dispatch reviewers afterwards' "$D" \
+  "T11: the retired unreviewed-final-fix shortcut is gone"
+# "final fix pass" and "deferred major(s)" remain legitimate terms (a major
+# explicitly deferred/accepted-risk still exists as a concept) -- what must
+# be gone is the OLD semantics: fixed/addressed WITHOUT a subsequent review.
+assert_absent 'fixed, not re-reviewed' "$D" \
+  "T11: the old 'fixed but never re-reviewed' semantics are retired everywhere"
+assert_absent 'without reviewer re-verification' "$D" \
+  "T11: the old 'no reviewer re-verification' semantics are retired everywhere"
+
+# Phase 7 must dispatch the bounded implementation-fixer for code-review
+# fixes, never the full implementer role (that Mode C is retired) -- the
+# exact "helper with no real call site" failure mode named in prior reviews.
+assert_present 'role .implementation-fixer. \(NOT .implementer' "$D" \
+  "T11: Phase 7's iteration loop dispatches implementation-fixer, not implementer, for fixes"
+assert_absent 'Re-dispatch the implementer subagent' "$D" \
+  "T11: the retired implementer-as-Phase-7-fixer prose is gone"
+
+# spec-fixer/plan-fixer batch on canonical finding IDs, never whole findings
+# files, matching implementation-fixer's pre-existing bounded-batch shape.
+assert_present '\| spec-fixer \|.*finding_ids' "$D" \
+  "T11: spec-fixer's registry row declares finding_ids, not findings_paths"
+assert_present '\| plan-fixer \|.*finding_ids' "$D" \
+  "T11: plan-fixer's registry row declares finding_ids, not findings_paths"
+assert_absent '\| spec-fixer \|.*findings_paths' "$D" \
+  "T11: spec-fixer no longer declares findings_paths"
+assert_absent '\| plan-fixer \|.*findings_paths' "$D" \
+  "T11: plan-fixer no longer declares findings_paths"
+
+# Reviewer findings are canonical JSONL now, never the retired Markdown
+# "### Finding N" prose block.
+assert_absent '### Finding N' "$D" \
+  "T11: the retired Markdown findings-block format is gone from every appendix"
+
+# Code review fix (round 2, item B): the three gate summarizers must read
+# the SAME attempt-scoped STATUS paths and findings-catalog.jsonl the gate
+# loop and fixer appendices actually write -- not a "claude-verdict.md" /
+# "iteration-*" alias that stopped existing when reviewer STATUS became
+# attempt-scoped. Assert both directions: the retired paths are gone, and
+# every summarizer's own body cites findings-catalog.jsonl.
+assert_absent 'Enumerate iteration folders under .*iteration-\*' "$D" \
+  "T11: no summarizer still enumerates the retired iteration-* glob (real iteration dirs are two-digit numeric)"
+assert_absent 'read the verdict files \(.claude-verdict\.md' "$D" \
+  "T11: no summarizer still reads the retired claude-verdict.md/codex-verdict.md pair"
+for _t11_summarizer in summarizer-spec summarizer-plan summarizer-code-review; do
+  _t11_summarizer_body="$(python3 - "$D" "$_t11_summarizer" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+role = sys.argv[2]
+m = re.search(rf"<!-- BEGIN: {re.escape(role)} -->(.*?)<!-- END: {re.escape(role)} -->", text, re.S)
+print(m.group(1) if m else "")
+PY
+)"
+  case "$_t11_summarizer_body" in
+    *findings-catalog.jsonl*) _ok "T11: \`$_t11_summarizer\` reads findings-catalog.jsonl, not a stale per-reviewer alias" ;;
+    *) _fail "T11: \`$_t11_summarizer\` does NOT mention findings-catalog.jsonl" ;;
+  esac
+done
+
+# Code review fix (round 4, item 2): pick ONE path convention for a
+# gate's iteration directory and never let the retired "<phase-dir>/
+# iteration-NN" shape coexist with the real "$PHASE_DIR/$ITERATION" one --
+# a real run would otherwise write BOTH a findings-catalog.jsonl under
+# 01/ and a claude-findings.jsonl/codex-findings.jsonl under iteration-01/
+# that nothing ever reads. Scoped to a phase-dir prefix (`N-name/
+# iteration-`) so this does not false-positive on unrelated English
+# compounds like "token/iteration-marker".
+assert_absent '[0-9]-[a-z-]+/iteration-' "$D"   "T11: no phase-dir + iteration- path convention survives anywhere (spec-review/plan-review/code-review all use \$PHASE_DIR/\$ITERATION)"
+
 finish

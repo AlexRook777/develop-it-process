@@ -78,6 +78,7 @@ STATUS_PUBLISHER_PATH="$FEATURE_FOLDER/../.orchestration/runtime/publish-status"
 CONTINUATION_PATH=""
 DECLARED_FOREIGN_CHANGES=""
 RUNTIME_DIR="$FEATURE_FOLDER/.orchestration/runtime"
+APPLICABLE_OPTIONAL_SKILLS=""
 
 # --- Sanity check: render_prompt must succeed with these fixture values -----
 # If this fails, every assertion below fails for the wrong reason (an unset
@@ -1018,6 +1019,35 @@ assert_eq 0 "$("$GREP_BIN" -c '^codex ' "$FAKE_ARGV_LOG" || true)"   "probe_mode
 : > "$FAKE_ARGV_LOG"
 FAKE_RC=1 probe_models yes >/dev/null 2>&1
 assert_rc 1 $? "probe_models reports failure when a model id is rejected"
+
+# --- Task 11: validate_artifact against a REAL dispatch_attempt's own
+# STATUS/attempt-directory conventions (not a hand-built fixture) --------
+if declare -F validate_artifact >/dev/null; then
+  : > "$FEATURE_FOLDER/RUN_LOG.md"
+  rm -f "$ORCHESTRATION_DIR/write-lease.json"
+  PLAN_PATH="$FEATURE_FOLDER/real-plan.md"
+  cat > "$PLAN_PATH" <<'EOF'
+# Goal
+
+Ship the thing end to end, with enough real prose here that the manifest's
+minimum non-whitespace byte count is comfortably exceeded, covering the
+goal, approach, and acceptance bar this fixture's plan-writer dispatch
+supposedly produced.
+
+# File Structure and Responsibilities
+
+| Path | Action | Responsibility |
+|---|---|---|
+| foo.py | Modify | Add the new behavior under test |
+EOF
+  FAKE_MODE=complete dispatch_attempt 4 00 plan-writer >/dev/null 2>"$BUILD/t11-pw-dispatch.err"
+  assert_rc 0 $? "dispatch_attempt for plan-writer succeeds against the fake CLI"
+  printf '{"schema_version":2,"plan_path":"%s","completed_at":"1970-01-01T00:00:00Z"}\n' \
+    "$PLAN_PATH" > "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/artifact-complete.json"
+  validate_artifact plan-writer "$DISPATCH_ID" >/dev/null \
+    && _ok "validate_artifact accepts a REAL dispatch_attempt's own STATUS.md and attempt directory" \
+    || _fail "validate_artifact rejected a genuinely successful real dispatch_attempt"
+fi
 
 # --- Task 8 Step 6: unauthorized mutation with NO lease held at all --------
 # A read-only role (mutates=no) never calls acquire_write_lease. If it still

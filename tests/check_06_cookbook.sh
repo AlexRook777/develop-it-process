@@ -440,7 +440,8 @@ if declare -F render_prompt >/dev/null; then
   FINDING_IDS="F1 F2"
   WRITE_LEASE=held
   RUN_LOG=/tmp/ff/RUN_LOG.md
-  RELEVANT_ARTIFACTS=/tmp/a.md
+  RELEVANT_ARTIFACTS="/tmp/a.md
+/tmp/b.md"
   FINAL_DIFF=/tmp/final.diff
   ACCEPTED_SPEC=/tmp/spec.md
   IMPLEMENTATION_SUMMARY=/tmp/impl.md
@@ -481,10 +482,14 @@ if declare -F render_prompt >/dev/null; then
   assert_eq "" "$unresolved" "every appendix renders with no unresolved \$VARS"
 
   # Multi-line values must survive verbatim -- this is why python3, not sed.
-  body="$(render_prompt spec-fixer)"
+  # (Task 11: spec-fixer/plan-fixer switched to the single-line, space-
+  # separated $FINDING_IDS batch; $RELEVANT_ARTIFACTS -- implementation-
+  # fixer's own newline-separated list -- is the genuinely multi-line
+  # variable now, same substitution code path.)
+  body="$(render_prompt implementation-fixer)"
   case "$body" in
-    *"/tmp/a.md"*"/tmp/b.md"*) _ok "multi-line \$FINDINGS_PATHS survives intact" ;;
-    *) _fail "multi-line substitution mangled \$FINDINGS_PATHS" ;;
+    *"/tmp/a.md"*"/tmp/b.md"*) _ok "multi-line \$RELEVANT_ARTIFACTS survives intact" ;;
+    *) _fail "multi-line substitution mangled \$RELEVANT_ARTIFACTS" ;;
   esac
 
   # An UNSET variable that the appendix uses must be a named failure, not a
@@ -1787,6 +1792,7 @@ _t8_code_types="$(printf '%s\n' \
   CODEX_DISABLED_BY_USER_CONSENT CODEX_SKIPPED_BY_USER_CONSENT MODEL_REJECTED DISPATCH_ORPHANED \
   PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE LOCAL_CLI_CANARIES_PASSED TARGET_DIRTY_TREE_GATE_PASSED \
   PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED RUNTIME_AND_REGISTRIES_VERIFIED VENDOR_PROVEN \
+  CONVERGENCE_RECORDED DIVERGENCE_DETECTED DIVERGENT_ROUND_CAP_REACHED \
   | sort)"
 assert_eq "$_t8_code_types" "$_t8_registry_types" \
   "event_required_fields' own type list matches the Event Contract Registry exactly"
@@ -1805,8 +1811,8 @@ done < <(printf '%s\n' "$_t8_registry_types")
 assert_eq "" "$_t8_mismatch" \
   "event_required_fields agrees with the registry's required_fields column for every type"
 _t8_yes_count="$(tail -n +2 "$BUILD/events.tsv" | awk -F'\t' '$3=="yes"' | wc -l | tr -d ' ')"
-assert_eq 13 "$_t8_yes_count" \
-  "exactly thirteen event types are proposition_required=yes (Task 9 adds CONTINUATION_CAP_REACHED)"
+assert_eq 15 "$_t8_yes_count" \
+  "exactly fifteen event types are proposition_required=yes (Task 11 adds DIVERGENCE_DETECTED and DIVERGENT_ROUND_CAP_REACHED)"
 
 # --- record_event flushes/fsyncs its append (Step 3, code review fix #5) ---
 if declare -F record_event >/dev/null; then
@@ -2047,5 +2053,761 @@ assert_eq 10 "$(jq -r '.phase' "$LEASE_FILE")" \
 assert_eq null "$(jq -r '.dispatch_id' "$LEASE_FILE")" \
   "Phase 10's lease has a JSON null dispatch_id, never an empty string"
 release_write_lease orchestrator-finalization >/dev/null
+
+# =============================================================================
+# Task 11: stable findings and review convergence
+# =============================================================================
+T11_FEATURE_FOLDER="$FEATURE_FOLDER"
+T11_ORCHESTRATION_DIR="$ORCHESTRATION_DIR"
+
+if declare -F ingest_findings >/dev/null && declare -F validate_artifact >/dev/null; then
+  bootstrap_runtime >/dev/null 2>&1
+  T11_DIR="$BUILD/t11"; rm -rf "$T11_DIR"; mkdir -p "$T11_DIR"
+  FEATURE_FOLDER="$T11_DIR"
+  ORCHESTRATION_DIR="$T11_DIR/.orchestration"
+  mkdir -p "$ORCHESTRATION_DIR"
+
+  # doc-v1/doc-v2/doc-v3: the shared Task 11 location-stability fixtures
+  # (v2 inserts paragraphs before an unchanged section; v3 repeats a sibling
+  # heading) -- see tests/lib/v2_fixtures.sh for the exact shape.
+  write_finding_location_fixtures "$T11_DIR"
+  _t11_line_v1="$FINDING_FIXTURE_LINE_V1"
+  _t11_line_v2="$FINDING_FIXTURE_LINE_V2"
+  _t11_line_o1="$FINDING_FIXTURE_LINE_O1"
+  _t11_line_o2="$FINDING_FIXTURE_LINE_O2"
+  [ -n "$_t11_line_v1" ] && [ -n "$_t11_line_v2" ] && [ "$_t11_line_v1" != "$_t11_line_v2" ] \
+    && _ok "T11 fixture: doc-v2's insertion actually shifted the flagged line number" \
+    || _fail "T11 fixture setup is broken: v1/v2 flagged line numbers did not differ ($_t11_line_v1 vs $_t11_line_v2)"
+
+  _t11_mk_status() {
+    # Usage: _t11_mk_status STATUS_PATH FINDINGS_JSONL_PATH PHASE ITER
+    printf 'verdict: CHANGES_REQUESTED\nreason: findings present\nblockers: 0\nmajors: 1\nminors: 0\nfindings: %s\nphase: %s\niteration: %s\n' \
+      "$2" "$3" "$4" > "$1"
+  }
+  _t11_status_pass() {
+    # Usage: _t11_status_pass STATUS_PATH FINDINGS_JSONL_PATH PHASE ITER
+    printf 'verdict: PASS\nreason: null\nblockers: 0\nmajors: 0\nminors: 0\nfindings: %s\nphase: %s\niteration: %s\n' \
+      "$2" "$3" "$4" > "$1"
+  }
+  _t11_attempt_dir() {
+    # Usage: _t11_attempt_dir PHASE_NAME ITER LABEL
+    # $PHASE_DIR/$ITERATION/attempts/<label> -- matches the REAL convention
+    # (code review fix, round 4: the retired "iteration-NN" shape must not
+    # survive anywhere, including this fixture helper).
+    local d="$T11_DIR/$1-review/$2/attempts/$3"
+    mkdir -p "$d"
+    printf '%s\n' "$d"
+  }
+
+  # ---- Assertions 1 and 4 (Step 1): unchanged AST node after an earlier
+  # insertion keeps its finding_id; the evidence line still moves. ----------
+  _t11_d1="$(_t11_attempt_dir 3-spec 01 v1)"
+  jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+    {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+     phase:"3", iteration:"01", severity:"major", artifact_path:$p,
+     artifact_revision:"rev1", location:"Details", line:$line,
+     issue_key:"unclear-detail", summary:"s", evidence:"e",
+     required_change:"c", provenance:"unknown", related_finding_ids:[]}' \
+    > "$_t11_d1/claude-findings.jsonl"
+  _t11_mk_status "$_t11_d1/STATUS.md" "$_t11_d1/claude-findings.jsonl" 3 01
+  ingest_findings spec-reviewer-claude "$_t11_d1/STATUS.md" "$_t11_d1/claude-findings.jsonl" >/dev/null
+  _t11_cat1="$T11_DIR/3-spec-review/01/findings-catalog.jsonl"
+  _t11_id_v1="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat1")"
+  _t11_line_stored_v1="$(jq -r 'select(.source_finding_id=="F1") | .line' "$_t11_cat1")"
+
+  _t11_d2="$(_t11_attempt_dir 3-spec 02 v2)"
+  jq -cn --arg p "$T11_DIR/doc-v2.md" --argjson line "$_t11_line_v2" '
+    {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+     phase:"3", iteration:"02", severity:"major", artifact_path:$p,
+     artifact_revision:"rev2", location:"Details", line:$line,
+     issue_key:"unclear-detail", summary:"s", evidence:"e",
+     required_change:"c", provenance:"unknown", related_finding_ids:[]}' \
+    > "$_t11_d2/claude-findings.jsonl"
+  _t11_mk_status "$_t11_d2/STATUS.md" "$_t11_d2/claude-findings.jsonl" 3 02
+  ingest_findings spec-reviewer-claude "$_t11_d2/STATUS.md" "$_t11_d2/claude-findings.jsonl" >/dev/null
+  _t11_cat2="$T11_DIR/3-spec-review/02/findings-catalog.jsonl"
+  _t11_id_v2="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat2")"
+  _t11_line_stored_v2="$(jq -r 'select(.source_finding_id=="F1") | .line' "$_t11_cat2")"
+
+  assert_eq "$_t11_id_v1" "$_t11_id_v2" \
+    "Step1#1/#4: an unchanged AST node keeps its finding_id after earlier-inserted paragraphs shift its line number"
+  [ "$_t11_line_stored_v1" != "$_t11_line_stored_v2" ] \
+    && _ok "Step1#4: the evidence line DID change even though the finding_id did not" \
+    || _fail "Step1#4: evidence line should differ between v1 and v2"
+
+  # ---- Assertion 2 (Step 1): same issue under repeated sibling heading #1
+  # vs #2 gets a DIFFERENT finding_id. ---------------------------------------
+  _t11_d3="$(_t11_attempt_dir 3-spec 03 v3)"
+  { jq -cn --arg p "$T11_DIR/doc-v3.md" --argjson line "$_t11_line_o1" \
+      '{source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+        phase:"3", iteration:"03", severity:"major", artifact_path:$p,
+        artifact_revision:"rev3", location:"Details", line:$line,
+        issue_key:"same-issue", summary:"s", evidence:"e", required_change:"c",
+        provenance:"unknown", related_finding_ids:[]}'
+    jq -cn --arg p "$T11_DIR/doc-v3.md" --argjson line "$_t11_line_o2" \
+      '{source_finding_id:"F2", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+        phase:"3", iteration:"03", severity:"major", artifact_path:$p,
+        artifact_revision:"rev3", location:"Details", line:$line,
+        issue_key:"same-issue", summary:"s", evidence:"e", required_change:"c",
+        provenance:"unknown", related_finding_ids:[]}'
+  } > "$_t11_d3/claude-findings.jsonl"
+  _t11_mk_status "$_t11_d3/STATUS.md" "$_t11_d3/claude-findings.jsonl" 3 03
+  ingest_findings spec-reviewer-claude "$_t11_d3/STATUS.md" "$_t11_d3/claude-findings.jsonl" >/dev/null
+  _t11_cat3="$T11_DIR/3-spec-review/03/findings-catalog.jsonl"
+  _t11_id_o1="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat3")"
+  _t11_id_o2="$(jq -r 'select(.source_finding_id=="F2") | .finding_id' "$_t11_cat3")"
+  [ -n "$_t11_id_o1" ] && [ -n "$_t11_id_o2" ] && [ "$_t11_id_o1" != "$_t11_id_o2" ] \
+    && _ok "Step1#2: the same issue under sibling heading occurrence #1 vs #2 gets a DIFFERENT finding_id" \
+    || _fail "Step1#2: repeated-sibling-heading disambiguation is broken ($_t11_id_o1 vs $_t11_id_o2)"
+
+  # ---- Assertion 3 (Step 1): a changed issue key at the SAME node gets a
+  # DIFFERENT finding_id. ----------------------------------------------------
+  _t11_d4="$(_t11_attempt_dir 3-spec 04 v4)"
+  { jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" \
+      '{source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+        phase:"3", iteration:"04", severity:"major", artifact_path:$p,
+        artifact_revision:"rev1", location:"Details", line:$line,
+        issue_key:"issue-a", summary:"s", evidence:"e", required_change:"c",
+        provenance:"unknown", related_finding_ids:[]}'
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" \
+      '{source_finding_id:"F2", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+        phase:"3", iteration:"04", severity:"major", artifact_path:$p,
+        artifact_revision:"rev1", location:"Details", line:$line,
+        issue_key:"issue-b", summary:"s", evidence:"e", required_change:"c",
+        provenance:"unknown", related_finding_ids:[]}'
+  } > "$_t11_d4/claude-findings.jsonl"
+  _t11_mk_status "$_t11_d4/STATUS.md" "$_t11_d4/claude-findings.jsonl" 3 04
+  ingest_findings spec-reviewer-claude "$_t11_d4/STATUS.md" "$_t11_d4/claude-findings.jsonl" >/dev/null
+  _t11_cat4="$T11_DIR/3-spec-review/04/findings-catalog.jsonl"
+  _t11_id_ka="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat4")"
+  _t11_id_kb="$(jq -r 'select(.source_finding_id=="F2") | .finding_id' "$_t11_cat4")"
+  [ -n "$_t11_id_ka" ] && [ -n "$_t11_id_kb" ] && [ "$_t11_id_ka" != "$_t11_id_kb" ] \
+    && _ok "Step1#3: a changed issue key at the same node gets a DIFFERENT finding_id" \
+    || _fail "Step1#3: issue-key change did not change the finding_id"
+
+  # ---- Step 6: a model-supplied canonical finding_id that DISAGREES with
+  # the deterministic hash is rejected, never silently trusted. -------------
+  _t11_d5="$(_t11_attempt_dir 3-spec 05 badid)"
+  jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+    {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+     phase:"3", iteration:"05", severity:"major", artifact_path:$p,
+     artifact_revision:"rev1", location:"Details", line:$line,
+     issue_key:"unclear-detail", summary:"s", evidence:"e", required_change:"c",
+     provenance:"unknown", related_finding_ids:[], finding_id:"not-the-real-hash"}' \
+    > "$_t11_d5/claude-findings.jsonl"
+  _t11_mk_status "$_t11_d5/STATUS.md" "$_t11_d5/claude-findings.jsonl" 3 05
+  rc=0
+  ingest_findings spec-reviewer-claude "$_t11_d5/STATUS.md" "$_t11_d5/claude-findings.jsonl" \
+    >/dev/null 2>"$BUILD/t11-badid.err" || rc=$?
+  assert_rc 1 "$rc" "ingest_findings rejects a model-supplied finding_id that disagrees with the computed hash"
+  assert_contains "INGEST_FINDINGS_ID_MISMATCH" "$BUILD/t11-badid.err" "mismatch failure names itself"
+
+  # ---- Step 6: a canonical-ID collision with CONFLICTING content is
+  # rejected (never guessed) and routed to EVENT_CORRECTED. -----------------
+  _t11_d6="$(_t11_attempt_dir 3-spec 06 coll)"
+  jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+    {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+     phase:"3", iteration:"06", severity:"major", artifact_path:$p,
+     artifact_revision:"rev1", location:"Details", line:$line,
+     issue_key:"unclear-detail", summary:"original summary", evidence:"e",
+     required_change:"c", provenance:"unknown", related_finding_ids:[]}' \
+    > "$_t11_d6/claude-findings.jsonl"
+  _t11_mk_status "$_t11_d6/STATUS.md" "$_t11_d6/claude-findings.jsonl" 3 06
+  ingest_findings spec-reviewer-claude "$_t11_d6/STATUS.md" "$_t11_d6/claude-findings.jsonl" >/dev/null
+  _t11_d6b="$(_t11_attempt_dir 3-spec 06 collb)"
+  jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+    {source_finding_id:"F1", reviewer_role:"spec-reviewer-codex", vendor:"codex",
+     phase:"3", iteration:"06", severity:"blocker", artifact_path:$p,
+     artifact_revision:"rev1", location:"Details", line:$line,
+     issue_key:"unclear-detail", summary:"CONFLICTING summary", evidence:"e",
+     required_change:"different change", provenance:"unknown", related_finding_ids:[]}' \
+    > "$_t11_d6b/codex-findings.jsonl"
+  _t11_mk_status "$_t11_d6b/STATUS.md" "$_t11_d6b/codex-findings.jsonl" 3 06
+  RUN_LOG="$T11_DIR/RUN_LOG.md"; : > "$RUN_LOG"
+  ingest_findings spec-reviewer-codex "$_t11_d6b/STATUS.md" "$_t11_d6b/codex-findings.jsonl" >/dev/null
+  _t11_cat6="$T11_DIR/3-spec-review/06/findings-catalog.jsonl"
+  # codex reported severity=blocker (rank 0), claude reported severity=major
+  # (rank 1) for the SAME canonical finding_id -- the MORE severe
+  # classification wins (never merely whichever arrived first), so the kept
+  # entry is codex's, not claude's earlier one.
+  assert_eq "CONFLICTING summary" "$(jq -r 'select(.finding_id!=null) | .summary' "$_t11_cat6" | head -1)" \
+    "a conflicting-severity collision keeps the MORE SEVERE catalog entry, never a first-writer-wins guess"
+  assert_present '^--- .*event=EVENT_CORRECTED' "$RUN_LOG" \
+    "a canonical-ID collision with conflicting content is durably recorded as EVENT_CORRECTED"
+  assert_present 'replacement_classification:.*finding_collision' "$RUN_LOG" \
+    "the EVENT_CORRECTED record classifies itself as a finding_collision"
+
+  # ---- Spec S16.5 / Step 9 proof: one reviewer's PASS cannot cancel the
+  # other's blocker -- the union survives even when the SECOND reviewer to
+  # ingest reports nothing at all. -------------------------------------------
+  _t11_d7="$(_t11_attempt_dir 3-spec 07 blocker)"
+  jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+    {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+     phase:"3", iteration:"07", severity:"blocker", artifact_path:$p,
+     artifact_revision:"rev1", location:"Details", line:$line,
+     issue_key:"real-bug", summary:"s", evidence:"e", required_change:"c",
+     provenance:"unknown", related_finding_ids:[]}' \
+    > "$_t11_d7/claude-findings.jsonl"
+  _t11_mk_status "$_t11_d7/STATUS.md" "$_t11_d7/claude-findings.jsonl" 3 07
+  _t11_out1="$(ingest_findings spec-reviewer-claude "$_t11_d7/STATUS.md" "$_t11_d7/claude-findings.jsonl")"
+  _t11_d7b="$(_t11_attempt_dir 3-spec 07 pass)"
+  : > "$_t11_d7b/codex-findings.jsonl"
+  _t11_status_pass "$_t11_d7b/STATUS.md" "$_t11_d7b/codex-findings.jsonl" 3 07
+  _t11_out2="$(ingest_findings spec-reviewer-codex "$_t11_d7b/STATUS.md" "$_t11_d7b/codex-findings.jsonl")"
+  printf '%s\n' "$_t11_out2" | "$GREP_BIN" -qE '^blockers=[1-9]' \
+    && _ok "S16.5/Step9: reviewer B's clean PASS never cancels reviewer A's open blocker in the shared catalog" \
+    || _fail "S16.5/Step9: the union lost reviewer A's blocker after reviewer B reported PASS ($_t11_out2)"
+
+  # ---- record_finding_disposition / dispositions_complete: the six-value
+  # vocabulary, "no assigned finding may disappear", and "a fixer cannot
+  # close its own findings" (spec S17.3 / S18.1). --------------------------
+  if declare -F record_finding_disposition >/dev/null && declare -F dispositions_complete >/dev/null; then
+    _t11_cat7="$T11_DIR/3-spec-review/07/findings-catalog.jsonl"
+    _t11_fid7="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat7")"
+
+    rc=0
+    record_finding_disposition "$_t11_cat7" "$_t11_fid7" "not-a-real-disposition" \
+      2>"$BUILD/t11-baddisp.err" || rc=$?
+    assert_rc 1 "$rc" "record_finding_disposition rejects a disposition outside the six-value grammar"
+
+    record_finding_disposition "$_t11_cat7" "$_t11_fid7" "fixed" "patched it" >/dev/null
+    _t11_status_after_fix="$(jq -r --arg id "$_t11_fid7" 'select(.finding_id==$id) | .status' "$_t11_cat7")"
+    assert_eq "fixed" "$_t11_status_after_fix" \
+      "record_finding_disposition moves an assigned finding to 'fixed'"
+    [ "$_t11_status_after_fix" != "verified" ] \
+      && _ok "Step9 proof: a fixer's own disposition can NEVER produce status=verified (only a later reviewer round can)" \
+      || _fail "Step9 proof VIOLATED: a fixer's own disposition produced 'verified'"
+
+    dispositions_complete "$_t11_cat7" "$_t11_fid7" \
+      && _ok "dispositions_complete: an assigned finding WITH a disposition is complete" \
+      || _fail "dispositions_complete should report complete once every assigned ID has a disposition"
+
+    rc=0
+    dispositions_complete "$_t11_cat7" "$_t11_fid7" "not-a-real-finding-id" 2>"$BUILD/t11-missingdisp.err" || rc=$?
+    assert_rc 1 "$rc" "dispositions_complete: an unknown/undispositioned assigned ID is reported missing"
+    assert_contains "DISPOSITIONS_MISSING" "$BUILD/t11-missingdisp.err" "the missing-disposition failure names itself"
+
+    # Only a FRESH reviewer round (never the fixer) can promote fixed ->
+    # verified: re-ingest THIS SAME iteration with an empty (clean) round
+    # from the SAME reviewer track and confirm the fixed finding is no
+    # longer reported as open/reopened afterward.
+    _t11_d7c="$T11_DIR/3-spec-review/07/attempts/reverify"
+    mkdir -p "$_t11_d7c"
+    : > "$_t11_d7c/claude-findings.jsonl"
+    _t11_status_pass "$_t11_d7c/STATUS.md" "$_t11_d7c/claude-findings.jsonl" 3 07
+    ingest_findings spec-reviewer-claude "$_t11_d7c/STATUS.md" "$_t11_d7c/claude-findings.jsonl" >/dev/null
+    _t11_status_reverified="$(jq -r --arg id "$_t11_fid7" 'select(.finding_id==$id) | .status' "$_t11_cat7")"
+    assert_eq "verified" "$_t11_status_reverified" \
+      "a subsequent reviewer round silently not re-reporting a 'fixed' finding is what promotes it to 'verified' -- never the fixer itself"
+
+    # Subsumption is explicit: a subsumed_by disposition records the winning ID.
+    record_finding_disposition "$_t11_cat6" "$(jq -r '.finding_id' "$_t11_cat6" | head -1)" \
+      "subsumed_by:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "split from F1" >/dev/null
+    _t11_subsumed_disp="$(jq -r '.disposition' "$_t11_cat6" | head -1)"
+    case "$_t11_subsumed_disp" in
+      subsumed_by:*) _ok "Step9 proof: subsumption is explicit -- the winning finding_id is recorded in the disposition" ;;
+      *) _fail "subsumed_by disposition was not recorded verbatim: [$_t11_subsumed_disp]" ;;
+    esac
+
+    # ---- CODE REVIEW FIX (Blocker 1): a re-reported, REWORDED finding
+    # must never be silently dropped nor promoted to verified. Fresh
+    # reviewer subprocesses write their OWN summary/required_change prose
+    # every round -- byte-identical text across rounds is the unlikely
+    # case, so this is the normal path, not an edge case. -------------------
+    _t11_d9="$(_t11_attempt_dir 3-spec 09 rewordA)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"09", severity:"blocker", artifact_path:$p,
+       artifact_revision:"revA", location:"Details", line:$line,
+       issue_key:"unclear-detail", summary:"round-1 wording", evidence:"e",
+       required_change:"c", provenance:"unknown", related_finding_ids:[]}'       > "$_t11_d9/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d9/STATUS.md" "$_t11_d9/claude-findings.jsonl" 3 09
+    _t11_out9a="$(ingest_findings spec-reviewer-claude "$_t11_d9/STATUS.md" "$_t11_d9/claude-findings.jsonl")"
+    printf '%s\n' "$_t11_out9a" | "$GREP_BIN" -qE '^blockers=1$' \
+      && _ok "reworded-blocker regression: round 1 ingest shows blockers=1" \
+      || _fail "reworded-blocker regression fixture setup broken: [$_t11_out9a]"
+    _t11_cat9="$T11_DIR/3-spec-review/09/findings-catalog.jsonl"
+    _t11_fid9="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat9")"
+    record_finding_disposition "$_t11_cat9" "$_t11_fid9" fixed "patched" >/dev/null
+
+    _t11_d9b="$(_t11_attempt_dir 3-spec 09 rewordB)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"09", severity:"blocker", artifact_path:$p,
+       artifact_revision:"revB", location:"Details", line:$line,
+       issue_key:"unclear-detail", summary:"round-2 wording, completely reworded", evidence:"e2",
+       required_change:"a different phrasing of the same required fix", provenance:"unknown",
+       related_finding_ids:[]}' \
+      > "$_t11_d9b/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d9b/STATUS.md" "$_t11_d9b/claude-findings.jsonl" 3 09
+    _t11_out9b="$(ingest_findings spec-reviewer-claude "$_t11_d9b/STATUS.md" "$_t11_d9b/claude-findings.jsonl")"
+    printf '%s\n' "$_t11_out9b" | "$GREP_BIN" -qE '^blockers=1$' \
+      && _ok "Blocker1 regression: a reworded re-report of a 'fixed' blocker stays an open blocker (never silently verified)" \
+      || _fail "Blocker1 REGRESSION: reworded re-report was dropped/verified, got: [$_t11_out9b]"
+    _t11_status9="$(jq -r --arg id "$_t11_fid9" 'select(.finding_id==$id) | .status' "$_t11_cat9")"
+    assert_eq "reopened" "$_t11_status9" \
+      "the reworded re-report's status is 'reopened' (fix_regression), never 'verified'"
+
+    # ---- CODE REVIEW FIX (Blocker 2): blocked/already_satisfied/
+    # subsumed_by must map onto the mandated status vocabulary and never
+    # permanently remove a finding from the gate counts (only
+    # accepted_risk/deferred -- an explicit, typed decision -- may). -------
+    _t11_d10="$(_t11_attempt_dir 3-spec 10 blk)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"10", severity:"blocker", artifact_path:$p,
+       artifact_revision:"r", location:"Details", line:$line,
+       issue_key:"needs-decision", summary:"s", evidence:"e", required_change:"c",
+       provenance:"unknown", related_finding_ids:[]}' > "$_t11_d10/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d10/STATUS.md" "$_t11_d10/claude-findings.jsonl" 3 10
+    ingest_findings spec-reviewer-claude "$_t11_d10/STATUS.md" "$_t11_d10/claude-findings.jsonl" >/dev/null
+    _t11_cat10="$T11_DIR/3-spec-review/10/findings-catalog.jsonl"
+    _t11_fid10="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat10")"
+    record_finding_disposition "$_t11_cat10" "$_t11_fid10" blocked "missing authority" >/dev/null
+    _t11_status10="$(jq -r --arg id "$_t11_fid10" 'select(.finding_id==$id) | .status' "$_t11_cat10")"
+    assert_eq "open" "$_t11_status10" \
+      "Blocker2 regression: a 'blocked' disposition on a blocker keeps status=open (never silently closes the gate)"
+    case " $(select_finding_batch "$_t11_cat10") " in
+      *" $_t11_fid10 "*) _ok "Blocker2 regression: a 'blocked' finding is STILL in the fixer batch (still blocking)" ;;
+      *) _fail "Blocker2 REGRESSION: a 'blocked' finding vanished from select_finding_batch" ;;
+    esac
+
+    _t11_d11="$(_t11_attempt_dir 3-spec 11 minor)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"11", severity:"blocker", artifact_path:$p,
+       artifact_revision:"r", location:"Details", line:$line,
+       issue_key:"already-fine", summary:"s", evidence:"e", required_change:"c",
+       provenance:"unknown", related_finding_ids:[]}' > "$_t11_d11/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d11/STATUS.md" "$_t11_d11/claude-findings.jsonl" 3 11
+    ingest_findings spec-reviewer-claude "$_t11_d11/STATUS.md" "$_t11_d11/claude-findings.jsonl" >/dev/null
+    _t11_cat11="$T11_DIR/3-spec-review/11/findings-catalog.jsonl"
+    _t11_fid11="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat11")"
+    record_finding_disposition "$_t11_cat11" "$_t11_fid11" already_satisfied "already correct" >/dev/null
+    _t11_status11="$(jq -r --arg id "$_t11_fid11" 'select(.finding_id==$id) | .status' "$_t11_cat11")"
+    assert_eq "fixed" "$_t11_status11" \
+      "Blocker2 regression: 'already_satisfied' maps to status=fixed -- same fixer-cannot-verify-itself rule as an actual fix"
+
+    _t11_d12="$(_t11_attempt_dir 3-spec 12 sub)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"12", severity:"major", artifact_path:$p,
+       artifact_revision:"r", location:"Details", line:$line,
+       issue_key:"dup-of-other", summary:"s", evidence:"e", required_change:"c",
+       provenance:"unknown", related_finding_ids:[]}' > "$_t11_d12/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d12/STATUS.md" "$_t11_d12/claude-findings.jsonl" 3 12
+    ingest_findings spec-reviewer-claude "$_t11_d12/STATUS.md" "$_t11_d12/claude-findings.jsonl" >/dev/null
+    _t11_cat12="$T11_DIR/3-spec-review/12/findings-catalog.jsonl"
+    _t11_fid12="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat12")"
+    record_finding_disposition "$_t11_cat12" "$_t11_fid12" \
+      "subsumed_by:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+      "merged into the other finding" >/dev/null
+    _t11_status12="$(jq -r --arg id "$_t11_fid12" 'select(.finding_id==$id) | .status' "$_t11_cat12")"
+    assert_eq "superseded" "$_t11_status12" \
+      "Blocker2 regression: 'subsumed_by' maps to the mandated status=superseded (spec S17.2), never a bespoke token"
+
+    # ---- CODE REVIEW FIX (Major 6): one reviewer's MAJOR must never
+    # silently cancel the OTHER reviewer's BLOCKER at the SAME canonical
+    # finding -- the more severe classification always wins, and the
+    # disagreement is still durably recorded (EVENT_CORRECTED). -----------
+    _t11_d13a="$(_t11_attempt_dir 3-spec 13 sevA)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"13", severity:"major", artifact_path:$p,
+       artifact_revision:"r", location:"Details", line:$line,
+       issue_key:"disputed-severity", summary:"claude thinks this is a major", evidence:"e",
+       required_change:"c", provenance:"unknown", related_finding_ids:[]}' > "$_t11_d13a/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d13a/STATUS.md" "$_t11_d13a/claude-findings.jsonl" 3 13
+    ingest_findings spec-reviewer-claude "$_t11_d13a/STATUS.md" "$_t11_d13a/claude-findings.jsonl" >/dev/null
+
+    : > "$T11_DIR/RUN_LOG.md"
+    _t11_d13b="$(_t11_attempt_dir 3-spec 13 sevB)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-codex", vendor:"codex",
+       phase:"3", iteration:"13", severity:"blocker", artifact_path:$p,
+       artifact_revision:"r", location:"Details", line:$line,
+       issue_key:"disputed-severity", summary:"codex thinks this is a blocker", evidence:"e2",
+       required_change:"c2", provenance:"unknown", related_finding_ids:[]}' > "$_t11_d13b/codex-findings.jsonl"
+    _t11_mk_status "$_t11_d13b/STATUS.md" "$_t11_d13b/codex-findings.jsonl" 3 13
+    _t11_out13b="$(ingest_findings spec-reviewer-codex "$_t11_d13b/STATUS.md" "$_t11_d13b/codex-findings.jsonl")"
+    printf '%s\n' "$_t11_out13b" | "$GREP_BIN" -qE '^blockers=1$' \
+      && _ok "Major6 regression: the MORE severe classification (blocker) wins over the earlier major, never dropped" \
+      || _fail "Major6 REGRESSION: a blocker was cancelled by an earlier major, got: [$_t11_out13b]"
+    assert_present '^--- .*event=EVENT_CORRECTED' "$T11_DIR/RUN_LOG.md" \
+      "Major6 regression: the severity disagreement is still durably recorded as EVENT_CORRECTED"
+
+    # ---- CODE REVIEW FIX (Major A -- new regression from the Blocker-6
+    # fix): a SEVERITY DOWNGRADE re-report must still reopen a fixed/
+    # verified finding -- an earlier version of the severity-conflict fix
+    # `continue`d past the reopen block whenever prior was more severe,
+    # letting a fixer's stale "fixed" claim survive a contradicting review
+    # entirely (the same failure class as Blocker 1, reached via severity
+    # instead of wording). ---------------------------------------------
+    _t11_d15="$(_t11_attempt_dir 3-spec 15 downgradeA)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"15", severity:"blocker", artifact_path:$p,
+       artifact_revision:"r", location:"Details", line:$line,
+       issue_key:"downgrade-case", summary:"round1", evidence:"e", required_change:"c",
+       provenance:"unknown", related_finding_ids:[]}' > "$_t11_d15/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d15/STATUS.md" "$_t11_d15/claude-findings.jsonl" 3 15
+    _t11_out15a="$(ingest_findings spec-reviewer-claude "$_t11_d15/STATUS.md" "$_t11_d15/claude-findings.jsonl")"
+    printf '%s\n' "$_t11_out15a" | "$GREP_BIN" -qE '^blockers=1$' \
+      && _ok "downgrade regression: round 1 ingest shows blockers=1" \
+      || _fail "downgrade regression fixture setup broken: [$_t11_out15a]"
+    _t11_cat15="$T11_DIR/3-spec-review/15/findings-catalog.jsonl"
+    _t11_fid15="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat15")"
+    record_finding_disposition "$_t11_cat15" "$_t11_fid15" fixed "patched" >/dev/null
+
+    _t11_d15b="$(_t11_attempt_dir 3-spec 15 downgradeB)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"15", severity:"major", artifact_path:$p,
+       artifact_revision:"r2", location:"Details", line:$line,
+       issue_key:"downgrade-case", summary:"round2, downgraded to major", evidence:"e2",
+       required_change:"c2", provenance:"unknown", related_finding_ids:[]}' > "$_t11_d15b/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d15b/STATUS.md" "$_t11_d15b/claude-findings.jsonl" 3 15
+    _t11_out15b="$(ingest_findings spec-reviewer-claude "$_t11_d15b/STATUS.md" "$_t11_d15b/claude-findings.jsonl")"
+    printf '%s\n' "$_t11_out15b" | "$GREP_BIN" -qE '^blockers=1$' \
+      && _ok "MajorA regression: a severity-downgraded re-report of a 'fixed' blocker still reopens (stays blockers=1)" \
+      || _fail "MajorA REGRESSION: a severity-downgraded re-report let a fixed blocker vanish, got: [$_t11_out15b]"
+    _t11_status15="$(jq -r --arg id "$_t11_fid15" 'select(.finding_id==$id) | .status' "$_t11_cat15")"
+    assert_eq "reopened" "$_t11_status15" \
+      "the downgraded re-report's status is 'reopened', never left at 'fixed'"
+    _t11_sev15="$(jq -r --arg id "$_t11_fid15" 'select(.finding_id==$id) | .severity' "$_t11_cat15")"
+    assert_eq "blocker" "$_t11_sev15" \
+      "the historically more-severe classification (blocker) is kept, not silently downgraded to major"
+
+    # ---- CODE REVIEW FIX (round 4, item 1 -- P4): a finding already
+    # PROMOTED to 'verified' (by an earlier round's silence) must still
+    # reopen when a LATER round re-reports it -- mutating the reopen
+    # check's tuple from `("fixed", "verified")` to `("fixed",)` alone
+    # leaves a re-reported 'verified' finding stuck at 'verified' and
+    # invisible to the gate. Continues the _t11_cat9/_t11_fid9 fixture. --
+    record_finding_disposition "$_t11_cat9" "$_t11_fid9" fixed "patched again" >/dev/null
+    _t11_d17_silent="$(_t11_attempt_dir 3-spec 09 p4silent)"
+    : > "$_t11_d17_silent/claude-findings.jsonl"
+    _t11_status_pass "$_t11_d17_silent/STATUS.md" "$_t11_d17_silent/claude-findings.jsonl" 3 09
+    ingest_findings spec-reviewer-claude "$_t11_d17_silent/STATUS.md" "$_t11_d17_silent/claude-findings.jsonl" >/dev/null
+    assert_eq "verified" "$(jq -r --arg id "$_t11_fid9" 'select(.finding_id==$id) | .status' "$_t11_cat9")" \
+      "P4 fixture setup: silence after a second 'fixed' disposition promotes to verified"
+    _t11_d17="$(_t11_attempt_dir 3-spec 09 p4reopen)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"09", severity:"blocker", artifact_path:$p,
+       artifact_revision:"r3", location:"Details", line:$line,
+       issue_key:"unclear-detail", summary:"round-4 wording, still broken", evidence:"e4",
+       required_change:"c4", provenance:"unknown", related_finding_ids:[]}' > "$_t11_d17/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d17/STATUS.md" "$_t11_d17/claude-findings.jsonl" 3 09
+    _t11_out17="$(ingest_findings spec-reviewer-claude "$_t11_d17/STATUS.md" "$_t11_d17/claude-findings.jsonl")"
+    printf '%s\n' "$_t11_out17" | "$GREP_BIN" -qE '^blockers=1$' \
+      && _ok "P4 regression: a re-reported 'verified' finding reopens (blockers=1)" \
+      || _fail "P4 REGRESSION: a re-reported 'verified' finding stayed invisible, got: [$_t11_out17]"
+    assert_eq "reopened" "$(jq -r --arg id "$_t11_fid9" 'select(.finding_id==$id) | .status' "$_t11_cat9")" \
+      "P4 regression: status is 'reopened', never left at 'verified'"
+
+    # ---- CODE REVIEW FIX (round 4, item 1 -- P5): a finding disposed
+    # `deferred`/`accepted_risk`/`subsumed_by` (status
+    # deferred/accepted_risk/superseded) must reopen when re-reported --
+    # this is the exact mechanism the iteration-3+ relaxed gate depends on
+    # ("a major triggers another round only until it carries an explicit
+    # disposition"); deleting the reopen mapping for these three statuses
+    # makes a still-broken deferred major permanently invisible. Continues
+    # the _t11_cat15/_t11_fid15 fixture. ---------------------------------
+    record_finding_disposition "$_t11_cat15" "$_t11_fid15" "deferred:followup-1" "deferred to a followup" >/dev/null
+    assert_eq "deferred" "$(jq -r --arg id "$_t11_fid15" 'select(.finding_id==$id) | .status' "$_t11_cat15")" \
+      "P5 fixture setup: the deferred disposition is recorded"
+    _t11_d18="$(_t11_attempt_dir 3-spec 15 p5reopen)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"15", severity:"blocker", artifact_path:$p,
+       artifact_revision:"r4", location:"Details", line:$line,
+       issue_key:"downgrade-case", summary:"round3, still broken despite deferral", evidence:"e3",
+       required_change:"c3", provenance:"unknown", related_finding_ids:[]}' > "$_t11_d18/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d18/STATUS.md" "$_t11_d18/claude-findings.jsonl" 3 15
+    _t11_out18="$(ingest_findings spec-reviewer-claude "$_t11_d18/STATUS.md" "$_t11_d18/claude-findings.jsonl")"
+    printf '%s\n' "$_t11_out18" | "$GREP_BIN" -qE '^blockers=1$' \
+      && _ok "P5 regression: a re-reported 'deferred' finding reopens (blockers=1)" \
+      || _fail "P5 REGRESSION: a re-reported 'deferred' finding stayed invisible, got: [$_t11_out18]"
+    assert_eq "reopened" "$(jq -r --arg id "$_t11_fid15" 'select(.finding_id==$id) | .status' "$_t11_cat15")" \
+      "P5 regression: status is 'reopened', never left at 'deferred'"
+
+    # ---- CODE REVIEW FIX (round 4, item 1 -- P7 adjacent): the promotion
+    # loop's own condition must never promote anything but a literal
+    # 'fixed' status -- a still-broken 'reopened' finding that a later
+    # round is silent about must NOT be swept up into 'verified' by that
+    # silence (only a genuine 'fixed' disposition, followed by silence,
+    # earns promotion). NOTE: the literal `seen_this_round` guard itself
+    # (spec_ 18.1's belt-and-suspenders line "if fid in seen_this_round:
+    # continue") is PROVEN unreachable dead code given the reopen block
+    # above: mutation-tested directly (removing just that guard) against
+    # this entire suite and got 0 failures, because no per-record path can
+    # ever leave a freshly-processed entry's status=='fixed' (it is always
+    # rewritten to reopened/open/deferred/accepted_risk/superseded first).
+    # This assertion instead pins the promotion CONDITION itself, which is
+    # the only currently-reachable half of that same safety property.
+    _t11_d19="$(_t11_attempt_dir 3-spec 09 p7silent)"
+    : > "$_t11_d19/claude-findings.jsonl"
+    _t11_status_pass "$_t11_d19/STATUS.md" "$_t11_d19/claude-findings.jsonl" 3 09
+    ingest_findings spec-reviewer-claude "$_t11_d19/STATUS.md" "$_t11_d19/claude-findings.jsonl" >/dev/null
+    assert_eq "reopened" "$(jq -r --arg id "$_t11_fid9" 'select(.finding_id==$id) | .status' "$_t11_cat9")" \
+      "P7-adjacent regression: a still-'reopened' finding is NOT promoted to verified by mere silence"
+
+    # ---- CODE REVIEW FIX (Medium C): same ID + same severity + genuinely
+    # different content must still fire EVENT_CORRECTED (audit signal),
+    # even though the merge always keeps the latest-ingested record
+    # (never silently loses the SIGNAL, only ever the OLD content). ------
+    _t11_d16a="$(_t11_attempt_dir 3-spec 16 contentA)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+       phase:"3", iteration:"16", severity:"blocker", artifact_path:$p,
+       artifact_revision:"r", location:"Details", line:$line,
+       issue_key:"same-node-diff-content", summary:"SQL injection in the query builder",
+       evidence:"e", required_change:"parameterize the query", provenance:"unknown",
+       related_finding_ids:[]}' > "$_t11_d16a/claude-findings.jsonl"
+    _t11_mk_status "$_t11_d16a/STATUS.md" "$_t11_d16a/claude-findings.jsonl" 3 16
+    ingest_findings spec-reviewer-claude "$_t11_d16a/STATUS.md" "$_t11_d16a/claude-findings.jsonl" >/dev/null
+
+    : > "$T11_DIR/RUN_LOG.md"
+    _t11_d16b="$(_t11_attempt_dir 3-spec 16 contentB)"
+    jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" '
+      {source_finding_id:"F1", reviewer_role:"spec-reviewer-codex", vendor:"codex",
+       phase:"3", iteration:"16", severity:"blocker", artifact_path:$p,
+       artifact_revision:"r", location:"Details", line:$line,
+       issue_key:"same-node-diff-content", summary:"completely unrelated: missing auth check",
+       evidence:"e2", required_change:"add an auth guard", provenance:"unknown",
+       related_finding_ids:[]}' > "$_t11_d16b/codex-findings.jsonl"
+    _t11_mk_status "$_t11_d16b/STATUS.md" "$_t11_d16b/codex-findings.jsonl" 3 16
+    ingest_findings spec-reviewer-codex "$_t11_d16b/STATUS.md" "$_t11_d16b/codex-findings.jsonl" >/dev/null
+    assert_present '^--- .*event=EVENT_CORRECTED' "$T11_DIR/RUN_LOG.md" \
+      "MediumC regression: same ID/same severity but genuinely different content still fires EVENT_CORRECTED"
+
+    # ---- CODE REVIEW FIX (round 4, item 3): an ORDINARY recurring finding
+    # -- same severity, realistically reworded prose each round (fresh
+    # reviewer subprocesses; NOT a topic change) -- must fire ZERO
+    # EVENT_CORRECTED across many rounds. Measured before this fix: one
+    # finding re-reported across four ordinary rounds emitted 3
+    # EVENT_CORRECTED events, burying the genuine same-node conflicts the
+    # signal exists to flag. -------------------------------------------
+    : > "$T11_DIR/RUN_LOG.md"
+    _t11_reword_summaries=(
+      "The heading text under Details is ambiguous and does not specify which detail is required, leaving the reader unable to determine the exact requirement."
+      "The heading text under Details remains ambiguous; it still does not specify which detail is required, so the reader cannot determine the exact requirement."
+      "Still true this round: the Details heading is ambiguous and fails to specify which detail is required, so a reader still cannot determine the exact requirement."
+      "Unresolved again: the Details heading stays ambiguous about which detail is required, and the reader still cannot pin down the exact requirement."
+    )
+    # Same $ITERATION for all four rounds -- ingest_findings' catalog is
+    # per-iteration (spec S17.2), so "recurring across rounds" within one
+    # gate iteration (repeat re-verification calls, same convention every
+    # other T11 fixture in this file already uses) is what persists a
+    # prior entry for ingest_findings to compare against.
+    for _t11_idx in 0 1 2 3; do
+      _t11_dOrd="$(_t11_attempt_dir 3-spec 20 "ordinary$_t11_idx")"
+      jq -cn --arg p "$T11_DIR/doc-v1.md" --argjson line "$_t11_line_v1" \
+        --arg summary "${_t11_reword_summaries[$_t11_idx]}" '
+        {source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+         phase:"3", iteration:"20", severity:"major", artifact_path:$p,
+         artifact_revision:"r", location:"Details", line:$line,
+         issue_key:"ordinary-recurring", summary:$summary, evidence:"e",
+         required_change:"clarify which specific detail the section requires",
+         provenance:"unknown", related_finding_ids:[]}' \
+        > "$_t11_dOrd/claude-findings.jsonl"
+      _t11_mk_status "$_t11_dOrd/STATUS.md" "$_t11_dOrd/claude-findings.jsonl" 3 20
+      ingest_findings spec-reviewer-claude "$_t11_dOrd/STATUS.md" "$_t11_dOrd/claude-findings.jsonl" >/dev/null
+    done
+    _t11_ordinary_corrections="$("$GREP_BIN" -c '^--- .*event=EVENT_CORRECTED' "$T11_DIR/RUN_LOG.md" || true)"
+    assert_eq 0 "${_t11_ordinary_corrections:-0}" \
+      "item3 regression: four ordinary rounds of the SAME recurring finding (realistic reword each time) fire ZERO EVENT_CORRECTED"
+  else
+    _fail "record_finding_disposition/dispositions_complete are not defined"
+  fi
+
+  # ---- CODE REVIEW FIX (Major 5): an explicit {#anchor} must NOT collapse
+  # the per-line node locator -- two DIFFERENT findings under the SAME
+  # anchored section, same issue_key, must still get DIFFERENT finding_ids
+  # (spec S17.2's disambiguator), never silently merge into one entry via
+  # EVENT_CORRECTED. -----------------------------------------------------
+  cat > "$T11_DIR/doc-v4.md" <<'EOF'
+# Root
+
+## Section {#mysection}
+
+First flagged line here.
+
+Second flagged line here.
+EOF
+  _t11_line_anchor1="$("$GREP_BIN" -n 'First flagged line here' "$T11_DIR/doc-v4.md" | cut -d: -f1)"
+  _t11_line_anchor2="$("$GREP_BIN" -n 'Second flagged line here' "$T11_DIR/doc-v4.md" | cut -d: -f1)"
+  _t11_d14="$(_t11_attempt_dir 3-spec 14 anchor)"
+  { jq -cn --arg p "$T11_DIR/doc-v4.md" --argjson line "$_t11_line_anchor1"       '{source_finding_id:"F1", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+        phase:"3", iteration:"14", severity:"major", artifact_path:$p,
+        artifact_revision:"r", location:"Section", line:$line,
+        issue_key:"dup-anchor-issue", summary:"s1", evidence:"e1", required_change:"c1",
+        provenance:"unknown", related_finding_ids:[]}'
+    jq -cn --arg p "$T11_DIR/doc-v4.md" --argjson line "$_t11_line_anchor2"       '{source_finding_id:"F2", reviewer_role:"spec-reviewer-claude", vendor:"claude",
+        phase:"3", iteration:"14", severity:"major", artifact_path:$p,
+        artifact_revision:"r", location:"Section", line:$line,
+        issue_key:"dup-anchor-issue", summary:"s2", evidence:"e2", required_change:"c2",
+        provenance:"unknown", related_finding_ids:[]}'
+  } > "$_t11_d14/claude-findings.jsonl"
+  _t11_mk_status "$_t11_d14/STATUS.md" "$_t11_d14/claude-findings.jsonl" 3 14
+  ingest_findings spec-reviewer-claude "$_t11_d14/STATUS.md" "$_t11_d14/claude-findings.jsonl" >/dev/null
+  _t11_cat14="$T11_DIR/3-spec-review/14/findings-catalog.jsonl"
+  _t11_id_anchor1="$(jq -r 'select(.source_finding_id=="F1") | .finding_id' "$_t11_cat14")"
+  _t11_id_anchor2="$(jq -r 'select(.source_finding_id=="F2") | .finding_id' "$_t11_cat14")"
+  [ -n "$_t11_id_anchor1" ] && [ -n "$_t11_id_anchor2" ] && [ "$_t11_id_anchor1" != "$_t11_id_anchor2" ]     && _ok "Major5 regression: two distinct findings under the SAME {#anchor} section get DIFFERENT finding_ids"     || _fail "Major5 REGRESSION: an explicit anchor collapsed two distinct findings onto one finding_id ($_t11_id_anchor1 vs $_t11_id_anchor2)"
+
+  # ---- select_finding_batch: bounded, blockers-first ordering. -------------
+  if declare -F select_finding_batch >/dev/null; then
+    _t11_batch="$(select_finding_batch "$_t11_cat4")"
+    case " $_t11_batch " in
+      *" $_t11_id_ka "*) _ok "select_finding_batch includes an open major finding" ;;
+      *) _fail "select_finding_batch did not include the open major finding: [$_t11_batch]" ;;
+    esac
+  fi
+
+  # ---- Convergence signals / divergence detection (spec S18.3). -----------
+  if declare -F record_convergence_signals >/dev/null && declare -F divergence_check >/dev/null; then
+    PHASE_DIR="$T11_DIR/conv-test"; mkdir -p "$PHASE_DIR"
+    # Deletion can produce NEGATIVE growth.
+    record_convergence_signals 3 "01" 1000 400 0 0 3 0 0 3 >/dev/null
+    _t11_g1="$(tail -n1 "$PHASE_DIR/convergence.jsonl" | jq -r '.growth_pct')"
+    [ "$_t11_g1" -lt 0 ] 2>/dev/null \
+      && _ok "Step9 proof: deletion (bytes shrink) produces a NEGATIVE growth_pct" \
+      || _fail "growth_pct should be negative for a shrinking artifact, got: $_t11_g1"
+
+    # Two consecutive growing rounds (over threshold, non-decreasing open
+    # blockers+majors) trigger divergence rule 3.
+    rm -f "$PHASE_DIR/convergence.jsonl"
+    record_convergence_signals 3 "01" 1000 1300 2 0 0 0 0 5 >/dev/null
+    record_convergence_signals 3 "02" 1300 1700 2 0 0 0 0 5 >/dev/null
+    _t11_div="$(divergence_check 3 "02" "$T11_DIR/no-such-catalog.jsonl")"
+    case "$_t11_div" in
+      yes:growth_without_reduction) _ok "Step9 proof: two growing rounds without reducing open blockers+majors trigger consolidation (divergence rule 3)" ;;
+      *) _fail "divergence_check should report growth_without_reduction, got: [$_t11_div]" ;;
+    esac
+
+    # A fix-induced blocker that persists (still open, one iteration after
+    # first appearing as a fix regression) is caught by rule 2.
+    _t11_fixregress_cat="$T11_DIR/fixregress-catalog.jsonl"
+    jq -cn '{finding_id:"x1", severity:"blocker", status:"reopened",
+             provenance:"fix_regression", origin_iteration:"01", recur_count:0}' \
+      > "$_t11_fixregress_cat"
+    _t11_div2="$(divergence_check 3 "02" "$_t11_fixregress_cat")"
+    case "$_t11_div2" in
+      yes:fix_regression_persists) _ok "Step9 proof: a fix-induced blocker that persists across a round is caught (divergence rule 2)" ;;
+      *) _fail "divergence_check should report fix_regression_persists, got: [$_t11_div2]" ;;
+    esac
+
+    # A finding fixed then reopened twice is caught by rule 1.
+    _t11_recur_cat="$T11_DIR/recur-catalog.jsonl"
+    jq -cn '{finding_id:"x2", severity:"major", status:"reopened",
+             provenance:"fix_regression", origin_iteration:"01", recur_count:2}' \
+      > "$_t11_recur_cat"
+    _t11_div3="$(divergence_check 3 "03" "$_t11_recur_cat")"
+    case "$_t11_div3" in
+      yes:finding_recurred_twice) _ok "a finding fixed then recurring twice is caught (divergence rule 1)" ;;
+      *) _fail "divergence_check should report finding_recurred_twice, got: [$_t11_div3]" ;;
+    esac
+
+    # Two consecutive rounds where the fixer reopens MORE blockers/majors
+    # than reviewers verify resolved trigger divergence rule 4 -- growth
+    # kept flat/negative so this isolates rule 4 from rule 3.
+    PHASE_DIR="$T11_DIR/conv-test-r4"; mkdir -p "$PHASE_DIR"
+    record_convergence_signals 3 "01" 1000 900 0 0 1 3 0 5 >/dev/null
+    record_convergence_signals 3 "02" 900 850 0 0 1 4 0 6 >/dev/null
+    _t11_div4="$(divergence_check 3 "02" "$T11_DIR/no-such-catalog-r4.jsonl")"
+    case "$_t11_div4" in
+      yes:fixer_reopens_more_than_resolved) _ok "Step9 proof: the fixer reopening more than it resolves for two consecutive rounds is caught (divergence rule 4)" ;;
+      *) _fail "divergence_check should report fixer_reopens_more_than_resolved, got: [$_t11_div4]" ;;
+    esac
+  else
+    _fail "record_convergence_signals/divergence_check are not defined"
+  fi
+
+  # ---- validate_artifact: structural manifest gate (spec S17.1). ----------
+  # Uses role_attempt_dir's OWN derivation (phase/iteration decoded from the
+  # dispatch_id string, never ambient $PHASE_DIR/$ITERATION) -- deliberately
+  # setting ambient PHASE_DIR/ITERATION to a DIFFERENT phase (5-plan-review)
+  # than the producer's real one (4-plan-writing) below, proving
+  # validate_artifact ignores ambient state for this lookup (the exact
+  # cross-phase bug this fixture would have masked otherwise).
+  if declare -F validate_artifact >/dev/null; then
+    PHASE_DIR="$T11_DIR/5-plan-review"; ITERATION="01"
+    _t11_pw_dir="$FEATURE_FOLDER/4-plan-writing/00/attempts/p04-i00-plan-writer-a01"
+    mkdir -p "$_t11_pw_dir"
+    PLAN_PATH="$T11_DIR/plan.md"
+    cat > "$PLAN_PATH" <<'EOF'
+# Goal
+
+Ship the thing end to end, with enough real prose here that the manifest's
+minimum non-whitespace byte count is comfortably exceeded by a wide margin,
+covering the goal, the approach, and the acceptance bar for this fixture.
+
+# File Structure and Responsibilities
+
+| Path | Action | Responsibility |
+|---|---|---|
+| foo.py | Modify | Add the new behavior under test |
+| tests/test_foo.py | Modify | Cover the new behavior |
+EOF
+    printf '{"schema_version":2,"plan_path":"%s","completed_at":"1970-01-01T00:00:00Z"}\n' \
+      "$PLAN_PATH" > "$_t11_pw_dir/artifact-complete.json"
+    printf 'verdict: DONE\nreason: null\nartifact_revision: %s\n' \
+      "$(sha256sum "$PLAN_PATH" | awk '{print $1}')" > "$_t11_pw_dir/STATUS.md"
+    validate_artifact plan-writer p04-i00-plan-writer-a01 >/dev/null \
+      && _ok "validate_artifact accepts a manifest-passing plan (headings present, size ok, revision matches, marker present)" \
+      || _fail "validate_artifact rejected a genuinely valid plan"
+
+    # Satisfy every OTHER manifest check (headings present, marker present)
+    # so this negative case genuinely isolates the byte-count gate -- a tiny
+    # file that ALSO fails headings/marker would still correctly return 1,
+    # but would prove nothing about the size check specifically.
+    rc=0
+    printf '# Goal\n# File Structure and Responsibilities\n' > "$T11_DIR/plan-tiny.md"
+    _t11_pw_dir2="$FEATURE_FOLDER/4-plan-writing/00/attempts/p04-i00-plan-writer-a02"
+    mkdir -p "$_t11_pw_dir2"
+    PLAN_PATH="$T11_DIR/plan-tiny.md"
+    printf '{"schema_version":2,"plan_path":"%s","completed_at":"1970-01-01T00:00:00Z"}\n' \
+      "$PLAN_PATH" > "$_t11_pw_dir2/artifact-complete.json"
+    printf 'verdict: DONE\nreason: null\nartifact_revision: %s\n' \
+      "$(sha256sum "$PLAN_PATH" | awk '{print $1}')" > "$_t11_pw_dir2/STATUS.md"
+    validate_artifact plan-writer p04-i00-plan-writer-a02 >"$BUILD/t11-va-tiny.out" 2>"$BUILD/t11-va-tiny.err" || rc=$?
+    assert_rc 1 "$rc" "validate_artifact rejects a plan below the manifest's minimum byte count"
+    assert_contains "VALIDATE_ARTIFACT_TOO_SMALL" "$BUILD/t11-va-tiny.err" \
+      "the size rejection specifically names itself (headings and marker both pass here)"
+
+    rc=0
+    PLAN_PATH="$T11_DIR/plan-nostatus.md"
+    printf '# Goal\n\nFile Structure and Responsibilities present too.\n' > "$PLAN_PATH"
+    validate_artifact plan-writer p04-i00-nonexistent-a01 >/dev/null 2>"$BUILD/t11-va-nostatus.err" || rc=$?
+    assert_rc 1 "$rc" "validate_artifact refuses without a matching successful STATUS -- size/marker alone never authorizes review"
+    assert_contains "VALIDATE_ARTIFACT_NO_STATUS" "$BUILD/t11-va-nostatus.err" "the missing-STATUS refusal names itself"
+
+    # ---- CODE REVIEW FIX (Minor 11a): "## Non-Goals" must NOT satisfy a
+    # required "Goal" heading -- the check is heading-anchored, never a
+    # bare substring match anywhere in the file. -----------------------
+    rc=0
+    printf '# Non-Goals\n\nWe are explicitly not doing X, Y, or Z in this iteration -- those are out of scope on purpose and documented here so nobody re-proposes them later without a fresh discussion.\n\n# File Structure and Responsibilities\n\n| Path | Action |\n|---|---|\n| foo.py | Modify |\n' \
+      > "$T11_DIR/plan-nongoal.md"
+    _t11_pw_dir3="$FEATURE_FOLDER/4-plan-writing/00/attempts/p04-i00-plan-writer-a03"
+    mkdir -p "$_t11_pw_dir3"
+    PLAN_PATH="$T11_DIR/plan-nongoal.md"
+    printf '{"schema_version":2,"plan_path":"%s","completed_at":"1970-01-01T00:00:00Z"}
+'       "$PLAN_PATH" > "$_t11_pw_dir3/artifact-complete.json"
+    printf 'verdict: DONE
+reason: null
+artifact_revision: %s
+'       "$(sha256sum "$PLAN_PATH" | awk '{print $1}')" > "$_t11_pw_dir3/STATUS.md"
+    validate_artifact plan-writer p04-i00-plan-writer-a03 >/dev/null 2>"$BUILD/t11-va-nongoal.err" || rc=$?
+    assert_rc 1 "$rc" "Minor11a regression: '## Non-Goals' does NOT satisfy a required 'Goal' heading"
+    assert_contains "VALIDATE_ARTIFACT_MISSING_HEADING:Goal" "$BUILD/t11-va-nongoal.err"       "the heading-anchored rejection specifically names the missing 'Goal' heading"
+  fi
+else
+  _fail "ingest_findings/validate_artifact are not defined"
+fi
+
+FEATURE_FOLDER="$T11_FEATURE_FOLDER"
+ORCHESTRATION_DIR="$T11_ORCHESTRATION_DIR"
 
 finish
