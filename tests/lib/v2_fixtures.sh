@@ -385,3 +385,28 @@ with open(path, "w") as f:
     f.write("```\n")
 PY
 }
+
+# ---- write_pending_proposition_header / write_pending_fulfillment (Task 15) -
+# Hand-written pending-propositions.jsonl rows -- the fixture-side
+# counterpart to record_event's own auto-written header and append_
+# proposition's own fulfillment record (Task 15's "RUN_LOG events, decisions,
+# write leases, and snapshots" / "Proposition ledger and audit" sections),
+# for tests that need a missing/duplicate/mislabeled header or a duplicate
+# fulfillment WITHOUT driving the full record_event/append_proposition call
+# path (tests/check_11_reconciliation.sh).
+#
+# Usage: write_pending_proposition_header FILE EVENT_ID PHASE KIND TRIGGER
+write_pending_proposition_header() {
+  local file="$1" event_id="$2" phase="$3" kind="$4" trigger="$5"
+  mkdir -p "$(dirname "$file")"
+  jq -cn --argjson event_id "$event_id" --arg phase "$phase" --arg kind "$kind" --arg trigger "$trigger" \
+    '{event_id:$event_id, phase:$phase, kind:$kind, trigger:$trigger}' >> "$file"
+}
+
+# Usage: write_pending_fulfillment FILE EVENT_ID [FULFILLED_AT]
+write_pending_fulfillment() {
+  local file="$1" event_id="$2" fulfilled_at="${3:-1970-01-01T00:00:00Z}"
+  mkdir -p "$(dirname "$file")"
+  jq -cn --argjson event_id "$event_id" --arg fulfilled_at "$fulfilled_at" \
+    '{event_id:$event_id, fulfilled_at:$fulfilled_at}' >> "$file"
+}

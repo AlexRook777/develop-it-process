@@ -1834,6 +1834,111 @@ _t8_yes_count="$(tail -n +2 "$BUILD/events.tsv" | awk -F'\t' '$3=="yes"' | wc -l
 assert_eq 15 "$_t8_yes_count" \
   "exactly fifteen event types are proposition_required=yes (Task 11 adds DIVERGENCE_DETECTED and DIVERGENT_ROUND_CAP_REACHED)"
 
+# --- Task 15: _event_proposition_required (the runtime mirror) agrees with
+# the registry's own proposition_required column for EVERY row, in BOTH
+# directions -- the SAME bidirectional discipline event_required_fields
+# just got checked against above, applied to the third column instead.
+if declare -F _event_proposition_required >/dev/null; then
+  _t15_prop_col="$(tsv_column "$BUILD/events.tsv" proposition_required)"
+  _t15_mismatch=""
+  while IFS= read -r _t15_type; do
+    [ -n "$_t15_type" ] || continue
+    _t15_registry_val="$(awk -F'\t' -v k="$_t15_type" -v c="$_t15_prop_col" \
+      '$1==k{print $c}' "$BUILD/events.tsv")"
+    _t15_code_val="$(_event_proposition_required "$_t15_type" 2>/dev/null)"
+    [ "$_t15_code_val" = "$_t15_registry_val" ] || _t15_mismatch="$_t15_mismatch $_t15_type"
+  done < <(printf '%s\n' "$_t8_registry_types")
+  assert_eq "" "$_t15_mismatch" \
+    "_event_proposition_required agrees with the registry's proposition_required column for every type"
+else
+  _fail "_event_proposition_required is not defined"
+fi
+
+# --- Task 15: record_event writes a pending-propositions.jsonl header ONLY
+# for a proposition_required=yes type, and never for a =no type -- the real
+# call site inside record_event itself, not a grep against its definition.
+: > "$RUN_LOG"
+rm -f "$ORCHESTRATION_DIR/pending-propositions.jsonl"
+record_event ATTEMPT_ALLOCATED dispatch_id=p01-i01-x-a01 logical_dispatch_id=p01-i01-x \
+  phase=1 iteration=01 role=x attempt=1 launched=false reason="no-header probe" >/dev/null
+if [ -f "$ORCHESTRATION_DIR/pending-propositions.jsonl" ]; then
+  assert_line_count 0 "$ORCHESTRATION_DIR/pending-propositions.jsonl" \
+    "record_event writes NO pending-propositions.jsonl header for a proposition_required=no type (ATTEMPT_ALLOCATED)"
+else
+  _ok "record_event writes NO pending-propositions.jsonl header for a proposition_required=no type (ATTEMPT_ALLOCATED)"
+fi
+
+record_event HALT reason="pending-header probe" >/dev/null
+_t15_halt_id="$("$GREP_BIN" -oE '^event_id:[[:space:]]+[0-9]+$' "$RUN_LOG" | tail -n1 | "$GREP_BIN" -oE '[0-9]+$')"
+assert_exists "$ORCHESTRATION_DIR/pending-propositions.jsonl" \
+  "record_event creates pending-propositions.jsonl on the first proposition_required=yes event (HALT)"
+# Task 15 round 2: record_event now ALSO auto-fulfills via append_proposition
+# immediately (BLOCKER 1 fix), so the file carries the header line AND its
+# own fulfillment record -- two lines, not one.
+assert_line_count 2 "$ORCHESTRATION_DIR/pending-propositions.jsonl" \
+  "one header line plus one auto-written fulfillment record for the one HALT event"
+_t15_header="$(jq -c 'select(has("trigger"))' "$ORCHESTRATION_DIR/pending-propositions.jsonl")"
+_t15_header_ok="$(printf '%s' "$_t15_header" | jq -e --argjson id "$_t15_halt_id" \
+  '.event_id==$id and .kind=="failure" and .trigger=="HALT" and (.phase != "")' >/dev/null 2>&1 && echo yes || echo no)"
+assert_eq yes "$_t15_header_ok" \
+  "the HALT header carries event_id/kind=failure/trigger=HALT and a NON-EMPTY phase (MINOR fix, Task 15 round 2: has(\"phase\") was satisfied by an empty string)"
+_t15_fulfilled_ok="$(jq -e --argjson id "$_t15_halt_id" \
+  'select(has("fulfilled_at")) | .event_id==$id' "$ORCHESTRATION_DIR/pending-propositions.jsonl" \
+  >/dev/null 2>&1 && echo yes || echo no)"
+assert_eq yes "$_t15_fulfilled_ok" \
+  "record_event's own auto-fulfillment (BLOCKER 1 fix) wrote a real fulfillment record for this exact event_id"
+assert_contains "trigger: HALT" "$FEATURE_FOLDER/process-improvement-proposition.md" \
+  "the auto-fulfillment actually wrote the real proposition entry, not just the fulfillment record"
+
+# --- Task 15 round 2 (NIT): _run_log_events_json splits on the HEADER LINE
+# itself, never a blank line -- an event whose own `reason` embeds a blank
+# line must not lose the FIELDS that follow it within the SAME block (a
+# blank-line split would orphan them into a headerless, discarded chunk).
+if declare -F _run_log_events_json >/dev/null; then
+  : > "$RUN_LOG"
+  {
+    printf -- '--- 2026-01-01T00:00:00Z  event=ATTEMPT_ALLOCATED\n'
+    printf 'event_id:                 1\n'
+    printf 'process_schema_version:   2\n'
+    printf 'phase:                    1\n'
+    printf 'iteration:                01\n'
+    printf 'dispatch_id:              p01-i01-x-a01\n'
+    printf 'caused_by_event_id:       \n'
+    printf 'authority:                process\n'
+    printf 'reason:                   multi-line reason\n\nwith an embedded blank line\n'
+    printf 'logical_dispatch_id:      p01-i01-x\n'
+    printf 'role:                     x\n'
+    printf 'attempt:                  1\n'
+    printf 'launched:                 false\n'
+    printf '\n'
+    printf -- '--- 2026-01-01T00:00:01Z  event=ATTEMPT_ALLOCATED\n'
+    printf 'event_id:                 2\n'
+    printf 'process_schema_version:   2\n'
+    printf 'phase:                    1\n'
+    printf 'iteration:                02\n'
+    printf 'dispatch_id:              p01-i02-y-a01\n'
+    printf 'caused_by_event_id:       \n'
+    printf 'authority:                process\n'
+    printf 'reason:                   ok\n'
+    printf 'logical_dispatch_id:      p01-i02-y\n'
+    printf 'role:                     y\n'
+    printf 'attempt:                  1\n'
+    printf 'launched:                 false\n'
+    printf '\n'
+  } > "$RUN_LOG"
+  _t15_events_json="$(_run_log_events_json)"
+  _t15_events_count="$(printf '%s\n' "$_t15_events_json" | jq -s 'length' 2>/dev/null)"
+  assert_eq 2 "${_t15_events_count:-0}" \
+    "_run_log_events_json parses BOTH blocks even though the first block's own reason embeds a blank line"
+  _t15_role_ok="$(printf '%s\n' "$_t15_events_json" | jq -e -s 'any(.[]; .event_id==1 and .role=="x")' >/dev/null 2>&1 && echo yes || echo no)"
+  assert_eq yes "$_t15_role_ok" \
+    "the FIRST block's own role field survives intact -- a blank-line split would have orphaned it into a discarded headerless chunk"
+  _t15_second_ok="$(printf '%s\n' "$_t15_events_json" | jq -e -s 'any(.[]; .event_id==2 and .role=="y")' >/dev/null 2>&1 && echo yes || echo no)"
+  assert_eq yes "$_t15_second_ok" \
+    "the SECOND block's own event_id/role survive intact, never merged into or lost after the first block's embedded blank line"
+fi
+
+
 # --- record_event flushes/fsyncs its append (Step 3, code review fix #5) ---
 if declare -F record_event >/dev/null; then
   case "$(declare -f record_event)" in

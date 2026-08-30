@@ -3394,6 +3394,16 @@ _mutation_dirty() {
     local p="$1"
     case "$p" in
       "$ff_rel/RUN_LOG.md"|"$ff_rel/full_log.md") return 0 ;;
+      # Task 15 round 2 fix: record_event now auto-fulfils every
+      # proposition_required=yes event via append_proposition, which
+      # writes this file the FIRST time any of the fifteen types fires --
+      # the SAME orchestrator-bookkeeping status as RUN_LOG.md/full_log.md
+      # above (written by the process itself, never a role's own
+      # deliverable), and it persists across every later attempt in the
+      # run exactly like they do. Missing this line made EVERY later
+      # attempt's own dirty-tree check see permanent, unrelated "dirt" the
+      # instant the first mandatory event of the whole run occurred.
+      "$ff_rel/process-improvement-proposition.md") return 0 ;;
       "$orch_rel"|"$orch_rel"/*) return 0 ;;
       "$ff_rel/transcripts"|"$ff_rel/transcripts"/*) return 0 ;;
       "$ff_rel"/*/attempts/*) return 0 ;;
@@ -4156,6 +4166,25 @@ event_required_fields() {
   esac
 }
 
+# The runtime mirror of the Event Contract Registry's own `proposition_
+# required` column (spec §21.1) -- the SAME hand-coded-case-statement-plus-
+# cross-check discipline `event_required_fields` above already uses against
+# `extract.py events`'s `required_fields` column, applied to its third
+# column instead. Exactly the fifteen types the registry marks `yes` return
+# `yes`; every other registered type (including the eight "no live call
+# site yet" rows and the ordinary dispatch-lifecycle/preflight-evidence
+# rows) returns `no`. `record_event` (below) is the only caller.
+_event_proposition_required() {
+  case "$1" in
+    ATTEMPT_FAILED|RECOVERY_AUTHORIZED|RECOVERY_CAP_REACHED|CONTINUATION_CAP_REACHED| \
+    ORCHESTRATION_CORRECTION|HALT|EVENT_CORRECTED|VENDOR_UNAVAILABLE|DEGRADED_REVIEW_ACCEPTED| \
+    ARTIFACT_INTEGRITY_BLOCKED|ITERATION_CAP_REACHED|ITERATION_CAP_OVERRIDE|PROCESS_DEVIATION| \
+    DIVERGENCE_DETECTED|DIVERGENT_ROUND_CAP_REACHED)
+      echo yes ;;
+    *) echo no ;;
+  esac
+}
+
 # Scans RUN_LOG.md for the highest existing event_id and returns one past it
 # -- never clock time, never an in-memory counter. The caller (record_event)
 # already holds the run-log lock, so this cannot race another allocation.
@@ -4259,9 +4288,69 @@ record_event() {
   # reinvented; a plain `>>` alone only guarantees libc's buffer was
   # handed to the kernel, not that it survived a crash immediately after.
   _bootstrap_fsync_path "$FEATURE_FOLDER/RUN_LOG.md" 2>/dev/null || true
+  # Spec §21.1: an event whose type is `proposition_required=yes` ALSO gets
+  # a header-only metadata record appended to pending-propositions.jsonl,
+  # under this SAME lock -- so two proposition-required events racing
+  # through dispatch_parallel's own forked attempts (Task 6) can never
+  # interleave two header lines. `trigger` is the event_type itself (the
+  # SAME "trigger tag equals the RUN_LOG event type" convention the
+  # pre-existing six-trigger mapping table already uses for CODEX_
+  # UNAVAILABLE/CLAUDE_FAILED/HALT/ITERATION_CAP_REACHED/_OVERRIDE);
+  # `kind` is always `failure` -- every proposition_required type is an
+  # off-nominal signal (a failure, a correction, a cap, a forced
+  # degradation acceptance), never a `success`/`idea` entry, which only
+  # ever originate from a spontaneous (non-mandatory) append. This header
+  # is PENDING, non-authoritative metadata (spec §21.1's own words) --
+  # `append_proposition` (below) is what turns it into real coverage.
+  local proposition_required
+  proposition_required="$(_event_proposition_required "$event_type")"
+  if [ "$proposition_required" = yes ]; then
+    mkdir -p "${ORCHESTRATION_DIR:-$FEATURE_FOLDER/.orchestration}"
+    jq -cn --argjson event_id "$event_id" --arg phase "${phase:-n/a}" \
+      --arg kind failure --arg trigger "$event_type" \
+      '{event_id:$event_id, phase:$phase, kind:$kind, trigger:$trigger}' \
+      >> "${ORCHESTRATION_DIR:-$FEATURE_FOLDER/.orchestration}/pending-propositions.jsonl"
+  fi
   _run_log_lock_release
   # shellcheck disable=SC2034  # consumed by the caller after record_event returns
   RECORD_EVENT_ID="$event_id"
+
+  # Code review fix (Task 15 round 2, BLOCKER 1): append_proposition had NO
+  # real call site -- the "orchestrator calls it after record_event" prose
+  # was unusable for the twelve of these fifteen types that fire from
+  # INSIDE cookbook helpers (recovery_retry_allowed's RECOVERY_AUTHORIZED,
+  # _dispatch_ingest_result's ATTEMPT_FAILED, ...), where no top-level
+  # phase narrative has an "immediately after" moment to hook a manual call
+  # onto. Auto-fulfilling HERE, unconditionally, right after the header is
+  # durable and the lock is released, is the one real path that reaches
+  # every type: this is what makes READY reachable for an ordinary run
+  # that hits a retry, a cap, or a correction -- a pending header that
+  # nothing ever fulfils otherwise unconditionally blocks readiness
+  # (reconcile_propositions' own PROPOSITION_NOT_FULFILLED rule). The
+  # entry's body is the event's own `reason` -- genuine, already-vetted
+  # text every real call site already supplies (never fabricated, never
+  # source/credential material), not a weaker stand-in for orchestrator
+  # judgment. Never inside the lock above: append_proposition's own I/O
+  # (process-improvement-proposition.md, pending-propositions.jsonl) needs
+  # no RUN_LOG mutex, and re-reading RUN_LOG.md here is safe once the
+  # event this call just fsynced is durable.
+  if [ "$proposition_required" = yes ]; then
+    append_proposition "$event_id" failure "$reason" >/dev/null 2>&1 || true
+  fi
+  # Trade-off, noted rather than silently accepted: auto-fulfilling with
+  # `$reason` hollows spec §21.2's three coverage rules toward tautology
+  # for these fifteen types, and the orchestrator no longer writes richer,
+  # hand-composed prose for them -- ledger quality for FUTURE runs is the
+  # cost, never current-run safety (§21.1: pending/fulfilled records never
+  # gate the CURRENT run's own decisions; every other §21.2 rule is
+  # independent of coverage and stays fully enforced). A later explicit
+  # orchestrator call REPLACING the auto entry (instead of duplicating it)
+  # was considered and skipped: process-improvement-proposition.md is
+  # documented append-only/never-rewritten, and reconcile_propositions'
+  # own DUPLICATE_PROPOSITION_COVERAGE check is spec §21.2 case 3's literal
+  # text ("duplicate proposition coverage for one event") -- loosening
+  # either to allow a second, richer fulfillment is a real design change,
+  # not a few-line one.
 }
 ```
 
@@ -4316,6 +4405,723 @@ Consumers follow the latest valid correction chain (by `corrected_event_id`)
 and retain the original block for audit — `record_event`'s own append-only
 construction (above) makes any other form of "correction" structurally
 unreachable.
+
+### Proposition ledger and audit (spec §21)
+
+`record_event` (above) already writes a PENDING, non-authoritative header
+(`event_id, phase, kind, trigger`) to `$ORCHESTRATION_DIR/pending-
+propositions.jsonl` the moment a `proposition_required=yes` event occurs
+(spec §21.1). Two more pieces close the loop: `append_proposition`, the
+ORCHESTRATOR-ONLY writer that turns one pending header into a real entry in
+`process-improvement-proposition.md` (never a role's own write — the same
+single-writer discipline `append_followup` already enforces for a second
+shared ledger), and the deterministic audit pair `reconcile_propositions` /
+`audit_run_state` that gates Phase 11 readiness (spec §20.11) without ever
+opening that prose file at all.
+
+<!-- lint: cookbook -->
+```bash
+# Parses $FEATURE_FOLDER/RUN_LOG.md's own block grammar (spec S15.1: a
+# header line `--- <ISO-ts>  event=<TYPE>` followed by `key:   value` body
+# lines, blocks separated by one blank line -- the SAME grammar every
+# existing single-field awk reader above already parses one field at a
+# time) into one JSON object per block, emitted as JSONL on stdout: every
+# body key becomes a string field, verbatim, plus `_type` (the `event=`
+# tag). This is the ONLY parser reconcile_propositions/audit_run_state use
+# to read RUN_LOG.md -- neither hand-rolls its own block scan, so a future
+# change to the block grammar has one parser to update, not two.
+_run_log_events_json() {
+  local log="${FEATURE_FOLDER:-}/RUN_LOG.md"
+  [ -f "$log" ] || return 0
+  "$PYTHON_BIN" - "$log" <<'PY'
+import json, re, sys
+
+HEADER = re.compile(r"^--- [^ ]+  event=([^ ]+)$")
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    lines = f.read().splitlines()
+
+# NIT (Task 15 round 2): split on the HEADER LINE ITSELF, never on a blank
+# line -- a blank-line split truncates any block whose own multi-line
+# `reason` (documented elsewhere as usually one line, but never STRUCTURALLY
+# forbidden from carrying more) happens to contain one. A header line can
+# only legitimately open a NEW block (record_event never emits one inside a
+# value), so anchoring on it is exact regardless of blank lines inside a
+# value.
+blocks = []
+current = None
+for line in lines:
+    m = HEADER.match(line)
+    if m:
+        if current is not None:
+            blocks.append(current)
+        current = {"_type": m.group(1)}
+        continue
+    if current is None:
+        continue
+    if not line.strip():
+        continue
+    if ":" not in line:
+        continue
+    k, v = line.split(":", 1)
+    k = k.strip()
+    if not k:
+        continue
+    v = v.strip()
+    # event_id is always a decimal integer (spec S15.1, _record_event_next_
+    # id) -- typed as a JSON NUMBER here so every jq comparison against
+    # pending-propositions.jsonl's own numeric event_id (and every numeric
+    # event_id ordering check below) is a same-type comparison, never a
+    # string/number mismatch that silently never matches.
+    if k == "event_id" and v.isdigit():
+        current[k] = int(v)
+    else:
+        current[k] = v
+if current is not None:
+    blocks.append(current)
+
+for rec in blocks:
+    print(json.dumps(rec))
+PY
+}
+
+# Append-only audit-findings ledger shared by reconcile_propositions and
+# audit_run_state (spec §21.2/§20.11): one JSON object per finding,
+# `{"check":"<CODE>", "detail":"...", "record_ids":[...]}`. Readiness (Phase
+# 11) treats a non-empty ledger as a blocking `NOT_READY` audit, quoting
+# each finding's own `record_ids` -- never a prose summary standing in for
+# the exact IDs.
+_audit_finding() {
+  # Usage: _audit_finding CHECK_CODE DETAIL [RECORD_ID...]
+  local check="$1" detail="$2"; shift 2
+  local ids_json
+  if [ "$#" -gt 0 ]; then
+    ids_json="$(printf '%s\n' "$@" | jq -R . | jq -s -c .)"
+  else
+    ids_json='[]'
+  fi
+  mkdir -p "${ORCHESTRATION_DIR:?}"
+  jq -cn --arg check "$check" --arg detail "$detail" --argjson record_ids "$ids_json" \
+    '{check:$check, detail:$detail, record_ids:$record_ids}' \
+    >> "$ORCHESTRATION_DIR/audit-findings.jsonl"
+}
+
+# The orchestrator-only writer that turns ONE pending header into a real,
+# durable entry (spec §21.1: "the orchestrator immediately uses that record
+# to append one full proposition entry through append_proposition; the
+# helper validates the header/event relation before writing"). Never called
+# from inside a dispatched role's own appendix -- the SAME rule append_
+# followup already documents for followups.jsonl. Refuses to write anything
+# unless the header's own `trigger` field agrees with what RUN_LOG.md
+# ACTUALLY recorded for that exact event_id, and that recorded type is
+# itself `proposition_required=yes` -- a forged or stale header can never
+# buy its way into a real entry. On success, appends the entry (using the
+# EXACT header/format already documented in "Entry format"/"First-write
+# header" below) and a separate fulfillment record
+# (`{"event_id":N,"fulfilled_at":<ts>}`) to pending-propositions.jsonl --
+# reconcile_propositions' own coverage/staleness checks read that
+# fulfillment record, never the prose body this function also writes.
+append_proposition() {
+  # Usage: append_proposition EVENT_ID KIND BODY
+  local event_id="${1:-}" kind="${2:-}" body="${3:-}"
+  [ -n "$event_id" ] || { echo "APPEND_PROPOSITION_MISSING_EVENT_ID" >&2; return 1; }
+  [ -n "$kind" ] || { echo "APPEND_PROPOSITION_MISSING_KIND" >&2; return 1; }
+  local pending="${ORCHESTRATION_DIR:?}/pending-propositions.jsonl"
+  [ -f "$pending" ] || { echo "APPEND_PROPOSITION_NO_PENDING_FILE" >&2; return 1; }
+
+  local header
+  header="$(jq -c --argjson id "$event_id" 'select(.event_id==$id and has("trigger"))' \
+    "$pending" 2>/dev/null | tail -n1)"
+  [ -n "$header" ] || { echo "APPEND_PROPOSITION_NO_HEADER:$event_id" >&2; return 1; }
+  local phase trigger header_kind
+  phase="$(printf '%s' "$header" | jq -r '.phase')"
+  trigger="$(printf '%s' "$header" | jq -r '.trigger')"
+  header_kind="$(printf '%s' "$header" | jq -r '.kind')"
+  # NIT (Task 15 round 2): the caller's own KIND must agree with the
+  # header's own auto-recorded kind -- otherwise a caller could file a
+  # `HALT` event under `kind: success`, which the Trigger -> kind mapping
+  # table (spec's own fixed enum for mandatory entries) never permits.
+  [ "$kind" = "$header_kind" ] \
+    || { echo "APPEND_PROPOSITION_KIND_MISMATCH:$event_id:$kind!=$header_kind" >&2; return 1; }
+
+  local real_type
+  real_type="$(_run_log_events_json | jq -r --argjson id "$event_id" \
+    'select(.event_id==$id) | ._type' 2>/dev/null | head -n1)"
+  [ -n "$real_type" ] || { echo "APPEND_PROPOSITION_NO_SUCH_EVENT:$event_id" >&2; return 1; }
+  [ "$real_type" = "$trigger" ] \
+    || { echo "APPEND_PROPOSITION_HEADER_EVENT_MISMATCH:$event_id:$trigger!=$real_type" >&2; return 1; }
+  [ "$(_event_proposition_required "$real_type")" = yes ] \
+    || { echo "APPEND_PROPOSITION_NOT_MANDATORY:$event_id:$real_type" >&2; return 1; }
+
+  local path="${FEATURE_FOLDER:?}/process-improvement-proposition.md"
+  local phase_name
+  phase_name="$(_phase_name "$phase" 2>/dev/null)" || phase_name="$phase"
+  local entry
+  entry="$(printf '## %s — phase %s (%s) — kind: %s — trigger: %s\n\n%s\n' \
+    "$(iso_now)" "$phase" "$phase_name" "$kind" "$trigger" "$body")"
+  if [ ! -f "$path" ]; then
+    {
+      printf '%s\n' "# Process improvement propositions"
+      printf '\n%s\n' "Auto-generated by the develop-it orchestrator during a real run. Entries here are observations about the develop-it process itself — they are written *during* the current run but only *read* by future runs that want to improve the process file."
+      printf '\n%s\n' "The orchestrator never reads back from this file in the current run. Writing here cannot influence current execution."
+      printf '\n%s\n' 'Mining for improvement: grep `^## ` for entry headers, `kind: friction` etc. for category filters.'
+      printf '\n---\n\n'
+      printf '%s\n' "$entry"
+    } > "$path"
+  else
+    printf '\n%s\n' "$entry" >> "$path"
+  fi
+
+  jq -cn --argjson event_id "$event_id" --arg fulfilled_at "$(iso_now)" \
+    '{event_id:$event_id, fulfilled_at:$fulfilled_at}' >> "$pending"
+}
+
+# Event-ID proposition/event reconciliation (spec §21.2). Reads ONLY
+# pending-propositions.jsonl's own headers/fulfillment records and RUN_LOG's
+# event envelopes (via _run_log_events_json, above) -- never process-
+# improvement-proposition.md's own prose body. Appends one _audit_finding
+# per violated rule and returns non-zero iff at least one rule was
+# violated; readiness (audit_run_state, below) treats ANY finding as
+# blocking. Matches EXACT event ids throughout -- never a time window.
+reconcile_propositions() {
+  local orch="${ORCHESTRATION_DIR:?}" rc=0
+  local pending="$orch/pending-propositions.jsonl"
+  [ -f "$pending" ] || : > "$pending"
+  local events; events="$(mktemp "$orch/.tmp.reconcile-events.XXXXXX")"
+  _run_log_events_json > "$events" 2>/dev/null || true
+
+  # Rule 1/2: every mandatory RUN_LOG event <-> exactly one header.
+  local id t cnt
+  while IFS=$'\t' read -r id t; do
+    [ -n "$id" ] || continue
+    [ "$(_event_proposition_required "$t")" = yes ] || continue
+    cnt="$(jq -c --argjson id "$id" 'select(.event_id==$id and has("trigger"))' \
+      "$pending" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${cnt:-0}" -eq 0 ]; then
+      _audit_finding MANDATORY_EVENT_WITHOUT_HEADER \
+        "mandatory RUN_LOG event=$t has no proposition header" "event_id:$id"
+      rc=1
+    elif [ "$cnt" -gt 1 ]; then
+      _audit_finding DUPLICATE_PROPOSITION_HEADER \
+        "mandatory RUN_LOG event=$t has $cnt proposition headers, expected exactly one" "event_id:$id"
+      rc=1
+    fi
+  done < <(jq -r '[.event_id, ._type] | @tsv' "$events" 2>/dev/null)
+
+  # Rule 3/4/6: every header names a REAL mandatory event with a matching
+  # trigger -- a header whose trigger claims a launched vendor failure
+  # (ATTEMPT_FAILED) for an event_id RUN_LOG actually recorded as
+  # DISPATCH_NOT_LAUNCHED (a prelaunch defect that never launched anything)
+  # is the specific mislabeling spec §21.2 names; any OTHER trigger/type
+  # disagreement (e.g. a stale header left over from an EVENT_CORRECTED
+  # reclassification) is the generic mismatch case.
+  local row trig real_type
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    id="$(printf '%s' "$row" | jq -r '.event_id')"
+    trig="$(printf '%s' "$row" | jq -r '.trigger')"
+    real_type="$(jq -r --argjson id "$id" 'select(.event_id==$id) | ._type' \
+      "$events" 2>/dev/null | head -n1)"
+    if [ -z "$real_type" ]; then
+      _audit_finding PROPOSITION_HEADER_WITHOUT_EVENT \
+        "proposition header names event_id RUN_LOG never recorded" "event_id:$id"
+      rc=1; continue
+    fi
+    # The specific prelaunch-mislabeling case (checked BEFORE the generic
+    # "not mandatory" rejection below): DISPATCH_NOT_LAUNCHED is legitimately
+    # proposition_required=no, so a header naming one would otherwise be
+    # swallowed by that generic branch -- but a header that ALSO claims a
+    # launched vendor failure (ATTEMPT_FAILED) for that exact event_id is a
+    # real, distinct violation spec §21.2 names, not merely "not mandatory".
+    if [ "$trig" = ATTEMPT_FAILED ] && [ "$real_type" = DISPATCH_NOT_LAUNCHED ]; then
+      _audit_finding PRELAUNCH_MISLABELED_AS_VENDOR_FAILURE \
+        "proposition claims a launched vendor failure (ATTEMPT_FAILED) for event_id=$id, which RUN_LOG records as DISPATCH_NOT_LAUNCHED" \
+        "event_id:$id"
+      rc=1; continue
+    fi
+    if [ "$(_event_proposition_required "$real_type")" != yes ]; then
+      _audit_finding PROPOSITION_HEADER_WITHOUT_EVENT \
+        "proposition header names event_id=$id whose RUN_LOG type ($real_type) is not proposition_required" \
+        "event_id:$id"
+      rc=1; continue
+    fi
+    if [ "$trig" != "$real_type" ]; then
+      _audit_finding PROPOSITION_HEADER_TRIGGER_MISMATCH \
+        "proposition header trigger ($trig) does not match event_id=$id's own recorded type ($real_type)" \
+        "event_id:$id"
+      rc=1
+    fi
+  done < <(jq -c 'select(has("trigger"))' "$pending" 2>/dev/null)
+
+  # Rule 5 (duplicate coverage) + stale correction: every mandatory event
+  # must have EXACTLY ONE fulfillment record (append_proposition's own
+  # durable proof a real entry was written) -- zero is an incomplete
+  # (stale) proposition, e.g. an EVENT_CORRECTED whose own correction was
+  # never actually written up; more than one is duplicate coverage.
+  while IFS=$'\t' read -r id t; do
+    [ -n "$id" ] || continue
+    [ "$(_event_proposition_required "$t")" = yes ] || continue
+    cnt="$(jq -c --argjson id "$id" 'select(.event_id==$id and has("fulfilled_at"))' \
+      "$pending" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${cnt:-0}" -eq 0 ]; then
+      _audit_finding PROPOSITION_NOT_FULFILLED \
+        "mandatory RUN_LOG event=$t has a pending header but no fulfilled proposition entry" "event_id:$id"
+      rc=1
+    elif [ "$cnt" -gt 1 ]; then
+      _audit_finding DUPLICATE_PROPOSITION_COVERAGE \
+        "mandatory RUN_LOG event=$t was fulfilled by more than one proposition entry" "event_id:$id"
+      rc=1
+    fi
+  done < <(jq -r '[.event_id, ._type] | @tsv' "$events" 2>/dev/null)
+
+  # Rule 7: a retry/continuation attempt (dispatch_id's own attempt suffix
+  # >= 2) must have a causal RECOVERY_AUTHORIZED for the SAME logical
+  # dispatch, recorded strictly BEFORE the retry's own DISPATCH_STARTED
+  # event_id -- never merely present somewhere in the run.
+  local sid did logi attn auth_hit
+  while IFS=$'\t' read -r sid did logi; do
+    [ -n "$sid" ] || continue
+    attn="$(printf '%s' "$did" | "$GREP_BIN" -oE -- '-a[0-9]{2}$' | tr -d 'a-')"
+    [ -n "$attn" ] || continue
+    [ "$((10#$attn))" -ge 2 ] || continue
+    auth_hit="$(jq -r --arg logi "$logi" --argjson sid "$sid" \
+      'select(._type=="RECOVERY_AUTHORIZED" and .logical_dispatch_id==$logi and (.event_id < $sid)) | .event_id' \
+      "$events" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${auth_hit:-0}" -eq 0 ]; then
+      _audit_finding RETRY_WITHOUT_RECOVERY_AUTHORIZED \
+        "dispatch_id=$did is a continuation attempt with no causal RECOVERY_AUTHORIZED for logical_dispatch_id=$logi" \
+        "event_id:$sid" "dispatch_id:$did"
+      rc=1
+    fi
+  done < <(jq -r 'select(._type=="DISPATCH_STARTED") | [.event_id, .dispatch_id, .logical_dispatch_id] | @tsv' \
+    "$events" 2>/dev/null)
+
+  # §21.2 case 6: "an event correction not reflected in the final
+  # classification" -- EVENT_CORRECTED.replacement_classification must
+  # actually govern what happens NEXT for the corrected dispatch, not just
+  # sit in RUN_LOG as an unconsumed claim. Re-derive what SHOULD happen via
+  # the SAME recovery_action helper a live run itself uses (fed the
+  # REPLACEMENT classification and the corrected attempt's own already-
+  # recorded mutation_state -- mutation_state is a property of the repo at
+  # attempt time, unaffected by a later classification correction) and
+  # check RUN_LOG's actual downstream history against it. Read-only: two of
+  # recovery_action's own branches (PRELAUNCH_FAILED, SPEND_CEILING) emit
+  # their OWN record_event side effects, which a deterministic audit must
+  # never trigger -- corrections reclassifying to either are skipped here
+  # (a correction that drastic needs human review, not automated
+  # recomputation), never silently mis-evaluated as some OTHER action.
+  local ec_row cid xid rclass xdid xlogical xmut raction later_cnt
+  while IFS= read -r ec_row; do
+    [ -n "$ec_row" ] || continue
+    cid="$(printf '%s' "$ec_row" | jq -r '.event_id')"
+    xid="$(printf '%s' "$ec_row" | jq -r '.corrected_event_id')"
+    rclass="$(printf '%s' "$ec_row" | jq -r '.replacement_classification')"
+    # A finding-scoped correction (corrected_event_id="finding:<id>", spec
+    # §17.2 -- ingest_findings' own collision path) has no attempt
+    # classification to reconcile against at all.
+    case "$xid" in finding:*) continue ;; esac
+    case "$rclass" in PRELAUNCH_FAILED|SPEND_CEILING) continue ;; esac
+    xdid="$(jq -r --argjson id "$xid" 'select(.event_id==$id) | .dispatch_id // empty'       "$events" 2>/dev/null | head -n1)"
+    [ -n "$xdid" ] || continue
+    xmut="$(jq -r --arg d "$xdid"       'select(._type=="DISPATCH_COMPLETED" and .dispatch_id==$d) | .mutation_state // empty'       "$events" 2>/dev/null | head -n1)"
+    [ -n "$xmut" ] || continue
+    xlogical="${xdid%-a[0-9][0-9]}"
+    recovery_action "$rclass" "$xmut" "$xlogical" >/dev/null 2>&1
+    raction="$RECOVERY_ACTION"
+    [ -n "$raction" ] || continue
+    later_cnt="$(jq -r --arg logi "$xlogical" --argjson cid "$cid"       'select(._type=="DISPATCH_STARTED" and .logical_dispatch_id==$logi and (.event_id > $cid)) | .event_id'       "$events" 2>/dev/null | wc -l | tr -d ' ')"
+    case "$raction" in
+      CONTINUE_WITHIN_CAP|TRANSIENT_RETRY|RETRY_PUBLICATION|CORRECT_AND_RETRY| \
+      RECONCILE_THEN_CONTINUE_IF_ISOLATED|RECONCILE_THEN_CONTINUE_IF_SAFE)
+        if [ "${later_cnt:-0}" -eq 0 ]; then
+          _audit_finding EVENT_CORRECTION_NOT_REFLECTED \
+            "correction event_id=$cid reclassifies event_id=$xid as $rclass (action=$raction, implies a continuation), but no later DISPATCH_STARTED exists for logical_dispatch_id=$xlogical" \
+            "event_id:$cid" "corrected_event_id:$xid"
+          rc=1
+        fi
+        ;;
+      HALT_OR_DEGRADE|HALT_EXACT_STATE|HALT_INTEGRITY|WAIT_FOR_OWNER| \
+      SUPPRESS_VENDOR_HALT_OR_DEGRADE|BRANCH_ON_VERDICT| \
+      RECONCILE_BLOCKED_NOT_ISOLATED|RECONCILE_UNKNOWN_NO_LOGICAL_ID)
+        if [ "${later_cnt:-0}" -gt 0 ]; then
+          _audit_finding EVENT_CORRECTION_NOT_REFLECTED \
+            "correction event_id=$cid reclassifies event_id=$xid as $rclass (action=$raction, implies no further automatic attempt), but a later DISPATCH_STARTED exists for logical_dispatch_id=$xlogical" \
+            "event_id:$cid" "corrected_event_id:$xid"
+          rc=1
+        fi
+        ;;
+    esac
+  done < <(jq -c 'select(._type=="EVENT_CORRECTED")' "$events" 2>/dev/null)
+
+  # Rule 8: exactly one completion block (DISPATCH_COMPLETED or
+  # DISPATCH_NOT_LAUNCHED) per dispatch id that ever started.
+  local started_ids d_id
+  started_ids="$(jq -r 'select(._type=="DISPATCH_STARTED" and .dispatch_id!="") | .dispatch_id' \
+    "$events" 2>/dev/null | sort -u)"
+  while IFS= read -r d_id; do
+    [ -n "$d_id" ] || continue
+    cnt="$(jq -r --arg d "$d_id" \
+      'select((._type=="DISPATCH_COMPLETED" or ._type=="DISPATCH_NOT_LAUNCHED") and .dispatch_id==$d) | .event_id' \
+      "$events" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${cnt:-0}" -eq 0 ]; then
+      _audit_finding DISPATCH_COMPLETION_MISSING \
+        "dispatch_id=$d_id started but has no completion record" "dispatch_id:$d_id"
+      rc=1
+    elif [ "$cnt" -gt 1 ]; then
+      _audit_finding DISPATCH_COMPLETION_DUPLICATE \
+        "dispatch_id=$d_id has $cnt completion records, expected exactly one" "dispatch_id:$d_id"
+      rc=1
+    fi
+  done <<<"$started_ids"
+
+  rm -f "$events"
+  return "$rc"
+}
+
+# The full spec §20.11/§21.2 readiness audit. Appends its OWN findings to
+# the SAME audit-findings.jsonl reconcile_propositions writes to (calling
+# it as one of its own clauses, never re-deriving event/proposition
+# reconciliation a second way), and additionally verifies runtime/process
+# identity, dispatch quiescence, lease clearance, explicit phase-acceptance
+# revisions, review-gate disposition, verification results, documentation
+# outputs, the follow-up ledger, context7 precedence, and the Phase 10
+# result. Returns non-zero iff any clause found a problem; Phase 11 reads
+# audit-findings.jsonl afterward for the exact record IDs.
+audit_run_state() {
+  local orch="${ORCHESTRATION_DIR:?}" rc=0
+  local events; events="$(mktemp "$orch/.tmp.audit-events.XXXXXX")"
+  _run_log_events_json > "$events" 2>/dev/null || true
+
+  # Runtime manifest still verifies (Task 3 seam) -- a manifest that
+  # verified once at bootstrap but was tampered with since is exactly what
+  # this re-check at readiness time exists to catch.
+  if [ -n "${RUNTIME_DIR:-}" ] && declare -F _bootstrap_verify_manifest >/dev/null 2>&1; then
+    _bootstrap_verify_manifest "$RUNTIME_DIR" \
+      || { _audit_finding RUNTIME_MANIFEST_INVALID "runtime manifest failed verification" "runtime:$RUNTIME_DIR"; rc=1; }
+  fi
+
+  # Process identity: every DISPATCH_COMPLETED this run wrote must carry
+  # the SAME develop_it_file_sha256 -- more than one distinct value means
+  # the process file was silently swapped mid-run. Names the CONFLICTING
+  # event_ids (MINOR fix, Task 15 round 2): "count:N" alone named neither
+  # the sha values nor which dispatches disagreed -- Step 5 requires the
+  # conflicting record IDs, not just a tally.
+  local sha_count distinct_shas one_sha conflict_ids
+  distinct_shas="$(jq -r 'select(._type=="DISPATCH_COMPLETED") | .develop_it_file_sha256 // empty' \
+    "$events" 2>/dev/null | sed '/^$/d' | sort -u)"
+  sha_count="$(printf '%s\n' "$distinct_shas" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [ "${sha_count:-0}" -gt 1 ]; then
+    conflict_ids=()
+    while IFS= read -r one_sha; do
+      [ -n "$one_sha" ] || continue
+      while IFS= read -r cid; do
+        [ -n "$cid" ] || continue
+        conflict_ids+=("event_id:$cid")
+      done < <(jq -r --arg sha "$one_sha" \
+        'select(._type=="DISPATCH_COMPLETED" and .develop_it_file_sha256==$sha) | .event_id' \
+        "$events" 2>/dev/null)
+    done <<<"$distinct_shas"
+    _audit_finding PROCESS_IDENTITY_MISMATCH \
+      "more than one develop_it_file_sha256 recorded across this run's dispatches ($sha_count distinct values)" \
+      "${conflict_ids[@]}"
+    rc=1
+  fi
+
+  # Every attempt classified, no dangling completion block, mandatory
+  # events/propositions reconcile by exact event id -- reconcile_
+  # propositions' own job; never re-derived here.
+  reconcile_propositions || rc=1
+
+  # "All attempts classified" (spec §20.11), taken literally (code review
+  # fix, Task 15 round 2): reconcile_propositions only counts that a
+  # completion BLOCK exists per dispatch id, never that its own
+  # `classification` field is one of classify_attempt's legal values. A
+  # blank or corrupted classification on an otherwise-present
+  # DISPATCH_COMPLETED slips through that count untouched.
+  local unclassified_ids ucid
+  unclassified_ids="$(jq -r 'select(._type=="DISPATCH_COMPLETED") |
+    select(.classification=="" or (.classification|IN(
+      "COMPLETED","TIMED_OUT","PRELAUNCH_FAILED","EXITED_NO_STATUS","MALFORMED_STATUS",
+      "UNKNOWN_VENDOR_ERROR","SPEND_CEILING","PERMANENT_VENDOR_ERROR",
+      "TRANSIENT_TRANSPORT_ERROR","PUBLICATION_LOST")|not)) | .event_id' \
+    "$events" 2>/dev/null)"
+  while IFS= read -r ucid; do
+    [ -n "$ucid" ] || continue
+    _audit_finding ATTEMPT_NOT_CLASSIFIED \
+      "DISPATCH_COMPLETED event_id=$ucid carries no legal classify_attempt classification" \
+      "event_id:$ucid"
+    rc=1
+  done <<<"$unclassified_ids"
+
+  # No RUNNING_OBSERVED / ORPHANED_UNOBSERVED dispatch left behind.
+  local logi state
+  while IFS= read -r logi; do
+    [ -n "$logi" ] || continue
+    state="$(resume_dispatch_state "$logi" 2>/dev/null)"
+    case "$state" in
+      RUNNING_OBSERVED|ORPHANED_UNOBSERVED)
+        _audit_finding DISPATCH_NOT_QUIESCED \
+          "logical_dispatch_id=$logi is still $state at readiness time" "logical_dispatch_id:$logi"
+        rc=1 ;;
+    esac
+  done < <(jq -r '.logical_dispatch_id // empty' "$events" 2>/dev/null | sed '/^$/d' | sort -u)
+
+  # No active write lease remains. Names the exact holder (MINOR fix, Task
+  # 15 round 2): "lease_state:$lease_state" alone named a CLASSIFICATION,
+  # never a record id -- Step 5 requires the conflicting record IDs. The
+  # lease file itself carries lease_owner/dispatch_id even when malformed
+  # enough to fail _write_lease_state's own JSON checks (jq -r with a `//
+  # empty` fallback degrades to an empty string rather than erroring), so
+  # both are always at least attempted.
+  local lease_state lease_file lease_owner lease_dispatch
+  lease_file="$orch/write-lease.json"
+  lease_state="$(_write_lease_state "$lease_file" 2>/dev/null)"
+  if [ "$lease_state" != NO_LEASE ]; then
+    lease_owner="$(jq -r '.lease_owner // empty' "$lease_file" 2>/dev/null)"
+    lease_dispatch="$(jq -r '.dispatch_id // empty' "$lease_file" 2>/dev/null)"
+    _audit_finding WRITE_LEASE_REMAINS \
+      "a write lease remains at readiness time ($lease_state)" \
+      "lease_owner:${lease_owner:-unknown}" "dispatch_id:${lease_dispatch:-none}"
+    rc=1
+  fi
+
+  # RUN_LOG checkpoints and Git snapshots agree (spec §20.11's final
+  # clause), taken as existence/well-formedness of the two durable
+  # artifacts each DISPATCH record itself names -- the minimal, real
+  # reading available without re-deriving checkpoint semantics a second
+  # time (checkpoint_resume_state already owns that): a completed
+  # checkpointed attempt whose own progress ledger vanished, or a started
+  # mutating attempt whose own declared snapshot manifest vanished, is
+  # exactly the kind of "RUN_LOG says X exists, the filesystem disagrees"
+  # split this clause exists to catch.
+  local cp_row cp_id cp_kind cp_status cp_dir cp_path
+  while IFS= read -r cp_row; do
+    [ -n "$cp_row" ] || continue
+    cp_id="$(printf '%s' "$cp_row" | jq -r '.event_id')"
+    cp_kind="$(printf '%s' "$cp_row" | jq -r '.checkpoint_kind // empty')"
+    case "$cp_kind" in ""|none) continue ;; esac
+    cp_status="$(printf '%s' "$cp_row" | jq -r '.status_path // empty')"
+    [ -n "$cp_status" ] || continue
+    cp_dir="$(dirname "$cp_status")"
+    cp_path="$cp_dir/progress.jsonl"
+    if [ ! -f "$cp_path" ]; then
+      _audit_finding CHECKPOINT_MALFORMED \
+        "DISPATCH_COMPLETED event_id=$cp_id declares checkpoint_kind=$cp_kind but $cp_path does not exist" \
+        "event_id:$cp_id"
+      rc=1
+    elif ! jq empty "$cp_path" >/dev/null 2>&1 && [ -s "$cp_path" ]; then
+      _audit_finding CHECKPOINT_MALFORMED \
+        "DISPATCH_COMPLETED event_id=$cp_id's own progress.jsonl at $cp_path is not valid JSONL" \
+        "event_id:$cp_id"
+      rc=1
+    fi
+  done < <(jq -c 'select(._type=="DISPATCH_COMPLETED")' "$events" 2>/dev/null)
+
+  local snap_row snap_id snap_path
+  while IFS= read -r snap_row; do
+    [ -n "$snap_row" ] || continue
+    snap_id="$(printf '%s' "$snap_row" | jq -r '.event_id')"
+    snap_path="$(printf '%s' "$snap_row" | jq -r '.snapshot // empty')"
+    case "$snap_path" in ""|none) continue ;; esac
+    [ -f "$snap_path" ] || {
+      _audit_finding SNAPSHOT_MISSING \
+        "DISPATCH_STARTED event_id=$snap_id declares snapshot=$snap_path but the manifest file does not exist" \
+        "event_id:$snap_id"
+      rc=1
+    }
+  done < <(jq -c 'select(._type=="DISPATCH_STARTED")' "$events" 2>/dev/null)
+
+  # Every explicit PHASE_ACCEPTED decision's own artifact_revision matches
+  # the STATUS the accepted dispatch actually published. This is the ONE
+  # place this audit reads a STATUS file: spec §21.1's metadata-only
+  # restriction binds reconcile_propositions' own proposition-coverage
+  # checks above, not this separate spec §20.11 "every accepted output ...
+  # matches its recorded revision" clause, which names STATUS revisions
+  # explicitly. status_path is read straight off the accepted dispatch's
+  # OWN durable DISPATCH_COMPLETED event -- never re-derived from a role
+  # name this event does not carry.
+  local pa_row pid pdid parev stat_path stat_rev
+  while IFS= read -r pa_row; do
+    [ -n "$pa_row" ] || continue
+    pid="$(printf '%s' "$pa_row" | jq -r '.event_id')"
+    pdid="$(printf '%s' "$pa_row" | jq -r '.dispatch_id // empty')"
+    parev="$(printf '%s' "$pa_row" | jq -r '.artifact_revision // empty')"
+    [ -n "$pdid" ] && [ -n "$parev" ] || continue
+    stat_path="$(jq -r --arg d "$pdid" \
+      'select(._type=="DISPATCH_COMPLETED" and .dispatch_id==$d) | .status_path // empty' \
+      "$events" 2>/dev/null | head -n1)"
+    # spec §20.11's "every accepted output EXISTS" leg (MAJOR fix, Task 15
+    # round 2): a missing status_path field or a status_path whose file was
+    # deleted/never written is itself the violation -- silently `continue`-
+    # ing here let an accepted phase with no real evidence pass clean.
+    if [ -z "$stat_path" ] || [ ! -f "$stat_path" ]; then
+      _audit_finding ACCEPTED_OUTPUT_MISSING \
+        "PHASE_ACCEPTED event_id=$pid names dispatch_id=$pdid whose own STATUS file (${stat_path:-<no status_path recorded>}) does not exist" \
+        "event_id:$pid" "dispatch_id:$pdid"
+      rc=1
+      continue
+    fi
+    stat_rev="$(status_field "$stat_path" artifact_revision 2>/dev/null)"
+    if [ "$parev" != "$stat_rev" ]; then
+      _audit_finding PHASE_ACCEPTED_REVISION_MISMATCH \
+        "PHASE_ACCEPTED event_id=$pid declares artifact_revision=$parev but dispatch_id=$pdid's own STATUS carries ${stat_rev:-<missing>}" \
+        "event_id:$pid" "dispatch_id:$pdid"
+      rc=1
+    fi
+  done < <(jq -c 'select(._type=="PHASE_ACCEPTED")' "$events" 2>/dev/null)
+
+  # Review caps respected (spec §20.11), as its OWN check (code review fix,
+  # Task 15 round 2): the BLOCKING_FINDING_UNRESOLVED scan below only
+  # catches a cap blown while a finding is STILL open -- it says nothing
+  # about a cap reached and then silently continued past with every
+  # finding dispositioned but NO recorded authorization for having gone
+  # past the cap at all. Every ITERATION_CAP_REACHED needs a LATER (higher
+  # event_id) ITERATION_CAP_OVERRIDE for the SAME phase_name, or a later
+  # HALT (the gate stopped instead of silently continuing) -- one of the
+  # two is the durable trail spec §18.2's "no unreviewed final fix, no
+  # silent cap bypass" discipline requires.
+  local cap_row cap_id cap_phase override_cnt halt_cnt
+  while IFS= read -r cap_row; do
+    [ -n "$cap_row" ] || continue
+    cap_id="$(printf '%s' "$cap_row" | jq -r '.event_id')"
+    cap_phase="$(printf '%s' "$cap_row" | jq -r '.phase_name // empty')"
+    override_cnt="$(jq -r --arg p "$cap_phase" --argjson id "$cap_id"       'select(._type=="ITERATION_CAP_OVERRIDE" and .phase_name==$p and (.event_id > $id)) | .event_id'       "$events" 2>/dev/null | wc -l | tr -d ' ')"
+    halt_cnt="$(jq -r --argjson id "$cap_id"       'select(._type=="HALT" and (.event_id > $id)) | .event_id'       "$events" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${override_cnt:-0}" -eq 0 ] && [ "${halt_cnt:-0}" -eq 0 ]; then
+      _audit_finding REVIEW_CAP_NOT_RESPECTED \
+        "event_id=$cap_id reached the review_iteration_cap for phase_name=$cap_phase with neither a later ITERATION_CAP_OVERRIDE nor a later HALT" \
+        "event_id:$cap_id"
+      rc=1
+    fi
+  done < <(jq -c 'select(._type=="ITERATION_CAP_REACHED")' "$events" 2>/dev/null)
+
+  # Blocking findings resolved by a later review -- the LAST iteration
+  # directory of each review gate.
+  local gate_dir last_iter catalog fid
+  for gate_dir in 3-spec-review 5-plan-review 7-code-review; do
+    [ -d "$FEATURE_FOLDER/$gate_dir" ] || continue
+    last_iter="$(find "$FEATURE_FOLDER/$gate_dir" -maxdepth 1 -type d -regextype posix-extended \
+      -regex '.*/[0-9]{2}' 2>/dev/null | sort | tail -n1)"
+    [ -n "$last_iter" ] || continue
+    catalog="$last_iter/findings-catalog.jsonl"
+    [ -f "$catalog" ] || continue
+    while IFS= read -r fid; do
+      [ -n "$fid" ] || continue
+      _audit_finding BLOCKING_FINDING_UNRESOLVED \
+        "finding $fid in $gate_dir is open/reopened and undispositioned at readiness time" "finding_id:$fid"
+      rc=1
+    done < <(jq -r 'select((.status=="open" or .status=="reopened") and
+                            (.severity=="blocker" or .severity=="major")) | .finding_id' \
+      "$catalog" 2>/dev/null)
+  done
+
+  # Required verification PASS or approved EXCLUDED (validate_verification_
+  # records already enforces per-record structure; this adds the readiness-
+  # time check that no verification_id's LATEST outcome is a plain FAIL).
+  local vfile vid
+  for vfile in "$FEATURE_FOLDER"/8-all-tests/*/verification-records.jsonl; do
+    [ -f "$vfile" ] || continue
+    validate_verification_records "$vfile" >/dev/null 2>&1 \
+      || { _audit_finding VERIFICATION_RECORDS_MALFORMED "verification records failed structural validation" "$vfile"; rc=1; }
+    while IFS= read -r vid; do
+      [ -n "$vid" ] || continue
+      _audit_finding VERIFICATION_NOT_PASS "verification $vid's latest recorded result is FAIL" "verification_id:$vid"
+      rc=1
+    done < <(jq -s -r 'group_by(.verification_id) | map(last) | .[] | select(.result=="FAIL") | .verification_id' \
+      "$vfile" 2>/dev/null)
+  done
+
+  # Documentation accepted: the three required Phase 9 outputs exist.
+  local doc
+  for doc in uat.md planned-vs-realized.md documentation-validation.md; do
+    [ -f "$FEATURE_FOLDER/9-documentation/$doc" ] || {
+      _audit_finding DOCUMENTATION_OUTPUT_MISSING "required documentation output is missing" \
+        "9-documentation/$doc"
+      rc=1
+    }
+  done
+
+  # Followups valid: well-formed, legal status, unique id (reuses the same
+  # field list/status enum append_followup itself enforces on write; this
+  # re-validates the ledger as a whole at readiness time).
+  if [ -f "$FEATURE_FOLDER/followups.jsonl" ]; then
+    local bad_id
+    while IFS= read -r bad_id; do
+      [ -n "$bad_id" ] || continue
+      _audit_finding FOLLOWUP_INVALID "followups.jsonl record fails validation" "id:$bad_id"
+      rc=1
+    done < <("$PYTHON_BIN" - "$FEATURE_FOLDER/followups.jsonl" <<'PY'
+import json, sys
+seen = set()
+FIELDS = ("id","origin_phase","origin_finding","description","actor",
+          "prerequisite","risk","status","evidence")
+LEGAL = {"open", "deferred", "accepted_risk", "resolved"}
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except json.JSONDecodeError:
+        print("malformed-line")
+        continue
+    fid = r.get("id", "malformed")
+    if any(f not in r for f in FIELDS) or r.get("status") not in LEGAL or fid in seen:
+        print(fid)
+        continue
+    seen.add(fid)
+PY
+)
+  fi
+
+  # Latest context7 event overrides earlier reachability: delegate to the
+  # existing, already-tested context7_policy reader (its own contract
+  # already implements "latest RUN_LOG event wins"). context7_policy's OWN
+  # only failure mode is "no evidence either way: refuse to guess" (no
+  # Phase 1 STATUS AND no RUN_LOG event) -- a run that reached Phase 11 is
+  # expected to have durable Phase 1 evidence, so THAT failure, here, is a
+  # genuine integrity gap worth a finding, not a discarded return code
+  # (code review fix, Task 15 round 2: the previous form called this and
+  # threw away both stdout and rc, so it could never fail).
+  if declare -F context7_policy >/dev/null 2>&1; then
+    if ! context7_policy >/dev/null 2>"$orch/.tmp.context7.err"; then
+      # Names the concrete missing artifact as the record id (code review
+      # fix, round 3: "phase:1" was a phase label, not a record id -- the
+      # SAME gap already fixed for WRITE_LEASE_REMAINS/PROCESS_IDENTITY_
+      # MISMATCH). context7_policy's own only failure mode is a total
+      # absence of evidence, so there is no conflicting EVENT to name;
+      # the concrete, dereferenceable thing IS the status path it looked
+      # for and did not find -- the same "missing path as record id"
+      # convention DOCUMENTATION_OUTPUT_MISSING already uses above.
+      _audit_finding CONTEXT7_POLICY_UNRESOLVED \
+        "context7_policy could not resolve a policy from durable evidence at readiness time" \
+        "1-preflight/phase-1/claude-check-status.md"
+      rc=1
+    fi
+    rm -f "$orch/.tmp.context7.err"
+  fi
+
+  # Phase 10 result valid: exactly the LATEST GIT_FINALIZATION_RESULT event,
+  # never missing or FAILED. BLOCKED is a valid, non-blocking degradation --
+  # Phase 11's own terminal-verdict rule downgrades it to READY_WITH_NOTES,
+  # this audit does not fail on it.
+  local gfr outcome gid
+  gfr="$(jq -c 'select(._type=="GIT_FINALIZATION_RESULT")' "$events" 2>/dev/null | tail -n1)"
+  if [ -z "$gfr" ]; then
+    _audit_finding GIT_FINALIZATION_MISSING "no event=GIT_FINALIZATION_RESULT is durable in RUN_LOG.md" "phase:10"
+    rc=1
+  else
+    outcome="$(printf '%s' "$gfr" | jq -r '.outcome // empty')"
+    if [ "$outcome" = FAILED ]; then
+      gid="$(printf '%s' "$gfr" | jq -r '.event_id')"
+      _audit_finding GIT_FINALIZATION_FAILED "Phase 10 git finalization outcome is FAILED" "event_id:$gid"
+      rc=1
+    fi
+  fi
+
+  rm -f "$events"
+  return "$rc"
+}
+```
 
 ### Write leases and mutation snapshots (spec §11)
 
@@ -4502,6 +5308,10 @@ _write_lease_foreign_paths_now() {
     status="${entry:0:2}"; path="${entry:3}"
     case "$path" in
       "$ff_rel/RUN_LOG.md"|"$ff_rel/full_log.md") continue ;;
+      # Task 15 round 2 fix: same orchestrator-bookkeeping exclusion as
+      # _mutation_dirty/checkpoint_partial_isolated -- never declare
+      # record_event's own auto-fulfilled proposition ledger as foreign dirt.
+      "$ff_rel/process-improvement-proposition.md") continue ;;
       "$orch_rel"|"$orch_rel"/*) continue ;;
       "$ff_rel/transcripts"|"$ff_rel/transcripts"/*) continue ;;
       "$ff_rel"/*/attempts/*) continue ;;
@@ -5131,6 +5941,11 @@ checkpoint_partial_isolated() {
     status="${entry:0:2}"; path="${entry:3}"
     case "$path" in
       "$ff_rel/RUN_LOG.md"|"$ff_rel/full_log.md") continue ;;
+      # Task 15 round 2 fix: the SAME orchestrator-bookkeeping exclusion
+      # _mutation_dirty's own copy of this list needed (record_event's
+      # auto-fulfilled process-improvement-proposition.md is never a role's
+      # own mutation, here either).
+      "$ff_rel/process-improvement-proposition.md") continue ;;
       "$orch_rel"|"$orch_rel"/*) continue ;;
       "$ff_rel/transcripts"|"$ff_rel/transcripts"/*) continue ;;
       "$ff_rel"/*/attempts/*) continue ;;
@@ -8523,7 +9338,9 @@ Phase 10 MUST NOT push, open a pull request, merge, publish, deploy, or rewrite 
 
 ## Phase 11 — Readiness and completion (delegated)
 
-Dispatch one `claude` subprocess for role `readiness-writer` (`dispatch_attempt 11 00 readiness-writer`). Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`, `$PLAN_PATH`. The subagent reads every per-phase summary file inside the feature folder (preflight statuses, phase-2 status, spec-review summary, plan-review summary, implementation summary, code-review summary, all-test summary, `9-documentation/documentation-validation.md`, `followups.jsonl`, and the LATEST `event=GIT_FINALIZATION_RESULT` entry in `RUN_LOG.md` — never a `git-status.md` file, which no longer exists) and writes:
+Before dispatching, the orchestrator runs the deterministic audit directly (spec §21, no vendor call, no lease): call `reconcile_propositions`, then `audit_run_state` (cookbook, above). Both read only durable RUN_LOG event envelopes plus `pending-propositions.jsonl`'s own headers/fulfillment records — never `process-improvement-proposition.md`'s prose body — and append every violation they find to `$ORCHESTRATION_DIR/audit-findings.jsonl` (`{"check":..., "detail":..., "record_ids":[...]}`, append-only). This file's presence/emptiness, not its callers' exit codes, is what readiness-writer and the terminal-verdict rule below consume: an empty (or absent) `audit-findings.jsonl` is a clean audit; any line in it names a real, exact-event-ID-backed problem and unconditionally forces `NOT_READY`.
+
+Dispatch one `claude` subprocess for role `readiness-writer` (`dispatch_attempt 11 00 readiness-writer`). Inputs: `$FEATURE_FOLDER`, `$SPEC_PATH`, `$PLAN_PATH`, `$ORCHESTRATION_DIR/audit-findings.jsonl`. The subagent reads every per-phase summary file inside the feature folder (preflight statuses, phase-2 status, spec-review summary, plan-review summary, implementation summary, code-review summary, all-test summary, `9-documentation/documentation-validation.md`, `followups.jsonl`, the deterministic audit's own `audit-findings.jsonl`, and the LATEST `event=GIT_FINALIZATION_RESULT` entry in `RUN_LOG.md` — never a `git-status.md` file, which no longer exists) and writes:
 
 - `<feature-folder>/final-readiness-report.md` — the human-facing report covering: artifacts, reviewer verdicts (including `partial_review` flag if Codex was unavailable), implementation result, verification result, documentation/UAT status, git result, skipped optional steps, residual MINOR/NIT items, follow-ups (from `followups.jsonl`, grouped by actor), and overall readiness verdict.
 - `<feature-folder>/readiness-status.md` — STATUS with `verdict=DONE` and `report_path=<absolute>`.
@@ -9154,6 +9971,8 @@ The orchestrator **MUST append an entry** on each of these events:
    `RETRY_WITHIN_ITERATION`.
 4. Any `event=HALT` (graceful or otherwise).
 5. Any `event=ITERATION_CAP_REACHED` AND any `event=ITERATION_CAP_OVERRIDE`. These two are counted **independently** — when a cap is reached and then overridden, that incident yields two distinct `RUN_LOG.md` events and therefore requires two distinct entries in `process-improvement-proposition.md`. A single entry cannot cover both.
+
+   **Registry-backed mandatory events (spec §21.1) are fulfilled AUTOMATICALLY, not through this section's generic printf path.** `HALT`, `ITERATION_CAP_REACHED`, and `ITERATION_CAP_OVERRIDE` (triggers #4/#5) are three of the fifteen Event Contract Registry rows marked `proposition_required=yes`; the other twelve (`ATTEMPT_FAILED`, `RECOVERY_AUTHORIZED`, `RECOVERY_CAP_REACHED`, `CONTINUATION_CAP_REACHED`, `ORCHESTRATION_CORRECTION`, `EVENT_CORRECTED`, `VENDOR_UNAVAILABLE`, `DEGRADED_REVIEW_ACCEPTED`, `ARTIFACT_INTEGRITY_BLOCKED`, `PROCESS_DEVIATION`, `DIVERGENCE_DETECTED`, `DIVERGENT_ROUND_CAP_REACHED`) occur inside this document's own cookbook helpers (recovery, leases, convergence) rather than directly in orchestrator prose, where no top-level phase narrative has an "immediately after `record_event`" moment to hook a manual instruction onto. Round 2 code review finding: an earlier revision of this paragraph told the orchestrator to manually call `append_proposition` after each of these fifteen types, using `$RECORD_EVENT_ID` -- unusable for the twelve that fire deep inside a helper, which left every one of them permanently unfulfilled and made `READY` unreachable for any run that ever hit a retry. `record_event` (cookbook, above) now calls `append_proposition` itself, automatically, immediately after durably writing each of these fifteen types' own pending header -- using the event's own `reason` field as the entry body (genuine, already-vetted text every real call site already supplies, never fabricated). No orchestrator action is needed or permitted for these fifteen types; do NOT also call `append_proposition` for one by hand, which would only produce `DUPLICATE_PROPOSITION_COVERAGE`. Triggers #1–#3 (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, retry-within-iteration) remain `proposition_required=no` — no single RUN_LOG event type maps 1:1 onto them — and keep using the generic printf path described in "Resume semantics" below, as does every spontaneous (non-mandatory) entry.
 6. Any deviation from this process file's prescribed shape — when the orchestrator interprets an ambiguous instruction, works around an undocumented CLI quirk, or has to compose behavior the process file did not explicitly cover. Illustrative (non-exhaustive) examples: "had to choose between two readings of `Step 6.−1` vs `Step 6.0`"; "process file did not specify behavior when summarizer returns empty output, composed best-effort fallback"; "CLI emitted an undocumented stderr warning that required ad-hoc handling". Deviation is NOT a structured `RUN_LOG.md` event type — it is recognized only by the orchestrator's own judgment at the moment it makes the deviating choice. Because it has no countable RUN_LOG counterpart, deviation entries are explicitly excluded from the strict 1:1 count check in Completion criteria (see that section for the exhaustive list of count-matched event types); deviation remains a mandatory append trigger here regardless.
 
 **Scope guardrail for deviation entries.** When a deviation is triggered by ambiguity in the spec/plan/diff being processed (rather than ambiguity in the process file itself), describe the deviation in terms of the *process-file instruction the orchestrator was trying to follow*, not in terms of the spec/plan/diff content. If the deviation is fundamentally about spec/plan/diff content and not about a process-file instruction, it is out of scope for `process-improvement-proposition.md` — record it in `RUN_LOG.md` instead. This mirrors the `kind: idea` rule (below) and the general anti-leak guidance.
@@ -9257,7 +10076,10 @@ This Develop-It SDLC step is complete only when ALL of the following hold:
 - Every dispatch entry in `RUN_LOG.md` carries the nine usage-telemetry fields (`model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`, `usage_status`).
 - Every phase summary file (`spec-review-summary.md`, `plan-review-summary.md`, `implementation-summary.md`, `code-review-summary.md`, `all-test-summary.md`) ends with a `## Usage` section containing phase total, per-vendor, and per-role × iteration tables.
 - `final-readiness-report.md` ends with a `## Usage rollup` section containing grand total, per-phase table, per-vendor grand total, and top-5 most expensive dispatches.
-- For every mandatory-trigger event recorded in `RUN_LOG.md` during the run (the six structured RUN_LOG event types covered by mandatory triggers #1–#5: `CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, retry-within-iteration, `HALT`, `ITERATION_CAP_REACHED`, `ITERATION_CAP_OVERRIDE` — note `ITERATION_CAP_REACHED` and `ITERATION_CAP_OVERRIDE` count independently per the rule in trigger #5 of the Process self-observation section), a corresponding entry must exist in `process-improvement-proposition.md`, matched by phase + `trigger:` tag value + close-in-time timestamp (the proposition entry's ISO-8601 timestamp falls within ±60 seconds of the RUN_LOG event timestamp, or strictly between the RUN_LOG event timestamp and the next mandatory RUN_LOG event timestamp for the same phase, whichever window is tighter). The `trigger:` tag in the entry header is the load-bearing match key (recovered directly from the header, not inferred from prose); `kind` is always `failure` for mandatory entries per the Trigger → kind mapping table and is therefore not discriminating. The completion check is: count of these six structured event types in `RUN_LOG.md` equals count of corresponding mandatory entries (entries whose header carries a `trigger:` tag) in `process-improvement-proposition.md`, with per-event-type counts matching as well as the overall total. (One entry per event instance — a single entry cannot 'cover' multiple later events.) Deviation entries (trigger #6) are mandatory to write but are NOT counted in this 1:1 match because deviation has no structured RUN_LOG event type and carries no `trigger:` tag; they appear as additional entries beyond the matched count.
+- For every mandatory-trigger event recorded in `RUN_LOG.md` during the run, a corresponding entry must exist in `process-improvement-proposition.md`. As of spec §21 (Task 15), the mandatory triggers split into two groups with two different matching mechanisms:
+  - `HALT`, `ITERATION_CAP_REACHED`, and `ITERATION_CAP_OVERRIDE` (`ITERATION_CAP_REACHED`/`ITERATION_CAP_OVERRIDE` counted independently per trigger #5) are three of the fifteen `proposition_required=yes` Event Contract Registry rows (the other twelve fire from inside cookbook helpers rather than orchestrator-narrated prose — see "Mandatory triggers" above): `record_event` writes a pending header (`event_id, phase, kind, trigger`) to `pending-propositions.jsonl` the instant one occurs, and immediately, automatically calls `append_proposition` itself — no orchestrator action needed or permitted — which validates the header/event relation by EXACT `event_id` before writing the full entry and its own fulfillment record. `reconcile_propositions` (cookbook, spec §21.2) is the completion check for all fifteen: it fails closed on a mandatory event with zero or more than one header, a header naming no real (or non-mandatory) event, a header with no matching fulfillment, or more than one fulfillment — never a timestamp window.
+  - `CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, and retry-within-iteration remain `proposition_required=no` in the registry (no single RUN_LOG event type maps 1:1 onto "a retry happened"), so they keep the ORIGINAL judgment-based discipline: the orchestrator appends directly via the plain `printf ... >> process-improvement-proposition.md` path described in "Resume semantics" above, matched for completion by phase + `trigger:` tag value + close-in-time timestamp (the proposition entry's ISO-8601 timestamp falls within ±60 seconds of the RUN_LOG event timestamp, or strictly between the RUN_LOG event timestamp and the next mandatory RUN_LOG event timestamp for the same phase, whichever window is tighter).
+  The `trigger:` tag in the entry header is the load-bearing match key for both groups (recovered directly from the header, not inferred from prose); `kind` is always `failure` for mandatory entries per the Trigger → kind mapping table and is therefore not discriminating. The completion check is exact-coverage, not a single shared count: all fifteen registry-backed types (this bullet's first group, `HALT`/`ITERATION_CAP_REACHED`/`ITERATION_CAP_OVERRIDE` plus the twelve helper-internal types named in "Mandatory triggers" above) are checked by `reconcile_propositions`'s own exact-event-ID coverage — every mandatory event_id has exactly one header and exactly one fulfillment, never a count comparison; the three remaining judgment-based types (`CODEX_UNAVAILABLE`, `CLAUDE_FAILED`, retry-within-iteration — this bullet's second group) keep the ORIGINAL count-matching discipline: count of these three structured event types in `RUN_LOG.md` equals count of corresponding mandatory entries (entries whose header carries a `trigger:` tag) in `process-improvement-proposition.md`, with per-event-type counts matching as well as the overall total, via the timestamp match above. (One entry per event instance — a single entry cannot 'cover' multiple later events.) Deviation entries (trigger #6) are mandatory to write but are NOT counted in either check because deviation has no structured RUN_LOG event type and carries no `trigger:` tag; they appear as additional entries beyond either matched count.
 
 Partial completion: if Codex was unavailable for part of the run, the run still completes, with `partial_review = true` flagged in summaries and the final readiness report.
 
@@ -11536,6 +12358,7 @@ You are the final readiness reporter. You have no shared context.
 - `$FEATURE_FOLDER`
 - `$SPEC_PATH`
 - `$PLAN_PATH`
+- `$FEATURE_FOLDER/.orchestration/audit-findings.jsonl` (the orchestrator's own deterministic `reconcile_propositions`/`audit_run_state` result, spec §21 — may be absent or empty; either means a clean audit)
 
 ## Behavior
 
@@ -11562,6 +12385,12 @@ You are the final readiness reporter. You have no shared context.
    roles. A run with any degradation cannot be reported `READY` — use
    `READY_WITH_NOTES` at minimum.
 
+   Also read `$FEATURE_FOLDER/.orchestration/audit-findings.jsonl` if it exists
+   (spec §21 — the orchestrator's own `reconcile_propositions`/`audit_run_state`
+   result, already durable BEFORE you were dispatched). Each line is one JSON
+   object `{"check":..., "detail":..., "record_ids":[...]}`. You never re-derive
+   this audit yourself — you only quote it.
+
 2. **Classify each preflight verdict** before composing the report. For each `(phase ∈ {1, 3, 5, 6, 7}, vendor ∈ {claude, codex})` pair:
    - **File present, `verdict: READY`** → `READY`.
    - **File present, any other verdict (e.g. `MISSING_SKILLS`, `FAILED`)** → `FAILED`, with the in-file `reason:` / `failure_mode:` carried into the report.
@@ -11583,11 +12412,12 @@ You are the final readiness reporter. You have no shared context.
    - **Follow-ups** — every record in `followups.jsonl` (if present), grouped by `actor`, each showing `id`, `description`, `status`, and `prerequisite`. Absent when the file does not exist.
    - **Git result** — the LATEST `event=GIT_FINALIZATION_RESULT` entry's `outcome` (`COMMITTED` / `NO_CHANGES` / `BLOCKED` / `FAILED`), `commit_sha` (or `null`), and `push_performed` (always `no` — Phase 10 never pushes). A `BLOCKED` or `FAILED` outcome is reported here, not silently treated as a successful finalization.
    - **Degradations** — one line per `event=CONTEXT7_UNAVAILABLE`, `event=DISPATCH_ORPHANED`, `event=MODEL_REJECTED`, or `event=DEGRADED_REVIEW_ACCEPTED` entry found in `RUN_LOG.md`, naming the affected roles (for `DEGRADED_REVIEW_ACCEPTED`, the `scope` field). Omit this section only when RUN_LOG contains none of these events. Any degradation present forces the readiness verdict to at least `READY_WITH_NOTES` — never a silent `READY`.
+   - **Reconciliation audit** — one line per record in `audit-findings.jsonl` (spec §21), each quoting its own `check` code, `detail`, and `record_ids` verbatim — you never paraphrase away the exact record IDs. Omit this section only when the file is absent or empty. ANY line present forces the overall readiness verdict to `NOT_READY` (see the readiness-verdict rule below) — a non-empty reconciliation audit is never merely a note.
    - **Skipped optional steps** — list anything bypassed and why.
    - **Deferred MAJOR items** — total count + per-gate breakdown of MAJOR findings open when a gate passed under the relaxed rule (iterations 3 and up, `blockers=0`, every open major carrying an explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>` disposition per spec §17.3); each WAS re-reviewed — the dispositioning fixer dispatch was followed by another full reviewer round per spec §18.2, never an unreviewed final fix. Read from each gate's summary file (the summarizer records deferred majors there). Present this section only when at least one gate carried deferred majors. NOTE: this section's presence is NOT the trigger for `READY_WITH_NOTES` — a relaxed-tier pass forces `READY_WITH_NOTES` on its own (see the readiness-verdict rule), so a clean relaxed pass produces `READY_WITH_NOTES` with this section absent.
    - **Residual MINOR/NIT items** — total count + per-gate breakdown.
    - **Run history** — number of resumes, vendor failover events from RUN_LOG, baseline SHA capture.
-   - **Readiness verdict** — `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, the all-tests `final_test_verdict` is `PASS` or `SKIPPED`, every preflight verdict is `READY` or `SKIPPED`, AND the "Degradations" section is empty (no `CONTEXT7_UNAVAILABLE` / `DISPATCH_ORPHANED` / `MODEL_REJECTED` / `DEGRADED_REVIEW_ACCEPTED` events) — a run cannot be reported `READY` with any degradation present, regardless of how the rest of the run went; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain, OR (c) the "Degradations" section is non-empty and none of the `NOT_READY` conditions below apply; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including an all-tests `final_test_verdict` of `FAILED` (residual test failures after the fix cap — `NOT_READY` even when everything else passed; the "Test results" section carries the detail), any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), any claude preflight that is not `READY`, or a git finalization `outcome` of `FAILED` (the intended local commit never landed). A `documentation_validation` other than `PASS`, or a git finalization `outcome` of `BLOCKED` (including the non-git and lease-conflict cases), do not by themselves force `NOT_READY` — they force at least `READY_WITH_NOTES`, per the Documentation/UAT status and Git result sections above.
+   - **Readiness verdict** — first: if `audit-findings.jsonl` carries any line at all, the verdict is unconditionally `NOT_READY` (spec §21.2/§20.11's "failed audit" gate) regardless of every other section below — quote each finding's own `record_ids` in the reason. Otherwise: `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, the all-tests `final_test_verdict` is `PASS` or `SKIPPED`, every preflight verdict is `READY` or `SKIPPED`, AND the "Degradations" section is empty (no `CONTEXT7_UNAVAILABLE` / `DISPATCH_ORPHANED` / `MODEL_REJECTED` / `DEGRADED_REVIEW_ACCEPTED` events) — a run cannot be reported `READY` with any degradation present, regardless of how the rest of the run went; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain, OR (c) the "Degradations" section is non-empty and none of the `NOT_READY` conditions below apply; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including a non-empty reconciliation audit (above), an all-tests `final_test_verdict` of `FAILED` (residual test failures after the fix cap — `NOT_READY` even when everything else passed; the "Test results" section carries the detail), any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), any claude preflight that is not `READY`, or a git finalization `outcome` of `FAILED` (the intended local commit never landed). A `documentation_validation` other than `PASS`, or a git finalization `outcome` of `BLOCKED` (including the non-git and lease-conflict cases), do not by themselves force `NOT_READY` — they force at least `READY_WITH_NOTES`, per the Documentation/UAT status and Git result sections above.
    - **Usage rollup** — emit a final `## Usage rollup` section containing four parts in this order:
      1. **Grand total** (one row) — columns: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration`. Sum across every dispatch entry in `RUN_LOG.md`.
      2. **Per-phase table** — one row per phase that ran (use `phase_name` for the row label). Same columns as grand total, plus a leading `Phase` column. Include a final `TOTAL` row that matches the grand total.

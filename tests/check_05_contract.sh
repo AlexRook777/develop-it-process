@@ -642,4 +642,85 @@ PYSCAN
 assert_eq "" "$_t14_direct_write_offenders" \
   "T14: no role appendix calls append_followup or redirects into followups.jsonl directly"
 
+# =============================================================================
+# Task 15: proposition ledger and audit (spec §21)
+# =============================================================================
+
+assert_present '^reconcile_propositions\(\) \{' "$D" "T15: reconcile_propositions is a real cookbook function"
+assert_present '^audit_run_state\(\) \{' "$D" "T15: audit_run_state is a real cookbook function"
+assert_present '^append_proposition\(\) \{' "$D" "T15: append_proposition is a real cookbook function"
+assert_present '^_event_proposition_required\(\) \{' "$D" "T15: _event_proposition_required is a real cookbook function"
+
+# record_event (Task 8's own function, modified by Task 15) has a real call
+# site writing pending-propositions.jsonl -- never merely documented in
+# prose next to an unwired definition (the GIT_FINALIZATION_RESULT gap
+# earlier tasks left for six tasks).
+_t15_record_event_body="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"^record_event\(\) \{\n(.*?)\n\}\n```", text, re.S | re.M)
+print(m.group(1) if m else "")
+PY
+)"
+case "$_t15_record_event_body" in
+  *pending-propositions.jsonl*) _ok "T15: record_event's own body writes pending-propositions.jsonl" ;;
+  *) _fail "T15: record_event's own body does NOT write pending-propositions.jsonl" ;;
+esac
+case "$_t15_record_event_body" in
+  *_event_proposition_required*) _ok "T15: record_event consults _event_proposition_required before writing a header" ;;
+  *) _fail "T15: record_event does NOT consult _event_proposition_required" ;;
+esac
+
+# Phase 11's own prose (the phase-range-scoped slice, same technique Task 14
+# already uses for Phases 8/9/10) calls the deterministic audit BEFORE
+# dispatching readiness-writer -- never merely described in the cookbook
+# with no orchestrator call site.
+_t15_phase11_range="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m1 = re.search(r"^## Phase 11 —", text, re.M)
+m2 = re.search(r"^## Failure handling", text, re.M)
+print(text[m1.end():m2.start()] if m1 and m2 else "")
+PY
+)"
+[ -n "$_t15_phase11_range" ] || _fail "T15: could not isolate Phase 11's own prose range"
+for _t15_fn in reconcile_propositions audit_run_state; do
+  case "$_t15_phase11_range" in
+    *"$_t15_fn"*) _ok "T15: Phase 11's own prose calls $_t15_fn" ;;
+    *) _fail "T15: Phase 11's own prose has NO $_t15_fn call site" ;;
+  esac
+done
+case "$_t15_phase11_range" in
+  *audit-findings.jsonl*) _ok "T15: Phase 11's own prose names the audit-findings.jsonl artifact" ;;
+  *) _fail "T15: Phase 11's own prose does NOT name audit-findings.jsonl" ;;
+esac
+
+# The readiness-writer appendix reads the audit artifact and the terminal-
+# verdict rule is gated on it -- an empty appendix contract or an ungated
+# verdict rule would let a real failed audit slip through to a silent READY.
+_t15_readiness_body="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"<!-- BEGIN: readiness-writer -->(.*?)<!-- END: readiness-writer -->", text, re.S)
+print(m.group(1) if m else "")
+PY
+)"
+case "$_t15_readiness_body" in
+  *audit-findings.jsonl*) _ok "T15: readiness-writer's own appendix reads audit-findings.jsonl" ;;
+  *) _fail "T15: readiness-writer's own appendix does NOT read audit-findings.jsonl" ;;
+esac
+case "$_t15_readiness_body" in
+  *'the verdict is unconditionally `NOT_READY`'*) _ok "T15: readiness-writer's terminal-verdict rule is unconditionally gated by a non-empty audit" ;;
+  *) _fail "T15: readiness-writer's terminal-verdict rule is NOT gated by the deterministic audit" ;;
+esac
+
+# Event Contract Registry / event_required_fields agreement already gets its
+# own bidirectional cross-check in check_06_cookbook.sh (proposition_required
+# column); this document-level check only pins the exact count of fifteen so
+# a future registry edit that silently drops or adds a `yes` row is caught
+# here too, independent of that runtime cross-check.
+_t15_yes_count="$("$GREP_BIN" -cE '^\| [A-Z_]+ \|.*\| (yes) \|$' "$D" || true)"
+assert_eq 15 "$_t15_yes_count" \
+  "T15: exactly fifteen Event Contract Registry rows declare proposition_required=yes"
+
 finish

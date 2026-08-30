@@ -1288,4 +1288,25 @@ record_event GIT_FINALIZATION_RESULT phase=10 iteration=00 dispatch_id="" reason
 record_event GIT_FINALIZATION_RESULT phase=10 iteration=00 dispatch_id="" reason=no-in-scope-changes   base_sha=deadbeef final_sha=deadbeef staged_paths='[]' commit_sha=null push_performed=no   outcome=NO_CHANGES || rc=$?
 assert_rc 0 "$rc" "T14: the documented NO_CHANGES record_event call (with reason=no-in-scope-changes) succeeds"
 
+# --- Task 15: reconcile_propositions/audit_run_state/append_proposition are
+# part of the REAL generated runtime bootstrap_runtime extracts -- not just
+# live in this test's own already-sourced cookbook.sh copy. A fresh subshell
+# that sources ONLY runtime/develop-it-runtime.sh (no test harness sourcing)
+# must see all three, the same discipline check_10 already applies to every
+# other Task 1-14 cookbook function.
+rc=0
+bootstrap_runtime >/dev/null 2>"$BUILD/t15-bootstrap.err" || rc=$?
+assert_rc 0 "$rc" "T15: bootstrap_runtime succeeds with the proposition-ledger cookbook additions present"
+_t15_runtime_check="$(
+  bash -c '
+    source "$1/develop-it-runtime.sh" || exit 1
+    for fn in reconcile_propositions audit_run_state append_proposition _event_proposition_required _run_log_events_json _audit_finding; do
+      declare -F "$fn" >/dev/null 2>&1 || { echo "MISSING:$fn"; exit 1; }
+    done
+    echo ALL_PRESENT
+  ' _ "$RUNTIME_DIR" 2>&1
+)"
+assert_eq ALL_PRESENT "$_t15_runtime_check" \
+  "T15: the generated runtime/develop-it-runtime.sh (sourced fresh, no test harness) exposes all six proposition-ledger/audit functions"
+
 finish
