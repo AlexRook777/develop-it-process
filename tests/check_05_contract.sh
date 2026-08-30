@@ -723,4 +723,221 @@ _t15_yes_count="$("$GREP_BIN" -cE '^\| [A-Z_]+ \|.*\| (yes) \|$' "$D" || true)"
 assert_eq 15 "$_t15_yes_count" \
   "T15: exactly fifteen Event Contract Registry rows declare proposition_required=yes"
 
+# =============================================================================
+# Task 16 Step 1: negative checks for nine retired concepts. Every pattern is
+# scoped to a normative marker/heading/formula/enum literal, or to the
+# executable ```bash``` blocks inside a role appendix / phase range -- never
+# to free English prose -- because the document legitimately narrates its own
+# history ("that role's Mode C is retired", "no compatibility reader ... is
+# provided") and a naive substring/keyword match on those retired NAMES would
+# false-positive on the very sentences that correctly bury them.
+# =============================================================================
+
+# 1. finishing-branch role or appendix. (check_02_markers.sh already proves
+# no marker exists for any role outside the registry's own set; this pins
+# the specific retired name directly, independent of that generic proof.)
+assert_absent '<!-- BEGIN: finishing-branch -->' "$D" \
+  "T16: no finishing-branch appendix marker survives"
+assert_absent '^\| finishing-branch \|' "$D" \
+  "T16: no finishing-branch role-registry row survives"
+# Widened per code review: "finishing-branch" as a value in some OTHER
+# role's own column (not column 1) would evade the line-anchored check
+# above. Scan every table row inside the Role Contract Registry section
+# specifically (not the whole document, which legitimately narrates
+# "finishing-branch is retired" in prose outside any table row).
+_t16_registry_section="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m1 = re.search(r"^## Role Contract Registry", text, re.M)
+m2 = re.search(r"^## Structural Artifact Manifest Registry", text, re.M)
+print(text[m1.end():m2.start()] if m1 and m2 else "")
+PY
+)"
+_t16_finishing_branch_anywhere="$(printf '%s\n' "$_t16_registry_section" | "$GREP_BIN" -nE '^\|.*finishing-branch.*\|$' || true)"
+assert_eq "" "$_t16_finishing_branch_anywhere" \
+  "T16: no registry table row mentions finishing-branch in ANY column, not just column 1"
+# The retired skill itself: `superpowers:finishing-a-development-branch` is
+# never a required skill probe, for any vendor, at any phase (it was a
+# required skill for a role -- finishing-branch -- that no longer exists;
+# Phase 10's own local-git-finalization is documented as having no subagent
+# and no skill of its own).
+assert_absent 'superpowers:finishing-a-development-branch' "$D" \
+  "T16: superpowers:finishing-a-development-branch is never a required (or any) skill probe"
+
+# 2. implementer Mode C. An active "### Mode C" heading would define real
+# behavior; a rationale sentence merely naming "Mode C" as retired (e.g. "that
+# role's Mode C is retired") does not match a heading anchor and is legitimate.
+assert_absent '^#{2,6} Mode C\b' "$D" \
+  "T16: no active 'Mode C' section heading survives at ANY heading level"
+assert_present '`\$MODE` — `A`, `B`, or `D`' "$D" \
+  "T16: implementer's own \$MODE enum is exactly A, B, D (no C)"
+
+# 3. direct role writes or moves to STATUS. Scan every appendix's OWN fenced
+# blocks -- ANY fence language, including a bare untagged ``` ``` (the
+# extractor's own executable-block scanner only recognizes ```bash/```python,
+# so a bare fence is invisible to check_01_lint.sh's "unmarked" detector too;
+# an LLM subprocess reading its own appendix does not care whether a fence is
+# tagged, so neither can this scanner) -- never its surrounding PROSE, which
+# legitimately explains the prohibition by naming STATUS.md -- for a
+# write/rename/copy that targets a STATUS.md path by any means other than the
+# sanctioned generated publisher.
+_t16_direct_status_writes="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+appendix_re = re.compile(r"<!-- BEGIN: ([a-z0-9-]+) -->(.*?)<!-- END: \1 -->", re.S)
+offenders = []
+for m in appendix_re.finditer(text):
+    role, body = m.group(1), m.group(2)
+    for code in re.findall(r"```[a-zA-Z0-9_+-]*\n(.*?)```", body, re.S):
+        for line in code.splitlines():
+            if "STATUS.md" not in line or "STATUS_PUBLISHER_PATH" in line:
+                continue
+            if re.search(r"(>{1,2}|\bmv\b|\bcp\b)\s*\S*STATUS\.md", line) or \
+               re.search(r"STATUS\.md\s*(>{1,2}|<)", line):
+                offenders.append(f"{role}: {line.strip()}")
+print("\n".join(offenders))
+PY
+)"
+assert_eq "" "$_t16_direct_status_writes" \
+  "T16: no role appendix's own executable code writes/moves/copies a STATUS.md file directly"
+
+# 4. line-number-based Markdown finding identity. The document must keep its
+# explicit disclaimer AND the finding_id formula must still omit any line
+# component -- proving the identity is location/anchor/fingerprint-derived,
+# never a hash over the line number (the `line` field remains legal as
+# diagnostic evidence only, per the plan's Global Constraints).
+assert_present 'never the line number itself' "$D" \
+  "T16: markdown finding identity explicitly documents excluding the line number"
+# Anchored end-to-end (not just a prefix substring) so inserting an extra
+# ingredient (e.g. `+ line +`) between the documented three arguments and the
+# closing paren actually breaks this -- a prefix-only match would keep
+# matching regardless of what gets appended before the close paren.
+_t16_finding_id_formula="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+pat = re.compile(r'sha256\(artifact_kind \+ "\\0" \+ normalized_location \+ "\\0" \+\s*normalized_issue_key\)', re.S)
+print("MATCH" if pat.search(text) else "NO_MATCH")
+PY
+)"
+assert_eq "MATCH" "$_t16_finding_id_formula" \
+  "T16: finding_id's own formula is EXACTLY the three documented arguments -- no line-number ingredient inserted"
+
+# 5. unreviewed final fixer acceptance. (T11 above already retires the old
+# "final fix pass, no re-review" shortcut phrase; this pins the affirmative
+# replacement rule -- a fixer's own STATUS never substitutes for a subsequent
+# reviewer verdict, at any iteration including the cap.)
+assert_present "there is no iteration, including the cap, at which a fixer's own STATUS substitutes for a subsequent reviewer verdict" "$D" \
+  "T16: a fixer's own STATUS never substitutes for a subsequent reviewer verdict, at any iteration"
+
+# 6. unbounded retry/review language. Every retry/review loop in this
+# document is bounded by a named policy cap; no prose authorizes retrying or
+# reviewing indefinitely, without limit, or until success.
+assert_absent 'retr(y|ied|ies).{0,20}indefinitely|indefinitely.{0,20}retr(y|ied|ies)' "$D" \
+  "T16: no 'retry indefinitely' language survives"
+assert_absent 'no (retry|iteration|review) limit|unlimited (retr(y|ies)|iterations?|reviews?)' "$D" \
+  "T16: no 'unlimited/no limit' retry-or-review language survives"
+assert_absent 'as many (times|iterations|rounds) as (it takes|needed|necessary)|until it (succeeds|passes)\b' "$D" \
+  "T16: no 'as many times as needed' / 'until it succeeds' retry language survives"
+
+# 7. subprocess writes to RUN_LOG.md. The parent orchestrator is RUN_LOG.md's
+# sole writer (record_event's own definition, called only from phase prose);
+# no role appendix's own fenced content -- ANY fence language, including a
+# bare untagged ``` ``` (same evasion class as check 3 above; an LLM
+# subprocess follows an appendix's instructions regardless of fence tag) --
+# may call record_event or redirect into RUN_LOG.md itself.
+_t16_subprocess_run_log_writes="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+appendix_re = re.compile(r"<!-- BEGIN: ([a-z0-9-]+) -->(.*?)<!-- END: \1 -->", re.S)
+offenders = []
+for m in appendix_re.finditer(text):
+    role, body = m.group(1), m.group(2)
+    for code in re.findall(r"```[a-zA-Z0-9_+-]*\n(.*?)```", body, re.S):
+        if re.search(r"\brecord_event\b", code) or re.search(r"(>{1,2})\s*\S*RUN_LOG\.md", code):
+            offenders.append(role)
+print("\n".join(sorted(set(offenders))))
+PY
+)"
+assert_eq "" "$_t16_subprocess_run_log_writes" \
+  "T16: no role appendix's own executable code calls record_event or writes RUN_LOG.md directly"
+
+# 8. Phase 10 remote action, push, or pull-request creation. Scoped to Phase
+# 10's own prose range (the same phase-range-scoped slicing T14/T15 already
+# use). Phase 10 is (today) a direct orchestrator operation with no fenced
+# code blocks of its own -- every command it runs is narrated inline -- but a
+# regression could add one (bash, another language, or a bare untagged
+# ``` ``` -- see the check-3/check-7 fence-evasion note above), so this scans
+# BOTH inline `code span` text AND any fenced block found in the range, never
+# bare prose words -- scoping to code spans/fences (not prose) is what lets
+# the surrounding plain-English prohibition sentence ("Phase 10 MUST NOT
+# push, open a pull request...") coexist without tripping this.
+_t16_phase10_range="$(python3 - "$D" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+m1 = re.search(r"^## Phase 10 —", text, re.M)
+m2 = re.search(r"^## Phase 11 —", text, re.M)
+print(text[m1.end():m2.start()] if m1 and m2 else "")
+PY
+)"
+[ -n "$_t16_phase10_range" ] || _fail "T16: could not isolate Phase 10's own prose range"
+_t16_phase10_remote_offenders="$(printf '%s' "$_t16_phase10_range" | python3 -c "
+import re, sys
+seg = sys.stdin.read()
+offenders = []
+pat = re.compile(r'git push|gh pr create|hub pull-request|git remote (add|set-url)')
+for span in re.findall(r'\`([^\`\n]+)\`', seg):
+    if pat.search(span):
+        offenders.append(span)
+for code in re.findall(r'\`\`\`[a-zA-Z0-9_+-]*\n(.*?)\`\`\`', seg, re.S):
+    if pat.search(code):
+        offenders.append(code.strip()[:80])
+print('\n'.join(offenders))
+")"
+assert_eq "" "$_t16_phase10_remote_offenders" \
+  "T16: Phase 10's own narrated commands (inline spans AND any fenced block) never push, open a pull request, or touch a remote"
+# Scoped to Phase 10's own range (not document-wide, which would pass even if
+# THIS phase's own record_event call regressed, as long as some OTHER phase's
+# prose happened to say push_performed=no somewhere).
+case "$_t16_phase10_range" in
+  *'push_performed=no'*) _ok "T16: Phase 10's own record_event call (within Phase 10's own range) hardcodes push_performed=no" ;;
+  *) _fail "T16: Phase 10's own range does NOT contain push_performed=no" ;;
+esac
+
+# 10. transcript filenames: exactly one form, `<dispatch-id>.stdout`/`.stderr`
+# (allocate_attempt's own real assignment). Two OTHER, incompatible spellings
+# must never appear as an actual example/extension -- the retired
+# `<phase>-iter<NN>-<role>` identifier WITH a file extension attached (the
+# bare identifier alone is legitimate: the document's own rationale sentence
+# names it, unextended, specifically to ban it), and the `.{json,err}`
+# extension pair from an earlier draft of the canonical write list.
+assert_absent '<phase>-iter<NN>-<role>\.(json|err|stdout|stderr)' "$D" \
+  "T16: no retired <phase>-iter<NN>-<role> transcript filename EXAMPLE (with an extension) survives"
+assert_absent '\{json,err\}' "$D" \
+  "T16: no transcript is ever named with the retired .{json,err} extension pair"
+
+# 11. Phase 10 stages REPO-ROOT-relative paths, not feature-folder-relative
+# ones (code review finding A9): `git -C "$REPO_ROOT" add` needs paths
+# relative to $REPO_ROOT, but the three fixed documentation outputs and
+# followups.jsonl live under $FEATURE_FOLDER, a SUBDIRECTORY of $REPO_ROOT --
+# a bare `9-documentation/uat.md` staging-path argument would never match a
+# real file relative to $REPO_ROOT and every run would silently stage
+# nothing (a bogus NO_CHANGES/BLOCKED outcome, never COMMITTED).
+case "$_t16_phase10_range" in
+  *'FEATURE_FOLDER_REL='*) _ok "T16: Phase 10's own prose computes FEATURE_FOLDER_REL before building staging paths" ;;
+  *) _fail "T16: Phase 10's own prose does NOT compute FEATURE_FOLDER_REL -- its staging paths are feature-folder-relative, not repo-root-relative" ;;
+esac
+case "$_t16_phase10_range" in
+  *'FEATURE_FOLDER_REL/9-documentation/uat.md'*) _ok "T16: Phase 10's own prose prefixes the fixed doc-output staging paths with \$FEATURE_FOLDER_REL" ;;
+  *) _fail "T16: Phase 10's own prose does NOT prefix its fixed doc-output staging paths with \$FEATURE_FOLDER_REL" ;;
+esac
+
+# 9. schema-v1 fallback or historical artifact migration. No helper reads,
+# converts, or upgrades a schema-v1 (or unrecognized) RUN_LOG -- the
+# documented behavior is an unconditional HALT token, never a silent
+# compatibility read.
+assert_absent 'read_legacy_run_log|convert_v1_to_v2|migrate_run_log|schema_v1_compat|v1_compatibility_reader|upgrade_schema_v1' "$D" \
+  "T16: no schema-v1 compatibility-reader or migration helper exists"
+assert_present 'RUN_LOG_SCHEMA_V1_OR_UNKNOWN' "$D" \
+  "T16: an unrecognized/schema-v1 RUN_LOG is an explicit HALT token, never a silent migration"
+
 finish

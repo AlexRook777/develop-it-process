@@ -26,20 +26,47 @@ You work independently and solo. You do not ask the user for help. You have full
 - Read this file (`$PROCESS_PATH`, default `develop-it-prompt.md`) — including appendices — and extract per-role appendix bodies with read-only shell (`cat`, `awk`, `sed`, `grep`, `python3`). Appendix content is NEVER written to disk.
 - Run `ls`, `git status`, `git log`, `git diff --stat` for orchestration awareness.
 - Create the per-feature folder and its required empty subfolders with `mkdir -p`. This is orchestration state, not an artifact.
-- **Canonical write list.** The orchestrator may `mkdir -p` and may write ONLY:
-  `RUN_LOG.md`, `full_log.md`, `process-improvement-proposition.md`, and
-  `transcripts/<dispatch-id>.{json,err}` — all inside `$FEATURE_FOLDER`. Nothing
-  else, ever. No control files. No `.tmp` companions (removing the hand-rolled
-  detached-child protocol removed every atomic-publication site the orchestrator
-  had). Reading remains restricted to STATUS files and the per-phase summaries
-  they reference.
-- **Relocation, not a general write.** The orchestrator may `mv` an already-written
-  vendor STATUS file to another path WITHIN `$FEATURE_FOLDER`, exactly as Step 1.2
-  (relocating the Phase 1 STATUS files into `1-preflight/phase-1/`) and the
-  per-phase preflight gates (Steps 3.0/5.0/6.−1/7.0, relocating into each phase's
-  `preflight/` subfolder) prescribe. This permits moving a file the subagent
-  already wrote; it does not permit writing new content, and it does not extend
-  to any path outside `$FEATURE_FOLDER`.
+- **Canonical write list.** The orchestrator's writes are every one of, and
+  ONLY, the following — all inside `$FEATURE_FOLDER` (Phase 10's own
+  target-repo commit is the one documented exception, see the "Running red
+  flags" exception below):
+  - The four root artifacts: `RUN_LOG.md`, `full_log.md`,
+    `process-improvement-proposition.md`, `followups.jsonl` (the last via
+    `append_followup`, the ONLY code path that ever writes it — see the
+    Follow-up Ledger Contract).
+  - `transcripts/<dispatch-id>.{stdout,stderr}` per attempt, and
+    `<attempt-dir>/prompt.txt` (the appendix's own one-time immutable
+    render — see the very next bullet below).
+  - The spec-mandated control files this document itself defines a full
+    contract for, each with a single named cookbook function as its sole
+    writer: `.orchestration/runtime/*` and its `.runtime.tmp.*` staging
+    directory (`bootstrap_runtime`), `.orchestration/write-lease.json` and
+    its `snapshots/` (`acquire_write_lease`/`release_write_lease`),
+    `.orchestration/pending-propositions.jsonl` (`record_event`, automatic),
+    and `.orchestration/audit-findings.jsonl` (`reconcile_propositions`/
+    `audit_run_state`, Phase 11 only).
+  - The one authorized readable-alias `cp` the very next bullet below
+    describes.
+
+  No OTHER control file, ever, and never a hand-rolled one: the retired
+  detached-child protocol's launch-intent file, nonce lease, `.pid` file, and
+  polling flag are gone for good (removing that hand-rolled process
+  supervision removed every atomic-publication site THAT protocol needed —
+  it did not remove the spec-mandated control files listed above, which
+  predate and are independent of it). Reading remains restricted to STATUS
+  files and the per-phase summaries they reference.
+- **A readable alias, not a general write.** The orchestrator may `cp` (never
+  `mv` — the attempt-scoped original stays exactly where `dispatch_attempt`
+  left it, as durable evidence in its own right) an already-published vendor
+  STATUS file to a second, fixed-name path WITHIN `$FEATURE_FOLDER`, exactly
+  as Step 1.2 (copying the Phase 1 preflight STATUS files into
+  `1-preflight/phase-1/`) and the per-phase preflight gates (Steps
+  3.0/5.0/6.−1/7.0, copying into each phase's `preflight/` subfolder)
+  prescribe — solely so a subprocess with no cookbook access (readiness-writer)
+  can be handed a literal path that does not depend on which attempt number a
+  re-probe happened to land on. This permits copying a file the subagent
+  already wrote and published; it does not permit writing new content, and it
+  does not extend to any path outside `$FEATURE_FOLDER`.
 - **Appendix content is written to exactly one disk location: the attempt's
   own immutable prompt file.** `dispatch_attempt` renders the appendix fully
   in memory, persists it once as `<attempt-dir>/prompt.txt`, and only then
@@ -247,8 +274,8 @@ this account and is used for the cheap `preflight-codex` probe;
 
 | Role | Vendor | Model | Effort | Timeout minutes | Mutates | Long running | May spawn children | Required inputs | Optional inputs | Status template | Outputs | Verdicts | Required status fields | Checkpoint kind | Phases |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| preflight-claude | claude | claude-haiku-4-5 | — | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2;context7;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent | none | 1 |
-| preflight-codex | codex | gpt-5.6-luna | medium | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent | none | 1 |
+| preflight-claude | claude | claude-haiku-4-5 | — | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2;context7;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent | none | 1;3;5;6;7 |
+| preflight-codex | codex | gpt-5.6-luna | medium | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent | none | 1;3;5;6;7 |
 | context-discovery | claude | claude-sonnet-5 | — | 30 | no | no | no | feature_folder;resolved_models | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | READY;BLOCKED | common_v2;relevant_skills;relevant_skills_reasons | none | 2 |
 | spec-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
 | spec-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
@@ -317,8 +344,15 @@ is edited to match.
 ## Process Policy Registry
 
 These are the reviewed schema-v2 numeric policy constants. Each is a fixed
-process constant — not a per-run tunable — and every occurrence elsewhere in
-this document (caps, thresholds, retry counts) must agree with this table.
+process constant — not a per-run tunable — and every occurrence of one of
+these ELEVEN named constants elsewhere in this document (caps, thresholds,
+retry counts) must agree with this table. This table is not a claim that
+every numeric cap anywhere in the document lives here: Phase 8's test-fix
+round cap (hardcoded `3` fix rounds / `4` total, `all-tests-runner`/
+`test-fixer`) is a pre-existing, project-specific constant that predates
+schema v2 and was deliberately never migrated into this reviewed set —
+narrowing this claim, not adding a twelfth row, is what keeps this table's
+own count exactly eleven, per this plan's own preserved-constants list.
 `tests/lib/extract.py policies` extracts this table verbatim; `tests/check_10_process_v2.sh`
 asserts every row is present with its exact value.
 
@@ -442,22 +476,27 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
   RUN_LOG.md
   full_log.md                           # all bash commands executed by the orchestrator (xtrace)
   process-improvement-proposition.md   # optional; created lazily on first append
-  1-preflight/                          # Phase 1 staging area (transient after relocation by Step 1.2)
-    phase-1/                            # Phase 1 canonical artifacts (relocated post-Phase 1)
+  1-preflight/
+    00/attempts/                        # dispatch_attempt's own canonical writes (spec-v2)
+      p01-i00-preflight-claude-a01/STATUS.md
+      p01-i00-preflight-codex-a01/STATUS.md
+    phase-1/                            # readable alias: Step 1.2's COPY of the above
       claude-check-status.md
       codex-check-status.md
-    # NOTE: the parent `1-preflight/` directory may also contain transient
-    # claude-check-status.md / codex-check-status.md files that are the
-    # most recent per-phase appendix output mid-move. Downstream consumers
-    # MUST NOT read from `1-preflight/<vendor>-check-status.md` directly;
-    # read from `1-preflight/phase-1/` for Phase 1 verdicts and from
-    # `<N>-<phase>/preflight/` for per-phase verdicts.
+    # NOTE: `phase-1/` is a convenience COPY, never the canonical record --
+    # readiness-writer (and the cookbook helpers below) are handed a literal
+    # path, with no attempt id to resolve, so they need a name that does not
+    # depend on which attempt number a missing-skill re-probe landed on. The
+    # real record is the attempt directory above, which Step 1.2 never
+    # deletes, moves, or overwrites. Downstream consumers MUST read from
+    # `1-preflight/phase-1/` for Phase 1 verdicts and from `<N>-<phase>/preflight/`
+    # for per-phase verdicts -- never a hand-derived attempt path.
   2-context-discovery/
     status.md
   3-spec-review/
     preflight/                          # Phase 3 per-phase preflight (Step 3.0)
-      claude-check-status.md
-      codex-check-status.md
+      claude-check-status.md   # readable alias: a COPY of 00/attempts/p03-i00-preflight-claude-aNN/STATUS.md
+      codex-check-status.md    # readable alias: a COPY of 00/attempts/p03-i00-preflight-codex-aNN/STATUS.md
     01/                                  # $PHASE_DIR/$ITERATION -- never "iteration-01"
       claude-findings.jsonl
       codex-findings.jsonl
@@ -474,16 +513,16 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     plan-status.md
   5-plan-review/
     preflight/                          # Phase 5 per-phase preflight (Step 5.0)
-      claude-check-status.md
-      codex-check-status.md
+      claude-check-status.md   # readable alias: a COPY of 00/attempts/p05-i00-preflight-claude-aNN/STATUS.md
+      codex-check-status.md    # readable alias: a COPY of 00/attempts/p05-i00-preflight-codex-aNN/STATUS.md
     01/
       …
     plan-review-summary.md
     summarizer-status.md
   6-implementation/
     preflight/                          # Phase 6 per-phase preflight (Step 6.−1)
-      claude-check-status.md
-      codex-check-status.md
+      claude-check-status.md   # readable alias: a COPY of 00/attempts/p06-i00-preflight-claude-aNN/STATUS.md
+      codex-check-status.md    # readable alias: a COPY of 00/attempts/p06-i00-preflight-codex-aNN/STATUS.md
     implementation-summary.md
     implementer-status.md
     debugger-status.md
@@ -491,8 +530,8 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     subagent-logs/
   7-code-review/
     preflight/                          # Phase 7 per-phase preflight (Step 7.0)
-      claude-check-status.md
-      codex-check-status.md
+      claude-check-status.md   # readable alias: a COPY of 00/attempts/p07-i00-preflight-claude-aNN/STATUS.md
+      codex-check-status.md    # readable alias: a COPY of 00/attempts/p07-i00-preflight-codex-aNN/STATUS.md
     01/
       …
     code-review-summary.md
@@ -515,12 +554,16 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     00/                                    # non-iterative phase -- iteration is always 00
       attempts/
         p09-i00-documentation-writer-a01/STATUS.md
+  11-readiness-report/
+    00/                                    # non-iterative phase -- iteration is always 00
+      attempts/
+        p11-i00-readiness-writer-a01/STATUS.md   # readiness-writer's OWN attempt housekeeping only
   followups.jsonl                          # orchestrator-owned; append_followup is its sole writer
   final-readiness-report.md
   readiness-status.md
   transcripts/
-    <phase>-iter<NN>-<role>.json
-    <phase>-iter<NN>-<role>.err
+    <dispatch-id>.stdout                 # e.g. p03-i01-spec-reviewer-claude-a01.stdout
+    <dispatch-id>.stderr
 ```
 
 Transcripts are named `<dispatch_id>.stdout` / `<dispatch_id>.stderr`, where
@@ -543,7 +586,7 @@ verdict lives in its own attempt-scoped `STATUS.md` under
 findings into one per-iteration `findings-catalog.jsonl`). A filename must
 not assert a model, or it starts lying the moment the Models table changes.
 
-Phase 10 (`git-finalization`, Local Git Finalization) intentionally has no `10-git-finalization/` folder: it is a direct orchestrator operation with no dispatched role and no attempt directory of its own — its only durable trace is the single `event=GIT_FINALIZATION_RESULT` entry it records in `RUN_LOG.md` (spec §20.10). Phase 11 (`readiness-report`) likewise has no `11-readiness-report/` folder: its two outputs (`final-readiness-report.md`, `readiness-status.md`) are cross-cutting feature-folder artifacts consumed by the user at the top level, not phase-internal scratch. The same rationale applies to `RUN_LOG.md`, `full_log.md`, `transcripts/`, `followups.jsonl`, and the optional `process-improvement-proposition.md`, which also live at the feature-folder root without a numeric prefix.
+Phase 10 (`git-finalization`, Local Git Finalization) intentionally has no `10-git-finalization/` folder at all: it is a direct orchestrator operation with no dispatched role and no attempt directory of its own — its only durable trace is the single `event=GIT_FINALIZATION_RESULT` entry it records in `RUN_LOG.md` (spec §20.10). Phase 11 (`readiness-report`) is different: it DOES dispatch a role (`readiness-writer`, via the same `dispatch_attempt` every other phase uses), so `dispatch_attempt` materializes the ordinary `11-readiness-report/00/attempts/<dispatch-id>/STATUS.md` housekeeping path for that one attempt — a real folder does exist, exactly like `9-documentation/00/attempts/...`. What `11-readiness-report/` never holds is the two HUMAN-FACING outputs: `final-readiness-report.md` and `readiness-status.md` are cross-cutting feature-folder artifacts consumed by the user at the top level, so the `readiness-writer` appendix writes them directly to the feature-folder root rather than inside its own phase folder. The same "root, not phase-internal" rationale applies to `RUN_LOG.md`, `full_log.md`, `transcripts/`, `followups.jsonl`, and the optional `process-improvement-proposition.md`.
 
 ### Files that stay outside the feature folder
 
@@ -1797,6 +1840,15 @@ role_attempt_dir() {
 # that far stays correctly recorded as `launched: false` forever.
 allocate_attempt() {
   # Usage: allocate_attempt PHASE ITERATION ROLE
+  # `-1` is accepted here (and by `_legal_phase_token`) purely as a reserved
+  # alias for the literal phase argument every REAL preflight dispatch
+  # actually passes: `1` (matching the "1-preflight/" folder every consumer
+  # in this document already reads from -- context7_policy, optional-skill
+  # routing, readiness-writer, the folder-layout diagram). No role's own
+  # registry `phases` column ever lists `-1` (preflight-claude/preflight-codex
+  # list `1;3;5;6;7`), so the `m1` token below is defined for completeness,
+  # never actually minted by a real dispatch; a `pm1-...` dispatch id
+  # correctly does not appear anywhere else in this document.
   local phase=$1 iteration=$2 role=$3 iter2 rc=0
   PHASE_TOKEN=$([ "$phase" = -1 ] && printf m1 || printf '%02d' "$phase")
   LOGICAL_DISPATCH_ID="p${PHASE_TOKEN}-i$(printf '%02d' "$iteration")-$role"
@@ -1929,7 +1981,7 @@ render_keys() {
     ACCEPTED_PLAN REVIEWED_REVISION FINDING_IDS WRITE_LEASE RUN_LOG \
     RELEVANT_ARTIFACTS FINAL_DIFF ACCEPTED_SPEC IMPLEMENTATION_SUMMARY \
     TEST_SUMMARY REVIEW_SUMMARY DECISIONS EXCLUSIONS FOLLOWUPS DOCS_INVENTORY \
-    PHASE_DIR DISPATCH_ID LOGICAL_DISPATCH_ID ATTEMPT ROLE_CONTRACTS_PATH \
+    PHASE PHASE_DIR DISPATCH_ID LOGICAL_DISPATCH_ID ATTEMPT ROLE_CONTRACTS_PATH \
     STATUS_PUBLISHER_PATH CONTINUATION_PATH DECLARED_FOREIGN_CHANGES RUNTIME_DIR \
     MODE CONTINUATION_PRIOR_CLASSIFICATION \
     APPLICABLE_OPTIONAL_SKILLS
@@ -2633,6 +2685,13 @@ _dispatch_prelaunch() {
   # Render-time identity every appendix/status-template resolution needs,
   # derived entirely from what this call just minted — callers no longer
   # hand-set $PHASE_DIR/$ITERATION/$DISPATCH_ID themselves.
+  # PHASE is the raw phase argument itself (e.g. "1" or "3") -- needed ONLY
+  # by a role dispatched under more than one phase number (today, only
+  # preflight-claude/preflight-codex, re-probed at Phases 1, 3, 5, 6, 7):
+  # its appendix cannot hardcode a single literal --phase value the way
+  # every single-phase role's appendix does.
+  # shellcheck disable=SC2034  # consumed by render_prompt via render_keys()
+  PHASE="$phase"
   # shellcheck disable=SC2034  # consumed by render_prompt via render_keys()
   PHASE_DIR="$FEATURE_FOLDER/$phase-$phase_name"
   # shellcheck disable=SC2034  # consumed by render_prompt via render_keys()
@@ -3998,7 +4057,7 @@ The table below is the normative row list `tests/lib/extract.py events` reads.
 common-envelope fields above (a `;`-separated list, empty when a type needs
 nothing beyond the envelope) — the same `;`-list convention the Role Contract
 Registry already uses for multi-valued cells. `proposition_required=yes`
-marks the thirteen event types whose occurrence must also yield an entry in
+marks the fifteen event types whose occurrence must also yield an entry in
 `process-improvement-proposition.md` (Task 15/16's ledger; declaring the flag
 here does not itself populate that document).
 
@@ -4364,13 +4423,18 @@ real cookbook function before this task (`allocate_attempt`'s
 `PROCESS_DEVIATION`) now routes through `record_event`. `recovery_retry_
 allowed` additionally now emits `RECOVERY_AUTHORIZED` on the path that grants
 a retry (the counterpart this document never previously logged, only its
-`RECOVERY_CAP_REACHED` denial). The decision types (`OWNER_DECISION`,
-`RISK_ACCEPTED`, `PHASE_ACCEPTED`, `EVENT_CORRECTED`) have no live call site
-yet — no phase in this document currently narrates an owner decision as
-literal cookbook code, only as prose — so this task defines their full
-contract (registry row, `event_required_fields` case, `record_event`
-compatibility) and leaves wiring an actual call site to whichever later task
-implements that behavior in code. `GIT_FINALIZATION_RESULT` gained its own
+`RECOVERY_CAP_REACHED` denial). Of the decision types, three (`OWNER_DECISION`,
+`RISK_ACCEPTED`, `PHASE_ACCEPTED`) still have no live call site — no phase in
+this document currently narrates an owner decision as literal cookbook code,
+only as prose — so this task defines their full contract (registry row,
+`event_required_fields` case, `record_event` compatibility) and leaves wiring
+an actual call site to whichever later task implements that behavior in
+code. `EVENT_CORRECTED` is the exception AS OF LATER TASKS, not this one:
+`ingest_findings`'s own finding-collision handling (spec §17.2, "Finding
+record and canonical ID derivation" above) gives it a real call site the
+instant two reviewers' findings collide on the same canonical ID with
+conflicting severity — this task only defines its contract; a later task
+(review convergence) is what wires the actual call site. `GIT_FINALIZATION_RESULT` gained its own
 registry row and `event_required_fields` case here in Task 8, with the same
 "no call site yet" status; Task 14's Phase 10 (Local Git Finalization) is
 what later gives it a real, direct `record_event GIT_FINALIZATION_RESULT`
@@ -8744,7 +8808,6 @@ Claude CLI must be able to load:
 - `superpowers:test-driven-development`
 - `superpowers:requesting-code-review`
 - `superpowers:receiving-code-review`
-- `superpowers:finishing-a-development-branch`
 
 Codex CLI must be able to load:
 - `superpowers:writing-plans` (read-only)
@@ -8763,11 +8826,11 @@ previous behaviour — hid the degradation from the final report.
 ### Step 1.1 — Skill probe flow
 
 1. `$FEATURE_FOLDER` and `$FEATURE_FOLDER/.orchestration/runtime/` already exist — Step 1.0's `preflight_zero_token_gates` (gates 1 and 5) created and bootstrapped them, and already `source`d `$RUNTIME_DIR/develop-it-runtime.sh` — every helper referenced below (`dispatch_parallel`, `validate_status`, `context7_policy`, ...) comes from that sourced file. This step only needs to create the `1-preflight/` subfolder with `mkdir -p`.
-2. **Dispatch both preflight subprocesses in parallel using `dispatch_parallel 1 00 preflight-claude preflight-codex`** (see "Reviewer parallelization" cookbook; preflight has no shared state between vendors, so this is safe as the very first dispatch of the run). This is the ONLY dispatch mechanism for Step 1.1 — there is no separate `dispatch_attempt` call for either preflight role.
-   - **Claude subprocess (always dispatched):** role `preflight-claude`. Output: `<feature-folder>/1-preflight/claude-check-status.md`. Transcript: `<feature-folder>/transcripts/<dispatch_id>.stdout` (stdout) and `<dispatch_id>.stderr` (stderr) — `allocate_attempt`'s naming form. This role's timeout comes from the Models table via `role_timeout`.
-3. **Codex subprocess (dispatched if and only if `codex_available = true`):** role `preflight-codex`, dispatched by the SAME `dispatch_parallel` call named in step 2 — not a second, separate dispatch. Output: `<feature-folder>/1-preflight/codex-check-status.md`. Transcript: `<feature-folder>/transcripts/<dispatch_id>.stdout` (stdout) and `<dispatch_id>.stderr` (stderr). Model and effort are resolved per-role from the Models table, which is what puts preflight in `micro` mode per the "Codex reviewer modes" table.
-4. Read only the two STATUS files. Validate each with `validate_status` (see cookbook). Each STATUS carries `required_skills_present`, `required_skills_missing`, `optional_skills_present`, and `optional_skills_absent` (spec §16.3/§16.4) — bracket-list values, same shape as the pre-existing `x_missing_skills`/`x_loaded_skills` fields — plus `x_plugin_roots_checked` naming every plugin root/path the probe inspected for an absent requirement. This is the durable capability evidence; downstream phases read it from the relocated `1-preflight/phase-1/<vendor>-check-status.md` rather than re-probing.
-4a. Read the `context7` field from `claude-check-status.md`. If it is `unreachable`, append one `event=CONTEXT7_UNAVAILABLE` entry to `RUN_LOG.md` (phase 1). Do NOT halt — this only affects `context7_policy()` (see cookbook) for the rest of the run. If it is `reachable`, no RUN_LOG entry is needed; `context7_policy()` reads the STATUS field directly.
+2. **Dispatch both preflight subprocesses in parallel using `dispatch_parallel 1 00 preflight-claude preflight-codex`** (see "Reviewer parallelization" cookbook; preflight has no shared state between vendors, so this is safe as the very first dispatch of the run). This is the ONLY dispatch mechanism for Step 1.1 — there is no separate `dispatch_attempt` call for either preflight role. Each subprocess's STATUS is published, exactly like every other role in this document, to the attempt-scoped `1-preflight/00/attempts/<dispatch-id>/STATUS.md` `dispatch_attempt` itself computed and passed as `$PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md` — never a hand-picked filename. There is no "canonical slot" any appendix writes to directly.
+   - **Claude subprocess (always dispatched):** role `preflight-claude`. Transcript: `<feature-folder>/transcripts/<dispatch_id>.stdout` (stdout) and `<dispatch_id>.stderr` (stderr) — `allocate_attempt`'s naming form. This role's timeout comes from the Models table via `role_timeout`.
+3. **Codex subprocess (dispatched if and only if `codex_available = true`):** role `preflight-codex`, dispatched by the SAME `dispatch_parallel` call named in step 2 — not a second, separate dispatch. Transcript: `<feature-folder>/transcripts/<dispatch_id>.stdout` (stdout) and `<dispatch_id>.stderr` (stderr). Model and effort are resolved per-role from the Models table, which is what puts preflight in `micro` mode per the "Codex reviewer modes" table.
+4. Read only the two STATUS files, located via `role_attempt_dir preflight-<vendor> "$(_latest_attempt_id p01-i00-preflight-<vendor>)")/STATUS.md` for each vendor (the same attempt-lookup idiom every other phase's runner/writer STATUS already uses — see e.g. the all-tests-runner's own real-STATUS lookup). Validate each with `validate_status` (see cookbook). Each STATUS carries `required_skills_present`, `required_skills_missing`, `optional_skills_present`, and `optional_skills_absent` (spec §16.3/§16.4) — bracket-list values, same shape as the pre-existing `x_missing_skills`/`x_loaded_skills` fields — plus `x_plugin_roots_checked` naming every plugin root/path the probe inspected for an absent requirement. This is the durable capability evidence; downstream phases read the readable-alias copy Step 1.2 makes of it (below) rather than re-probing or re-resolving an attempt id themselves.
+4a. Read the `context7` field from the claude preflight's STATUS (the same file just read in step 4). If it is `unreachable`, append one `event=CONTEXT7_UNAVAILABLE` entry to `RUN_LOG.md` (phase 1). Do NOT halt — this only affects `context7_policy()` (see cookbook) for the rest of the run. If it is `reachable`, no RUN_LOG entry is needed; `context7_policy()` reads the STATUS field directly.
 5. **Missing-skill re-probe (spec §16.3).** If either STATUS reports
    `verdict=MISSING_SKILLS`, do NOT immediately HALT. Call `skills_reprobe_
    needed` (see cookbook) with: (a) `yes` iff an earlier phase in THIS run
@@ -8789,22 +8852,29 @@ previous behaviour — hid the degradation from the final report.
 6. If the `codex` check fails, apply the "Distinguish orchestration bugs from vendor failures" filter from Failure handling first. If the captured stderr indicates a local CLI usage error (`unexpected argument`, `Usage:`, `unknown option`), this is an orchestration bug, not a Codex outage — correct the invocation per the cookbook's "CLI invocation forms" and retry once. Otherwise branch on the failure mode:
    - **Mode 0 (binary missing — environmental):** HALT unconditionally. Surface the remediation message ("Install the Codex CLI and re-run") and STOP. Do NOT prompt the user. A missing binary is an environment defect that must be fixed before the run can proceed in any mode; silently degrading would mask a broken setup.
    - **Modes 1, 2, 3, 4 (after the one allowed Mode-4 retry), or 5:** prompt the user interactively: `Codex is unavailable (mode=<N>, stderr=<tail>). Continue in claude-only mode for this run? [y/N]`. A non-interactive run may pre-answer this prompt by setting `CODEX_CONSENT=y|n`. When `CODEX_CONSENT` is unset and stdin is not a TTY, HALT rather than reading EOF as "no" — a silent EOF-as-no would let an unattended run degrade without anyone actually consenting.
-     - On `y` (interactive or `CODEX_CONSENT=y`): set the run-scoped flag `codex_disabled_by_user = true` (see "Run-scoped user opt-out: `codex_disabled_by_user`" below), set `codex_available = false`, append one `event=CODEX_DISABLED_BY_USER_CONSENT` entry to `RUN_LOG.md` (see RUN_LOG additions below), and PROCEED to Step 1.2 (artifact relocation, defined below) with Claude-only mode for the rest of the run. The relocation step's conditional `[ -f … ]` guards handle the absent-codex STATUS case. After Step 1.2 completes, proceed to Phase 2.
+     - On `y` (interactive or `CODEX_CONSENT=y`): set the run-scoped flag `codex_disabled_by_user = true` (see "Run-scoped user opt-out: `codex_disabled_by_user`" below), set `codex_available = false`, append one `event=CODEX_DISABLED_BY_USER_CONSENT` entry to `RUN_LOG.md` (see RUN_LOG additions below), and PROCEED to Step 1.2 (readable-alias copy, defined below) with Claude-only mode for the rest of the run. Step 1.2's conditional `[ -f … ]` guard handles the absent-codex STATUS case. After Step 1.2 completes, proceed to Phase 2.
      - On `N`, `CODEX_CONSENT=n`, or any non-`y` response: HALT and surface the same remediation as Mode 0.
      - On EOF with `CODEX_CONSENT` unset and stdin not a TTY: HALT and surface the same remediation as Mode 0 — do not treat the EOF itself as an answer.
 7. If the `claude` check fails, HALT. Claude is required for every phase — there is no claude-less degraded mode and no user prompt.
-8. If both report `READY`, run Step 1.2 (artifact relocation, defined immediately below) **FIRST**, then append one `RUN_LOG.md` entry per subprocess whose `status_path` names the **relocated** path (`1-preflight/phase-1/<vendor>-check-status.md`). Call `vendor_proven_mark claude preflight-claude` and, if codex ran and is `READY`, `vendor_proven_mark codex preflight-codex` — this preflight probe is `micro`/cheap by design, so `vendor_proven_mark` here is a starting floor (spec §16.3 evidence), not the primary source of proof; the first SUBSTANTIVE per-phase dispatch that completes (reviewer, plan-writer, implementer, ...) re-marks it regardless. After the entries are written, proceed to Phase 2.
+8. If both report `READY`, call `vendor_proven_mark claude preflight-claude` and, if codex ran and is `READY`, `vendor_proven_mark codex preflight-codex` — this preflight probe is `micro`/cheap by design, so `vendor_proven_mark` here is a starting floor (spec §16.3 evidence), not the primary source of proof; the first SUBSTANTIVE per-phase dispatch that completes (reviewer, plan-writer, implementer, ...) re-marks it regardless. Run Step 1.2 (the readable-alias copy, defined immediately below) — its ordering relative to this call does not matter, since Step 1.2 only COPIES an already-durable attempt-scoped STATUS and never consumes or moves it. `dispatch_parallel`'s own `_dispatch_ingest_result` already appended each subprocess's RUN_LOG dispatch entry, carrying its REAL attempt-scoped `status_path` — Step 1.2 never appends a second, competing entry for the same dispatch. After Step 1.2 completes, proceed to Phase 2.
 
-   **Relocate, then log — never the reverse.** Logging first would record
-   `1-preflight/<vendor>-check-status.md`, a path Step 1.2 vacates microseconds
-   later and that the per-phase preflight gates then reuse as scratch. The RUN_LOG
-   entry would point at a slot holding some later phase's file, or nothing at all,
-   and the readiness writer — which Step 1.2 requires to read from
-   `1-preflight/phase-1/` — would disagree with the log that is supposed to be the
-   run's source of truth. This ordering matches the per-phase gates (Steps 3.0,
-   5.0, 6.−1, 7.0), which all relocate before they log; Phase 1 is not an exception.
+### Step 1.2 — Copy Phase 1 STATUS artifacts to their readable alias
 
-### Step 1.2 — Relocate Phase 1 STATUS artifacts
+Every dispatched role in this document, preflight included, publishes its
+STATUS to exactly one place: the attempt-scoped path `dispatch_attempt`
+computed (spec-v2's sole write target — see the canonical write list above).
+There is no "canonical slot" filename any appendix writes directly, and
+nothing here ever `mv`s a STATUS file: an attempt directory is durable
+evidence in its own right (resume classification, `audit_run_state`, and a
+future reconciliation all expect it to remain exactly as `dispatch_attempt`
+left it). Step 1.2 exists for exactly one reason: a subprocess with no
+cookbook access (notably `readiness-writer`, whose own appendix is handed a
+literal path, not a shell it can run `_latest_attempt_id` in) needs a FIXED
+name that does not depend on which attempt number a missing-skill re-probe
+happened to land on. Step 1.2 makes ONE read-only-source COPY of the
+already-published, already-validated attempt-scoped STATUS to that fixed
+alias — it is never the canonical record, only a convenience for a reader
+that cannot resolve an attempt id itself.
 
 Step 1.2 runs on **every** Phase 1 completion path that proceeds onward to Phase 2:
 - the dual-READY success path (step 8 above), AND
@@ -8812,25 +8882,33 @@ Step 1.2 runs on **every** Phase 1 completion path that proceeds onward to Phase
 
 It does NOT run on the HALT paths (Mode 0 codex failure, claude failure, `N`/EOF consent response) — those terminate the run before Phase 2.
 
-Immediately after step 8 completes (or immediately after the consented-degradation branch in step 6 completes), and BEFORE Phase 2 begins or any per-phase preflight gate can run, relocate Phase 1's STATUS files:
+At any point after step 8 completes (or after the consented-degradation branch in step 6 completes) and BEFORE Phase 2 begins or any per-phase preflight gate can run — ordering relative to step 8's `vendor_proven_mark` calls does not matter, since this copy neither consumes nor competes with anything — copy Phase 1's STATUS files to their alias:
 
 <!-- lint: snippet -->
 ```bash
 mkdir -p "$FEATURE_FOLDER/1-preflight/phase-1"
 for v in claude codex; do
-  src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
+  logical="p01-i00-preflight-${v}"
+  latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
+  src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
   if [ -f "$src" ]; then
-    mv "$src" "$FEATURE_FOLDER/1-preflight/phase-1/${v}-check-status.md"
+    cp "$src" "$FEATURE_FOLDER/1-preflight/phase-1/${v}-check-status.md"
   fi
 done
-# An `if` is required, not `[ -f … ] && mv`: as the LAST statement of a block
-# the latter returns 1 whenever the file is absent, which is the normal
-# codex-skipped path, making a successful phase look like a failure.
+# `_latest_attempt_id` returning nothing (codex never dispatched, or a
+# prelaunch failure that consumed an attempt but never launched) is the
+# normal codex-skipped/consented-degradation path, not an error -- `continue`
+# to the next vendor rather than treating a lookup miss as a HALT-worthy
+# condition. An `if [ -f "$src" ]`, not `[ -f … ] && cp`, for the same reason
+# Task-era code already documented for the retired `mv` form: as the LAST
+# statement of a block the `&&` form returns 1 whenever the file is absent,
+# which is the normal codex-skipped path, making a successful phase look
+# like a failure.
 ```
 
-The conditional `[ -f … ]` guards handle the consented-degradation case (codex STATUS file may not exist when `codex_disabled_by_user=true` was set above, or when codex Mode 0/1/2/3/5 killed the subprocess before any STATUS write — see "File policy for non-READY paths" below). No synthetic STATUS file is fabricated for absent codex outputs; the absence plus the corresponding `CODEX_DISABLED_BY_USER_CONSENT` or `CODEX_UNAVAILABLE` event in RUN_LOG is the canonical Phase 1 codex verdict.
+The conditional guards above handle the consented-degradation case (codex STATUS file may not exist when `codex_disabled_by_user=true` was set above, or when codex Mode 0/1/2/3/5 killed the subprocess before any STATUS write — see "File policy for non-READY paths" below). No synthetic STATUS file is fabricated for absent codex outputs; the absence plus the corresponding `CODEX_DISABLED_BY_USER_CONSENT` or `CODEX_UNAVAILABLE` event in RUN_LOG is the canonical Phase 1 codex verdict.
 
-This relocation frees the canonical `$FEATURE_FOLDER/1-preflight/<vendor>-check-status.md` slot to be reused as a transient staging area by per-phase preflight gates without clobbering the Phase 1 record. Downstream consumers of Phase 1 verdicts (notably the readiness writer) MUST read from `1-preflight/phase-1/`, NOT from the bare `1-preflight/<vendor>-check-status.md` slot.
+Downstream consumers of Phase 1 verdicts (notably the readiness writer) read this alias from `1-preflight/phase-1/`. The real, canonical attempt-scoped STATUS this alias was copied from remains exactly where `dispatch_attempt` wrote it, untouched, for the life of the run.
 
 ### Run-scoped user opt-out: `codex_disabled_by_user`
 
@@ -8899,28 +8977,36 @@ Before iter 01's first reviewer dispatch (the gate's **first work dispatch**, de
 1. `mkdir -p <feature-folder>/3-spec-review/preflight`.
 2. Reset `codex_available = true` for the phase.
 3. If `codex_disabled_by_user = true` (run-scoped flag from Phase 1; reconstitute by scanning RUN_LOG per the rule in "Run-scoped user opt-out"):
-   - Dispatch `preflight-claude` only.
+   - Dispatch `preflight-claude` only, via `dispatch_attempt 3 00 preflight-claude`.
    - Append one `event=CODEX_SKIPPED_BY_USER_CONSENT` entry to `RUN_LOG.md` with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `role: preflight-codex`, `vendor: codex` (see RUN_LOG additions for the full block shape).
    - Set `codex_available = false`.
-4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`), so the two parallel writes do not collide.
-5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
+4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via `dispatch_parallel 3 00 preflight-claude preflight-codex` (the "Reviewer parallelization" cookbook pattern). Each subprocess publishes its own STATUS to its own attempt-scoped path under `$FEATURE_FOLDER/3-spec-review/00/attempts/` — `dispatch_attempt` mints a distinct attempt id per role, so the two parallel writes never collide.
+5. After **both** probes return (or only the claude probe in the opt-out case), copy each STATUS file from its real attempt-scoped path to the phase-local readable alias:
 
    <!-- lint: snippet -->
    ```bash
    for v in claude codex; do
-     src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
+     logical="p03-i00-preflight-${v}"
+     latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
+     src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
      if [ -f "$src" ]; then
-       mv "$src" "$FEATURE_FOLDER/3-spec-review/preflight/${v}-check-status.md"
+       cp "$src" "$FEATURE_FOLDER/3-spec-review/preflight/${v}-check-status.md"
      fi
    done
-   # An `if` is required, not `[ -f … ] && mv`: as the LAST statement of a block
-   # the latter returns 1 whenever the file is absent, which is the normal
-   # codex-skipped path, making a successful phase look like a failure.
+   # `cp`, never `mv` -- the attempt-scoped original at $src remains the
+   # durable record (resume classification, audit_run_state, and a future
+   # reconciliation all expect every attempt directory to remain exactly as
+   # dispatch_attempt left it). `_latest_attempt_id` returning nothing (codex
+   # skipped via consent, or a prelaunch failure that never launched) is the
+   # normal non-error case -- `continue` to the next vendor, not a HALT. An
+   # `if [ -f "$src" ]`, not `[ -f … ] && cp`: as the LAST statement of a
+   # block the `&&` form returns 1 whenever the file is absent, which is the
+   # normal codex-skipped path, making a successful phase look like a failure.
    ```
 
-   Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" below). Order of the two moves is irrelevant. Do not read any STATUS verdict until both moves (or their no-op equivalents) complete.
+   Either copy is a no-op if the corresponding source is absent (see "File policy for non-READY paths" below). Order of the two copies is irrelevant. Do not read any STATUS verdict until both copies (or their no-op equivalents) complete.
 
-6. Append one RUN_LOG dispatch entry per probe with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 3-spec-review/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
+6. `dispatch_parallel`/`dispatch_attempt` already appended each probe's own RUN_LOG dispatch entry (`phase: 3`, `phase_name: spec-review`, `iteration: 00`, `role: preflight-claude` or `preflight-codex`, `vendor: claude` or `codex`, `status_path:` its REAL attempt-scoped path) — read the verdict from the copied alias `3-spec-review/preflight/<vendor>-check-status.md` (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
 7. Branch on the verdicts:
    - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
    - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 3 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase, matching every other vendor-side failure mid-run. Proceed to step 1 of the iteration loop with `codex_available = false`.
@@ -8990,28 +9076,36 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 1. `mkdir -p <feature-folder>/5-plan-review/preflight`.
 2. Reset `codex_available = true` for the phase.
 3. If `codex_disabled_by_user = true` (run-scoped flag from Phase 1; reconstitute by scanning RUN_LOG per the rule in "Run-scoped user opt-out"):
-   - Dispatch `preflight-claude` only.
+   - Dispatch `preflight-claude` only, via `dispatch_attempt 5 00 preflight-claude`.
    - Append one `event=CODEX_SKIPPED_BY_USER_CONSENT` entry to `RUN_LOG.md` with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `role: preflight-codex`, `vendor: codex` (see RUN_LOG additions for the full block shape).
    - Set `codex_available = false`.
-4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`), so the two parallel writes do not collide.
-5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
+4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via `dispatch_parallel 5 00 preflight-claude preflight-codex` (the "Reviewer parallelization" cookbook pattern). Each subprocess publishes its own STATUS to its own attempt-scoped path under `$FEATURE_FOLDER/5-plan-review/00/attempts/` — `dispatch_attempt` mints a distinct attempt id per role, so the two parallel writes never collide.
+5. After **both** probes return (or only the claude probe in the opt-out case), copy each STATUS file from its real attempt-scoped path to the phase-local readable alias:
 
    <!-- lint: snippet -->
    ```bash
    for v in claude codex; do
-     src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
+     logical="p05-i00-preflight-${v}"
+     latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
+     src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
      if [ -f "$src" ]; then
-       mv "$src" "$FEATURE_FOLDER/5-plan-review/preflight/${v}-check-status.md"
+       cp "$src" "$FEATURE_FOLDER/5-plan-review/preflight/${v}-check-status.md"
      fi
    done
-   # An `if` is required, not `[ -f … ] && mv`: as the LAST statement of a block
-   # the latter returns 1 whenever the file is absent, which is the normal
-   # codex-skipped path, making a successful phase look like a failure.
+   # `cp`, never `mv` -- the attempt-scoped original at $src remains the
+   # durable record (resume classification, audit_run_state, and a future
+   # reconciliation all expect every attempt directory to remain exactly as
+   # dispatch_attempt left it). `_latest_attempt_id` returning nothing (codex
+   # skipped via consent, or a prelaunch failure that never launched) is the
+   # normal non-error case -- `continue` to the next vendor, not a HALT. An
+   # `if [ -f "$src" ]`, not `[ -f … ] && cp`: as the LAST statement of a
+   # block the `&&` form returns 1 whenever the file is absent, which is the
+   # normal codex-skipped path, making a successful phase look like a failure.
    ```
 
-   Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" in Step 1.0). Order of the two moves is irrelevant. Do not read any STATUS verdict until both moves (or their no-op equivalents) complete.
+   Either copy is a no-op if the corresponding source is absent (see "File policy for non-READY paths" in Step 1.0). Order of the two copies is irrelevant. Do not read any STATUS verdict until both copies (or their no-op equivalents) complete.
 
-6. Append one RUN_LOG dispatch entry per probe with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 5-plan-review/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
+6. `dispatch_parallel`/`dispatch_attempt` already appended each probe's own RUN_LOG dispatch entry (`phase: 5`, `phase_name: plan-review`, `iteration: 00`, `role: preflight-claude` or `preflight-codex`, `vendor: claude` or `codex`, `status_path:` its REAL attempt-scoped path) — read the verdict from the copied alias `5-plan-review/preflight/<vendor>-check-status.md` (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
 7. Branch on the verdicts:
    - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
    - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 5 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase. Proceed to step 1 of the iteration loop with `codex_available = false`.
@@ -9055,28 +9149,36 @@ Before Step 6.0 (the gate's first work dispatch is the implementer dispatch in S
 1. `mkdir -p <feature-folder>/6-implementation/preflight`.
 2. Reset `codex_available = true` for the phase.
 3. If `codex_disabled_by_user = true` (run-scoped flag from Phase 1; reconstitute by scanning RUN_LOG per the rule in "Run-scoped user opt-out"):
-   - Dispatch `preflight-claude` only.
+   - Dispatch `preflight-claude` only, via `dispatch_attempt 6 00 preflight-claude`.
    - Append one `event=CODEX_SKIPPED_BY_USER_CONSENT` entry to `RUN_LOG.md` with `phase: 6`, `phase_name: implementation`, `iteration: 00`, `role: preflight-codex`, `vendor: codex` (see RUN_LOG additions for the full block shape).
    - Set `codex_available = false`.
-4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`).
-5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
+4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via `dispatch_parallel 6 00 preflight-claude preflight-codex` (the "Reviewer parallelization" cookbook pattern). Each subprocess publishes its own STATUS to its own attempt-scoped path under `$FEATURE_FOLDER/6-implementation/00/attempts/` — `dispatch_attempt` mints a distinct attempt id per role, so the two parallel writes never collide.
+5. After **both** probes return (or only the claude probe in the opt-out case), copy each STATUS file from its real attempt-scoped path to the phase-local readable alias:
 
    <!-- lint: snippet -->
    ```bash
    for v in claude codex; do
-     src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
+     logical="p06-i00-preflight-${v}"
+     latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
+     src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
      if [ -f "$src" ]; then
-       mv "$src" "$FEATURE_FOLDER/6-implementation/preflight/${v}-check-status.md"
+       cp "$src" "$FEATURE_FOLDER/6-implementation/preflight/${v}-check-status.md"
      fi
    done
-   # An `if` is required, not `[ -f … ] && mv`: as the LAST statement of a block
-   # the latter returns 1 whenever the file is absent, which is the normal
-   # codex-skipped path, making a successful phase look like a failure.
+   # `cp`, never `mv` -- the attempt-scoped original at $src remains the
+   # durable record (resume classification, audit_run_state, and a future
+   # reconciliation all expect every attempt directory to remain exactly as
+   # dispatch_attempt left it). `_latest_attempt_id` returning nothing (codex
+   # skipped via consent, or a prelaunch failure that never launched) is the
+   # normal non-error case -- `continue` to the next vendor, not a HALT. An
+   # `if [ -f "$src" ]`, not `[ -f … ] && cp`: as the LAST statement of a
+   # block the `&&` form returns 1 whenever the file is absent, which is the
+   # normal codex-skipped path, making a successful phase look like a failure.
    ```
 
-   Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" in Step 1.0).
+   Either copy is a no-op if the corresponding source is absent (see "File policy for non-READY paths" in Step 1.0).
 
-6. Append one RUN_LOG dispatch entry per probe with `phase: 6`, `phase_name: implementation`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 6-implementation/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
+6. `dispatch_parallel`/`dispatch_attempt` already appended each probe's own RUN_LOG dispatch entry (`phase: 6`, `phase_name: implementation`, `iteration: 00`, `role: preflight-claude` or `preflight-codex`, `vendor: claude` or `codex`, `status_path:` its REAL attempt-scoped path) — read the verdict from the copied alias `6-implementation/preflight/<vendor>-check-status.md` (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
 7. Branch on the verdicts:
    - **Claude probe fails (any mode):** HALT unconditionally (same rule as every gate). No user prompt; claude is required for every phase.
    - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** **non-blocking.** Append `event=CODEX_UNAVAILABLE` with `phase: 6`, `phase_name: implementation`, `iteration: 00`, `failure_mode: <N>`, and the stderr tail. Surface a one-line warning to the dispatch event stream. **Do NOT prompt the user. Do NOT HALT. Proceed directly to Step 6.0.** Codex is not dispatched downstream in Phase 6, so the codex verdict is informational only — the probe runs only to give the user early warning of a vendor outage before the long implementer run starts. The Phase 6 carve-out applies to all of Modes 0–5 alike: at this gate alone, Mode 0 does not HALT; it logs and proceeds.
@@ -9209,28 +9311,36 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 1. `mkdir -p <feature-folder>/7-code-review/preflight`.
 2. Reset `codex_available = true` for the phase.
 3. If `codex_disabled_by_user = true` (run-scoped flag from Phase 1; reconstitute by scanning RUN_LOG per the rule in "Run-scoped user opt-out"):
-   - Dispatch `preflight-claude` only.
+   - Dispatch `preflight-claude` only, via `dispatch_attempt 7 00 preflight-claude`.
    - Append one `event=CODEX_SKIPPED_BY_USER_CONSENT` entry to `RUN_LOG.md` with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `role: preflight-codex`, `vendor: codex` (see RUN_LOG additions for the full block shape).
    - Set `codex_available = false`.
-4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via the "Reviewer parallelization" cookbook pattern. Each appendix writes its own filename to the canonical Phase 1 slot (`$FEATURE_FOLDER/1-preflight/{claude,codex}-check-status.md`).
-5. After **both** probes return (or only the claude probe in the opt-out case), conditionally move each STATUS file from the canonical slot to the phase-local path:
+4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via `dispatch_parallel 7 00 preflight-claude preflight-codex` (the "Reviewer parallelization" cookbook pattern). Each subprocess publishes its own STATUS to its own attempt-scoped path under `$FEATURE_FOLDER/7-code-review/00/attempts/` — `dispatch_attempt` mints a distinct attempt id per role, so the two parallel writes never collide.
+5. After **both** probes return (or only the claude probe in the opt-out case), copy each STATUS file from its real attempt-scoped path to the phase-local readable alias:
 
    <!-- lint: snippet -->
    ```bash
    for v in claude codex; do
-     src="$FEATURE_FOLDER/1-preflight/${v}-check-status.md"
+     logical="p07-i00-preflight-${v}"
+     latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
+     src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
      if [ -f "$src" ]; then
-       mv "$src" "$FEATURE_FOLDER/7-code-review/preflight/${v}-check-status.md"
+       cp "$src" "$FEATURE_FOLDER/7-code-review/preflight/${v}-check-status.md"
      fi
    done
-   # An `if` is required, not `[ -f … ] && mv`: as the LAST statement of a block
-   # the latter returns 1 whenever the file is absent, which is the normal
-   # codex-skipped path, making a successful phase look like a failure.
+   # `cp`, never `mv` -- the attempt-scoped original at $src remains the
+   # durable record (resume classification, audit_run_state, and a future
+   # reconciliation all expect every attempt directory to remain exactly as
+   # dispatch_attempt left it). `_latest_attempt_id` returning nothing (codex
+   # skipped via consent, or a prelaunch failure that never launched) is the
+   # normal non-error case -- `continue` to the next vendor, not a HALT. An
+   # `if [ -f "$src" ]`, not `[ -f … ] && cp`: as the LAST statement of a
+   # block the `&&` form returns 1 whenever the file is absent, which is the
+   # normal codex-skipped path, making a successful phase look like a failure.
    ```
 
-   Either move is a no-op if the corresponding file is absent (see "File policy for non-READY paths" in Step 1.0).
+   Either copy is a no-op if the corresponding source is absent (see "File policy for non-READY paths" in Step 1.0).
 
-6. Append one RUN_LOG dispatch entry per probe with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `role: preflight-claude` (or `preflight-codex`), `vendor: claude` (or `codex`), `appendix: preflight-claude` (or `preflight-codex`), `status_path: 7-code-review/preflight/<vendor>-check-status.md`, and `verdict:` from the relocated STATUS file (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
+6. `dispatch_parallel`/`dispatch_attempt` already appended each probe's own RUN_LOG dispatch entry (`phase: 7`, `phase_name: code-review`, `iteration: 00`, `role: preflight-claude` or `preflight-codex`, `vendor: claude` or `codex`, `status_path:` its REAL attempt-scoped path) — read the verdict from the copied alias `7-code-review/preflight/<vendor>-check-status.md` (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
 7. Branch on the verdicts:
    - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
    - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 7 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1. **Before proceeding, record the required degraded-coverage decision (spec §16.5):** append `record_event DEGRADED_REVIEW_ACCEPTED decision_id="p7-degraded-<run>" scope="phase=7;iteration=00" evidence="codex_unavailable failure_mode=<N>"` (`authority_identity: standing_process_policy` — this is a decision the process itself pre-authorizes for a single-vendor Phase 7 continuation, within the orchestrator's existing autonomy ceiling; it is never inferred ad hoc). A one-vendor Phase 7 MAY NOT proceed to the iteration loop without this event durable in `RUN_LOG.md` — this is what makes the degradation explicit rather than a silent strict PASS (the readiness writer's own rules already force `READY_WITH_NOTES` downstream; this event is what makes the ACCEPTANCE, not just the fact of degradation, auditable). Proceed to step 1 of the iteration loop with `codex_available = false`.
@@ -9326,7 +9436,7 @@ You read only the writer's own STATUS.md and `documentation-validation.md`.
 
 Git finalization moves after documentation so the final local commit can include all intended product documentation changes (`9-documentation/uat.md`, `planned-vs-realized.md`, `documentation-validation.md`, `followups.jsonl`, plus any other path `documentation-writer`'s own STATUS `changed_paths` field names). Phase 10 is executed **directly by the orchestrator. It MUST NOT dispatch `finishing-branch` or any other subagent/model role** — `finishing-branch` is retired (see the Role Contract Registry note above). This is the one phase, besides the orchestrator's existing `RUN_LOG.md`/`full_log.md`/`process-improvement-proposition.md`/`transcripts/` writes, where the orchestrator itself is permitted to mutate the repository (see the "Running red flags" exception above).
 
-1. Compute the exact candidate staging paths: `9-documentation/uat.md`, `9-documentation/planned-vs-realized.md`, `9-documentation/documentation-validation.md`, `followups.jsonl`, plus every path listed in `documentation-writer`'s own STATUS `changed_paths` field (repo-relative, deduplicated). Assert every one of `documentation-writer`'s three REQUIRED outputs (`uat.md`, `planned-vs-realized.md`, `documentation-validation.md`) actually exists on disk — a `DONE`/`PARTIAL` STATUS whose accepted output is nonetheless missing is invalid/incomplete documentation, spec §20.10 step 1's own gate. If any is missing: go to step 6 with `REASON=missing-documentation-output:<path>`, `outcome=BLOCKED`, `base_sha`/`final_sha` = the current `git -C "$REPO_ROOT" rev-parse HEAD`, `staged_paths=[]`, `commit_sha=null` — no lease is ever acquired.
+1. Compute `FEATURE_FOLDER_REL="${FEATURE_FOLDER#"$REPO_ROOT"/}"` (the same repo-root-stripping idiom `PROCESS_PATH_REL` already uses above) — every path `git -C "$REPO_ROOT"` operates on below MUST be relative to `$REPO_ROOT`, never to `$FEATURE_FOLDER`, since `git add`/`git diff` run with `-C "$REPO_ROOT"`. Compute the exact candidate staging paths: `$FEATURE_FOLDER_REL/9-documentation/uat.md`, `$FEATURE_FOLDER_REL/9-documentation/planned-vs-realized.md`, `$FEATURE_FOLDER_REL/9-documentation/documentation-validation.md`, `$FEATURE_FOLDER_REL/followups.jsonl`, plus every path listed in `documentation-writer`'s own STATUS `changed_paths` field (already repo-relative per that field's own contract, deduplicated). Assert every one of `documentation-writer`'s three REQUIRED outputs (`uat.md`, `planned-vs-realized.md`, `documentation-validation.md`) actually exists on disk at its real `$FEATURE_FOLDER/9-documentation/...` path — a `DONE`/`PARTIAL` STATUS whose accepted output is nonetheless missing is invalid/incomplete documentation, spec §20.10 step 1's own gate. If any is missing: go to step 6 with `REASON=missing-documentation-output:<path>`, `outcome=BLOCKED`, `base_sha`/`final_sha` = the current `git -C "$REPO_ROOT" rev-parse HEAD`, `staged_paths=[]`, `commit_sha=null` — no lease is ever acquired.
 2. If `$IMPLEMENTATION_BASE_SHA=non-git` (captured at Phase 6, spec §16.2), skip straight to step 6 with `REASON=not-a-git-repo`, `outcome=BLOCKED`, `base_sha=non-git`, `final_sha=non-git`, `staged_paths=[]`, `commit_sha=null` — no lease is ever acquired; there is nothing a lease could protect.
 3. Otherwise call `acquire_write_lease orchestrator-finalization orchestrator "" 10 <the staging paths from step 1>` (cookbook, spec §11.1/§20.10) — the third argument (`DISPATCH_ID`) is an EMPTY string, never the literal word `null`: the cookbook's own contract records an empty `DISPATCH_ID` as JSON `null` in `write-lease.json`, but a non-empty string `"null"` would be recorded as the JSON STRING `"null"`, not the JSON value `null` spec §20.10 requires. This single call itself IS the required "assert no lease remains" check — `acquire_write_lease` already refuses an active, malformed, stale, or ambiguous existing lease and returns non-zero without staging anything. On failure, go to step 6 with `REASON=<the refusal>`, `outcome=BLOCKED`, `base_sha`/`final_sha` = the pre-attempt `git -C "$REPO_ROOT" rev-parse HEAD` (nothing changed), `staged_paths=[]`, `commit_sha=null`.
 4. On success, `BASE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"`. Before staging, verify `git -C "$REPO_ROOT" diff --cached --name-only` is empty — a non-empty pre-existing staged diff is an unexplained dirty-tree-ownership conflict, not this phase's own doing. If non-empty: go to step 6 with `REASON=unexpected-pre-staged-paths`, `outcome=BLOCKED`, `final_sha=$BASE_SHA`, `commit_sha=null`, then release the lease (step 7). Otherwise stage ONLY the declared paths (`git -C "$REPO_ROOT" add -- <staging paths>`), then re-check `git diff --cached --name-only`: every staged path MUST be a member of the declared set — reject any path that is not (`git -C "$REPO_ROOT" restore --staged -- <the offending paths>`, then step 6 with `REASON=unexpected-staged-path`, `outcome=BLOCKED`).
@@ -9533,7 +9643,9 @@ Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of `review_iteration
 `DEGRADED_REVIEW_ACCEPTED`, `PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE`,
 `LOCAL_CLI_CANARIES_PASSED`, `TARGET_DIRTY_TREE_GATE_PASSED`,
 `PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED`, `RUNTIME_AND_REGISTRIES_VERIFIED`,
-`VENDOR_PROVEN`, `PLAN_REVIEW_STALE` (plus the reserved `CODEX_RE_ENABLED_BY_USER`).
+`VENDOR_PROVEN`, `PLAN_REVIEW_STALE`, `CONTINUATION_CAP_REACHED`,
+`CONVERGENCE_RECORDED`, `DIVERGENCE_DETECTED`, `DIVERGENT_ROUND_CAP_REACHED`
+(plus the reserved `CODEX_RE_ENABLED_BY_USER`).
 Every type in this list beyond the legacy pre-schema-v2 names above has a row
 in the Event Contract Registry (below), which `record_event` validates
 against. An event entry NEVER substitutes for the `DISPATCH_COMPLETED` entry
@@ -9843,7 +9955,7 @@ cost_usd:                 <n|n/a>
 usage_status:             ok
 ```
 
-Summarizer appendices already filter by `phase=<n>`, so per-phase preflight events appear in each phase's existing summary scope automatically — no summarizer changes are required. Phase 1 verdicts continue to be read by summarizers from RUN_LOG dispatch entries for Phase 1 (the same source they use today), not from the relocated `1-preflight/phase-1/` STATUS files. The relocated STATUS files are consumed only by the readiness writer and by ad-hoc human inspection.
+Summarizer appendices already filter by `phase=<n>`, so per-phase preflight events appear in each phase's existing summary scope automatically — no summarizer changes are required. Phase 1 verdicts continue to be read by summarizers from RUN_LOG dispatch entries for Phase 1 (the same source they use today), not from the copied `1-preflight/phase-1/` STATUS-file alias. That alias is consumed only by the readiness writer and by ad-hoc human inspection.
 
 **Consumer rule for downstream readers:** when locating the implementation baseline, scan `RUN_LOG.md` for entries matching `event=IMPLEMENTATION_BASELINE` (NOT `IMPLEMENTATION_BASELINE_BLOCKED`) and use the LATEST one (last by file order). This handles the case where a user resumed a run multiple times — only the most recent clean baseline is authoritative. Failover events use the same `event=` key approach; baselines and failovers are independent.
 
@@ -9853,7 +9965,7 @@ On re-run of this prompt against the same feature folder:
 3. Determine the last completed phase/iteration.
 4. Reconstitute the run-scoped `codex_disabled_by_user` flag by scanning RUN_LOG for `event=CODEX_DISABLED_BY_USER_CONSENT` (see "`CODEX_DISABLED_BY_USER_CONSENT` event" above). Resume does NOT re-prompt the user.
 5. Branch by the phase being resumed into:
-   - **Resuming before Phase 2** (no phases have started yet — RUN_LOG contains no dispatch entries past Phase 1, or RUN_LOG is empty / has only Phase 1 entries with no `READY` verdict): run Phase 1 in full as if a fresh invocation. Phase 1 itself is not "gated" by per-phase preflight — the Phase 1 logic *is* the preflight. The Step 1.2 relocation runs again on success.
+   - **Resuming before Phase 2** (no phases have started yet — RUN_LOG contains no dispatch entries past Phase 1, or RUN_LOG is empty / has only Phase 1 entries with no `READY` verdict): run Phase 1 in full as if a fresh invocation. Phase 1 itself is not "gated" by per-phase preflight — the Phase 1 logic *is* the preflight. Step 1.2's readable-alias copy runs again on success.
    - **Resuming into Phase N where N ∈ {3, 5, 6, 7}** (a gated phase): the orchestrator runs (or re-runs) Phase N's per-phase preflight before the **next dispatch in the session** (defined as the next dispatch after the process resume, even if Phase N's first work dispatch already executed in a prior session), regardless of whether Phase N's preflight ran in the pre-resume session, and regardless of whether the resume happens before Phase N's first dispatch, between iterations, during a fixer dispatch, or immediately after one. Re-run STATUS files OVERWRITE the prior session's `<phase>/preflight/<vendor>-check-status.md` artifacts — overwrite (not versioned filenames) is the intentional policy: the per-phase preflight verdict is the **current** truth. Pre-resume preflight history is preserved indirectly via the RUN_LOG dispatch entries (each retains `develop_it_git_sha`, timestamp, and verdict). After the resume preflight completes, the per-phase cache applies normally for any further iterations in that session until the next phase transition or halt.
    - **Resuming into a non-gated phase** (Phase 2, 4, 8, 9, 11, or any future phase not in {3, 5, 6, 7}): no preflight runs on resume. The orchestrator picks up where it left off using the most recent applicable preflight verdict from RUN_LOG (Phase 1 for Phases 2 and 4, or the most recent per-phase preflight for Phase 8 or 9 (and analogously for any future non-gated phase)) and any in-scope flags such as `codex_disabled_by_user`. This is a direct consequence of the "gated set is exactly {3, 5, 6, 7}" rule, not a violation of it. Phase 10 is a direct orchestrator operation with no dispatch and no preflight of its own — on resume into Phase 10, the orchestrator simply re-evaluates the lease/staging state exactly as Step 5 below describes; Phase 11 (readiness) likewise dispatches only `readiness-writer`, a non-gated role.
 6. Resume from the next un-completed step.
@@ -10058,7 +10170,7 @@ The Proposition file content rules in the Anti-leak red flags section apply to t
 
 This Develop-It SDLC step is complete only when ALL of the following hold:
 
-- Phase 1 preflight passed: `1-preflight/phase-1/claude-check-status.md` is `READY`, AND the readiness writer's classification for the Phase 1 codex slot is one of: (a) `READY` (codex STATUS present with `verdict: READY`), (b) `SKIPPED` consented via `event=CODEX_DISABLED_BY_USER_CONSENT` (codex STATUS absent), or (c) `FAILED` with a present codex STATUS file carrying `verdict: FAILED` / non-`READY` (Mode 4 malformed STATUS may legitimately remain at the relocated path). A Phase 1 codex classification of `INVALID_ORCHESTRATION` blocks completion — this includes both (i) STATUS absent with NO corresponding event, AND (ii) STATUS absent with `event=CODEX_UNAVAILABLE` but no `event=CODEX_DISABLED_BY_USER_CONSENT` (per spec, Phase 1 Mode 0 HALTs unconditionally and Modes 1–5 require user consent — reaching completion without one of those events is an orchestration violation). The Phase 1 path is stricter than per-phase gates: an unavailable codex at Phase 1 is passable ONLY with recorded user consent.
+- Phase 1 preflight passed: `1-preflight/phase-1/claude-check-status.md` is `READY`, AND the readiness writer's classification for the Phase 1 codex slot is one of: (a) `READY` (codex STATUS present with `verdict: READY`), (b) `SKIPPED` consented via `event=CODEX_DISABLED_BY_USER_CONSENT` (codex STATUS absent), or (c) `FAILED` with a present codex STATUS file carrying `verdict: FAILED` / non-`READY` (Mode 4 malformed STATUS may legitimately remain at the alias path). A Phase 1 codex classification of `INVALID_ORCHESTRATION` blocks completion — this includes both (i) STATUS absent with NO corresponding event, AND (ii) STATUS absent with `event=CODEX_UNAVAILABLE` but no `event=CODEX_DISABLED_BY_USER_CONSENT` (per spec, Phase 1 Mode 0 HALTs unconditionally and Modes 1–5 require user consent — reaching completion without one of those events is an orchestration violation). The Phase 1 path is stricter than per-phase gates: an unavailable codex at Phase 1 is passable ONLY with recorded user consent.
 - Per-phase preflight passed for every phase in {3, 5, 6, 7}: `<phase-dir>/preflight/claude-check-status.md` is `READY`, AND the readiness writer's classification for that phase's codex slot is `READY`, `SKIPPED` (matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for `(phase=<P>, iteration=00)`), or `FAILED` (matching `event=CODEX_UNAVAILABLE` for `(phase=<P>, iteration=00)`, OR a present codex STATUS file with `verdict: FAILED` / non-`READY` — Mode 4 malformed STATUS may legitimately remain). Only an `INVALID_ORCHESTRATION` classification blocks completion. `FAILED` codex per-phase verdicts surface in the readiness report's `partial_review` / `codex_unavailable_reason` notes but do not gate completion. For Phase 6 specifically, this is explicit: Phase 6 codex probe failure is non-blocking by design — see Step 6.−1. Unlike Phase 1, per-phase gates do not require user consent for codex degradation; the per-phase preflight model trades that prompt for fast automatic degradation since the user has already opted into the run.
 - Phase 2 context discovery passed (`2-context-discovery/status.md` = `READY`).
 - Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `3-spec-review/spec-review-summary.md` exists.
@@ -10100,7 +10212,7 @@ You are a one-shot preflight checker invoked by the develop-it orchestrator. You
 - Allowed verdicts: `READY;MISSING_SKILLS`
 - Required status fields: `common_v2;context7;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent`
 - Checkpoint kind: `none`
-- Phases: `1`
+- Phases: `1;3;5;6;7`
 
 ## Inputs (substituted by orchestrator)
 
@@ -10116,7 +10228,6 @@ Attempt to load each of these Superpowers skills. For each, report `LOADED` or `
 - superpowers:test-driven-development
 - superpowers:requesting-code-review
 - superpowers:receiving-code-review
-- superpowers:finishing-a-development-branch
 
 ## Optional skill discovery
 
@@ -10151,14 +10262,14 @@ generated publisher exactly once -- it is the ONLY sanctioned writer:
 $STATUS_PUBLISHER_PATH \
   --contracts $ROLE_CONTRACTS_PATH --role preflight-claude \
   --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 1 --iteration 00 --attempt $ATTEMPT \
+  --phase $PHASE --iteration 00 --attempt $ATTEMPT \
   --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
   --allowed-root $FEATURE_FOLDER <<'STATUS'
 schema_version: 2
 dispatch_id: $DISPATCH_ID
 logical_dispatch_id: $LOGICAL_DISPATCH_ID
 role: preflight-claude
-phase: 1
+phase: $PHASE
 iteration: 00
 attempt: $ATTEMPT
 verdict: READY | MISSING_SKILLS
@@ -10203,7 +10314,7 @@ You are a one-shot preflight checker invoked by the develop-it orchestrator. You
 - Allowed verdicts: `READY;MISSING_SKILLS`
 - Required status fields: `common_v2;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent`
 - Checkpoint kind: `none`
-- Phases: `1`
+- Phases: `1;3;5;6;7`
 
 ## Inputs
 
@@ -10242,14 +10353,14 @@ generated publisher exactly once -- it is the ONLY sanctioned writer:
 $STATUS_PUBLISHER_PATH \
   --contracts $ROLE_CONTRACTS_PATH --role preflight-codex \
   --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 1 --iteration 00 --attempt $ATTEMPT \
+  --phase $PHASE --iteration 00 --attempt $ATTEMPT \
   --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
   --allowed-root $FEATURE_FOLDER <<'STATUS'
 schema_version: 2
 dispatch_id: $DISPATCH_ID
 logical_dispatch_id: $LOGICAL_DISPATCH_ID
 role: preflight-codex
-phase: 1
+phase: $PHASE
 iteration: 00
 attempt: $ATTEMPT
 verdict: READY | MISSING_SKILLS
@@ -12363,7 +12474,7 @@ You are the final readiness reporter. You have no shared context.
 ## Behavior
 
 1. Read the following files inside `$FEATURE_FOLDER`:
-   - `1-preflight/phase-1/claude-check-status.md` (Phase 1 claude verdict; relocated from the canonical slot by Step 1.2)
+   - `1-preflight/phase-1/claude-check-status.md` (Phase 1 claude verdict; a copy of the attempt-scoped original made by Step 1.2)
    - `1-preflight/phase-1/codex-check-status.md` (Phase 1 codex verdict; may be absent if Codex failed at Phase 1 or `codex_disabled_by_user` was set there)
    - For each phase P in {3, 5, 6, 7}, read both:
      - `<phase-dir>/preflight/claude-check-status.md`

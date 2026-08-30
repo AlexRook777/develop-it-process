@@ -451,6 +451,7 @@ if declare -F render_prompt >/dev/null; then
   EXCLUSIONS=none
   FOLLOWUPS=none
   DOCS_INVENTORY=/tmp/docs.txt
+  PHASE=7
   PHASE_DIR=/tmp/ff/7-code-review
   DISPATCH_ID=p07-i00-implementation-fixer-a01
   LOGICAL_DISPATCH_ID=p07-i00-implementation-fixer

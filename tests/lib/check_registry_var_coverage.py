@@ -26,6 +26,12 @@ EXEMPT_VARS = {
     "FEATURE_FOLDER", "PHASE_DIR", "DISPATCH_ID", "LOGICAL_DISPATCH_ID",
     "ATTEMPT", "ROLE_CONTRACTS_PATH", "STATUS_PUBLISHER_PATH", "GREP_BIN",
     "RESOLVED_MODELS",
+    # PHASE (bare, distinct from PHASE_DIR): the raw phase-argument render
+    # key, needed only by a role dispatched under more than one phase number
+    # (preflight-claude/preflight-codex, re-probed at Phases 1, 3, 5, 6, 7) --
+    # same mechanical-plumbing role as PHASE_DIR/DISPATCH_ID, not a declared
+    # business input.
+    "PHASE",
     # Task 9: every checkpointed appendix sources the generated runtime to
     # call checkpoint_append directly (the same mechanical plumbing role as
     # ROLE_CONTRACTS_PATH/STATUS_PUBLISHER_PATH -- how it reaches the

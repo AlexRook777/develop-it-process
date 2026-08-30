@@ -86,11 +86,26 @@ load_cookbook() {
   return 0
 }
 
+# Every FIXTURE_ROOT this process has ever minted, cleaned up once at exit --
+# init_fixture_env may be called many times in one test file (each mints a
+# fresh mktemp -d), and a bare `trap ... EXIT` would overwrite itself on each
+# call, silently leaking every FIXTURE_ROOT but the last. Accumulate instead.
+_FIXTURE_ROOTS=()
+_cleanup_fixture_roots() {
+  local d
+  for d in "${_FIXTURE_ROOTS[@]}"; do rm -rf "$d"; done
+}
+
 # Build a throwaway target repo and feature folder, then initialise.
 # Usage: init_fixture_env [outside]   ("outside" puts the feature folder outside the repo)
 init_fixture_env() {
   local where="${1:-inside}"
   FIXTURE_ROOT="$(mktemp -d)"
+  _FIXTURE_ROOTS+=("$FIXTURE_ROOT")
+  # Idempotent: registering the same EXIT trap on every call is harmless
+  # (it just re-sets the identical handler), and guarantees the array above
+  # is only ever read once, after every call has finished appending to it.
+  trap _cleanup_fixture_roots EXIT
   REPO_ROOT="$FIXTURE_ROOT/target"
   mkdir -p "$REPO_ROOT"
   git -C "$REPO_ROOT" init -q

@@ -3,34 +3,99 @@
 `develop-it-prompt.md` is a single self-contained orchestration prompt. An
 orchestrating agent reads it and drives `claude` and `codex` CLI subprocesses
 through a phased spec -> plan -> implement -> review pipeline. The document is
-the single source of truth: there is no framework code and no runtime. The
+the single source of truth: there is no separate framework codebase. The
 shell helpers the orchestrator calls (`render_prompt`, `role_model`,
 `dirty_tree_check`, and the rest) live inside the document itself, in fenced
-`bash` blocks, and are extracted into real files only at test time.
+`bash` blocks, and are never edited or maintained as standalone files.
+They ARE extracted into real files at two distinct times, for two distinct
+purposes, and neither one is a second normative copy: `./tests/run.sh`
+extracts them into `tests/.build/` to unit-test them offline; and, on every
+real run, Phase −1 extracts the SAME cookbook (plus the role-contract,
+policy, and event registries) into `$FEATURE_FOLDER/.orchestration/runtime/`
+so every subsequent phase's dispatch has real, sourceable shell functions to
+call. The document's own bytes remain the only place this logic is authored
+or reviewed — both extractions are generated, disposable derivatives, never
+committed (see "Recovery and resume" below).
 
 ## The pipeline
 
+This is schema v2: every run's `RUN_LOG.md`, STATUS files, checkpoints, and
+event records follow the reviewed schema-v2 contracts below. It applies only
+to newly created runs — a historical feature folder written by an older
+version of this prompt is left exactly as it is; there is no compatibility
+reader or migration path for it (see "Artifacts" below).
+
 The phases run in this order:
 
-- **Phase -1 — Preflight.** CLI canary (are `claude`/`codex`/`jq`/`git`/... on
-  PATH), Superpowers skill probe, and a model probe that verifies every pinned
-  model id is accepted before any billable work starts.
+- **Phase −1 (folder `1-preflight/`) — Preflight.** Zero-token gates: local
+  CLI canary (are `claude`/`codex`/`jq`/`git`/... on PATH), the target repo's
+  dirty-tree check, process-identity/gitignore validation, generated-runtime
+  extraction and verification, then a Superpowers skill probe and a model
+  probe per vendor that verifies every pinned model id is accepted before any
+  billable work starts. A missing/unavailable Codex at this phase HALTs
+  (Mode 0) or degrades only after explicit recorded user consent (Modes 1–5)
+  — it never silently falls back.
 - **Phase 2 — Context discovery.** A read-only subagent surveys the repo and
   available skills.
 - **Phase 3 — Spec review gate.**
 - **Phase 4 — Plan writing.**
 - **Phase 5 — Plan review gate.**
-- **Phase 6 — Implementation**, by a single supervising subagent.
+- **Phase 6 — Implementation**, by a single supervising subagent, with
+  resumable checkpoints (see "Recovery and resume" below).
 - **Phase 7 — Code review gate.**
 - **Phase 8 — All tests**, a test-run/fix loop.
-- **Phase 9 — Git finalization.**
-- **Phase 10 — Final readiness report.**
+- **Phase 9 — Documentation and handoff.** Writes `uat.md`,
+  `planned-vs-realized.md`, and `documentation-validation.md`, all reviewed
+  against a structural contract before the run is allowed to proceed.
+- **Phase 10 — Local git finalization.** A direct orchestrator operation —
+  no subagent is dispatched. It commits locally at most once, under the
+  orchestrator's own write lease, and **never pushes, opens a pull request,
+  merges, or touches a remote**; `push_performed` is recorded `no` on every
+  outcome. Pushing, merging, and opening a PR are separately scoped owner
+  actions outside this process run — see `RUNBOOK.md`'s "Finalization
+  BLOCKED|FAILED" operator check.
+- **Phase 11 — Readiness and completion.** A deterministic reconciliation
+  audit runs first (no vendor call), then `readiness-writer` composes
+  `final-readiness-report.md`.
 
 Every review gate (Phases 3, 5, 7) is **cross-vendor**: a Claude reviewer and a
 Codex reviewer run independently in parallel, and the gate's decision is driven
 by their severity counts (blockers/majors/minors), not by a bare pass/fail
 string. Each gate is severity-gated and iterates — re-dispatching a fixer
-subagent and re-reviewing — until it passes or hits its iteration cap (10).
+subagent and re-reviewing — until it passes or hits its `review_iteration_cap`
+(10). A fixer's own claim of `DONE` is never accepted as final: every fix
+round is re-reviewed by a fresh reviewer dispatch before the gate can pass, at
+every iteration including the cap — there is no "final fix pass" that skips
+re-review.
+
+### Attempt identity and STATUS
+
+Every dispatched subprocess writes exactly one attempt-scoped STATUS file —
+`<phase-dir>/<iteration>/attempts/<dispatch-id>/STATUS.md` — via a generated
+publisher program that is the sole sanctioned writer; no role appendix writes
+or renames a STATUS file itself. `dispatch_id` has the fixed shape
+`p<phase-token>-i<NN>-<role>-a<NN>`, unique per attempt, so a retried or
+resumed attempt never collides with or silently overwrites a prior one's
+evidence. The parent orchestrator is `RUN_LOG.md`'s sole writer; subprocesses
+never touch it directly — they return results through their own attempt-scoped
+files, which the orchestrator reads and durably records.
+
+### Recovery and resume
+
+A failed or interrupted attempt is classified against a fixed twelve-row
+recovery matrix (`RM01`–`RM12` in `develop-it-prompt.md`) keyed on failure
+classification and repository mutation state, so retries are deterministic
+and bounded — never open-ended. A role with `checkpoint_kind != none` records
+durable progress as it works — this is most roles that dispatch in Phases 3
+through 7 and 9, not just the implementer: both spec/plan/code reviewers
+(every vendor), the spec/plan/implementation fixers, the plan-writer, the
+implementer (and its `impl-worker` children), and documentation-writer. A
+resumed attempt continues from its own last checkpoint rather than
+restarting, up to the `continuation_cap` (3). Anything the matrix classifies
+as requiring a human decision (an ambiguous lease, dirty-uncheckpointed state)
+HALTs with the exact durable paths to inspect — it never guesses. See
+`RUNBOOK.md` §Step 8's "Operator checklist" for the exact procedure for each
+recovery case.
 
 ## How to use it
 
@@ -82,10 +147,21 @@ another model.
 A run leaves everything under the per-feature artifacts folder
 (`docs/superpowers/specs/<date>-<slug>-artifacts/`): `RUN_LOG.md` is the
 durable, append-only event log used for resume and auditing; each phase has a
-numbered subfolder holding its STATUS files and findings; and
-`final-readiness-report.md` is the human-facing summary written at Phase 10,
-covering reviewer verdicts, implementation and verification results, the git
-result, and any residual minor findings.
+numbered subfolder holding its own attempt-scoped STATUS files and findings;
+and `final-readiness-report.md` is the human-facing summary written at
+Phase 11, covering preflight/reviewer verdicts, implementation and
+verification results, documentation/UAT status, the local git result, the
+reconciliation audit, and any residual minor findings.
+
+**Existing Prism artifacts are unchanged by this work.** Schema v2 applies
+only to feature folders a run creates from now on. A feature folder written
+by an older version of this prompt — including every one already under
+`/home/oleks/repos/prism/docs/superpowers/specs/`, and that project's own
+spec/plan/review artifact folders more generally — is left exactly as it is:
+no task in this plan reads, edits, migrates, backfills, or deletes anything
+there, and this process provides no compatibility reader for a schema-v1
+`RUN_LOG.md` (an unrecognized or v1 log is a HALT, `RUN_LOG_SCHEMA_V1_OR_UNKNOWN`
+— never a silent upgrade).
 
 ## Tests
 
