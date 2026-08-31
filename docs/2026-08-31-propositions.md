@@ -67,7 +67,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P03 — Run-level exclusivity for non-parallel-safe test suites in Phase 8
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (08bbd1c)
 
 **Criticality:** High · **Effort:** Easy
 
@@ -153,7 +153,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P10 — Reproduce a test failure in isolation before dispatching `test-fixer`
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (08bbd1c)
 
 **Criticality:** High · **Effort:** Moderate
 
@@ -228,7 +228,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P16 — Let a verification command declare `environment: exclusive`
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (08bbd1c)
 
 **Criticality:** Medium · **Effort:** Moderate
 
