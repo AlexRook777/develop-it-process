@@ -1350,8 +1350,12 @@ t14_git_add() {
   eval "${T14_ADD_CMD_TMPL//<staging paths>/\"\$paths\"}"
 }
 t14_git_commit() {
-  local msg="$1"
-  eval "$(printf '%s' "$T14_COMMIT_CMD_TMPL" | sed "s#<message per the plan.s git rules / CLAUDE\.md git policy>#$msg#")"
+  # P24: Phase 10's own prose no longer inlines a free-form message literal
+  # in the git command itself -- it composes $COMMIT_MSG from a deterministic
+  # template first, then commits with that variable. Set it, then run the
+  # extracted command verbatim (still pulled from the doc, never retyped).
+  local COMMIT_MSG="$1"
+  eval "$T14_COMMIT_CMD_TMPL"
 }
 t14_git_restore() {
   local paths="$*"

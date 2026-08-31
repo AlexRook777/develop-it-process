@@ -1176,11 +1176,13 @@ _bootstrap_publish() {
     return 1
   fi
   if _bootstrap_verify_manifest "$RUNTIME_DIR"; then
-    mv "$tmp" "$ORCHESTRATION_DIR/quarantine/$(basename "$tmp").$$.$RANDOM"
+    mv "$tmp" "$ORCHESTRATION_DIR/quarantine/$(basename "$tmp").$$.$RANDOM" \
+      || echo "BOOTSTRAP_QUARANTINE_MV_FAILED:$tmp" >&2
     echo BOOTSTRAP_RACE_LOST_VALID
     return 0
   fi
-  mv "$tmp" "$ORCHESTRATION_DIR/quarantine/$(basename "$tmp").$$.$RANDOM"
+  mv "$tmp" "$ORCHESTRATION_DIR/quarantine/$(basename "$tmp").$$.$RANDOM" \
+    || echo "BOOTSTRAP_QUARANTINE_MV_FAILED:$tmp" >&2
   echo "BOOTSTRAP_RACE_LOST_INVALID:$RUNTIME_DIR" >&2
   return 1
 }
@@ -1202,7 +1204,8 @@ _bootstrap_sweep_orphans() {
     [ -e "$orphan" ] || continue
     orphan_age=$(( now - $(stat -c %Y "$orphan" 2>/dev/null || echo "$now") ))
     [ "$orphan_age" -ge "$orphan_age_threshold" ] || continue
-    mv "$orphan" "$quarantine/$(basename "$orphan").$$.$RANDOM"
+    mv "$orphan" "$quarantine/$(basename "$orphan").$$.$RANDOM" \
+      || echo "BOOTSTRAP_QUARANTINE_MV_FAILED:$orphan" >&2
   done
 }
 
@@ -1241,15 +1244,12 @@ bootstrap_runtime() {
   #    from under a live extraction would corrupt that attempt -- the
   #    renameat2(..., RENAME_NOREPLACE) publish step is what makes that race
   #    safe, and an unconditional sweep here would defeat it by deleting one
-  #    side of the race before it ever gets to publish.
-  orphan_age_threshold="${BOOTSTRAP_ORPHAN_AGE_SECONDS:-300}"
-  now="$(date +%s)"
-  for orphan in "$ORCHESTRATION_DIR"/.runtime.tmp.*; do
-    [ -e "$orphan" ] || continue
-    orphan_age=$(( now - $(stat -c %Y "$orphan" 2>/dev/null || echo "$now") ))
-    [ "$orphan_age" -ge "$orphan_age_threshold" ] || continue
-    mv "$orphan" "$quarantine/$(basename "$orphan").$$.$RANDOM"
-  done
+  #    side of the race before it ever gets to publish. Same helper as the
+  #    BOOTSTRAP_REUSED path above -- was hand-duplicated inline here, which
+  #    also leaked orphan_age_threshold/now/orphan/orphan_age as globals
+  #    (this function's own `local` declaration at its top never covered
+  #    them, since they were never declared local in the duplicate).
+  _bootstrap_sweep_orphans "$quarantine"
 
   # 3. Create a unique staging directory (mkdir already gives O_EXCL-equivalent
   #    directory-creation semantics) under umask 077.
@@ -2237,6 +2237,16 @@ only distinguishes what its own tests need.
 #   97  VENDOR_HEADROOM_REFUSED -- the spend/quota probe below refused (or could not prove liveness)
 # Each return site keeps its own echo token; grep for the token, not the number.
 
+# The single source for the 5b spend/quota-ceiling signature vocabulary
+# (Failure handling table below and this file's own comments call it "5b
+# ceiling"). Both `_vendor_headroom_probe`'s probe-refusal check and
+# `classify_attempt`'s substantive-dispatch check must recognise the SAME
+# words -- they were previously two hand-duplicated copies of this literal,
+# which could silently drift apart.
+_spend_ceiling_pattern() {
+  printf '%s' 'spend limit|monthly spend|usage limit reached|credit balance is too low|billing|quota exceeded|contact your organization administrator|insufficient_quota'
+}
+
 # One minimal, cheap liveness call proving the vendor CLI currently responds
 # and is not mid a spend/quota refusal. This is the ONLY vendor spend before
 # the registry timeout/spend gates below. It proves ONLY current liveness --
@@ -2294,7 +2304,7 @@ _vendor_headroom_probe() {
   # below -- a probe refusal and a substantive-dispatch ceiling are the same
   # account-level condition, so they must be recognised by the same words.
   if "$GREP_BIN" -qiE \
-      'spend limit|monthly spend|usage limit reached|credit balance is too low|billing|quota exceeded|contact your organization administrator|insufficient_quota' \
+      "$(_spend_ceiling_pattern)" \
       "$probe_out" "$probe_err" 2>/dev/null
   then
     return 1
@@ -3371,7 +3381,7 @@ classify_attempt() {
   combined="$combined
 $(tail -n 40 "$err" 2>/dev/null)"
   if printf '%s' "$combined" | "$GREP_BIN" -qiE \
-    'spend limit|monthly spend|usage limit reached|credit balance is too low|billing|quota exceeded|contact your organization administrator|insufficient_quota'
+    "$(_spend_ceiling_pattern)"
   then
     CLASSIFY_ATTEMPT_RESULT=SPEND_CEILING
     CLASSIFY_ATTEMPT_REASON="rc=$rc"
@@ -4325,6 +4335,15 @@ record_event() {
   _run_log_lock_acquire || return 1
   local event_id schema
   event_id="$(_record_event_next_id)"
+  # Documented exception to "fail loudly, never silently default"
+  # (policy_value's own doctrine, "Policy lookup contract" above): unlike
+  # every other policy_value call site in this document, record_event's own
+  # ATTEMPT_ALLOCATED writer (allocate_attempt, Phase -1) and other early
+  # call sites are exercised in real, supported states where $RUNTIME_DIR/
+  # policy.tsv is not yet materialized (bootstrap_runtime, gate 5, has not
+  # run yet) -- schema=2 is the CURRENT and only schema this document has
+  # ever defined (see the "process_schema_version" policy row above), so
+  # defaulting to it here is a known, bounded fallback, not a guess.
   schema="$(policy_value process_schema_version 2>/dev/null)"; [ -n "$schema" ] || schema=2
   {
     printf -- '--- %s  event=%s\n' "$(iso_now)" "$event_type"
@@ -5261,10 +5280,11 @@ _write_lease_state() {
   local lease_file="${1:-${ORCHESTRATION_DIR:-}/write-lease.json}"
   [ -f "$lease_file" ] || { echo NO_LEASE; return 0; }
   jq empty "$lease_file" >/dev/null 2>&1 || { echo MALFORMED_LEASE; return 0; }
-  local dispatch_id authority acquired_at
+  local dispatch_id authority acquired_at acquired_epoch_stored
   dispatch_id="$(jq -r '.dispatch_id // empty' "$lease_file" 2>/dev/null)"
   authority="$(jq -r '.authority // empty' "$lease_file" 2>/dev/null)"
   acquired_at="$(jq -r '.acquired_at // empty' "$lease_file" 2>/dev/null)"
+  acquired_epoch_stored="$(jq -r '.acquired_epoch // empty' "$lease_file" 2>/dev/null)"
   case "$authority" in role|orchestrator) : ;; *) echo MALFORMED_LEASE; return 0 ;; esac
 
   if [ -z "$dispatch_id" ] || [ "$dispatch_id" = null ]; then
@@ -5296,7 +5316,14 @@ _write_lease_state() {
     "")
       local now acquired_epoch age
       now="$(date +%s)"
-      acquired_epoch="$(date -u -d "$acquired_at" +%s 2>/dev/null)"
+      # Prefer the epoch stamped at acquisition time (no reparse needed).
+      # Fall back to the GNU-only `date -d` parse only for leases written
+      # before acquired_epoch existed.
+      if [ -n "$acquired_epoch_stored" ] && [ "$acquired_epoch_stored" != null ]; then
+        acquired_epoch="$acquired_epoch_stored"
+      else
+        acquired_epoch="$(date -u -d "$acquired_at" +%s 2>/dev/null)"
+      fi
       if [ -n "$acquired_epoch" ]; then
         age=$((now - acquired_epoch))
       else
@@ -5477,16 +5504,24 @@ acquire_write_lease() {
   local foreign_paths_json
   foreign_paths_json="$(_write_lease_foreign_paths_now "$dispatch_id")"
 
+  # acquired_epoch is captured from the SAME `date` invocation family as
+  # acquired_at, once, here -- so the read side (`_write_lease_state`) never
+  # has to reparse the formatted timestamp with GNU-only `date -d` (that
+  # reparse silently failed on non-GNU `date`, reproducing the exact false
+  # AMBIGUOUS_LEASE this lease-startup-grace machinery exists to prevent).
+  # Leases written before this field existed fall back to the old parse.
   tmp="$ORCHESTRATION_DIR/.write-lease.tmp.$BASHPID.$RANDOM"
   jq -n \
     --argjson schema_version 2 --argjson dispatch_id "$dispatch_id_json" \
     --arg lease_owner "$owner" --arg authority "$authority" --arg phase "$phase" \
-    --arg acquired_at "$(iso_now)" --arg baseline_head "$baseline_head" \
+    --arg acquired_at "$(iso_now)" --argjson acquired_epoch "$(date +%s)" \
+    --arg baseline_head "$baseline_head" \
     --argjson declared_write_paths "$declared_json" \
     --argjson declared_foreign_paths "$foreign_paths_json" --argjson declared_foreign_commits '[]' \
     --arg snapshot_manifest_path "$manifest_dir/manifest.json" \
     '{schema_version:$schema_version, dispatch_id:$dispatch_id, lease_owner:$lease_owner,
       authority:$authority, phase:$phase, acquired_at:$acquired_at,
+      acquired_epoch:$acquired_epoch,
       baseline_head:$baseline_head, declared_write_paths:$declared_write_paths,
       declared_foreign_paths:$declared_foreign_paths,
       declared_foreign_commits:$declared_foreign_commits,
@@ -6328,6 +6363,16 @@ canary_preflight() {
     return 1
   fi
 
+  # write-lease.json's startup-grace fallback (for leases written before
+  # acquired_epoch existed) reparses acquired_at with GNU-only `date -d`. A
+  # silent parse failure there reproduces the exact false AMBIGUOUS_LEASE the
+  # grace window exists to prevent, so the capability is asserted here as an
+  # environment defect rather than surfacing as a misclassified lease.
+  if [ "$(date -u -d "1970-01-01T00:00:01Z" +%s 2>/dev/null)" != "1" ]; then
+    echo "halt: 'date -d' cannot parse ISO-8601 UTC timestamps on this host (non-GNU date?)" >&2
+    return 1
+  fi
+
   # Syntax sanity-check both CLIs (no model call, no token spend).
   claude --help >/dev/null 2>&1 || { echo "halt: 'claude --help' failed" >&2; return 1; }
   claude --help 2>&1 | grep -q -- '--output-format' \
@@ -6366,12 +6411,14 @@ probe_models() {
     seen[$model]=1
     case "$(role_vendor "$role")" in
       claude)
-        printf 'ok\n' | claude --model "$model" -p --output-format=json \
+        printf 'ok\n' | timeout --kill-after=10s 30s \
+          claude --model "$model" -p --output-format=json \
           --dangerously-skip-permissions - >/dev/null 2>&1 \
           || { echo "model rejected: role=$role model=$model vendor=claude" >&2; rc=1; } ;;
       codex)
         [ "$codex_present" = yes ] || continue
-        printf 'ok\n' | codex -a never -m "$model" exec -C "$REPO_ROOT" \
+        printf 'ok\n' | timeout --kill-after=10s 30s \
+          codex -a never -m "$model" exec -C "$REPO_ROOT" \
           -s read-only --skip-git-repo-check --json - >/dev/null 2>&1 \
           || { echo "model rejected: role=$role model=$model vendor=codex" >&2; rc=1; } ;;
     esac
@@ -6548,34 +6595,47 @@ porcelain_offenders() {
   local a
   for a in "$@"; do [ -n "$a" ] && allow+=("${a%/}"); done
 
-  _allowed() {
-    local p="$1" d
-    for d in ${allow[@]+"${allow[@]}"}; do
-      [ "$p" = "$d" ] && return 0
-      case "$p" in "$d"/*) return 0 ;; esac
-    done
-    return 1
-  }
+  # A single pre-joined membership string, walked one path-ancestor at a
+  # time with a plain `case` substring match below, replaces the old
+  # define-then-`unset -f _allowed` global-function closure substitute --
+  # that was a latent reentrancy trap (bash functions are always global; a
+  # nested/concurrent porcelain_offenders call could unset _allowed out from
+  # under another call still relying on it). Nothing here is global, so
+  # there is nothing for a second call to clobber. "$p is allowed" iff some
+  # ancestor of $p (walking up via dirname, $p itself included) is exactly
+  # one of the allow entries -- the same "equal to, or nested under" rule
+  # `_allowed` used to implement per-entry. An empty $allow_joined ("||")
+  # matches nothing, same as the old empty-array case (everything is an
+  # offender).
+  local old_ifs="$IFS" allow_joined
+  IFS='|'; allow_joined="|${allow[*]}|"; IFS="$old_ifs"
 
-  local status path old
+  local status path old p cand
   while IFS= read -r -d '' entry; do
     status="${entry:0:2}"
     path="${entry:3}"
+    old=""
     case "$status" in
       R*|C*)
-        # Consume the second field: the ORIGINAL path.
-        IFS= read -r -d '' old || old=""
-        # Both sides must be in scope. Checking only the destination would hide
-        # a file being moved OUT of an out-of-scope location.
-        _allowed "$path" || printf '%s\n' "$path"
-        [ -n "$old" ] && { _allowed "$old" || printf '%s\n' "$old"; }
-        ;;
-      *)
-        _allowed "$path" || printf '%s\n' "$path"
-        ;;
+        # Consume the second field: the ORIGINAL path. Both sides must be in
+        # scope -- checking only the destination would hide a file being
+        # moved OUT of an out-of-scope location.
+        IFS= read -r -d '' old || old="" ;;
     esac
+    for p in "$path" ${old:+"$old"}; do
+      # Strip exactly one trailing slash before the walk (git reports an
+      # untracked DIRECTORY with one, per the note above) -- `dirname` on a
+      # string that still has one collapses straight past the directory's
+      # own name to its PARENT, which would skip the exact allow-list entry.
+      cand="${p%/}"
+      while :; do
+        case "$allow_joined" in *"|$cand|"*) continue 2 ;; esac
+        [ "$cand" = "." ] && break
+        cand="$(dirname -- "$cand")"
+      done
+      printf '%s\n' "$p"
+    done
   done < <(git -C "$repo" status --porcelain=v1 -z)
-  unset -f _allowed
 }
 
 # Gate: HALT when the target repo has changes outside the allow-list.
@@ -9440,7 +9500,18 @@ Git finalization moves after documentation so the final local commit can include
 2. If `$IMPLEMENTATION_BASE_SHA=non-git` (captured at Phase 6, spec §16.2), skip straight to step 6 with `REASON=not-a-git-repo`, `outcome=BLOCKED`, `base_sha=non-git`, `final_sha=non-git`, `staged_paths=[]`, `commit_sha=null` — no lease is ever acquired; there is nothing a lease could protect.
 3. Otherwise call `acquire_write_lease orchestrator-finalization orchestrator "" 10 <the staging paths from step 1>` (cookbook, spec §11.1/§20.10) — the third argument (`DISPATCH_ID`) is an EMPTY string, never the literal word `null`: the cookbook's own contract records an empty `DISPATCH_ID` as JSON `null` in `write-lease.json`, but a non-empty string `"null"` would be recorded as the JSON STRING `"null"`, not the JSON value `null` spec §20.10 requires. This single call itself IS the required "assert no lease remains" check — `acquire_write_lease` already refuses an active, malformed, stale, or ambiguous existing lease and returns non-zero without staging anything. On failure, go to step 6 with `REASON=<the refusal>`, `outcome=BLOCKED`, `base_sha`/`final_sha` = the pre-attempt `git -C "$REPO_ROOT" rev-parse HEAD` (nothing changed), `staged_paths=[]`, `commit_sha=null`.
 4. On success, `BASE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"`. Before staging, verify `git -C "$REPO_ROOT" diff --cached --name-only` is empty — a non-empty pre-existing staged diff is an unexplained dirty-tree-ownership conflict, not this phase's own doing. If non-empty: go to step 6 with `REASON=unexpected-pre-staged-paths`, `outcome=BLOCKED`, `final_sha=$BASE_SHA`, `commit_sha=null`, then release the lease (step 7). Otherwise stage ONLY the declared paths (`git -C "$REPO_ROOT" add -- <staging paths>`), then re-check `git diff --cached --name-only`: every staged path MUST be a member of the declared set — reject any path that is not (`git -C "$REPO_ROOT" restore --staged -- <the offending paths>`, then step 6 with `REASON=unexpected-staged-path`, `outcome=BLOCKED`).
-5. If the (now-verified) staged diff is empty, no in-scope path actually changed: go to step 6 with `REASON=no-in-scope-changes`, `outcome=NO_CHANGES`, `final_sha=$BASE_SHA`, `commit_sha=null` — a no-change result is valid and never creates an empty commit. Otherwise create the commit (`git -C "$REPO_ROOT" commit -m "<message per the plan's git rules / CLAUDE.md git policy>"`). On a non-zero exit (e.g. a failing commit hook), go to step 6 with `REASON=<the commit command's own exit code/stderr tail>`, `outcome=FAILED`, `final_sha=$BASE_SHA` (the commit never landed), `commit_sha=null` — do not retry blindly. On success, `FINAL_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"` and go to step 6 with `REASON=finalized`, `outcome=COMMITTED`, `commit_sha=$FINAL_SHA`.
+5. If the (now-verified) staged diff is empty, no in-scope path actually changed: go to step 6 with `REASON=no-in-scope-changes`, `outcome=NO_CHANGES`, `final_sha=$BASE_SHA`, `commit_sha=null` — a no-change result is valid and never creates an empty commit. Otherwise compose the commit message deterministically before committing, giving Phase 10's one durable git-visible artifact the same structural contract every other artifact in this document has (the manifest registry, above) instead of the prior free-form instruction:
+   - `FEATURE_SLUG="$(basename "$FEATURE_FOLDER" | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-//; s/-artifacts$//')"` — the `<slug>` component of the "Naming convention" pattern above.
+   - Line 1 (summary) — the ONLY line this template leaves to judgment: one line following the plan's own git-message convention (CLAUDE.md's conventional-commit style, e.g. `feat: <what changed>`), naming `$FEATURE_SLUG`.
+   - A blank line, then this fixed body, one field per line, every value already known from this run (never re-derived, never guessed):
+     ```
+     Spec: <$SPEC_PATH>
+     Plan: <$PLAN_PATH>
+     Gate verdicts: spec-review=<final spec-review iteration verdict>; plan-review=<final plan-review iteration verdict>; code-review=<final code-review iteration verdict>; all-tests=<Phase 8 summarizer's final_test_verdict>
+     ```
+   - A blank line, then this fixed footer: `Feature folder: <$FEATURE_FOLDER_REL>`
+
+   `$COMMIT_MSG` is these four parts (summary; body; footer) joined by blank lines exactly as laid out above. Create the commit (`git -C "$REPO_ROOT" commit -m "$COMMIT_MSG"`). On a non-zero exit (e.g. a failing commit hook), go to step 6 with `REASON=<the commit command's own exit code/stderr tail>`, `outcome=FAILED`, `final_sha=$BASE_SHA` (the commit never landed), `commit_sha=null` — do not retry blindly. On success, `FINAL_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"` and go to step 6 with `REASON=finalized`, `outcome=COMMITTED`, `commit_sha=$FINAL_SHA`.
 6. Record exactly one `record_event GIT_FINALIZATION_RESULT reason=$REASON base_sha=$BASE_SHA final_sha=$FINAL_SHA staged_paths=<JSON array of the staged-path manifest> commit_sha=<the commit SHA, or the literal word null> push_performed=no outcome=<COMMITTED|NO_CHANGES|BLOCKED|FAILED>` (spec §20.10 step 4). `reason` (the common envelope's own required field, never empty) is set by whichever branch above reached this step — COMMITTED and NO_CHANGES carry a plain descriptive reason exactly like every BLOCKED/FAILED branch already must, since `record_event` itself refuses any event with an empty `reason`. This is the ONLY durable record Phase 10 produces — there is no `git-status.md` and no per-phase folder (see "Folder layout" above); Phase 11 reads this event straight out of `RUN_LOG.md`.
 7. If a lease was acquired in step 3, release it now (`release_write_lease orchestrator-finalization`) — only after step 6's result is durable (spec §20.10 step 5). If no lease was ever acquired (the step 1, 2, or 3 early exits), there is nothing to release.
 
@@ -10687,8 +10758,9 @@ You are assigned at most `document_fixer_batch_size` finding IDs at a time (see 
 5. Address assigned MINOR findings only when the change is trivial and improves clarity; otherwise dispose them `already_satisfied` with a one-line reason (they are allowed to remain).
 6. Where reviewers disagree on the same finding, prefer the more conservative reading (more explicit, more constrained, less ambiguous).
 7. Where a finding requires a decision no one but the user can make, do NOT guess: dispose it `blocked` and set the overall verdict to `BLOCKED`.
-8. Inspect adjacent sections, references, and acceptance criteria your edit may have made stale (ripple check), per spec §18.4.
-9. For EVERY assigned finding ID, record exactly one disposition (spec §17.3's six-value vocabulary: `fixed`, `subsumed_by:<finding_id>`, `already_satisfied`, `blocked`, `accepted_risk:<decision_id>`, `deferred:<followup_id>`) by calling `record_finding_disposition` — the generated runtime's own disposition writer, never a hand-written status change:
+8. Do not restructure spec text the finding did not flag. If fixing an assigned finding surfaces an UNRELATED opportunity (a real improvement the finding itself did not flag), do NOT fold it into this pass — note it in your human-facing summary as a follow-up for a human to triage later; only edits addressing an assigned finding ID belong in this pass (spec §17.3/§18.4).
+9. Inspect adjacent sections, references, and acceptance criteria your edit may have made stale (ripple check), per spec §18.4.
+10. For EVERY assigned finding ID, record exactly one disposition (spec §17.3's six-value vocabulary: `fixed`, `subsumed_by:<finding_id>`, `already_satisfied`, `blocked`, `accepted_risk:<decision_id>`, `deferred:<followup_id>`) by calling `record_finding_disposition` — the generated runtime's own disposition writer, never a hand-written status change:
 
 <!-- lint: snippet -->
 ```bash
@@ -11066,7 +11138,9 @@ You are assigned at most `document_fixer_batch_size` finding IDs at a time.
 3. Patch the plan in place to address every BLOCKER and MAJOR among your assigned IDs — prefer simplifying, replacing, or deleting redundant text over appending another rule (spec §18.4).
 4. Address assigned MINOR findings opportunistically; otherwise dispose them `already_satisfied`.
 5. Where a finding requires user input, dispose it `blocked` and set `verdict=BLOCKED`.
-6. Preserve the plan's overall structure (header, file structure section, task numbering, TDD shape) and the `## Task Contract` block's schema (spec §19.1) — a field fix belongs in that JSON block, not only in the prose task description. Inspect adjacent sections/acceptance criteria for ripple effects.
+6. Preserve the plan's overall structure (header, file structure section, task numbering, TDD shape) and the `## Task Contract` block's schema (spec §19.1) — a field fix belongs in that JSON block, not only in the prose task description.
+7. Do not restructure plan text the finding did not flag. If fixing an assigned finding surfaces an UNRELATED opportunity (a real improvement the finding itself did not flag), do NOT fold it into this pass — note it in your human-facing summary as a follow-up for a human to triage later; only edits addressing an assigned finding ID belong in this pass (spec §17.3/§18.4).
+8. Inspect adjacent sections/acceptance criteria for ripple effects.
 
 For EVERY assigned finding ID, record exactly one disposition (spec §17.3's six-value vocabulary: `fixed`, `subsumed_by:<finding_id>`, `already_satisfied`, `blocked`, `accepted_risk:<decision_id>`, `deferred:<followup_id>`) by calling `record_finding_disposition` — the generated runtime's own disposition writer:
 
