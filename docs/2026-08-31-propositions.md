@@ -93,7 +93,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P05 — Wrap `probe_models` vendor calls in `timeout`
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (e534b81)
 
 **Criticality:** High · **Effort:** Easy
 
@@ -105,7 +105,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P06 — Store the write-lease acquisition epoch at write time; stop reparsing with GNU-only `date -d`
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (e534b81)
 
 **Criticality:** High · **Effort:** Easy
 
@@ -117,7 +117,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P07 — `record_event` must not silently default the schema version
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (e534b81)
 
 **Criticality:** Medium · **Effort:** Easy
 
@@ -204,7 +204,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P14 — Copy the implementation-fixer's scope-creep clause into spec-fixer and plan-fixer
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (e534b81)
 
 **Criticality:** Medium · **Effort:** Easy
 
@@ -303,7 +303,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P22 — Consolidate duplicated cookbook plumbing (six small single-source fixes)
 
-**Status:** ⬜ pending
+**Status:** 🟨 items 1, 2, 6 implemented (e534b81); items 3–5 pending
 
 **Criticality:** Medium · **Effort:** Easy–Moderate (independent items)
 
@@ -331,7 +331,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P24 — Give the Phase 10 commit message a deterministic contract
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (e534b81)
 
 **Criticality:** Low · **Effort:** Easy
 
