@@ -51,7 +51,7 @@ Diffs touching no seam-classified file skip the dispatch entirely (zero added co
 
 ## P02 — Extend the `MISSING_SKILLS` re-probe from Phase 1 to every per-phase preflight gate
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (55f3872)
 
 **Criticality:** High · **Effort:** Moderate
 
@@ -141,7 +141,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P09 — Drop the Phase 6 Codex preflight dispatch (it is paid and purely informational)
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (55f3872)
 
 **Criticality:** Medium (pure cost) · **Effort:** Easy
 
@@ -180,7 +180,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P12 — Fix the Codex skill probe at the source: one-command scan plus an `UNCERTAIN` verdict
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (55f3872)
 
 **Criticality:** Medium · **Effort:** Easy–Moderate
 
