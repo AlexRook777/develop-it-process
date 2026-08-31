@@ -258,9 +258,72 @@ if declare -F vendor_proven >/dev/null && declare -F vendor_proven_mark >/dev/nu
   assert_eq false "$(vendor_proven claude)" \
     "T10 vendor_proven: a SPEND_CEILING classification DOES revoke a prior proof"
 
+  # Task 6 (P04) regression: vendor_proven's OLD parser split RUN_LOG.md on
+  # every blank line (`text.split("\n\n")`), so a VENDOR_PROVEN block whose
+  # own `reason` happens to embed a blank line was itself split in two: the
+  # first half keeps the header but loses the `vendor:`/`role:` lines (which
+  # record_event always prints AFTER reason), and the second half keeps
+  # `vendor:`/`role:` but loses the header line the old parser required to
+  # recognize a block at all -- so the whole event became invisible to
+  # vendor_proven, which is the exact bug _run_log_events_json's own header-
+  # line-anchored split (used here via the shared _run_log_latest_field
+  # helper) was written to fix.
+  : > "$_t10_vp_ff/RUN_LOG.md"
+  assert_eq false "$(vendor_proven claude)" \
+    "T6 regression setup: claude starts unproven in the fresh fixture"
+  record_event VENDOR_PROVEN role=implementer vendor=claude \
+    reason="$(printf 'substantive dispatch completed\n\nreason wraps onto a second paragraph')" \
+    >/dev/null
+  assert_eq true "$(vendor_proven claude)" \
+    "T6 (P04) regression: a VENDOR_PROVEN event whose reason embeds a blank line is still read correctly (old blank-line-split parser made it invisible)"
+
   rm -rf "$(dirname "$_t10_vp_ff")"
 else
   _fail "vendor_proven / vendor_proven_mark are not both defined"
+fi
+
+# --- Task 6 (P04) regression: dispatch_is_running exact dispatch_id match --
+# The old scanner's `case "$line" in *"$id")` was an UNANCHORED SUFFIX match
+# against the whole `dispatch_id:<value>` line: a DISPATCH_COMPLETED for some
+# unrelated, LONGER dispatch id that merely ENDS WITH the id being queried
+# would incorrectly satisfy that pattern and falsely mark the queried id
+# completed. Pin the fix: a completion for a longer id sharing the queried
+# id's exact string as a suffix must never affect the queried id's own
+# still-running answer.
+if declare -F dispatch_is_running >/dev/null; then
+  _t6_dir_ff="$(mktemp -d)/artifacts"; mkdir -p "$_t6_dir_ff"
+  FEATURE_FOLDER="$_t6_dir_ff"
+  ORCHESTRATION_DIR="$_t6_dir_ff/.orchestration"
+  mkdir -p "$ORCHESTRATION_DIR"
+  : > "$_t6_dir_ff/RUN_LOG.md"
+
+  _t6_short_id="p07-i01-code-reviewer-claude-a01"
+  _t6_long_id="prefix-$_t6_short_id"
+
+  record_event DISPATCH_STARTED phase=7 iteration=01 dispatch_id="$_t6_short_id" \
+    reason="t6 fixture start" phase_name=code-review role=code-reviewer-claude vendor=claude \
+    logical_dispatch_id=p07-i01-code-reviewer-claude model=claude-x \
+    status_path=/dev/null cwd=/tmp lease=none snapshot=none >/dev/null
+  # A DISPATCH_COMPLETED for an entirely different, longer dispatch id that
+  # happens to END with the short id's exact string.
+  record_event DISPATCH_COMPLETED phase=7 iteration=01 dispatch_id="$_t6_long_id" \
+    reason="t6 fixture complete for the UNRELATED longer id" phase_name=code-review \
+    role=code-reviewer-claude vendor=claude appendix=code-reviewer-claude \
+    logical_dispatch_id=p07-i01-code-reviewer-claude-other develop_it_git_sha=deadbeef \
+    develop_it_file_sha256=abc123 develop_it_dirty=clean status_path=/dev/null \
+    verdict=DONE classification=COMPLETED exit_code=0 model=claude-x \
+    start_ms=0 end_ms=1 duration_ms=1 stdout_path=/tmp/out stderr_path=/tmp/err \
+    mutation_state=NO_SIDE_EFFECTS checkpoint_kind=none tokens_input_new=0 \
+    tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 \
+    cost_usd=n/a usage_status=ok >/dev/null
+
+  dispatch_is_running "$_t6_short_id"
+  assert_rc 0 $? \
+    "T6 (P04) regression: dispatch_is_running is still TRUE for the short id -- an unrelated longer id's completion (mere suffix match) must not falsely complete it"
+
+  rm -rf "$(dirname "$_t6_dir_ff")"
+else
+  _fail "dispatch_is_running is not defined"
 fi
 
 # --- Task 10: applicable_optional_skills is the installed ∩ relevant set ----
