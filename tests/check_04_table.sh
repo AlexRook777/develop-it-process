@@ -60,8 +60,8 @@ assert_tsv_key "$BUILD/roles.tsv" role documentation-writer
 assert_tsv_missing_key "$BUILD/roles.tsv" role finishing-branch
 assert_tsv_field "$BUILD/roles.tsv" impl-worker status_template none
 assert_tsv_field "$BUILD/roles.tsv" impl-worker phases child
-assert_eq 25 "$(tail -n +2 "$BUILD/roles.tsv" | wc -l | tr -d ' ')" "25 registry rows including child-only impl-worker"
-assert_eq 24 "$(awk -F '\t' 'NR>1 && $16 != "child" {n++} END {print n+0}' "$BUILD/roles.tsv")" "24 top-level dispatched roles"
+assert_eq 26 "$(tail -n +2 "$BUILD/roles.tsv" | wc -l | tr -d ' ')" "26 registry rows including child-only impl-worker"
+assert_eq 25 "$(awk -F '\t' 'NR>1 && $16 != "child" {n++} END {print n+0}' "$BUILD/roles.tsv")" "25 top-level dispatched roles"
 
 # --- role_* wrappers agree with the registry, for every row ---
 rows=0
@@ -77,7 +77,7 @@ while IFS= read -r _row_line; do
   assert_eq "$timeout" "$(role_timeout "$role" 2>/dev/null)" "role_timeout $role"
 done < <(tail -n +2 "$BUILD/roles.tsv")
 
-assert_eq 25 "$rows" "role table covers all 25 registry rows"
+assert_eq 26 "$rows" "role table covers all 26 registry rows"
 
 # No stale ids, and no model may be named only in the table.
 for m in claude-haiku-4-5 claude-opus-5 claude-sonnet-5 gpt-5.6-luna gpt-5.6-sol; do
@@ -103,7 +103,7 @@ assert_eq no  "$(role_may_spawn_children impl-worker)" \
   "T13: impl-worker's own contract forbids spawning a grandchild"
 
 # Code review fix (round 1, finding 11): the two checks above only look at
-# TWO of the 25 registry rows -- prove the claim in their own messages ("only
+# TWO of the 26 registry rows -- prove the claim in their own messages ("only
 # the implementer") against every OTHER role too, not just these two.
 _t13_spawn_offenders="$(awk -F '\t' 'NR>1 && $1!="implementer" && $8=="yes" {print $1}' "$BUILD/roles.tsv")"
 assert_eq "" "$_t13_spawn_offenders" \
@@ -112,7 +112,9 @@ assert_eq "" "$_t13_spawn_offenders" \
 # --- Task 14: phase renumbering -- documentation-writer stays phase 9,
 # readiness-writer moves from 10 to 11. No new role is added for Phase 10
 # (local git finalization): it is a direct orchestrator operation, never a
-# dispatched role, so the registry stays at 25 rows / 24 top-level roles.
+# dispatched role, so the registry never gains a phase-10 row (Task 5/P01's
+# seam-verifier is a phase-7 row, not phase 10, and brings the registry to
+# 26 rows / 25 top-level roles).
 assert_tsv_field "$BUILD/roles.tsv" documentation-writer phases 9
 assert_tsv_field "$BUILD/roles.tsv" readiness-writer phases 11
 assert_eq 0 "$(awk -F '\t' 'NR>1 && $16=="10" {n++} END {print n+0}' "$BUILD/roles.tsv")" \

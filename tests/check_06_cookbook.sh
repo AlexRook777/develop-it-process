@@ -442,6 +442,7 @@ if declare -F render_prompt >/dev/null; then
   RUN_LOG=/tmp/ff/RUN_LOG.md
   RELEVANT_ARTIFACTS="/tmp/a.md
 /tmp/b.md"
+  SEAM_FILES="/tmp/deploy/manifest.yaml"
   FINAL_DIFF=/tmp/final.diff
   ACCEPTED_SPEC=/tmp/spec.md
   IMPLEMENTATION_SUMMARY=/tmp/impl.md
@@ -1813,7 +1814,7 @@ _t8_code_types="$(printf '%s\n' \
   PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE LOCAL_CLI_CANARIES_PASSED TARGET_DIRTY_TREE_GATE_PASSED \
   PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED RUNTIME_AND_REGISTRIES_VERIFIED VENDOR_PROVEN \
   CONVERGENCE_RECORDED DIVERGENCE_DETECTED DIVERGENT_ROUND_CAP_REACHED \
-  PLAN_REVIEW_STALE \
+  PLAN_REVIEW_STALE SEAM_VERIFIER_SKIPPED \
   | sort)"
 assert_eq "$_t8_code_types" "$_t8_registry_types" \
   "event_required_fields' own type list matches the Event Contract Registry exactly"

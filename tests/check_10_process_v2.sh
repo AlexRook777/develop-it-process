@@ -14,11 +14,12 @@ assert_contains '| artifact_growth_warning_pct | 10 |' "$PROCESS_DOC" "growth th
 assert_contains '| divergent_round_cap | 2 |' "$PROCESS_DOC" "divergence cap"
 assert_contains '| long_role_headroom_threshold_minutes | 60 |' "$PROCESS_DOC" "long-role threshold"
 assert_contains '| test_suite_parallel_safe | no |' "$PROCESS_DOC" "test-suite parallel-safety flag"
+assert_contains '| seam_globs |' "$PROCESS_DOC" "seam glob registry (P01)"
 
 # extract.py writes $BUILD/policies.tsv itself; redirecting stdout onto the same
 # path would splice two independent writes at offset 0.
 python3 "$REPO_TOP/tests/lib/extract.py" policies > /dev/null
-assert_line_count 13 "$BUILD/policies.tsv" "policy header plus 12 rows"
+assert_line_count 14 "$BUILD/policies.tsv" "policy header plus 13 rows"
 
 # shellcheck source=lib/v2_fixtures.sh
 source "$REPO_TOP/tests/lib/v2_fixtures.sh"
@@ -132,7 +133,7 @@ appendix_pub_bad="$(printf '%s\n' "$appendix_pub_report" | sed -n 1p)"
 appendix_pub_count="$(printf '%s\n' "$appendix_pub_report" | sed -n 2p)"
 assert_eq "" "$appendix_pub_bad" \
   "every appendix calls \$STATUS_PUBLISHER_PATH exactly once (offenders: role:count)"
-assert_eq 24 "$appendix_pub_count" "24 top-level role appendices were scanned"
+assert_eq 25 "$appendix_pub_count" "25 top-level role appendices were scanned"
 
 # The retired v1 phrasing ("write STATUS ... atomically (write .tmp then
 # rename)") must be gone from every appendix -- a hand-rolled atomic-write

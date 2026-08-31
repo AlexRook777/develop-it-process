@@ -289,6 +289,7 @@ this account and is used for the cheap `preflight-codex` probe;
 | debugger | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;plan_path;implementation_summary_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 6 |
 | code-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
 | code-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
+| seam-verifier | claude | claude-opus-5 | — | 30 | no | no | no | feature_folder;iteration;spec_path;seam_files | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
 | implementation-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | accepted_plan;reviewed_revision;finding_ids;iteration;write_lease | implementation_base_sha;run_log;relevant_artifacts;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | changed_paths;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;finding_dispositions | implementation | 7 |
 | all-tests-runner | claude | claude-sonnet-5 | — | 60 | yes | yes | no | feature_folder;repo_root;round | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;test_report | PASS;FAIL;SKIPPED | common_v2 | none | 8 |
 | test-fixer | claude | claude-sonnet-5 | — | 60 | yes | yes | no | feature_folder;plan_path;round;test_report_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 8 |
@@ -344,8 +345,8 @@ is edited to match.
 ## Process Policy Registry
 
 These are the reviewed schema-v2 policy constants — numeric caps/thresholds
-plus one process-wide declaration flag. Each is a fixed process constant —
-not a per-run tunable — and every occurrence of one of these TWELVE named
+plus two process-wide declaration flags. Each is a fixed process constant —
+not a per-run tunable — and every occurrence of one of these THIRTEEN named
 constants elsewhere in this document (caps, thresholds, retry counts,
 declared flags) must agree with this table. This table is not a claim that
 every numeric cap anywhere in the document lives here: Phase 8's test-fix
@@ -355,7 +356,12 @@ schema v2 and was deliberately never migrated into this reviewed set —
 narrowing this claim, not adding a row for THAT cap, is what keeps the
 Phase 8 fix-round cap itself out of this table. `test_suite_parallel_safe`
 (P03) is a distinct, deliberate addition — a per-project declaration, not a
-numeric cap — bringing this table's own count to twelve.
+numeric cap — bringing this table's own count to twelve. `seam_globs` (P01)
+is the thirteenth: the `;`-separated list of shell glob patterns (matched
+with `case`, never a hand-rolled regex) that classify a changed file as an
+integration seam — deploy manifests, migration directories, env/config
+files, and third-party client wrappers — for the Phase 7 seam-verifier
+dispatch gate (see "Seam classification gate" below).
 `tests/lib/extract.py policies` extracts this table verbatim; `tests/check_10_process_v2.sh`
 asserts every row is present with its exact value.
 
@@ -373,6 +379,7 @@ asserts every row is present with its exact value.
 | divergent_round_cap | 2 | Consecutive divergent rounds before automatic fixing stops |
 | long_role_headroom_threshold_minutes | 60 | Timeout threshold requiring a just-in-time vendor liveness/headroom probe |
 | test_suite_parallel_safe | no | Whether the target project's test suite tolerates its own default parallel worker count (`yes`) or must be forced serial under the P03 test-execution lease (`no`, default) |
+| seam_globs | deploy/*;infra/*;terraform/*;*.tf;*.tfvars;migrations/*;*/migrations/*;.env*;*.env;config/*;*/clients/* | `;`-separated shell glob patterns classifying a changed file as an integration seam (deploy manifests, migration dirs, env/config files, third-party client wrappers) for the Phase 7 seam-verifier dispatch gate (P01) |
 
 Resolve a single policy value with the cookbook helper below — never by
 re-reading this table with ad hoc `grep`/`awk`, which would drift from the
@@ -588,6 +595,13 @@ verdict lives in its own attempt-scoped `STATUS.md` under
 `attempts/<dispatch-id>/`, and `ingest_findings` merges both reviewers'
 findings into one per-iteration `findings-catalog.jsonl`). A filename must
 not assert a model, or it starts lying the moment the Models table changes.
+Phase 7's `seam-verifier` (P01) is the one documented exception to the
+vendor-named convention: it shares vendor `claude` with `code-reviewer-claude`
+in the SAME iteration directory, so a vendor-named file would collide with
+that reviewer's own `claude-findings.jsonl`. Its findings file is named by
+**role** instead — `seam-findings.jsonl` — the same collision-avoidance
+reasoning the vendor convention itself exists for, applied to the one case
+where two roles in one gate now share a vendor.
 
 Phase 10 (`git-finalization`, Local Git Finalization) intentionally has no `10-git-finalization/` folder at all: it is a direct orchestrator operation with no dispatched role and no attempt directory of its own — its only durable trace is the single `event=GIT_FINALIZATION_RESULT` entry it records in `RUN_LOG.md` (spec §20.10). Phase 11 (`readiness-report`) is different: it DOES dispatch a role (`readiness-writer`, via the same `dispatch_attempt` every other phase uses), so `dispatch_attempt` materializes the ordinary `11-readiness-report/00/attempts/<dispatch-id>/STATUS.md` housekeeping path for that one attempt — a real folder does exist, exactly like `9-documentation/00/attempts/...`. What `11-readiness-report/` never holds is the two HUMAN-FACING outputs: `final-readiness-report.md` and `readiness-status.md` are cross-cutting feature-folder artifacts consumed by the user at the top level, so the `readiness-writer` appendix writes them directly to the feature-folder root rather than inside its own phase folder. The same "root, not phase-internal" rationale applies to `RUN_LOG.md`, `full_log.md`, `transcripts/`, `followups.jsonl`, and the optional `process-improvement-proposition.md`.
 
@@ -1983,6 +1997,7 @@ render_keys() {
     REPO_ROOT ROUND TEST_REPORT_PATH RESOLVED_MODELS CONTEXT7_POLICY GREP_BIN \
     ACCEPTED_PLAN REVIEWED_REVISION FINDING_IDS WRITE_LEASE RUN_LOG \
     RELEVANT_ARTIFACTS FINAL_DIFF ACCEPTED_SPEC IMPLEMENTATION_SUMMARY \
+    SEAM_FILES \
     TEST_SUMMARY REVIEW_SUMMARY DECISIONS EXCLUSIONS FOLLOWUPS DOCS_INVENTORY \
     PHASE PHASE_DIR DISPATCH_ID LOGICAL_DISPATCH_ID ATTEMPT ROLE_CONTRACTS_PATH \
     STATUS_PUBLISHER_PATH CONTINUATION_PATH DECLARED_FOREIGN_CHANGES RUNTIME_DIR \
@@ -4120,6 +4135,7 @@ here does not itself populate that document).
 | DIVERGENCE_DETECTED | phase_name;divergence_reason | yes |
 | DIVERGENT_ROUND_CAP_REACHED | phase_name;cap_value;divergent_rounds | yes |
 | PLAN_REVIEW_STALE | phase_name;plan_revision | no |
+| SEAM_VERIFIER_SKIPPED | phase_name;role;vendor | no |
 
 `ATTEMPT_ALLOCATED` is one row beyond the spec's own 23-name list: it is the
 pre-existing attempt-identity event `allocate_attempt` has always written
@@ -4168,6 +4184,15 @@ above, not a new type: `ingest_findings` calls it with
 since no prior RUN_LOG event exists to correct — findings live in the
 per-iteration `findings-catalog.jsonl`, never in `RUN_LOG.md` itself) and
 `replacement_classification=finding_collision`.
+
+`SEAM_VERIFIER_SKIPPED` (P01, the row after `PLAN_REVIEW_STALE`) is written
+by `seam_verifier_dispatch_files` (Runtime cookbook, "Seam classification
+gate" below) the moment a Phase 7 iteration's diff touches no
+`seam_globs`-classified file — routine evidence that the bounded
+seam-verifier dispatch was correctly skipped, exactly the same
+`phase_name;role;vendor`-scoped shape `CODEX_SKIPPED_BY_USER_CONSENT`
+already uses, and not `proposition_required` for the same reason: a skipped
+zero-cost dispatch is not a failure or a process deviation.
 
 <!-- lint: cookbook -->
 ```bash
@@ -4235,6 +4260,7 @@ event_required_fields() {
     DIVERGENCE_DETECTED)         printf '%s\n' "phase_name;divergence_reason" ;;
     DIVERGENT_ROUND_CAP_REACHED) printf '%s\n' "phase_name;cap_value;divergent_rounds" ;;
     PLAN_REVIEW_STALE)           printf '%s\n' "phase_name;plan_revision" ;;
+    SEAM_VERIFIER_SKIPPED)       printf '%s\n' "phase_name;role;vendor" ;;
     *) echo "EVENT_TYPE_UNKNOWN:$1" >&2; return 1 ;;
   esac
 }
@@ -9531,6 +9557,51 @@ After the implementer reports `DONE` or `DONE_WITH_EXCLUSIONS` with `verificatio
 
 Proceed to Phase 7 only after the summarizer reports `DONE`. If the summarizer fails (Mode 1/2/3/4/5), HALT — the readiness report depends on this `## Usage` section.
 
+### Seam classification gate (P01)
+
+Phase 7's own zero-token dispatch gate for the `seam-verifier` role (spec-adjacent P01, same "gate records its own skip evidence" shape `plan_review_stale_gate` above already uses): decides whether THIS iteration's diff touches an integration seam — a deploy manifest, a migration directory, an env/config file, or a third-party client wrapper — named by the `seam_globs` Process Policy Registry value (a `;`-separated list of shell glob patterns, matched with `case`, never a hand-rolled regex). A diff touching no seam-classified file skips the `seam-verifier` dispatch entirely: zero added cost on a pure in-repo change.
+
+The check is re-run fresh every iteration against the SAME cumulative diff scope the two code reviewers already use (`$IMPLEMENTATION_BASE_SHA` through this round's `$REVIEWED_REVISION`, never just the latest fixer round's own incremental change) — Step 7.1 never lets the two reviewers skip a re-review or carry forward a prior verdict once dispatched, and the seam-verifier dispatch DECISION mirrors that same rule: recomputed from scratch every iteration, never a carried-forward prior verdict.
+
+<!-- lint: cookbook -->
+```bash
+# ---- Seam classification (P01) ----------------------------------------------
+# Usage: seam_verifier_dispatch_files <phase> <iteration> <file> [<file> ...]
+# Prints the subset of the given files that match a seam_globs pattern, one
+# per line -- this iteration's $SEAM_FILES input for the seam-verifier
+# dispatch. An empty result means no seam-classified file is in scope: this
+# function has ALREADY recorded the required RUN_LOG evidence for that skip
+# (event=SEAM_VERIFIER_SKIPPED) before returning, so no call site can forget
+# to log why zero seams were dispatched this iteration.
+seam_verifier_dispatch_files() {
+  local phase="$1" iteration="$2"; shift 2
+  local globs pattern file
+  globs="$(policy_value seam_globs)" || return 1
+  local -a pats=()
+  IFS=';' read -r -a pats <<<"$globs"
+  local -a hits=()
+  for file in "$@"; do
+    [ -n "$file" ] || continue
+    for pattern in "${pats[@]}"; do
+      [ -n "$pattern" ] || continue
+      # shellcheck disable=SC2254  # intentional glob match against the
+      # seam_globs policy value -- this is a classification, not a literal
+      # string compare.
+      case "$file" in
+        $pattern) hits+=("$file"); break ;;
+      esac
+    done
+  done
+  if [ "${#hits[@]}" -eq 0 ]; then
+    record_event SEAM_VERIFIER_SKIPPED phase="$phase" iteration="$iteration" \
+      phase_name=code-review role=seam-verifier vendor=claude \
+      reason="no seam-classified file in the diff"
+    return 0
+  fi
+  printf '%s\n' "${hits[@]}"
+}
+```
+
 ## Phase 7 — Code review gate (delegated, two reviewers, severity-gated)
 
 Same shape as Phase 3, applied to the implementation diff and behavior.
@@ -9599,7 +9670,8 @@ For each iteration N (start at 1, hard cap `review_iteration_cap`):
    whole call waits on both children, so it inherits the longer of the two roles'
    timeouts.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
-3. Read only verdict files, then `ingest_findings code-reviewer-claude "$claude_status" "7-code-review/$ITERATION/claude-findings.jsonl"` and, when active, the codex counterpart — both merge into `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (derived from each STATUS_FILE's own attempt directory, never a phase-relative alias).
+   - **Seam verifier subprocess (dispatched if and only if this iteration's diff touches a seam-classified file — P01):** when `$IMPLEMENTATION_BASE_SHA != non-git`, compute the cumulative diff scope the same way the two reviewers do — `SEAM_CANDIDATES="$(git -C "$REPO_ROOT" diff --name-only "$IMPLEMENTATION_BASE_SHA" "$REVIEWED_REVISION" 2>/dev/null; git -C "$REPO_ROOT" ls-files --others --exclude-standard 2>/dev/null)"` — otherwise leave `SEAM_CANDIDATES` empty (there is no diff to classify). Call `SEAM_FILES="$(seam_verifier_dispatch_files 7 "$ITERATION" $SEAM_CANDIDATES)"` (Runtime cookbook, "Seam classification gate"). An empty `$SEAM_FILES` means that helper has ALREADY recorded `event=SEAM_VERIFIER_SKIPPED` — do not dispatch and do not log a second event. Otherwise dispatch one `claude` subprocess for role `seam-verifier` via `dispatch_attempt 7 "$ITERATION" seam-verifier`. Inputs: `$FEATURE_FOLDER`, `$ITERATION=NN`, `$SPEC_PATH`, `$SEAM_FILES` (the matched seam file list ONLY — never the whole diff). Its real STATUS: `seam_status="$(role_attempt_dir seam-verifier "$(_latest_attempt_id p07-i$ITERATION-seam-verifier)")/STATUS.md"`. Findings: `7-code-review/$ITERATION/seam-findings.jsonl` (role-named, not vendor-named — see the naming-convention note above; `claude-findings.jsonl` is already taken by `code-reviewer-claude` in this same directory). This role's timeout comes from the Models table via `role_timeout`. `unset SEAM_FILES SEAM_CANDIDATES` immediately after this dispatch decision, dispatched or not — the next iteration recomputes both from scratch rather than inheriting a stale list.
+3. Read only verdict files, then `ingest_findings code-reviewer-claude "$claude_status" "7-code-review/$ITERATION/claude-findings.jsonl"`, when active the codex counterpart, and — when the seam-verifier was dispatched this iteration — `ingest_findings seam-verifier "$seam_status" "7-code-review/$ITERATION/seam-findings.jsonl"`. All active reviewers merge into the SAME `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (derived from each STATUS_FILE's own attempt directory, never a phase-relative alias) — the gate's severity arithmetic, fixer loop, and iteration cap below read this one catalog and are unaware of how many reviewers fed it.
 4. Apply the iteration-dependent gate against the catalog counts — **iterations 1–2:** re-dispatch when `blockers + majors > 0`; **iterations 3 and up:** re-dispatch when `blockers > 0` OR any open major still lacks a disposition:
    - Call `reconstruct_checkpoint_state 7 "$ITERATION"` (`implementation-fixer` is Phase 7's own checkpointed role — see the `reconstruct_checkpoint_state` case table above — so this reads `p07-i$ITERATION-implementation-fixer`'s own prior attempt, never Phase 6's) so `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_CHANGES` reflect this exact iteration's own prior attempt, if any, before rendering the appendix.
    - `FINDING_IDS="$(select_finding_batch "$PHASE_DIR/$ITERATION/findings-catalog.jsonl")"` — the SAME path implementation-fixer itself reads; `ACCEPTED_PLAN="$PLAN_PATH"`; `WRITE_LEASE="$ORCHESTRATION_DIR/write-lease.json"`.
@@ -9894,7 +9966,8 @@ Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of `review_iteration
 `LOCAL_CLI_CANARIES_PASSED`, `TARGET_DIRTY_TREE_GATE_PASSED`,
 `PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED`, `RUNTIME_AND_REGISTRIES_VERIFIED`,
 `VENDOR_PROVEN`, `PLAN_REVIEW_STALE`, `CONTINUATION_CAP_REACHED`,
-`CONVERGENCE_RECORDED`, `DIVERGENCE_DETECTED`, `DIVERGENT_ROUND_CAP_REACHED`
+`CONVERGENCE_RECORDED`, `DIVERGENCE_DETECTED`, `DIVERGENT_ROUND_CAP_REACHED`,
+`SEAM_VERIFIER_SKIPPED`
 (plus the reserved `CODEX_RE_ENABLED_BY_USER`).
 Every type in this list beyond the legacy pre-schema-v2 names above has a row
 in the Event Contract Registry (below), which `record_event` validates
@@ -11936,6 +12009,89 @@ Verdict rule: `PASS` iff `blockers=0 AND majors=0`.
 
 Exit 0 only after the publisher exits 0.
 <!-- END: code-reviewer-codex -->
+
+<!-- BEGIN: seam-verifier -->
+# Role: seam-verifier
+
+You are an integration-seam verifier invoked as a fresh subprocess by the develop-it orchestrator. You have no shared context and you do NOT receive the implementation diff, the plan, or either code reviewer's findings — only the seam file list and the spec's integration claims. Your job is DIFFERENT from the two code reviewers: they read static evidence and argue from it; you EXECUTE live checks and report what actually happened. A prose argument that a seam "looks correct" is never evidence.
+
+## Role contract
+
+- Required inputs: `feature_folder;iteration;spec_path;seam_files`
+- Optional inputs: `none`
+- Outputs: `verdict;findings`
+- Allowed verdicts: `PASS;CHANGES_REQUESTED`
+- Required status fields: `common_v2;blockers;majors;minors;findings`
+- Checkpoint kind: `review`
+- Phases: `7`
+
+## Inputs
+
+- `$FEATURE_FOLDER`
+- `$ITERATION`
+- `$SPEC_PATH` — read only for its integration claims (what the change asserts about deploy config, migrations, env/config, or third-party services); not a general acceptance-criteria review.
+- `$SEAM_FILES` — the newline-separated list of seam-classified files touched by this iteration's diff (the `seam_globs` policy match — deploy manifests, migration directories, env/config files, third-party client wrappers). This is the ENTIRE scope of your review. Do not read, diff, or reason about any file outside this list plus `$SPEC_PATH`.
+
+## Mode
+
+`live-verification` mode (execution-only, seam-scoped). You never receive the full diff, the plan, or the other reviewers' findings, and you do not read `RUN_LOG.md`, any transcript, or any prior iteration's findings — your independence is over the seam files themselves, not over repository discovery. Do not run a broad `git diff`, `git log`, or repository-wide search; every command you run must be tied to producing or attempting live evidence for one specific file in `$SEAM_FILES`. There is no fixed command-count budget (unlike the Codex reviewers) — the bound is scope, not count: nothing outside `$SEAM_FILES` and `$SPEC_PATH` is in play.
+
+## Behavior
+
+For EACH file in `$SEAM_FILES`, classify it and attempt the matching live check:
+
+- **Migration** (a migration directory / migration-tool file): run the migration against a scratch or temporary database — never the project's real/shared database. If no scratch-DB story is reachable in this environment, do not guess: record `UNVERIFIABLE:<reason>`.
+- **Deploy manifest / IaC template**: run that tool's own dry-run or validate command (e.g. a Terraform validate, a CloudFormation template validation, a Kubernetes `--dry-run=client` apply) against the file. If no such validator is reachable, record `UNVERIFIABLE:<reason>`.
+- **Env/config file**: exercise the process's own config-loading path against it (its normal startup/config-check command, or a schema/lint check if one exists). If none is reachable, record `UNVERIFIABLE:<reason>`.
+- **Third-party client wrapper**: execute it against a sandbox or mock endpoint per the spec's own integration claims (never the real third-party service). If no sandbox/mock is reachable, record `UNVERIFIABLE:<reason>`.
+
+Every seam file yields either a captured command plus its real output/exit code, or an explicit `UNVERIFIABLE:<reason>` line — never a prose claim that the change "should work." A seam file whose live check actually passes produces no finding. A seam file that fails its live check produces a finding on the same BLOCKER / MAJOR / MINOR severity ladder the two code reviewers use, evidenced by the captured command output. A seam file recorded `UNVERIFIABLE:<reason>` ALSO produces a finding — mechanical default `severity: major` (an unverified integration seam is itself a coverage gap, never silently promoted to a pass) — unless the spec itself explicitly accepts that seam as out of scope for this change, in which case record `severity: minor` and say so in `required_change`.
+
+## Findings budget
+
+Max 5 BLOCKER/MAJOR + max 5 MINOR per iteration (one finding per seam file, at most). Each finding ≤ 150 words, and each MUST carry the actual command and captured output/exit code (or the literal `UNVERIFIABLE:<reason>`) in `evidence` — a finding whose `evidence` is prose reasoning alone is a defect in this role's own output.
+
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/7-code-review/$ITERATION/seam-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "seam-verifier"`, `vendor: "claude"`, `phase: "7"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path` (the specific seam file this finding concerns), `artifact_revision` (current `HEAD`), `location`, `line`, `issue_key`, `summary`, `evidence` (the real command + output/exit code, or `UNVERIFIABLE:<reason>`), `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
+
+## Publish STATUS
+
+Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
+own validator. Compose every field below, in this order, and pipe it to the
+generated publisher exactly once -- it is the ONLY sanctioned writer:
+
+<!-- lint: snippet -->
+```bash
+$STATUS_PUBLISHER_PATH \
+  --contracts $ROLE_CONTRACTS_PATH --role seam-verifier \
+  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
+  --phase 7 --iteration $ITERATION --attempt $ATTEMPT \
+  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
+  --allowed-root $FEATURE_FOLDER <<'STATUS'
+schema_version: 2
+dispatch_id: $DISPATCH_ID
+logical_dispatch_id: $LOGICAL_DISPATCH_ID
+role: seam-verifier
+phase: 7
+iteration: $ITERATION
+attempt: $ATTEMPT
+verdict: PASS | CHANGES_REQUESTED
+reason: <one line, or the literal word null>
+published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
+artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+output_count: 1
+output_01: <absolute path to the findings file you wrote>
+checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
+blockers: <int>
+majors: <int>
+minors: <int>
+findings: <path to the findings file you wrote, or none>
+STATUS
+```
+
+Verdict: `PASS` iff `blockers=0 AND majors=0`.
+
+Exit 0 only after the publisher exits 0.
+<!-- END: seam-verifier -->
 
 <!-- BEGIN: implementation-fixer -->
 # Role: implementation-fixer
