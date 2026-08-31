@@ -343,16 +343,19 @@ is edited to match.
 
 ## Process Policy Registry
 
-These are the reviewed schema-v2 numeric policy constants. Each is a fixed
-process constant — not a per-run tunable — and every occurrence of one of
-these ELEVEN named constants elsewhere in this document (caps, thresholds,
-retry counts) must agree with this table. This table is not a claim that
+These are the reviewed schema-v2 policy constants — numeric caps/thresholds
+plus one process-wide declaration flag. Each is a fixed process constant —
+not a per-run tunable — and every occurrence of one of these TWELVE named
+constants elsewhere in this document (caps, thresholds, retry counts,
+declared flags) must agree with this table. This table is not a claim that
 every numeric cap anywhere in the document lives here: Phase 8's test-fix
 round cap (hardcoded `3` fix rounds / `4` total, `all-tests-runner`/
 `test-fixer`) is a pre-existing, project-specific constant that predates
 schema v2 and was deliberately never migrated into this reviewed set —
-narrowing this claim, not adding a twelfth row, is what keeps this table's
-own count exactly eleven, per this plan's own preserved-constants list.
+narrowing this claim, not adding a row for THAT cap, is what keeps the
+Phase 8 fix-round cap itself out of this table. `test_suite_parallel_safe`
+(P03) is a distinct, deliberate addition — a per-project declaration, not a
+numeric cap — bringing this table's own count to twelve.
 `tests/lib/extract.py policies` extracts this table verbatim; `tests/check_10_process_v2.sh`
 asserts every row is present with its exact value.
 
@@ -369,6 +372,7 @@ asserts every row is present with its exact value.
 | artifact_growth_warning_pct | 10 | Per-fix net growth contributing to divergence detection |
 | divergent_round_cap | 2 | Consecutive divergent rounds before automatic fixing stops |
 | long_role_headroom_threshold_minutes | 60 | Timeout threshold requiring a just-in-time vendor liveness/headroom probe |
+| test_suite_parallel_safe | no | Whether the target project's test suite tolerates its own default parallel worker count (`yes`) or must be forced serial under the P03 test-execution lease (`no`, default) |
 
 Resolve a single policy value with the cookbook helper below — never by
 re-reading this table with ad hoc `grep`/`awk`, which would drift from the
@@ -5682,6 +5686,74 @@ perform a rollback; RM08's `HALT_EXACT_STATE` (Recovery Matrix, above)
 remains the only response to a genuinely dirty-and-uncheckpointed or
 integrity-unknown tree.
 
+### Test-execution lease (spec-adjacent, P03)
+
+A non-parallel-safe test suite (`policy_value test_suite_parallel_safe` =
+`no`, the default) shares one resource — most commonly a single test
+database — across every invocation. Two concurrent executions against it (a
+second `develop-it` run, an operator running tests by hand, or an
+over-eager `test-fixer` re-running tests while the Phase 8 runner loop is
+still live) invent failures neither run actually has, and Phase 8's fix
+loop then burns fix rounds "repairing" code that was never broken. The
+`test-lease` below is a SEPARATE lock from the mutation write-lease above:
+it serializes test EXECUTION, not repository writes, and it is held by
+anyone about to invoke the suite — the Phase 8 `all-tests-runner`, a
+`test-fixer` spot-checking its own fix (P10, below), and the implementer
+running its own plan-declared verification commands alike — never only a
+dispatched role. Deliberately NOT the mutation write-lease's own machinery:
+no dispatch-liveness classification and no before/after snapshot apply here
+— running tests mutates no tracked source, so there is nothing to snapshot,
+and a manual operator invocation has no `DISPATCH_ID`/RUN_LOG lifecycle to
+classify staleness against. Reused from that machinery is only the one part
+that actually transfers: exclusive file creation via `ln`, the same
+primitive that makes `acquire_write_lease` atomic under concurrent callers.
+A held lease past `TEST_LEASE_WAIT_TIMEOUT_SECONDS` (default 120s, polled
+every `TEST_LEASE_POLL_INTERVAL_SECONDS`, default 5s) is never forced —
+the caller HALTs, naming the lease path, exactly as spec'd: "a held lease
+means wait-with-timeout, then HALT with the lease path — never run
+concurrently."
+
+<!-- lint: cookbook -->
+```bash
+# Usage: acquire_test_lease OWNER PHASE
+acquire_test_lease() {
+  local owner="${1:-}" phase="${2:-}"
+  [ -n "$owner" ] || { echo "TEST_LEASE_BAD_OWNER" >&2; return 1; }
+  mkdir -p "${ORCHESTRATION_DIR:?}"
+  local lease_file="$ORCHESTRATION_DIR/test-lease.json"
+  local timeout="${TEST_LEASE_WAIT_TIMEOUT_SECONDS:-120}" \
+    interval="${TEST_LEASE_POLL_INTERVAL_SECONDS:-5}" waited=0 tmp
+  while :; do
+    tmp="$ORCHESTRATION_DIR/.test-lease.tmp.$BASHPID.$RANDOM"
+    jq -n --arg owner "$owner" --arg phase "$phase" --arg acquired_at "$(iso_now)" \
+      --argjson acquired_epoch "$(date +%s)" \
+      '{lease_owner:$owner, phase:$phase, acquired_at:$acquired_at, acquired_epoch:$acquired_epoch}' \
+      > "$tmp" 2>/dev/null || { rm -f "$tmp"; echo "TEST_LEASE_BUILD_FAILED" >&2; return 1; }
+    if ln "$tmp" "$lease_file" 2>/dev/null; then
+      rm -f "$tmp"
+      return 0
+    fi
+    rm -f "$tmp"
+    [ "$waited" -ge "$timeout" ] && break
+    sleep "$interval"
+    waited=$((waited + interval))
+  done
+  echo "TEST_LEASE_BLOCKED:$lease_file" >&2
+  return 1
+}
+
+# Usage: release_test_lease OWNER
+release_test_lease() {
+  local owner="${1:-}" lease_file="${ORCHESTRATION_DIR:?}/test-lease.json"
+  [ -n "$owner" ] || { echo "TEST_LEASE_BAD_OWNER" >&2; return 1; }
+  [ -f "$lease_file" ] || { echo "TEST_LEASE_NOT_HELD:$owner" >&2; return 1; }
+  local held_owner
+  held_owner="$(jq -r '.lease_owner // empty' "$lease_file" 2>/dev/null)"
+  [ "$held_owner" = "$owner" ] || { echo "TEST_LEASE_NOT_OWNER:$owner:$held_owner" >&2; return 1; }
+  rm -f "$lease_file"
+}
+```
+
 ### Checkpoint contract and resumable continuation (spec §10)
 
 Durable progress is append-only JSONL at the current attempt's own
@@ -8254,7 +8326,7 @@ handoff             required, non-null follow-up behavior whenever
 
 A task whose declared `actor` is `owner`, `CI`, or `deployed_environment` is an explicit handoff item, never a surprise implementer failure: the plan names exactly what that actor must do and what happens once it is done.
 
-`validate_plan_tasks` (cookbook, below) is the orchestrator's own zero-token structural gate over this block. It never substitutes for the plan reviewers' semantic judgment (is the objective right, is this command actually safe) — only for mechanical checks a reviewer should never have to spend a model call on: a duplicate task_id, a missing required field, an actor outside the four-value enum, an unreachable prerequisite or a cyclic dependency (prerequisites must form a DAG), a credential whose NAME is not currently available in the orchestrator's own environment (checked by presence only — the value is never read or printed, satisfying the no-secret-material rule), an ambiguous verification command, a verification command that is really just a post-implementation-only review remedy rather than an executable check, and a step/verification command that implies an external/destructive effect the task's own `side_effects` field left undeclared.
+`validate_plan_tasks` (cookbook, below) is the orchestrator's own zero-token structural gate over this block. It never substitutes for the plan reviewers' semantic judgment (is the objective right, is this command actually safe) — only for mechanical checks a reviewer should never have to spend a model call on: a duplicate task_id, a missing required field, an actor outside the four-value enum, an unreachable prerequisite or a cyclic dependency (prerequisites must form a DAG), a credential whose NAME is not currently available in the orchestrator's own environment (checked by presence only — the value is never read or printed, satisfying the no-secret-material rule), an ambiguous verification command, a verification command that is really just a post-implementation-only review remedy rather than an executable check, a step/verification command that implies an external/destructive effect the task's own `side_effects` field left undeclared, and (P16) two tasks with no prerequisite ordering between them that both declare an `environment: exclusive` verification command.
 
 <!-- lint: cookbook -->
 ```bash
@@ -8427,6 +8499,36 @@ for tid in tasks:
     if color[tid] == WHITE:
         visit(tid, [])
 
+# P16: refuse a plan whose task graph would let two independently-schedulable
+# tasks both declare an environment=exclusive verification command -- an
+# exclusive command must run alone (spec §19.2 above), so two of them are
+# only safe when one task is a (transitive) prerequisite of the other,
+# guaranteeing they never run concurrently. `seen` bounds the walk even over
+# an already-reported cycle -- this check never depends on the DAG check
+# above having succeeded.
+def _ancestors(tid, seen):
+    for dep in tasks.get(tid, {}).get("prerequisites") or []:
+        if dep in tasks and dep not in seen:
+            seen.add(dep)
+            _ancestors(dep, seen)
+    return seen
+
+exclusive_tasks = [
+    tid for tid, t in tasks.items()
+    if any(isinstance(v, dict) and v.get("environment") == "exclusive"
+           for v in (t.get("verification") or []))
+]
+_ancestor_cache = {}
+for i, a in enumerate(exclusive_tasks):
+    for b in exclusive_tasks[i + 1:]:
+        anc_a = _ancestor_cache.setdefault(a, _ancestors(a, set()))
+        anc_b = _ancestor_cache.setdefault(b, _ancestors(b, set()))
+        if b not in anc_a and a not in anc_b:
+            errors.append(
+                f"tasks {a} and {b}: both declare an environment=exclusive verification "
+                f"command with no prerequisite ordering between them -- co-scheduling two "
+                f"exclusive commands is refused (P16)")
+
 if errors:
     for e in errors:
         print(e, file=sys.stderr)
@@ -8464,6 +8566,7 @@ Rules — an empty result is never `PASS`:
 - `EXCLUDED` is legal only with evidence that the command is pre-existing, environment-bound, actor-bound, or outside the change's capability. It cannot hide a new regression.
 - `NOT_RUN` names its actor/prerequisite in `reason` and becomes handoff/readiness work — never silently treated as PASS.
 - A performance verdict (a command whose text names a benchmark/latency/throughput measurement) requires a declared `environment: controlled` and a non-null `baseline_comparison` to assert `PASS`/`FAIL`; otherwise it is advisory/inconclusive and MUST be recorded as `NOT_RUN` instead. A claimed performance fix must remeasure under the same controlled conditions before it may assert `PASS` again.
+- `environment: exclusive` (P16) declares a command that must run alone — e.g. the shared-DB integration suite P03 already forces serial. The actor about to run it takes the P03 test lease (`acquire_test_lease`/`release_test_lease`, above) around that one command and releases it immediately after; it is never co-scheduled with another `exclusive` command and never dispatched under `dispatch_parallel`, whose only live callers today are review-pair/preflight fan-outs, not verification commands — `validate_plan_tasks` (below) refuses a plan whose task graph would let two independently-schedulable tasks both declare one.
 - The debugger consumes only genuine `FAIL` records; it never mutates a deployed environment or invents evidence to convert an `EXCLUDED`/`NOT_RUN` record into `PASS`.
 - Implementation overall may be `DONE_WITH_EXCLUSIONS` (a legal `implementer` verdict, see Role Contract Registry) only when every non-excluded required verification record is `PASS` and every `EXCLUDED` record's evidence is policy-valid per the rule above; `NOT_RUN` records remain visible as handoff/readiness work and do not, by themselves, block this verdict.
 
@@ -9521,8 +9624,9 @@ For each round N (start at 1, hard cap at 4 — the initial run plus at most 3 f
 4. Call `validate_verification_records "8-all-tests/NN/verification-records.jsonl"` (cookbook, spec §19.2) — the zero-token enforcement of every per-record rule (empty-is-never-PASS, EXCLUDED evidence, NOT_RUN reason, controlled performance baseline) the runner's own STATUS cannot self-certify. A validation failure is Mode 4 (malformed evidence) regardless of what the runner claimed. `EXCLUDED` and `NOT_RUN` records are policy-valid evidence, never silently promoted to `PASS` — both flow through to Phase 9/Phase 11 exactly as recorded, never becoming PASS by exhausting the fix cap below.
 5. Branch on the runner's verdict:
    - **`PASS` or `SKIPPED`** → proceed to Step 8.2.
-   - **A genuine `FAIL`, with fix rounds used < 3:** dispatch one `claude` subprocess for role `test-fixer` (`dispatch_attempt 8 $ROUND test-fixer` — `mutates=yes`, so this dispatch automatically acquires the single write lease and its before/after mutation snapshot before launch; `test-fixer` never runs without holding it). Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$ROUND=NN`, `$TEST_REPORT_PATH` (= `8-all-tests/NN/test-report.md`), `$IMPLEMENTATION_BASE_SHA`. This role's timeout comes from the Models table via `role_timeout`. On `verdict=DONE`, increment N and loop from step 1 — this is the review-back rule: the fixer's own `DONE` claim is never trusted on its own word; the NEXT round's runner, re-verifying every command from scratch under the same lease/snapshot/checkpoint discipline, is the canonical re-verification authority (the fixer's own appendix already states this). On `verdict=BLOCKED`, stop the fix loop early — do NOT HALT; proceed to Step 8.2 with the round's failures as residual.
-   - **A genuine `FAIL`, with fix rounds exhausted (3 used):** do NOT HALT. Proceed to Step 8.2 — the final test verdict is `FAILED`, and `all-test-summary.md` MUST carry the detailed residual-failure record (failing test names, error excerpts, suspected causes, and what each fix round attempted).
+   - **A `FAIL`:** before dispatching anything, reproduce it in isolation (P10) — a deterministic, no-vendor-call step the orchestrator runs directly, exactly like the audit calls in Phase 11 below: `acquire_test_lease orchestrator-test-repro 8` (cookbook, spec-adjacent P03 — a held lease means wait-with-timeout, then HALT naming the lease path; never run concurrently with it), re-run ONLY the command(s) whose record in `8-all-tests/NN/verification-records.jsonl` this round shows `result=FAIL` — once, serialized — then `release_test_lease orchestrator-test-repro`.
+     - **Reproduces (the re-run command still fails):** a genuine defect. With fix rounds used < 3, dispatch one `claude` subprocess for role `test-fixer` (`dispatch_attempt 8 $ROUND test-fixer` — `mutates=yes`, so this dispatch automatically acquires the single write lease and its before/after mutation snapshot before launch; `test-fixer` never runs without holding it). Inputs: `$FEATURE_FOLDER`, `$PLAN_PATH`, `$ROUND=NN`, `$TEST_REPORT_PATH` (= `8-all-tests/NN/test-report.md`), `$IMPLEMENTATION_BASE_SHA`. This role's timeout comes from the Models table via `role_timeout`. On `verdict=DONE`, increment N and loop from step 1 — this is the review-back rule: the fixer's own `DONE` claim is never trusted on its own word; the NEXT round's runner, re-verifying every command from scratch under the same lease/snapshot/checkpoint discipline, is the canonical re-verification authority (the fixer's own appendix already states this). On `verdict=BLOCKED`, stop the fix loop early — do NOT HALT; proceed to Step 8.2 with the round's failures as residual. With fix rounds exhausted (3 used): do NOT HALT. Proceed to Step 8.2 — the final test verdict is `FAILED`, and `all-test-summary.md` MUST carry the detailed residual-failure record (failing test names, error excerpts, suspected causes, and what each fix round attempted).
+     - **Does not reproduce (every re-run command now passes):** flaky, not a defect — never dispatch `test-fixer` for it and never spend a fix round on it. Append a `## Flake check (round NN)` note to `8-all-tests/NN/test-report.md` naming the command(s), `result=flaky`, and the isolated re-run's outcome (this note is prose in the round report, not a `verification-records.jsonl` entry — `flaky` is not a legal verification `result`, spec §19.2). Treat the round as PASS-with-note: proceed directly to Step 8.2 without incrementing the fix-round count. `summarizer-all-tests` already folds any detail present in a round's `test-report.md` into `all-test-summary.md` (see its own appendix, step 2) — the exact file `readiness-writer` reads — so this note is surfaced to readiness without any further change. A round with both a reproducing and a non-reproducing failure takes both branches: record the flaky note for the non-reproducing command(s) AND the reproduces-branch above for the rest.
 
 ### Step 8.2 — Summarizer
 
@@ -11398,7 +11502,11 @@ VIOLATION` before you would ever be launched to do it.
    performance command (benchmark/latency/throughput) may only assert
    `PASS`/`FAIL` under a declared `environment=controlled` with a non-null
    `baseline_comparison`; otherwise record it `NOT_RUN` (advisory/inconclusive)
-   instead.
+   instead. A command declared `environment=exclusive` (P16) — e.g. one that
+   hits the same shared test DB P03 already serializes Phase 8 around — takes
+   the P03 test lease (`acquire_test_lease implementer 6` /
+   `release_test_lease implementer`, cookbook) around that one command's run
+   only; never run it while another exclusive command holds the lease.
 4. Apply no-secret checks when the feature touches credentials, config, notebooks, examples, generated artifacts, or deployment files. Record the no-secret check result in the summary.
 5. Track per-task progress in `$FEATURE_FOLDER/6-implementation/subagent-logs/` (one file per task). After every committed task AND its review, call `checkpoint_append` -- the generated runtime's own checkpoint writer (never hand-write the JSON line yourself):
 
@@ -11935,15 +12043,39 @@ You are a test runner invoked as a fresh subprocess by the develop-it orchestrat
 
 **All test commands run in the foreground under print-mode rules (spec §12.2) — never backgrounded.**
 
-1. Determine the execution mode. `start-all-tests.sh` is a project-specific convention; fall through to discovery when absent.
+1. **Probe and force serial mode (P03).** Before running anything, detect
+   whether this suite is safe to run at whatever parallelism the project
+   defaults to: read `policy_value test_suite_parallel_safe` (cookbook), and
+   independently probe the repo itself for signals of a shared, non-isolated
+   resource under an already-configured parallel runner — `pytest-xdist`/
+   `-n auto` (or any `-n` > 1) with no per-worker suffix on
+   `TEST_DATABASE_URL` (or an equivalent shared-resource env var), a Jest
+   `maxWorkers` setting with no `--runInBand`, or any other multi-worker
+   flag paired with that same single shared resource. Force serial
+   execution — pass the project's own serial flag (e.g. `-p 1` /
+   `--runInBand`) or drop the discovered parallel flag — whenever EITHER
+   the policy value is `no` (the default) OR the probe finds one of these
+   signals, regardless of the declared policy (the probe is a second,
+   independent net, not a substitute for the declared policy). Record which
+   of `policy` / `probe` / `neither` forced serial mode (and, for `probe`,
+   which signal) — step 5 writes this into `test-report.md`.
+2. Acquire the test-execution lease before running anything below
+   (`acquire_test_lease all-tests-runner 8`, cookbook, spec-adjacent P03) —
+   a lease already held by another runner/fixer/operator means
+   wait-with-timeout, then HALT naming the lease path; never run
+   concurrently with it. Release it (`release_test_lease all-tests-runner`)
+   only after every command in this step has finished, success or failure
+   alike.
+3. Determine the execution mode. `start-all-tests.sh` is a project-specific convention; fall through to discovery when absent.
    - If `$REPO_ROOT/start-all-tests.sh` exists, the mode is `script`: run it from `$REPO_ROOT` (`bash start-all-tests.sh`), capturing stdout+stderr.
    - Otherwise the mode is `discovery`: enumerate every test suite present in the repo — e.g. Python suites (`uv run pytest`, honoring `pyproject.toml` / `pytest.ini` configuration — plain `pytest` is not installed standalone in this environment), JS/TS `package.json` `test` scripts (run per package), and any other runner the repo's config files declare. Run each suite, capturing output.
    - Also run every command the accepted plan's own `## Task Contract` blocks declared under `verification` (spec §19.2), even when it duplicates a suite already covered by the script/discovery mode above — the plan's own declared commands are first-class evidence, not merely covered by the repository-wide run.
    - If the script does not exist, no test suite is discovered, AND the plan declared no verification commands of its own, the round verdict is `SKIPPED` with `reason=no-tests-found`.
-2. For EACH command run in step 1 (the full-suite script/discovery run counts as one command; each plan-declared verification command counts as its own), call `append_verification_record` (cookbook, spec §19.2) to append one record to `$FEATURE_FOLDER/8-all-tests/$ROUND/verification-records.jsonl` — `result: PASS|FAIL|EXCLUDED|NOT_RUN` per that command's own outcome, never a single rollup standing in for every command. Round 1 starts the file fresh; a later fix round APPENDS to the SAME file (never truncates it), reusing the SAME `verification_id` for a command re-run after a fix, so the latest record supersedes the earlier one (the same Mode A/Mode B convention the implementer's own verification records already use).
-3. Do NOT fix anything. You only run tests and report — fixing belongs to the `test-fixer` role.
-4. Write `$FEATURE_FOLDER/8-all-tests/$ROUND/test-report.md` — the detailed per-round report: execution mode, exact commands, per-suite pass/fail counts, every failing test's name, the relevant error excerpt (assertion/traceback tail, not the full log).
-5. Rewrite `$FEATURE_FOLDER/8-all-tests/all-test-summary.md` (full overwrite, cumulative across rounds — re-read earlier rounds' `test-report.md` and their attempt-scoped STATUS.md files) with:
+   - Every command run under step 1's forced serial mode carries the serial flag; a plan-declared `environment: exclusive` verification command (P16) additionally holds the SAME test lease this step already acquired — never released and re-acquired mid-round for it, since one lease per round already covers it.
+4. For EACH command run in step 3 (the full-suite script/discovery run counts as one command; each plan-declared verification command counts as its own), call `append_verification_record` (cookbook, spec §19.2) to append one record to `$FEATURE_FOLDER/8-all-tests/$ROUND/verification-records.jsonl` — `result: PASS|FAIL|EXCLUDED|NOT_RUN` per that command's own outcome, never a single rollup standing in for every command. Round 1 starts the file fresh; a later fix round APPENDS to the SAME file (never truncates it), reusing the SAME `verification_id` for a command re-run after a fix, so the latest record supersedes the earlier one (the same Mode A/Mode B convention the implementer's own verification records already use).
+5. Do NOT fix anything. You only run tests and report — fixing belongs to the `test-fixer` role.
+6. Write `$FEATURE_FOLDER/8-all-tests/$ROUND/test-report.md` — the detailed per-round report: execution mode, exact commands, per-suite pass/fail counts, every failing test's name, the relevant error excerpt (assertion/traceback tail, not the full log), and step 1's forced-serial-mode determination (`policy` / `probe` / `neither`, plus the triggering signal when `probe`).
+7. Rewrite `$FEATURE_FOLDER/8-all-tests/all-test-summary.md` (full overwrite, cumulative across rounds — re-read earlier rounds' `test-report.md` and their attempt-scoped STATUS.md files) with:
    - Execution mode (`script` / `discovery`) and the commands used.
    - Per-round results table: round, suites run, total / passed / failed.
    - Current verdict after this round.
@@ -11984,6 +12116,7 @@ x_tests_total: <int>
 x_tests_passed: <int>
 x_tests_failed: <int>
 x_verification_records_path: <absolute path to $ROUND/verification-records.jsonl>
+x_serial_forced_by: policy | probe | neither
 STATUS
 ```
 
@@ -12029,10 +12162,11 @@ You are a test fixer invoked as a fresh subprocess when a Phase 8 all-tests roun
 ## Behavior
 
 1. Read `$TEST_REPORT_PATH` to identify the failing tests and their failure signatures.
-2. Apply systematic debugging per failure cluster: hypothesis → minimal repro → root cause → fix. Fix the code when the code is wrong; fix the test ONLY when the test itself is defective against the spec/plan intent — never weaken, skip, or delete a test just to make it pass.
-3. Re-run the failing tests to spot-check your fixes (the canonical re-verification is the next all-tests round).
-4. If the fix changes source/tests, commit per the project's git policy.
-5. Where a failure requires a decision that cannot be made without user input, do NOT guess — set `verdict=BLOCKED`.
+2. **Reproduce before fixing (P10, mirrored from Phase 8 Step 8.1).** Phase 8 already re-ran `$TEST_REPORT_PATH`'s failures in isolation before dispatching you, so ordinarily every cluster here is genuine. Mirror the same check for any failure this attempt inherits or turns up mid-round that was NOT part of that pre-dispatch reproduction (e.g., a new failure surfaced by your own earlier fix's re-run, step 3 below): re-run just that cluster's failing command(s) once, serialized, holding the P03 test lease (`acquire_test_lease test-fixer 8` / `release_test_lease test-fixer`, cookbook — wait-with-timeout, then HALT naming the lease path on a held lease). A cluster that does not reproduce is flaky, not a defect — do not edit code for it; note it `flaky` in your STATUS `reason`/progress notes and leave it for the next round's runner, the canonical re-verification authority. Only a cluster that DOES reproduce proceeds to step 3.
+3. Apply systematic debugging per failure cluster: hypothesis → minimal repro → root cause → fix. Fix the code when the code is wrong; fix the test ONLY when the test itself is defective against the spec/plan intent — never weaken, skip, or delete a test just to make it pass.
+4. Re-run the failing tests to spot-check your fixes (the canonical re-verification is the next all-tests round).
+5. If the fix changes source/tests, commit per the project's git policy.
+6. Where a failure requires a decision that cannot be made without user input, do NOT guess — set `verdict=BLOCKED`.
 
 You may use `$IMPLEMENTATION_BASE_SHA` to constrain `git log`/`git diff` scope to commits made during this run.
 
@@ -12451,7 +12585,7 @@ You are a phase summarizer invoked as a fresh subprocess by the develop-it orche
 ## Behavior
 
 1. Read every round's own attempt-scoped STATUS (`8-all-tests/*/attempts/*-all-tests-runner-*/STATUS.md`, and `8-all-tests/*/attempts/*-test-fixer-*/STATUS.md` where present — never the retired `round-*/test-runner-status.md` alias). Determine: `final_test_verdict` (`PASS` if the last round passed; `SKIPPED` if the runner reported no tests; `FAILED` if failures remain after the fix loop ended — cap exhausted or fixer `BLOCKED`), rounds used, fix rounds dispatched, residual failure count.
-2. Verify `all-test-summary.md` carries the **Residual failures** detail section whenever `final_test_verdict=FAILED`; if the runner's last write is missing detail that exists in the round reports, fold it in (edit the summary in place) — the summary must be self-sufficient for the readiness writer and the user.
+2. Verify `all-test-summary.md` carries the **Residual failures** detail section whenever `final_test_verdict=FAILED`; if the runner's last write is missing detail that exists in the round reports, fold it in (edit the summary in place) — the summary must be self-sufficient for the readiness writer and the user. Likewise, fold in a **Flaky (non-blocking)** section (round, command, `result=flaky`) whenever any round's own `test-report.md` carries a `## Flake check` note (P10, spec-adjacent) — present regardless of `final_test_verdict`, since a flaky round is PASS-with-note, never a silent drop.
 3. Read `$FEATURE_FOLDER/RUN_LOG.md`. Filter dispatch entries (NOT event entries) where `phase=8`. Compute the same Usage aggregation as `summarizer-implementation` (phase total, per-vendor subtotal, per-role × round detail; rows with `usage_status=unavailable` are skipped from the detail table but counted in a footnote).
 4. APPEND the `## Usage` section to `$FEATURE_FOLDER/8-all-tests/all-test-summary.md` with the three standard tables (same columns and formatting rules as `summarizer-implementation`).
 
@@ -12666,7 +12800,7 @@ You are the final readiness reporter. You have no shared context.
    - **Preflight verdicts** — per `(phase, vendor)` table for phases in {1, 3, 5, 7} (both vendors) plus phase 6 (claude only): each row reports `phase`, `vendor`, classification (`READY` / `SKIPPED` / `FAILED` / `INVALID_ORCHESTRATION`), and `failure_mode` (if `FAILED`) or skip-reason (if `SKIPPED`). Phase 1 rows are read from `1-preflight/phase-1/`; per-phase rows from `<phase-dir>/preflight/`. Any `INVALID_ORCHESTRATION` row forces the overall readiness verdict to `NOT_READY`. Phase 6 gets no `vendor=codex` row (P09 — no dispatch, no classification); add one note line beneath the table instead, sourced from Step 6.−1's own `latest_codex_outcome`-derived RUN_LOG scan (most recent outcome from Phase 5, falling back to Phase 3) — informational only, never a factor in the readiness verdict.
    - **Reviewer verdicts** — per-gate iteration counts, final verdicts, `partial_review` flag with per-gate `codex_unavailable_reason` if any.
    - **Implementation result** — task count, commits, `implementation_base_sha`, verification, no-secret check, browser-QA result if applicable. If a post-debug re-verification occurred, note it. Read `implementer-status.md`'s own `x_baseline_sha`/`x_final_sha` (cross-check `x_baseline_sha` against the LATEST `event=GIT_FINALIZATION_RESULT` entry's own `base_sha` field in `RUN_LOG.md` — a mismatch is itself a degradation worth a Degradations line) and `x_remaining_handoffs` (surfaced as its own bulleted list under this section when non-null — this is where a Mode D continuation's own leftover follow-ups become visible to the user, not silently dropped).
-   - **Test results** — `final_test_verdict` (`PASS` / `FAILED` / `SKIPPED`), execution mode (`start-all-tests.sh` — a project-specific convention — vs discovered suites), rounds used, fix rounds dispatched, and — when `FAILED` — the residual-failure detail carried over from `all-test-summary.md` (failing test names, error excerpts, what each fix round attempted).
+   - **Test results** — `final_test_verdict` (`PASS` / `FAILED` / `SKIPPED`), execution mode (`start-all-tests.sh` — a project-specific convention — vs discovered suites), rounds used, fix rounds dispatched, and — when `FAILED` — the residual-failure detail carried over from `all-test-summary.md` (failing test names, error excerpts, what each fix round attempted). Include the **Flaky (non-blocking)** section from `all-test-summary.md` whenever present (P10) — regardless of `final_test_verdict` — so a round the process treated as PASS-with-note stays visible rather than silently dropped.
    - **Documentation/UAT status** — `documentation_validation` (`PASS` / `PARTIAL` / `FAILED`) from `9-documentation/documentation-validation.md`, whether `uat.md` includes its required "Not yet executed" section, and a link to `uat.md`. A `documentation_validation` other than `PASS` forces the readiness verdict to at least `READY_WITH_NOTES`.
    - **Follow-ups** — every record in `followups.jsonl` (if present), grouped by `actor`, each showing `id`, `description`, `status`, and `prerequisite`. Absent when the file does not exist.
    - **Git result** — the LATEST `event=GIT_FINALIZATION_RESULT` entry's `outcome` (`COMMITTED` / `NO_CHANGES` / `BLOCKED` / `FAILED`), `commit_sha` (or `null`), and `push_performed` (always `no` — Phase 10 never pushes). A `BLOCKED` or `FAILED` outcome is reported here, not silently treated as a successful finalization.

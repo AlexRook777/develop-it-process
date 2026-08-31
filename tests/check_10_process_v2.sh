@@ -13,11 +13,12 @@ assert_contains '| documentation_fix_cap | 2 |' "$PROCESS_DOC" "documentation ca
 assert_contains '| artifact_growth_warning_pct | 10 |' "$PROCESS_DOC" "growth threshold"
 assert_contains '| divergent_round_cap | 2 |' "$PROCESS_DOC" "divergence cap"
 assert_contains '| long_role_headroom_threshold_minutes | 60 |' "$PROCESS_DOC" "long-role threshold"
+assert_contains '| test_suite_parallel_safe | no |' "$PROCESS_DOC" "test-suite parallel-safety flag"
 
 # extract.py writes $BUILD/policies.tsv itself; redirecting stdout onto the same
 # path would splice two independent writes at offset 0.
 python3 "$REPO_TOP/tests/lib/extract.py" policies > /dev/null
-assert_line_count 12 "$BUILD/policies.tsv" "policy header plus 11 rows"
+assert_line_count 13 "$BUILD/policies.tsv" "policy header plus 12 rows"
 
 # shellcheck source=lib/v2_fixtures.sh
 source "$REPO_TOP/tests/lib/v2_fixtures.sh"
