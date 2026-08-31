@@ -34,7 +34,7 @@ Ratings: Criticality **Critical/High/Medium/Low** (same definitions as the R-ser
 
 ## P01 — Add an integration-seam adversarial pass to the Phase 7 gate
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (7f066a7)
 
 **Criticality:** High · **Effort:** Moderate
 
