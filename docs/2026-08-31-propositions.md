@@ -81,7 +81,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P04 — Fix `vendor_proven`'s regressed RUN_LOG parser and consolidate all scanners onto one reader
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (b734f1d)
 
 **Criticality:** Critical · **Effort:** Moderate
 
