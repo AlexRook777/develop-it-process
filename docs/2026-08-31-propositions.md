@@ -165,7 +165,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P11 — Give the two vendor reviewers structurally distinct lenses, with an integration-surface dimension
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (2049378)
 
 **Criticality:** High · **Effort:** Moderate
 
@@ -192,7 +192,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P13 — Material plan deviations must be able to change the readiness verdict
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (2049378)
 
 **Criticality:** High · **Effort:** Moderate
 
