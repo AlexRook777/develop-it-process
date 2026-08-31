@@ -375,6 +375,14 @@ elif defect == "self_reference":
     # this is a degenerate 1-node cycle, so the SAME cycle-detection code
     # path the two-task mutual cycle already exercises must also catch it.
     t1["prerequisites"] = ["task-01"]
+elif defect == "exclusive_co_schedule":
+    # Task 3 code review fix (P16): two tasks with NO prerequisite ordering
+    # between them (t2 no longer depends on t1) both declaring
+    # environment=exclusive on a verification command -- refused as unsafe
+    # co-scheduling (validate_plan_tasks' own P16 check).
+    t2["prerequisites"] = []
+    t1["verification"][0]["environment"] = "exclusive"
+    t2["verification"][0]["environment"] = "exclusive"
 else:
     sys.exit(f"write_plan_task_fixture: unknown defect: {defect}")
 

@@ -5738,7 +5738,17 @@ acquire_test_lease() {
     sleep "$interval"
     waited=$((waited + interval))
   done
-  echo "TEST_LEASE_BLOCKED:$lease_file" >&2
+  # No dispatch-liveness classification exists for this lock (see the
+  # section prose above) -- unlike a stuck write-lease, an orphaned
+  # test-lease has no automatic reclaim path, so the HALT message itself
+  # IS the recovery documentation: name the file, the owner who holds it
+  # (best-effort re-read; the file may already be gone by the time this
+  # prints, in which case "unknown" is honest, not a bug), and the manual
+  # remedy, so an operator is never left to discover `rm test-lease.json`
+  # by reading this cookbook.
+  local blocked_owner
+  blocked_owner="$(jq -r '.lease_owner // empty' "$lease_file" 2>/dev/null)"
+  echo "TEST_LEASE_BLOCKED:$lease_file owner=${blocked_owner:-unknown} -- if that owner's dispatch/process is no longer running, remove this file and retry" >&2
   return 1
 }
 
@@ -6384,7 +6394,7 @@ deliberately stops rather than recovering:
 | `role_mutates` | Action on `UNFINISHED` |
 |---|---|
 | `no` — reviewers, summarizers, `context-discovery`, preflight, `readiness-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: no`, `action: redispatched`, and re-dispatch once. These roles only read and write their own STATUS and findings, so a repeat is idempotent. **Exception:** if the run-scoped `claude_spend_exhausted` / `codex_spend_exhausted` flag is set for this role's vendor (Mode 5b), do NOT re-dispatch — log `action: halted` with `reason: vendor spend ceiling`, and halt. Idempotence makes a repeat *safe*, not *useful*; under a ceiling it cannot succeed, and it buries the real cause under a second identical failure. |
-| `yes` — `implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `documentation-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: yes`, `action: halted`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, the `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch or keep the partial work. **Never auto-retry.** After the fact nothing can distinguish "the task ran once" from "the task ran twice", and a re-run implementer duplicates commits and re-applies edits. |
+| `yes` — `implementer`, `impl-worker`, `debugger`, `test-fixer`, all three fixers, `plan-writer`, `all-tests-runner`, `documentation-writer` | log `event=DISPATCH_ORPHANED` with `role_mutates: yes`, `action: halted`, then **HALT** with a reconciliation report: `git -C "$REPO_ROOT" log --oneline "$IMPLEMENTATION_BASE_SHA"..HEAD`, the `dirty_tree_check` output, and the transcript path. The user decides whether to reset to the baseline and re-dispatch or keep the partial work. **Never auto-retry.** After the fact nothing can distinguish "the task ran once" from "the task ran twice", and a re-run implementer duplicates commits and re-applies edits. If the orphaned role is `all-tests-runner` or `test-fixer`, also check `$ORCHESTRATION_DIR/test-lease.json` (P03, spec-adjacent): this lock carries no dispatch-liveness classification of its own, so an orphaned holder never self-clears, and every future test invocation would otherwise wait-with-timeout then HALT against a lease nobody will ever release — remove that file as part of this same reconciliation once the orphaned dispatch is confirmed dead, the same confirmation this row already requires before deciding what to do with the orphaned dispatch itself. |
 
 The ordered classifier that fully replaces this hand-rolled three-state read
 (ambiguity between "never launched" and "launched, crashed, no evidence at
@@ -12064,8 +12074,8 @@ You are a test runner invoked as a fresh subprocess by the develop-it orchestrat
    a lease already held by another runner/fixer/operator means
    wait-with-timeout, then HALT naming the lease path; never run
    concurrently with it. Release it (`release_test_lease all-tests-runner`)
-   only after every command in this step has finished, success or failure
-   alike.
+   only after every command step 3 runs below has finished, success or
+   failure alike.
 3. Determine the execution mode. `start-all-tests.sh` is a project-specific convention; fall through to discovery when absent.
    - If `$REPO_ROOT/start-all-tests.sh` exists, the mode is `script`: run it from `$REPO_ROOT` (`bash start-all-tests.sh`), capturing stdout+stderr.
    - Otherwise the mode is `discovery`: enumerate every test suite present in the repo — e.g. Python suites (`uv run pytest`, honoring `pyproject.toml` / `pytest.ini` configuration — plain `pytest` is not installed standalone in this environment), JS/TS `package.json` `test` scripts (run per package), and any other runner the repo's config files declare. Run each suite, capturing output.
@@ -12162,9 +12172,9 @@ You are a test fixer invoked as a fresh subprocess when a Phase 8 all-tests roun
 ## Behavior
 
 1. Read `$TEST_REPORT_PATH` to identify the failing tests and their failure signatures.
-2. **Reproduce before fixing (P10, mirrored from Phase 8 Step 8.1).** Phase 8 already re-ran `$TEST_REPORT_PATH`'s failures in isolation before dispatching you, so ordinarily every cluster here is genuine. Mirror the same check for any failure this attempt inherits or turns up mid-round that was NOT part of that pre-dispatch reproduction (e.g., a new failure surfaced by your own earlier fix's re-run, step 3 below): re-run just that cluster's failing command(s) once, serialized, holding the P03 test lease (`acquire_test_lease test-fixer 8` / `release_test_lease test-fixer`, cookbook — wait-with-timeout, then HALT naming the lease path on a held lease). A cluster that does not reproduce is flaky, not a defect — do not edit code for it; note it `flaky` in your STATUS `reason`/progress notes and leave it for the next round's runner, the canonical re-verification authority. Only a cluster that DOES reproduce proceeds to step 3.
+2. **Reproduce before fixing (P10, mirrored from Phase 8 Step 8.1).** Phase 8 already re-ran `$TEST_REPORT_PATH`'s failures in isolation before dispatching you, so ordinarily every cluster here is genuine. Mirror the same check for any failure this attempt inherits or turns up mid-round that was NOT part of that pre-dispatch reproduction (e.g., a new failure surfaced by your own earlier fix's re-run, step 4 below): re-run just that cluster's failing command(s) once, serialized, holding the P03 test lease (`acquire_test_lease test-fixer 8` / `release_test_lease test-fixer`, cookbook — wait-with-timeout, then HALT naming the lease path on a held lease). A cluster that does not reproduce is flaky, not a defect — do not edit code for it; note it `flaky` in your STATUS `reason`/progress notes and leave it for the next round's runner, the canonical re-verification authority. Only a cluster that DOES reproduce proceeds to step 3.
 3. Apply systematic debugging per failure cluster: hypothesis → minimal repro → root cause → fix. Fix the code when the code is wrong; fix the test ONLY when the test itself is defective against the spec/plan intent — never weaken, skip, or delete a test just to make it pass.
-4. Re-run the failing tests to spot-check your fixes (the canonical re-verification is the next all-tests round).
+4. Re-run the failing tests to spot-check your fixes (the canonical re-verification is the next all-tests round), holding the SAME P03 test lease step 2 uses (`acquire_test_lease test-fixer 8` / `release_test_lease test-fixer`, cookbook) around this re-run — never run it lease-less just because step 2 already acquired and released one for a different cluster.
 5. If the fix changes source/tests, commit per the project's git policy.
 6. Where a failure requires a decision that cannot be made without user input, do NOT guess — set `verdict=BLOCKED`.
 

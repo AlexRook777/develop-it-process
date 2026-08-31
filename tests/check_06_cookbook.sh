@@ -2180,6 +2180,43 @@ assert_eq null "$(jq -r '.dispatch_id' "$LEASE_FILE")" \
   "Phase 10's lease has a JSON null dispatch_id, never an empty string"
 release_write_lease orchestrator-finalization >/dev/null
 
+# --- Task 3 code review fix: acquire_test_lease/release_test_lease (P03) ---
+# A SEPARATE lock from the write lease above (no dispatch-liveness
+# classification) -- exercised directly since nothing else in this suite
+# calls it: acquire, a second concurrent acquire blocks and times out
+# (forced short here so the test doesn't actually wait the real 120s
+# default), release, and a clean re-acquire.
+if declare -F acquire_test_lease >/dev/null && declare -F release_test_lease >/dev/null; then
+  T3TL_LEASE="$ORCHESTRATION_DIR/test-lease.json"
+  rm -f "$T3TL_LEASE"
+  acquire_test_lease runner-a 8 >/dev/null 2>&1
+  assert_exists "$T3TL_LEASE" "acquire_test_lease creates the lease file"
+  assert_eq runner-a "$(jq -r '.lease_owner' "$T3TL_LEASE")" "the lease records its owner"
+
+  rc=0
+  TEST_LEASE_WAIT_TIMEOUT_SECONDS=1 TEST_LEASE_POLL_INTERVAL_SECONDS=1 \
+    acquire_test_lease runner-b 8 >/dev/null 2>"$BUILD/t3tl-blocked.err" || rc=$?
+  assert_rc 1 "$rc" "a second acquire_test_lease call blocks-then-times-out while the lease is held"
+  assert_contains "TEST_LEASE_BLOCKED" "$BUILD/t3tl-blocked.err" "the timeout failure names itself"
+  assert_contains "owner=runner-a" "$BUILD/t3tl-blocked.err" "the blocked message names the current holder (P03 manual-recovery fix)"
+  assert_exists "$T3TL_LEASE" "the blocked second attempt never removed the held lease"
+
+  rc=0; release_test_lease runner-b 2>"$BUILD/t3tl-relwrong.err" || rc=$?
+  assert_rc 1 "$rc" "release_test_lease refuses a non-owner caller"
+  assert_contains "TEST_LEASE_NOT_OWNER" "$BUILD/t3tl-relwrong.err" "non-owner refusal names itself"
+  assert_exists "$T3TL_LEASE" "a non-owner release call never removes the lease file"
+
+  release_test_lease runner-a >/dev/null
+  assert_not_exists "$T3TL_LEASE" "release_test_lease removes the lease file"
+
+  acquire_test_lease runner-c 8 >/dev/null 2>&1
+  assert_exists "$T3TL_LEASE" "re-acquiring after a clean release succeeds"
+  assert_eq runner-c "$(jq -r '.lease_owner' "$T3TL_LEASE")" "the re-acquired lease records the new owner"
+  release_test_lease runner-c >/dev/null
+else
+  _fail "acquire_test_lease/release_test_lease are not defined"
+fi
+
 # =============================================================================
 # Task 11: stable findings and review convergence
 # =============================================================================
@@ -2988,6 +3025,7 @@ if declare -F validate_plan_tasks >/dev/null; then
   _t12_expect_fail unreachable_prerequisite         "unreachable"
   _t12_expect_fail forward_reference                "forward reference"
   _t12_expect_fail self_reference                   "cycle detected"
+  _t12_expect_fail exclusive_co_schedule            "co-scheduling two exclusive"
 
   # Code review fix (blocker 4): the credential-availability check must
   # apply ONLY to actor=implementer. An owner-actor task naming a credential
