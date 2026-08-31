@@ -275,7 +275,7 @@ this account and is used for the cheap `preflight-codex` probe;
 | Role | Vendor | Model | Effort | Timeout minutes | Mutates | Long running | May spawn children | Required inputs | Optional inputs | Status template | Outputs | Verdicts | Required status fields | Checkpoint kind | Phases |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | preflight-claude | claude | claude-haiku-4-5 | — | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2;context7;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent | none | 1;3;5;6;7 |
-| preflight-codex | codex | gpt-5.6-luna | medium | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS | common_v2;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent | none | 1;3;5;6;7 |
+| preflight-codex | codex | gpt-5.6-luna | medium | 5 | no | no | no | feature_folder | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | check_status | READY;MISSING_SKILLS;UNCERTAIN | common_v2;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent | none | 1;3;5;7 |
 | context-discovery | claude | claude-sonnet-5 | — | 30 | no | no | no | feature_folder;resolved_models | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | READY;BLOCKED | common_v2;relevant_skills;relevant_skills_reasons | none | 2 |
 | spec-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
 | spec-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
@@ -520,9 +520,8 @@ If the input spec does not follow the `<date>-<slug>-design.md` pattern, dispatc
     plan-review-summary.md
     summarizer-status.md
   6-implementation/
-    preflight/                          # Phase 6 per-phase preflight (Step 6.−1)
+    preflight/                          # Phase 6 per-phase preflight (Step 6.−1) -- claude only (P09): no codex-check-status.md
       claude-check-status.md   # readable alias: a COPY of 00/attempts/p06-i00-preflight-claude-aNN/STATUS.md
-      codex-check-status.md    # readable alias: a COPY of 00/attempts/p06-i00-preflight-codex-aNN/STATUS.md
     implementation-summary.md
     implementer-status.md
     debugger-status.md
@@ -2697,7 +2696,8 @@ _dispatch_prelaunch() {
   # hand-set $PHASE_DIR/$ITERATION/$DISPATCH_ID themselves.
   # PHASE is the raw phase argument itself (e.g. "1" or "3") -- needed ONLY
   # by a role dispatched under more than one phase number (today, only
-  # preflight-claude/preflight-codex, re-probed at Phases 1, 3, 5, 6, 7):
+  # preflight-claude (re-probed at Phases 1, 3, 5, 6, 7) and preflight-codex
+  # (re-probed at Phases 1, 3, 5, 7 -- P09 dropped its Phase 6 dispatch):
   # its appendix cannot hardcode a single literal --phase value the way
   # every single-phase role's appendix does.
   # shellcheck disable=SC2034  # consumed by render_prompt via render_keys()
@@ -6964,6 +6964,54 @@ vendor_preflight_reprobe_once() {
     printf 'no\n'
   fi
 }
+
+# Usage: latest_codex_outcome PHASE
+# Zero-cost (no dispatch, no RUN_LOG write) lookup of the most recent codex
+# per-phase-preflight outcome already durable for PHASE's own gate
+# (iteration 00), read straight out of RUN_LOG.md. P09: Phase 6 no longer
+# dispatches `preflight-codex` at all (it bought only an early-warning line
+# for a full paid probe), so Step 6.−1 calls this against Phase 5, falling
+# back to Phase 3, instead of running one. Scans blocks top-to-bottom
+# (RUN_LOG is append-only) and keeps the LAST match, since a resumed run may
+# have re-probed. Recognizes the three legal `(phase, iteration=00)` codex
+# block shapes: a `DISPATCH_COMPLETED` for `role: preflight-codex`
+# (`verdict: READY` or a confirmed `MISSING_SKILLS`/`UNCERTAIN`), a
+# `CODEX_UNAVAILABLE` (`failure_mode: <N>`, or the literal
+# `missing_skills`/`uncertain` mode string used by the skill-probe re-probe
+# branches), or a `CODEX_SKIPPED_BY_USER_CONSENT`. Prints one of `READY`,
+# `UNAVAILABLE mode=<N>`, `SKIPPED`, or `none` (no matching entry for that
+# phase at all -- e.g. a fresh run that never reached that gate).
+latest_codex_outcome() {
+  local phase="$1" log="${2:-$FEATURE_FOLDER/RUN_LOG.md}"
+  [ -f "$log" ] || { printf 'none\n'; return 0; }
+  "$PYTHON_BIN" - "$log" "$phase" <<'PY'
+import re, sys
+path, phase = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8", errors="replace").read()
+blocks = text.split("\n\n")
+result = "none"
+for b in blocks:
+    m = re.search(r"^---\s+[^\s]+\s+event=([^\s]+)", b, re.M)
+    if not m:
+        continue
+    event = m.group(1)
+    if event not in ("DISPATCH_COMPLETED", "CODEX_UNAVAILABLE", "CODEX_SKIPPED_BY_USER_CONSENT"):
+        continue
+    fields = dict(re.findall(r"^([a-zA-Z_]+):\s*(.*?)\s*$", b, re.M))
+    if fields.get("phase") != phase or fields.get("iteration") != "00":
+        continue
+    if event == "DISPATCH_COMPLETED":
+        if fields.get("role") != "preflight-codex":
+            continue
+        v = fields.get("verdict", "")
+        result = "READY" if v == "READY" else ("UNAVAILABLE mode=" + v.lower() if v else "none")
+    elif event == "CODEX_UNAVAILABLE":
+        result = "UNAVAILABLE mode=" + fields.get("failure_mode", "unknown")
+    else:
+        result = "SKIPPED"
+print(result)
+PY
+}
 ```
 
 ### Optional-skill applicability (spec §16.4)
@@ -8892,7 +8940,9 @@ previous behaviour — hid the degradation from the final report.
 4. Read only the two STATUS files, located via `role_attempt_dir preflight-<vendor> "$(_latest_attempt_id p01-i00-preflight-<vendor>)")/STATUS.md` for each vendor (the same attempt-lookup idiom every other phase's runner/writer STATUS already uses — see e.g. the all-tests-runner's own real-STATUS lookup). Validate each with `validate_status` (see cookbook). Each STATUS carries `required_skills_present`, `required_skills_missing`, `optional_skills_present`, and `optional_skills_absent` (spec §16.3/§16.4) — bracket-list values, same shape as the pre-existing `x_missing_skills`/`x_loaded_skills` fields — plus `x_plugin_roots_checked` naming every plugin root/path the probe inspected for an absent requirement. This is the durable capability evidence; downstream phases read the readable-alias copy Step 1.2 makes of it (below) rather than re-probing or re-resolving an attempt id themselves.
 4a. Read the `context7` field from the claude preflight's STATUS (the same file just read in step 4). If it is `unreachable`, append one `event=CONTEXT7_UNAVAILABLE` entry to `RUN_LOG.md` (phase 1). Do NOT halt — this only affects `context7_policy()` (see cookbook) for the rest of the run. If it is `reachable`, no RUN_LOG entry is needed; `context7_policy()` reads the STATUS field directly.
 5. **Missing-skill re-probe (spec §16.3).** If either STATUS reports
-   `verdict=MISSING_SKILLS`, do NOT immediately HALT. Call `skills_reprobe_
+   `verdict=MISSING_SKILLS`, or the codex STATUS reports `verdict=UNCERTAIN`
+   (P12 — codex-only; `preflight-claude` never publishes this verdict), do NOT
+   immediately HALT. Call `skills_reprobe_
    needed` (see cookbook) with: (a) `yes` iff an earlier phase in THIS run
    already recorded `READY` for that vendor (scan `RUN_LOG.md` — a per-phase
    missing claim contradicting a prior READY is the known false-negative
@@ -8900,15 +8950,22 @@ previous behaviour — hid the degradation from the final report.
    filesystem check shows the named skill directory/`SKILL.md` actually
    exists under one of the checked plugin roots; (c) `yes` iff the STATUS
    file itself, or its sibling `.tmp.*`, shows the attempt reached publication
-   but lost its final STATUS. On `true`, re-dispatch that ONE vendor's
+   but lost its final STATUS. An `UNCERTAIN` verdict additionally ALWAYS
+   triggers the re-probe regardless of those three conditions — the probe's
+   own scan was incomplete by definition, so it is never treated as evidence
+   of absence. On `true` (or on any `UNCERTAIN`), re-dispatch that ONE vendor's
    preflight role once more (same `dispatch_parallel` mechanism, a fresh
    attempt) and use the re-probe's verdict in place of the first. A second
    consecutive `MISSING_SKILLS` (from the re-probe, or when re-probe was not
-   indicated) is accepted as real: print to the user which CLI is missing
-   which skills (from `required_skills_missing` plus `x_plugin_roots_
-   checked`), plus an install hint ("Install the Superpowers plugin (e.g.
-   `claude plugin install superpowers`) and re-run this prompt against the
-   same feature folder"). HALT.
+   indicated) is accepted as real; a second consecutive `UNCERTAIN` is
+   accepted as "still can't tell" and handled identically to a confirmed
+   `MISSING_SKILLS` from here on — it is NEVER promoted to a `MISSING` claim.
+   Either way: print to the user which CLI's skills could not be confirmed
+   (from `required_skills_missing` plus `x_plugin_roots_checked` for
+   `MISSING_SKILLS`, or the STATUS `reason:` plus `x_plugin_roots_checked` for
+   a persistent `UNCERTAIN`), plus an install hint ("Install the Superpowers
+   plugin (e.g. `claude plugin install superpowers`) and re-run this prompt
+   against the same feature folder"). HALT.
 6. If the `codex` check fails, apply the "Distinguish orchestration bugs from vendor failures" filter from Failure handling first. If the captured stderr indicates a local CLI usage error (`unexpected argument`, `Usage:`, `unknown option`), this is an orchestration bug, not a Codex outage — correct the invocation per the cookbook's "CLI invocation forms" and retry once. Otherwise branch on the failure mode:
    - **Mode 0 (binary missing — environmental):** HALT unconditionally. Surface the remediation message ("Install the Codex CLI and re-run") and STOP. Do NOT prompt the user. A missing binary is an environment defect that must be fixed before the run can proceed in any mode; silently degrading would mask a broken setup.
    - **Modes 1, 2, 3, 4 (after the one allowed Mode-4 retry), or 5:** prompt the user interactively: `Codex is unavailable (mode=<N>, stderr=<tail>). Continue in claude-only mode for this run? [y/N]`. A non-interactive run may pre-answer this prompt by setting `CODEX_CONSENT=y|n`. When `CODEX_CONSENT` is unset and stdin is not a TTY, HALT rather than reading EOF as "no" — a silent EOF-as-no would let an unattended run degrade without anyone actually consenting.
@@ -8975,7 +9032,7 @@ Downstream consumers of Phase 1 verdicts (notably the readiness writer) read thi
 If the user consented to a claude-only run at the Phase 1 prompt above, the orchestrator sets a run-scoped flag `codex_disabled_by_user = true`. This flag:
 
 - Persists for the entire run, including across resumes. RUN_LOG is the canonical storage; there is no separate state file.
-- Suppresses per-phase codex re-probes at Phases 3, 5, 6, 7 (each per-phase preflight emits `CODEX_SKIPPED_BY_USER_CONSENT` instead of running the probe — see the per-phase preflight Step 0 in each gate below).
+- Suppresses per-phase codex re-probes at Phases 3, 5, 7 (each per-phase preflight emits `CODEX_SKIPPED_BY_USER_CONSENT` instead of running the probe — see the per-phase preflight Step 0 in each gate below). Phase 6 never dispatches `preflight-codex` at all (P09), regardless of this flag — see Step 6.−1.
 - Forces `codex_available = false` at every gate.
 - Is recorded in the RUN_LOG at the time of consent (`event=CODEX_DISABLED_BY_USER_CONSENT`) and re-asserted at each per-phase preflight entry (`event=CODEX_SKIPPED_BY_USER_CONSENT`).
 
@@ -9070,6 +9127,10 @@ Before iter 01's first reviewer dispatch (the gate's **first work dispatch**, de
 7. Branch on the verdicts:
    - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
    - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 3 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase, matching every other vendor-side failure mid-run. Proceed to step 1 of the iteration loop with `codex_available = false`.
+   - **Either probe (a successfully-completed dispatch — rc=0, STATUS parses) reports `verdict=MISSING_SKILLS` or `verdict=UNCERTAIN`** — a legal semantic verdict, distinct from the Modes 0–5 subprocess failures above (spec §16.3, generalizing Phase 1 Step 1.1 step 5's own re-probe to this gate — P02): call `skills_reprobe_needed` (cookbook) for that vendor with the same three conditions Phase 1 uses — (a) `yes` iff an earlier phase in THIS run already recorded `READY` for that vendor (scan `RUN_LOG.md`); (b) `yes` iff a deterministic filesystem check shows the named skill directory/`SKILL.md` actually exists under a checked plugin root; (c) `yes` iff the STATUS file (or its sibling `.tmp.*`) shows the attempt reached publication but lost its final STATUS. An `UNCERTAIN` verdict (P12 — the probe itself could not finish scanning every configured plugin root) additionally ALWAYS triggers the re-probe regardless of those three conditions; it is never treated as an absence claim. On `true` (or on any `UNCERTAIN`), re-dispatch that ONE vendor's preflight role once more (same `dispatch_parallel` mechanism as the initial probe, a fresh attempt) and use the re-probe's verdict in place of the first. A second consecutive `MISSING_SKILLS` is accepted as real; a second consecutive `UNCERTAIN` is accepted as "still can't tell" and handled exactly like `MISSING_SKILLS` below for control-flow purposes — it is NEVER promoted to a confirmed-`MISSING` claim:
+     - **Claude confirmed `MISSING_SKILLS`, or claude still `UNCERTAIN` after the re-probe:** HALT — claude is required for every phase. For `MISSING_SKILLS`, print which skills are missing (`required_skills_missing` plus `x_plugin_roots_checked`) plus the Phase 1 install hint; for `UNCERTAIN`, print that claude's skill scan could not complete after one retry and surface `x_plugin_roots_checked` so the user can verify manually.
+     - **Codex confirmed `MISSING_SKILLS`, or codex still `UNCERTAIN` after the re-probe:** treat exactly like a codex probe failure (the bullet above) — set `codex_available = false` for the remainder of Phase 3 only, and append `event=CODEX_UNAVAILABLE` with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `failure_mode:` the literal string `missing_skills` or `uncertain`, and the missing-skills/uncertain detail in place of a stderr tail. Do NOT HALT — codex degrades to claude-only for the phase like every other vendor-side per-phase failure. Proceed to step 1 of the iteration loop with `codex_available = false`.
+     Both probe attempts (the original and the re-probe) stay in `RUN_LOG.md` with their raw outputs — the re-probe is a normal `dispatch_parallel`/`dispatch_attempt` call and gets its own `DISPATCH_STARTED`/`DISPATCH_COMPLETED` pair like any other attempt, so a flake remains auditable.
    - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed).
 
 ### File policy for non-READY paths (applies to every per-phase preflight gate)
@@ -9169,6 +9230,10 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 7. Branch on the verdicts:
    - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
    - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 5 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase. Proceed to step 1 of the iteration loop with `codex_available = false`.
+   - **Either probe (a successfully-completed dispatch — rc=0, STATUS parses) reports `verdict=MISSING_SKILLS` or `verdict=UNCERTAIN`** — a legal semantic verdict, distinct from the Modes 0–5 subprocess failures above (spec §16.3, generalizing Phase 1 Step 1.1 step 5's own re-probe to this gate — P02): call `skills_reprobe_needed` (cookbook) for that vendor with the same three conditions Phase 1 uses — (a) `yes` iff an earlier phase in THIS run already recorded `READY` for that vendor (scan `RUN_LOG.md`); (b) `yes` iff a deterministic filesystem check shows the named skill directory/`SKILL.md` actually exists under a checked plugin root; (c) `yes` iff the STATUS file (or its sibling `.tmp.*`) shows the attempt reached publication but lost its final STATUS. An `UNCERTAIN` verdict (P12 — the probe itself could not finish scanning every configured plugin root) additionally ALWAYS triggers the re-probe regardless of those three conditions; it is never treated as an absence claim. On `true` (or on any `UNCERTAIN`), re-dispatch that ONE vendor's preflight role once more (same `dispatch_parallel` mechanism as the initial probe, a fresh attempt) and use the re-probe's verdict in place of the first. A second consecutive `MISSING_SKILLS` is accepted as real; a second consecutive `UNCERTAIN` is accepted as "still can't tell" and handled exactly like `MISSING_SKILLS` below for control-flow purposes — it is NEVER promoted to a confirmed-`MISSING` claim:
+     - **Claude confirmed `MISSING_SKILLS`, or claude still `UNCERTAIN` after the re-probe:** HALT — claude is required for every phase. For `MISSING_SKILLS`, print which skills are missing (`required_skills_missing` plus `x_plugin_roots_checked`) plus the Phase 1 install hint; for `UNCERTAIN`, print that claude's skill scan could not complete after one retry and surface `x_plugin_roots_checked` so the user can verify manually.
+     - **Codex confirmed `MISSING_SKILLS`, or codex still `UNCERTAIN` after the re-probe:** treat exactly like a codex probe failure (the bullet above) — set `codex_available = false` for the remainder of Phase 5 only, and append `event=CODEX_UNAVAILABLE` with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `failure_mode:` the literal string `missing_skills` or `uncertain`, and the missing-skills/uncertain detail in place of a stderr tail. Do NOT HALT — codex degrades to claude-only for the phase like every other vendor-side per-phase failure. Proceed to step 1 of the iteration loop with `codex_available = false`.
+     Both probe attempts (the original and the re-probe) stay in `RUN_LOG.md` with their raw outputs — the re-probe is a normal `dispatch_parallel`/`dispatch_attempt` call and gets its own `DISPATCH_STARTED`/`DISPATCH_COMPLETED` pair like any other attempt, so a flake remains auditable.
    - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed).
 
 The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this gate.
@@ -9200,51 +9265,44 @@ If iteration cap (`review_iteration_cap`) trips with any active reviewer still r
 
 ## Phase 6 — Implementation (delegated, single supervising subagent)
 
-**Plan acceptance gate (spec §19.1/§20.5-§20.6), before ANY other Phase 6 work — even the Codex preflight probe below.** Call `plan_ready_for_implementation` (cookbook). Implementation may start only from a plan revision whose latest plan-review verdict is accepted and whose open blocking finding count is zero; on failure, surface the printed reason and HALT — do not proceed to Step 6.−1. Once this gate passes and Step 6.0's `capture_implementation_baseline` durably records `event=IMPLEMENTATION_BASELINE`, the plan's pre-implementation review window is closed for the remainder of this run (`plan_review_window_closed` reads that same event; see Phase 5's review-window check above).
+**Plan acceptance gate (spec §19.1/§20.5-§20.6), before ANY other Phase 6 work — even the zero-cost Codex outcome scan below.** Call `plan_ready_for_implementation` (cookbook). Implementation may start only from a plan revision whose latest plan-review verdict is accepted and whose open blocking finding count is zero; on failure, surface the printed reason and HALT — do not proceed to Step 6.−1. Once this gate passes and Step 6.0's `capture_implementation_baseline` durably records `event=IMPLEMENTATION_BASELINE`, the plan's pre-implementation review window is closed for the remainder of this run (`plan_review_window_closed` reads that same event; see Phase 5's review-window check above).
 
 ### Step 6.−1 — Per-phase preflight
 
-Before Step 6.0 (the gate's first work dispatch is the implementer dispatch in Step 6.1; this preflight precedes the baseline capture in Step 6.0 so the user is warned upfront if Codex is gone before sinking time into the long implementer run, per the spec's Phase 6 trade-off):
+Before Step 6.0 (the gate's first work dispatch is the implementer dispatch in Step 6.1; this preflight precedes the baseline capture in Step 6.0 so the user is warned upfront if Claude is gone before sinking time into the long implementer run):
+
+**P09: Phase 6 no longer dispatches `preflight-codex` at all.** The prior design ran the full paid probe here even though "Codex is not dispatched downstream in Phase 6" made its verdict "informational only — the probe runs only to give the user early warning of a vendor outage." A full paid subprocess dispatch buying nothing but a warning line is exactly the cost this step now avoids: the same warning comes free from `RUN_LOG.md`, which already durably records Phase 3's and Phase 5's own codex preflight outcomes.
 
 1. `mkdir -p <feature-folder>/6-implementation/preflight`.
-2. Reset `codex_available = true` for the phase.
-3. If `codex_disabled_by_user = true` (run-scoped flag from Phase 1; reconstitute by scanning RUN_LOG per the rule in "Run-scoped user opt-out"):
-   - Dispatch `preflight-claude` only, via `dispatch_attempt 6 00 preflight-claude`.
-   - Append one `event=CODEX_SKIPPED_BY_USER_CONSENT` entry to `RUN_LOG.md` with `phase: 6`, `phase_name: implementation`, `iteration: 00`, `role: preflight-codex`, `vendor: codex` (see RUN_LOG additions for the full block shape).
-   - Set `codex_available = false`.
-4. Otherwise, dispatch `preflight-claude` and `preflight-codex` **fully in parallel** via `dispatch_parallel 6 00 preflight-claude preflight-codex` (the "Reviewer parallelization" cookbook pattern). Each subprocess publishes its own STATUS to its own attempt-scoped path under `$FEATURE_FOLDER/6-implementation/00/attempts/` — `dispatch_attempt` mints a distinct attempt id per role, so the two parallel writes never collide.
-5. After **both** probes return (or only the claude probe in the opt-out case), copy each STATUS file from its real attempt-scoped path to the phase-local readable alias:
+2. Dispatch `preflight-claude` only, via `dispatch_attempt 6 00 preflight-claude`. There is no codex branch here, and no `codex_disabled_by_user` check — Phase 6 dispatches no codex subprocess regardless of that run-scoped flag.
+3. After the probe returns, copy its STATUS file from its real attempt-scoped path to the phase-local readable alias:
 
    <!-- lint: snippet -->
    ```bash
-   for v in claude codex; do
-     logical="p06-i00-preflight-${v}"
-     latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
-     src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
+   logical="p06-i00-preflight-claude"
+   latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || latest=""
+   if [ -n "$latest" ]; then
+     src="$(role_attempt_dir preflight-claude "$latest")/STATUS.md"
      if [ -f "$src" ]; then
-       cp "$src" "$FEATURE_FOLDER/6-implementation/preflight/${v}-check-status.md"
+       cp "$src" "$FEATURE_FOLDER/6-implementation/preflight/claude-check-status.md"
      fi
-   done
-   # `cp`, never `mv` -- the attempt-scoped original at $src remains the
-   # durable record (resume classification, audit_run_state, and a future
-   # reconciliation all expect every attempt directory to remain exactly as
-   # dispatch_attempt left it). `_latest_attempt_id` returning nothing (codex
-   # skipped via consent, or a prelaunch failure that never launched) is the
-   # normal non-error case -- `continue` to the next vendor, not a HALT. An
-   # `if [ -f "$src" ]`, not `[ -f … ] && cp`: as the LAST statement of a
-   # block the `&&` form returns 1 whenever the file is absent, which is the
-   # normal codex-skipped path, making a successful phase look like a failure.
+   fi
+   # `cp`, never `mv` -- same durable-record rationale as every other
+   # per-phase preflight alias copy in this document.
    ```
 
-   Either copy is a no-op if the corresponding source is absent (see "File policy for non-READY paths" in Step 1.0).
+   There is no `codex-check-status.md` alias for Phase 6 — do not create one.
 
-6. `dispatch_parallel`/`dispatch_attempt` already appended each probe's own RUN_LOG dispatch entry (`phase: 6`, `phase_name: implementation`, `iteration: 00`, `role: preflight-claude` or `preflight-codex`, `vendor: claude` or `codex`, `status_path:` its REAL attempt-scoped path) — read the verdict from the copied alias `6-implementation/preflight/<vendor>-check-status.md` (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
-7. Branch on the verdicts:
+4. `dispatch_attempt` already appended the claude probe's own RUN_LOG dispatch entry (`phase: 6`, `phase_name: implementation`, `iteration: 00`, `role: preflight-claude`, `vendor: claude`, `status_path:` its REAL attempt-scoped path) — read the verdict from the copied alias `6-implementation/preflight/claude-check-status.md`.
+5. Branch on the claude verdict:
    - **Claude probe fails (any mode):** HALT unconditionally (same rule as every gate). No user prompt; claude is required for every phase.
-   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** **non-blocking.** Append `event=CODEX_UNAVAILABLE` with `phase: 6`, `phase_name: implementation`, `iteration: 00`, `failure_mode: <N>`, and the stderr tail. Surface a one-line warning to the dispatch event stream. **Do NOT prompt the user. Do NOT HALT. Proceed directly to Step 6.0.** Codex is not dispatched downstream in Phase 6, so the codex verdict is informational only — the probe runs only to give the user early warning of a vendor outage before the long implementer run starts. The Phase 6 carve-out applies to all of Modes 0–5 alike: at this gate alone, Mode 0 does not HALT; it logs and proceeds.
-   - **Both READY (or claude READY and codex skipped via consent):** proceed to Step 6.0.
+   - **Claude probe reports `verdict=MISSING_SKILLS`:** see the missing-skill re-probe branch below (spec §16.3) — do NOT fall through to step 6 until that branch resolves.
+   - **Claude probe `READY`:** continue to step 6.
+6. **Missing-skill re-probe (spec §16.3), claude only — Phase 6 dispatches no codex probe to apply this to.** If the claude STATUS reports `verdict=MISSING_SKILLS`, do NOT immediately HALT. Call `skills_reprobe_needed` (cookbook) with the same three conditions Phase 1 Step 1.1 step 5 uses: (a) `yes` iff an earlier phase in THIS run already recorded `READY` for claude; (b) `yes` iff a deterministic filesystem check shows the named skill directory/`SKILL.md` actually exists under a checked plugin root; (c) `yes` iff the STATUS file (or its sibling `.tmp.*`) shows the attempt reached publication but lost its final STATUS. On `true`, re-dispatch `preflight-claude` once more (same `dispatch_attempt` mechanism, a fresh attempt) and use the re-probe's verdict in place of the first. A second consecutive `MISSING_SKILLS` (from the re-probe, or when re-probe was not indicated) is accepted as real: print which skills are missing (`required_skills_missing` plus `x_plugin_roots_checked`) plus the Phase 1 install hint, and HALT — claude is required for every phase, exactly as at Phase 1. Both probe attempts stay in `RUN_LOG.md` with their raw outputs so a flake remains auditable.
+7. **Zero-cost codex early warning (no dispatch, informational only, never blocks).** Call `latest_codex_outcome 5` (cookbook); if it prints `none`, call `latest_codex_outcome 3` instead. Surface a one-line advisory to the dispatch event stream from whichever call returned something other than `none`: `Codex last known status (phase <N>): <READY | UNAVAILABLE mode=<M> | SKIPPED>`, or `Codex last known status: no prior phase recorded it` if both calls print `none`. This writes NOTHING to `RUN_LOG.md` — no new event, no STATUS file, no `(phase=6, vendor=codex)` verdict — and never prompts, blocks, or HALTs.
+8. Proceed to Step 6.0.
 
-The "File policy for non-READY paths" rules from Step 1.0 apply unchanged.
+The "File policy for non-READY paths" rules from Step 1.0 apply, restricted to the claude probe — Phase 6 has no codex probe for that policy to describe.
 
 ### Step 6.0 — Capture implementation baseline
 
@@ -9404,6 +9462,10 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 7. Branch on the verdicts:
    - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
    - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 7 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1. **Before proceeding, record the required degraded-coverage decision (spec §16.5):** append `record_event DEGRADED_REVIEW_ACCEPTED decision_id="p7-degraded-<run>" scope="phase=7;iteration=00" evidence="codex_unavailable failure_mode=<N>"` (`authority_identity: standing_process_policy` — this is a decision the process itself pre-authorizes for a single-vendor Phase 7 continuation, within the orchestrator's existing autonomy ceiling; it is never inferred ad hoc). A one-vendor Phase 7 MAY NOT proceed to the iteration loop without this event durable in `RUN_LOG.md` — this is what makes the degradation explicit rather than a silent strict PASS (the readiness writer's own rules already force `READY_WITH_NOTES` downstream; this event is what makes the ACCEPTANCE, not just the fact of degradation, auditable). Proceed to step 1 of the iteration loop with `codex_available = false`.
+   - **Either probe (a successfully-completed dispatch — rc=0, STATUS parses) reports `verdict=MISSING_SKILLS` or `verdict=UNCERTAIN`** — a legal semantic verdict, distinct from the Modes 0–5 subprocess failures above (spec §16.3, generalizing Phase 1 Step 1.1 step 5's own re-probe to this gate — P02): call `skills_reprobe_needed` (cookbook) for that vendor with the same three conditions Phase 1 uses — (a) `yes` iff an earlier phase in THIS run already recorded `READY` for that vendor (scan `RUN_LOG.md`); (b) `yes` iff a deterministic filesystem check shows the named skill directory/`SKILL.md` actually exists under a checked plugin root; (c) `yes` iff the STATUS file (or its sibling `.tmp.*`) shows the attempt reached publication but lost its final STATUS. An `UNCERTAIN` verdict (P12 — the probe itself could not finish scanning every configured plugin root) additionally ALWAYS triggers the re-probe regardless of those three conditions; it is never treated as an absence claim. On `true` (or on any `UNCERTAIN`), re-dispatch that ONE vendor's preflight role once more (same `dispatch_parallel` mechanism as the initial probe, a fresh attempt) and use the re-probe's verdict in place of the first. A second consecutive `MISSING_SKILLS` is accepted as real; a second consecutive `UNCERTAIN` is accepted as "still can't tell" and handled exactly like `MISSING_SKILLS` below for control-flow purposes — it is NEVER promoted to a confirmed-`MISSING` claim:
+     - **Claude confirmed `MISSING_SKILLS`, or claude still `UNCERTAIN` after the re-probe:** HALT — claude is required for every phase. For `MISSING_SKILLS`, print which skills are missing (`required_skills_missing` plus `x_plugin_roots_checked`) plus the Phase 1 install hint; for `UNCERTAIN`, print that claude's skill scan could not complete after one retry and surface `x_plugin_roots_checked` so the user can verify manually.
+     - **Codex confirmed `MISSING_SKILLS`, or codex still `UNCERTAIN` after the re-probe:** treat exactly like a codex probe failure (the bullet above), INCLUDING its `DEGRADED_REVIEW_ACCEPTED` requirement — set `codex_available = false` for the remainder of Phase 7 only, append `event=CODEX_UNAVAILABLE` with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `failure_mode:` the literal string `missing_skills` or `uncertain`, and the missing-skills/uncertain detail in place of a stderr tail, THEN append the same `record_event DEGRADED_REVIEW_ACCEPTED decision_id="p7-degraded-<run>" scope="phase=7;iteration=00" evidence="codex_unavailable failure_mode=<missing_skills|uncertain>"` before proceeding — a one-vendor Phase 7 never proceeds without that event regardless of which codex failure caused it. Do NOT HALT. Proceed to step 1 of the iteration loop with `codex_available = false`.
+     Both probe attempts (the original and the re-probe) stay in `RUN_LOG.md` with their raw outputs — the re-probe is a normal `dispatch_parallel`/`dispatch_attempt` call and gets its own `DISPATCH_STARTED`/`DISPATCH_COMPLETED` pair like any other attempt, so a flake remains auditable.
    - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed). No `DEGRADED_REVIEW_ACCEPTED` is needed here — full dual-vendor coverage is not degraded.
 
 The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this gate.
@@ -9603,7 +9665,8 @@ run-scoped flag, because a throttle genuinely may have cleared by the time the
 user resumes.
 
 **5b overrides the sticky-within-phase rule.** The per-phase preflight gates
-(Steps 3.0, 5.0, 6.−1, 7.0) each say a codex failure in "Modes 0, 1, 2, 3, 4, or
+that dispatch codex (Steps 3.0, 5.0, 7.0 — Phase 6's Step 6.−1 dispatches no
+codex probe at all, see P09) each say a codex failure in "Modes 0, 1, 2, 3, 4, or
 5" sets `codex_available = false` *for the remainder of that phase only*. That
 scoping is correct for every mode except 5b: a spend ceiling does not expire at a
 phase boundary, so re-probing codex at the next gate can only fail again and cost
@@ -9637,11 +9700,13 @@ Every subagent must:
 - Write STATUS.md LAST, after all other outputs are flushed.
 - Write it atomically: write `STATUS.md.tmp` and rename to `STATUS.md`. You only ever read `STATUS.md`.
 - Include these keys (simple `key: value` lines, YAML-compatible):
-  - `verdict:` one of `PASS`, `CHANGES_REQUESTED`, `BLOCKED`, `READY`, `MISSING_SKILLS`, `DONE`, `DONE_WITH_EXCLUSIONS`, `FAILED`, `NEEDS_DEBUG`, `SKIPPED` (the subset that applies to the role).
+  - `verdict:` one of `PASS`, `CHANGES_REQUESTED`, `BLOCKED`, `READY`, `MISSING_SKILLS`, `UNCERTAIN`, `DONE`, `DONE_WITH_EXCLUSIONS`, `FAILED`, `NEEDS_DEBUG`, `SKIPPED` (the subset that applies to the role — `UNCERTAIN` applies only to `preflight-codex`, see its own appendix).
   - `blockers:`, `majors:`, `minors:` — integers, reviewers only.
   - `reason:` — one-line, required when verdict is not `PASS`/`READY`/`DONE`.
   - `cost_hint:` — optional token-or-time estimate.
   - Reviewers also include `findings:` pointing to the full findings file.
+
+**`MISSING_SKILLS`/`UNCERTAIN` retry-once rule (spec §16.3/P02).** Neither verdict is ever treated as ground truth on first sight — every gate that dispatches `preflight-claude`/`preflight-codex` (Phase 1 Step 1.1 step 5, and Steps 3.0/5.0/6.−1/7.0's own branch) retries it EXACTLY ONCE via `skills_reprobe_needed` (or, for `UNCERTAIN`, unconditionally — see P12) before accepting it, mirroring the Mode 4 malformed-STATUS idiom below ("Retry ONCE same prompt. If still malformed, HALT"/degrade) generalized from a subprocess-failure mode to a semantic verdict. This is a fixed process rule, not a per-gate judgment call: no future gate may skip the retry and accept either verdict on the first probe alone.
 
 ### Per-subprocess timeouts
 
@@ -9663,9 +9728,9 @@ On ANY failure mode of a `codex` subprocess:
 - Proceed with the Claude reviewer's verdict alone.
 - The active gate's summarizer (and the final readiness writer) record `partial_review = true` and `codex_unavailable_reason = <mode>` in their summaries.
 
-Once `codex_available = false`, no further `codex` subprocesses are dispatched for the remainder of the **phase**. The flag is scoped to the current phase only — at the next per-phase preflight gate (Phases 3, 5, 6, 7), `codex_available` is reset to `true` and the codex probe re-runs, unless the run-scoped `codex_disabled_by_user` flag is set (see "Run-scoped user opt-out: `codex_disabled_by_user`" in the Phase 1 section), in which case the per-phase codex probe is skipped and `codex_available` stays `false` for that phase too. Within a phase's iteration loop the sticky rule still holds: a codex failure during, say, spec-review iter 02 keeps codex disabled through iter 03+, but does NOT carry into the next phase's preflight.
+Once `codex_available = false`, no further `codex` subprocesses are dispatched for the remainder of the **phase**. The flag is scoped to the current phase only — at the next per-phase preflight gate that dispatches codex (Phases 3, 5, 7), `codex_available` is reset to `true` and the codex probe re-runs, unless the run-scoped `codex_disabled_by_user` flag is set (see "Run-scoped user opt-out: `codex_disabled_by_user`" in the Phase 1 section), in which case the per-phase codex probe is skipped and `codex_available` stays `false` for that phase too. Within a phase's iteration loop the sticky rule still holds: a codex failure during, say, spec-review iter 02 keeps codex disabled through iter 03+, but does NOT carry into the next phase's preflight. Phase 6 never sets or reads `codex_available` at all (P09) — its Step 6.−1 has no codex dispatch for the flag to describe.
 
-The Phase 1 user prompt described in Step 1.1 step 6 is the ONLY automatic-degradation prompt; per-phase preflight failures (Modes 0–5 at Phases 3, 5, 7) silently degrade the phase to claude-only without prompting. At Phase 6 the codex preflight failure is non-blocking and also does not prompt (codex is not dispatched downstream).
+The Phase 1 user prompt described in Step 1.1 step 6 is the ONLY automatic-degradation prompt; per-phase preflight failures (Modes 0–5 at Phases 3, 5, 7) silently degrade the phase to claude-only without prompting. Phase 6 dispatches no codex subprocess at all (P09): Step 6.−1 surfaces the last known codex outcome from Phase 5, falling back to Phase 3, as a zero-cost informational note — there is no Phase 6 codex preflight failure to prompt on or degrade from.
 
 On a process resume that lands inside a gated phase, the orchestrator re-runs that phase's per-phase preflight before the next dispatch in the session — see "Resume semantics" below for the full branch.
 
@@ -9680,7 +9745,7 @@ On ANY failure mode of a `claude` subprocess:
 
 For each row, **first** apply the "Distinguish orchestration bugs from vendor failures" rule above — only proceed to the table action if the failure is genuinely on the vendor side.
 
-The "Codex subprocess" column below applies AT A PER-PHASE GATE (Phases 3, 5, 6, 7) and INSIDE A PHASE'S ITERATION LOOP. At **Phase 1** the codex column is overridden by Step 1.1 step 6 (Mode 0 HALTs unconditionally; Modes 1–5 prompt the user and set the run-scoped `codex_disabled_by_user` flag on consent). At **Phase 6** Mode 0–5 all degrade non-blocking (the probe is informational; no implementer-blocking action).
+The "Codex subprocess" column below applies AT A PER-PHASE GATE THAT DISPATCHES CODEX (Phases 3, 5, 7) and INSIDE A PHASE'S ITERATION LOOP. At **Phase 1** the codex column is overridden by Step 1.1 step 6 (Mode 0 HALTs unconditionally; Modes 1–5 prompt the user and set the run-scoped `codex_disabled_by_user` flag on consent). **Phase 6 dispatches no codex subprocess at all (P09)** — this table does not apply there; see Step 6.−1's own zero-cost `latest_codex_outcome` note instead.
 
 | Mode | Claude subprocess           | Codex subprocess (per-phase / in-iteration)                 |
 |------|------------------------------|--------------------------------------------------------------|
@@ -9909,7 +9974,7 @@ stderr_tail:              |
 
 `CODEX_DISABLED_BY_USER_CONSENT` is the canonical storage for the run-scoped `codex_disabled_by_user` flag. To reconstitute the flag on resume, scan `RUN_LOG.md` top-to-bottom for entries whose first-line tag is exactly `event=CODEX_DISABLED_BY_USER_CONSENT`. The flag is `true` if at least one such entry exists and no later entry carries the tag `event=CODEX_RE_ENABLED_BY_USER` (re-enabling is out of scope; the tag is reserved). Readers MUST match on the full first-line tag, NOT on `phase` / `phase_name`, since the event is unique per run.
 
-**`CODEX_SKIPPED_BY_USER_CONSENT` event** (emitted at the entry of each per-phase preflight gate — Phases 3, 5, 6, 7 — when `codex_disabled_by_user = true`):
+**`CODEX_SKIPPED_BY_USER_CONSENT` event** (emitted at the entry of each per-phase preflight gate that dispatches codex — Phases 3, 5, 7 — when `codex_disabled_by_user = true`; Phase 6 never emits this event, since it never dispatches `preflight-codex` regardless of the flag — see P09 / Step 6.−1):
 
 ```
 --- 2026-05-28T20:31:00Z  event=CODEX_SKIPPED_BY_USER_CONSENT
@@ -10242,7 +10307,8 @@ The Proposition file content rules in the Anti-leak red flags section apply to t
 This Develop-It SDLC step is complete only when ALL of the following hold:
 
 - Phase 1 preflight passed: `1-preflight/phase-1/claude-check-status.md` is `READY`, AND the readiness writer's classification for the Phase 1 codex slot is one of: (a) `READY` (codex STATUS present with `verdict: READY`), (b) `SKIPPED` consented via `event=CODEX_DISABLED_BY_USER_CONSENT` (codex STATUS absent), or (c) `FAILED` with a present codex STATUS file carrying `verdict: FAILED` / non-`READY` (Mode 4 malformed STATUS may legitimately remain at the alias path). A Phase 1 codex classification of `INVALID_ORCHESTRATION` blocks completion — this includes both (i) STATUS absent with NO corresponding event, AND (ii) STATUS absent with `event=CODEX_UNAVAILABLE` but no `event=CODEX_DISABLED_BY_USER_CONSENT` (per spec, Phase 1 Mode 0 HALTs unconditionally and Modes 1–5 require user consent — reaching completion without one of those events is an orchestration violation). The Phase 1 path is stricter than per-phase gates: an unavailable codex at Phase 1 is passable ONLY with recorded user consent.
-- Per-phase preflight passed for every phase in {3, 5, 6, 7}: `<phase-dir>/preflight/claude-check-status.md` is `READY`, AND the readiness writer's classification for that phase's codex slot is `READY`, `SKIPPED` (matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for `(phase=<P>, iteration=00)`), or `FAILED` (matching `event=CODEX_UNAVAILABLE` for `(phase=<P>, iteration=00)`, OR a present codex STATUS file with `verdict: FAILED` / non-`READY` — Mode 4 malformed STATUS may legitimately remain). Only an `INVALID_ORCHESTRATION` classification blocks completion. `FAILED` codex per-phase verdicts surface in the readiness report's `partial_review` / `codex_unavailable_reason` notes but do not gate completion. For Phase 6 specifically, this is explicit: Phase 6 codex probe failure is non-blocking by design — see Step 6.−1. Unlike Phase 1, per-phase gates do not require user consent for codex degradation; the per-phase preflight model trades that prompt for fast automatic degradation since the user has already opted into the run.
+- Per-phase preflight passed for every phase in {3, 5, 7}: `<phase-dir>/preflight/claude-check-status.md` is `READY`, AND the readiness writer's classification for that phase's codex slot is `READY`, `SKIPPED` (matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for `(phase=<P>, iteration=00)`), or `FAILED` (matching `event=CODEX_UNAVAILABLE` for `(phase=<P>, iteration=00)`, OR a present codex STATUS file with `verdict: FAILED` / non-`READY` — Mode 4 malformed STATUS may legitimately remain). Only an `INVALID_ORCHESTRATION` classification blocks completion. `FAILED` codex per-phase verdicts surface in the readiness report's `partial_review` / `codex_unavailable_reason` notes but do not gate completion. Unlike Phase 1, per-phase gates do not require user consent for codex degradation; the per-phase preflight model trades that prompt for fast automatic degradation since the user has already opted into the run.
+- Phase 6 preflight passed (P09 — Phase 6 dispatches no codex probe at all): `6-implementation/preflight/claude-check-status.md` is `READY`. There is no `(phase=6, vendor=codex)` classification to satisfy — no `6-implementation/preflight/codex-check-status.md` is ever written and none is expected; Step 6.−1's `latest_codex_outcome` note is informational prose, not a completion input.
 - Phase 2 context discovery passed (`2-context-discovery/status.md` = `READY`).
 - Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `3-spec-review/spec-review-summary.md` exists.
 - Implementation plan was written by the `plan-writer` subagent (`4-plan-writing/plan-status.md` = `DONE`).
@@ -10382,10 +10448,10 @@ You are a one-shot preflight checker invoked by the develop-it orchestrator. You
 - Required inputs: `feature_folder`
 - Optional inputs: `none`
 - Outputs: `check_status`
-- Allowed verdicts: `READY;MISSING_SKILLS`
+- Allowed verdicts: `READY;MISSING_SKILLS;UNCERTAIN`
 - Required status fields: `common_v2;required_skills_present;required_skills_missing;optional_skills_present;optional_skills_absent`
 - Checkpoint kind: `none`
-- Phases: `1;3;5;6;7`
+- Phases: `1;3;5;7`
 
 ## Inputs
 
@@ -10395,13 +10461,19 @@ You are a one-shot preflight checker invoked by the develop-it orchestrator. You
 
 `micro` mode. Filesystem reads: skill directory listing only (existence check); do NOT read skill file contents. Command budget: max 2 shell or read commands.
 
+**P12 — the whole required-skill scan MUST run as a SINGLE command across every configured plugin root**, never a per-skill or per-root loop. A budget-limited loop that checks root 1 for all three skills, then runs out of budget before reaching root 2, reports a skill `MISSING` that may only be absent from the root it never reached — the likely mechanism behind observed spurious `MISSING_SKILLS` verdicts. One command over every root closes that gap structurally instead of relying on getting lucky with root order: something of the shape `find <plugin-root-1> <plugin-root-2> … -maxdepth 3 -iname 'SKILL.md' | grep -E 'writing-plans|subagent-driven-development|verification-before-completion'`, run once against every root named in this run's plugin configuration, not once per root.
+
+This single command counts as (at most) one of the two budgeted shell/read commands; the other is reserved for the optional-skill discovery listing below. Never split the three required-skill checks across separate commands, even if the budget would technically allow it.
+
 ## Required skill probes
 
 - `superpowers:writing-plans`
 - `superpowers:subagent-driven-development`
 - `superpowers:verification-before-completion`
 
-For each, report `LOADED` if the skill's directory or `SKILL.md` file exists, or `MISSING` if it does not. Do NOT read the contents of `SKILL.md`. Do NOT load the skill. A path existence check is sufficient. Name every plugin root/path checked before reporting `MISSING` — this is the evidence a re-probe request (see Phase -1 Step 1.1 step 5) uses to tell a genuine absence from a stale listing.
+For each, report `LOADED` if the single-command scan above found its directory or `SKILL.md` file under any configured plugin root, or `MISSING` if the scan covered every configured root and found none. Do NOT read the contents of `SKILL.md`. Do NOT load the skill. A path existence check is sufficient. Name every plugin root/path checked before reporting `MISSING` — this is the evidence a re-probe request (see Phase -1 Step 1.1 step 5) uses to tell a genuine absence from a stale listing.
+
+**`UNCERTAIN` verdict (P12).** Report `verdict: UNCERTAIN` instead of `MISSING_SKILLS` — for the WHOLE probe, never per-skill — whenever the single-command scan did not actually cover every configured plugin root: the command budget was exhausted before it could run, the command itself failed or errored, or the configured-root list was empty/unresolvable. `MISSING` is reserved for a skill genuinely absent from a scan that covered every configured root; a partial scan can only ever produce `UNCERTAIN`, never `MISSING`, for the skills it didn't finish checking. Still name every root actually covered (or attempted) in `x_plugin_roots_checked`, and put the reason the scan was partial in `reason:` (e.g. `partial scan: command budget exhausted before root 2 of 3`). The orchestrator treats `UNCERTAIN` as an automatic re-probe trigger, never as evidence of absence (see Phase -1 Step 1.1 step 5 and each per-phase preflight gate's own branch).
 
 ## Optional skill discovery
 
@@ -10434,18 +10506,18 @@ role: preflight-codex
 phase: $PHASE
 iteration: 00
 attempt: $ATTEMPT
-verdict: READY | MISSING_SKILLS
-reason: <one line, or the literal word null>
+verdict: READY | MISSING_SKILLS | UNCERTAIN
+reason: <one line, or the literal word null -- required for MISSING_SKILLS and UNCERTAIN: for UNCERTAIN, state which root(s) the single-command scan did not cover and why (budget exhausted / command failed / root list empty)>
 published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
 artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
 output_count: 0
 checkpoint_path: null
 required_skills_present: [skill1, skill2, ...]
-required_skills_missing: [skill3, ...] (empty list if READY)
+required_skills_missing: [skill3, ...] (empty list if READY or UNCERTAIN -- UNCERTAIN means the scan could not confirm absence, never that a skill was found missing)
 optional_skills_present: [skill4, ...] (empty list if none installed beyond the required set)
 optional_skills_absent: []
-x_plugin_roots_checked: [/path/one, /path/two, ...]
-x_missing_skills: [skill1, skill2, ...] (empty list if READY; same content as required_skills_missing, kept for back-compat)
+x_plugin_roots_checked: [/path/one, /path/two, ...] (for UNCERTAIN: every root actually covered before the scan stopped, so the re-probe evidence check can tell what was and wasn't verified)
+x_missing_skills: [skill1, skill2, ...] (empty list if READY or UNCERTAIN; same content as required_skills_missing, kept for back-compat)
 x_loaded_skills: [skill3, skill4, ...]
 STATUS
 ```
@@ -12550,10 +12622,11 @@ You are the final readiness reporter. You have no shared context.
 1. Read the following files inside `$FEATURE_FOLDER`:
    - `1-preflight/phase-1/claude-check-status.md` (Phase 1 claude verdict; a copy of the attempt-scoped original made by Step 1.2)
    - `1-preflight/phase-1/codex-check-status.md` (Phase 1 codex verdict; may be absent if Codex failed at Phase 1 or `codex_disabled_by_user` was set there)
-   - For each phase P in {3, 5, 6, 7}, read both:
+   - For each phase P in {3, 5, 7}, read both:
      - `<phase-dir>/preflight/claude-check-status.md`
      - `<phase-dir>/preflight/codex-check-status.md`
-     where `<phase-dir>` ∈ {`3-spec-review`, `5-plan-review`, `6-implementation`, `7-code-review`} corresponding to phases {3, 5, 6, 7}. The codex file may be absent per the file-policy rules (see step 2 of this appendix for the classification).
+     where `<phase-dir>` ∈ {`3-spec-review`, `5-plan-review`, `7-code-review`} corresponding to phases {3, 5, 7}. The codex file may be absent per the file-policy rules (see step 2 of this appendix for the classification).
+   - For phase 6, read only `6-implementation/preflight/claude-check-status.md`. Phase 6 never dispatches `preflight-codex` (P09) — there is no `6-implementation/preflight/codex-check-status.md` to read and none is expected; do not treat its absence as a file-policy case.
    - `2-context-discovery/status.md`
    - `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md` (for `codex_unavailable_reason`)
    - `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`
@@ -12576,20 +12649,21 @@ You are the final readiness reporter. You have no shared context.
    object `{"check":..., "detail":..., "record_ids":[...]}`. You never re-derive
    this audit yourself — you only quote it.
 
-2. **Classify each preflight verdict** before composing the report. For each `(phase ∈ {1, 3, 5, 6, 7}, vendor ∈ {claude, codex})` pair:
+2. **Classify each preflight verdict** before composing the report. For each `(phase ∈ {1, 3, 5, 7}, vendor ∈ {claude, codex})` pair, plus `(phase=6, vendor=claude)`:
    - **File present, `verdict: READY`** → `READY`.
-   - **File present, any other verdict (e.g. `MISSING_SKILLS`, `FAILED`)** → `FAILED`, with the in-file `reason:` / `failure_mode:` carried into the report.
-   - **Claude file absent for a phase that ran a claude probe** → `INVALID_ORCHESTRATION`. Set the overall readiness verdict to `NOT_READY` with reason `invalid_orchestration: claude preflight STATUS missing for phase=<P>`. (Claude failures HALT the run, so on HALT the readiness writer does not execute and this branch is only reached when the orchestrator silently dropped a claude STATUS write — a bug.)
+   - **File present, any other verdict (e.g. `MISSING_SKILLS`, `UNCERTAIN`, `FAILED`)** → `FAILED`, with the in-file `reason:` / `failure_mode:` carried into the report.
+   - **Claude file absent for a phase that ran a claude probe** → `INVALID_ORCHESTRATION`. Set the overall readiness verdict to `NOT_READY` with reason `invalid_orchestration: claude preflight STATUS missing for phase=<P>`. (Claude failures HALT the run, so on HALT the readiness writer does not execute and this branch is only reached when the orchestrator silently dropped a claude STATUS write — a bug.) This applies to Phase 6's claude probe exactly like every other phase.
    - **(Phase 1 only) Codex file absent AND there is an `event=CODEX_DISABLED_BY_USER_CONSENT` in RUN_LOG** → `SKIPPED` (consented degradation at Phase 1). Not a failure. This event is unique per run (no `(phase, iteration)` match required — match on the full first-line tag) and is the canonical Phase 1 user-consent signal; `CODEX_SKIPPED_BY_USER_CONSENT` is NOT logged at Phase 1, so do not look for it there.
-   - **(Phases 3, 5, 6, 7) Codex file absent AND there is a matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for the same `(phase, iteration=00)` in RUN_LOG** → `SKIPPED`. Not a failure.
+   - **(Phases 3, 5, 7) Codex file absent AND there is a matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for the same `(phase, iteration=00)` in RUN_LOG** → `SKIPPED`. Not a failure.
    - **(Phase 1 only) Codex file absent AND there is a matching `event=CODEX_UNAVAILABLE` for `phase: 1` BUT NO `event=CODEX_DISABLED_BY_USER_CONSENT` in RUN_LOG** → `INVALID_ORCHESTRATION`. Per the spec, Phase 1 requires Mode 0 to HALT and Modes 1–5 to proceed only after recorded user consent. Reaching the readiness writer with a Phase 1 codex `CODEX_UNAVAILABLE` and no consent event means the orchestrator violated the Phase 1 HALT-or-prompt rule (e.g., resumed past a HALT it should have honored). Set the overall readiness verdict to `NOT_READY` with reason `invalid_orchestration: Phase 1 codex CODEX_UNAVAILABLE without user consent — run should have HALTed`.
-   - **(Phases 3, 5, 6, 7) Codex file absent AND there is a matching `event=CODEX_UNAVAILABLE` for the same `(phase, iteration=00)`** → `FAILED` with `failure_mode` taken from the event. Per-phase Mode 0–5 failures at these gates are passable degradation per the spec (claude-only for the phase, or non-blocking at Phase 6); no user consent is required at per-phase gates.
-   - **Codex file absent AND no matching `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (per-phase) or `CODEX_UNAVAILABLE` event** → `INVALID_ORCHESTRATION`. Set the overall readiness verdict to `NOT_READY` with reason `invalid_orchestration: codex preflight STATUS missing for phase=<P> with no corresponding event`.
+   - **(Phases 3, 5, 7) Codex file absent AND there is a matching `event=CODEX_UNAVAILABLE` for the same `(phase, iteration=00)`** → `FAILED` with `failure_mode` taken from the event. Per-phase Mode 0–5 failures at these gates are passable degradation per the spec (claude-only for the phase); no user consent is required at per-phase gates.
+   - **(Phases 1, 3, 5, 7) Codex file absent AND no matching `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (per-phase) or `CODEX_UNAVAILABLE` event** → `INVALID_ORCHESTRATION`. Set the overall readiness verdict to `NOT_READY` with reason `invalid_orchestration: codex preflight STATUS missing for phase=<P> with no corresponding event`.
+   - **(Phase 6 only) There is no `(phase=6, vendor=codex)` pair to classify.** P09 removed Phase 6's codex dispatch entirely: no `6-implementation/preflight/codex-check-status.md` file exists for any run, and Step 6.−1 never appends a `CODEX_UNAVAILABLE` or `CODEX_SKIPPED_BY_USER_CONSENT` event for `(phase=6, iteration=00)`. That absence is normal, not `INVALID_ORCHESTRATION` — do not apply the catch-all rule above to Phase 6. Report Phase 6's codex status as Step 6.−1's own `latest_codex_outcome`-derived note (see step 3 below) instead of a classified verdict.
 
    The classification per `(phase, vendor)` is reported in the new "Preflight verdicts" section (see step 3 below).
 3. Compose `$FEATURE_FOLDER/final-readiness-report.md` with these sections:
    - **Artifacts** — paths to canonical spec, canonical plan, all summary files, AND `<feature-folder>/process-improvement-proposition.md`. The proposition file is listed by path only — its content is NOT read for verdict purposes. If the file does not exist at Phase 11 (no mandatory triggers fired and no spontaneous entries were emitted), list it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
-   - **Preflight verdicts** — per `(phase, vendor)` table for phases in {1, 3, 5, 6, 7}: each row reports `phase`, `vendor`, classification (`READY` / `SKIPPED` / `FAILED` / `INVALID_ORCHESTRATION`), and `failure_mode` (if `FAILED`) or skip-reason (if `SKIPPED`). Phase 1 rows are read from `1-preflight/phase-1/`; per-phase rows from `<phase-dir>/preflight/`. Any `INVALID_ORCHESTRATION` row forces the overall readiness verdict to `NOT_READY`.
+   - **Preflight verdicts** — per `(phase, vendor)` table for phases in {1, 3, 5, 7} (both vendors) plus phase 6 (claude only): each row reports `phase`, `vendor`, classification (`READY` / `SKIPPED` / `FAILED` / `INVALID_ORCHESTRATION`), and `failure_mode` (if `FAILED`) or skip-reason (if `SKIPPED`). Phase 1 rows are read from `1-preflight/phase-1/`; per-phase rows from `<phase-dir>/preflight/`. Any `INVALID_ORCHESTRATION` row forces the overall readiness verdict to `NOT_READY`. Phase 6 gets no `vendor=codex` row (P09 — no dispatch, no classification); add one note line beneath the table instead, sourced from Step 6.−1's own `latest_codex_outcome`-derived RUN_LOG scan (most recent outcome from Phase 5, falling back to Phase 3) — informational only, never a factor in the readiness verdict.
    - **Reviewer verdicts** — per-gate iteration counts, final verdicts, `partial_review` flag with per-gate `codex_unavailable_reason` if any.
    - **Implementation result** — task count, commits, `implementation_base_sha`, verification, no-secret check, browser-QA result if applicable. If a post-debug re-verification occurred, note it. Read `implementer-status.md`'s own `x_baseline_sha`/`x_final_sha` (cross-check `x_baseline_sha` against the LATEST `event=GIT_FINALIZATION_RESULT` entry's own `base_sha` field in `RUN_LOG.md` — a mismatch is itself a degradation worth a Degradations line) and `x_remaining_handoffs` (surfaced as its own bulleted list under this section when non-null — this is where a Mode D continuation's own leftover follow-ups become visible to the user, not silently dropped).
    - **Test results** — `final_test_verdict` (`PASS` / `FAILED` / `SKIPPED`), execution mode (`start-all-tests.sh` — a project-specific convention — vs discovered suites), rounds used, fix rounds dispatched, and — when `FAILED` — the residual-failure detail carried over from `all-test-summary.md` (failing test names, error excerpts, what each fix round attempted).
@@ -12602,7 +12676,7 @@ You are the final readiness reporter. You have no shared context.
    - **Deferred MAJOR items** — total count + per-gate breakdown of MAJOR findings open when a gate passed under the relaxed rule (iterations 3 and up, `blockers=0`, every open major carrying an explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>` disposition per spec §17.3); each WAS re-reviewed — the dispositioning fixer dispatch was followed by another full reviewer round per spec §18.2, never an unreviewed final fix. Read from each gate's summary file (the summarizer records deferred majors there). Present this section only when at least one gate carried deferred majors. NOTE: this section's presence is NOT the trigger for `READY_WITH_NOTES` — a relaxed-tier pass forces `READY_WITH_NOTES` on its own (see the readiness-verdict rule), so a clean relaxed pass produces `READY_WITH_NOTES` with this section absent.
    - **Residual MINOR/NIT items** — total count + per-gate breakdown.
    - **Run history** — number of resumes, vendor failover events from RUN_LOG, baseline SHA capture.
-   - **Readiness verdict** — first: if `audit-findings.jsonl` carries any line at all, the verdict is unconditionally `NOT_READY` (spec §21.2/§20.11's "failed audit" gate) regardless of every other section below — quote each finding's own `record_ids` in the reason. Otherwise: `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, the all-tests `final_test_verdict` is `PASS` or `SKIPPED`, every preflight verdict is `READY` or `SKIPPED`, AND the "Degradations" section is empty (no `CONTEXT7_UNAVAILABLE` / `DISPATCH_ORPHANED` / `MODEL_REJECTED` / `DEGRADED_REVIEW_ACCEPTED` events) — a run cannot be reported `READY` with any degradation present, regardless of how the rest of the run went; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 6, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain, OR (c) the "Degradations" section is non-empty and none of the `NOT_READY` conditions below apply; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including a non-empty reconciliation audit (above), an all-tests `final_test_verdict` of `FAILED` (residual test failures after the fix cap — `NOT_READY` even when everything else passed; the "Test results" section carries the detail), any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), any claude preflight that is not `READY`, or a git finalization `outcome` of `FAILED` (the intended local commit never landed). A `documentation_validation` other than `PASS`, or a git finalization `outcome` of `BLOCKED` (including the non-git and lease-conflict cases), do not by themselves force `NOT_READY` — they force at least `READY_WITH_NOTES`, per the Documentation/UAT status and Git result sections above.
+   - **Readiness verdict** — first: if `audit-findings.jsonl` carries any line at all, the verdict is unconditionally `NOT_READY` (spec §21.2/§20.11's "failed audit" gate) regardless of every other section below — quote each finding's own `record_ids` in the reason. Otherwise: `READY` if all gates passed strictly (`blockers=0, majors=0` per active reviewers, i.e. every gate converged by iteration 2), verification=PASS, the all-tests `final_test_verdict` is `PASS` or `SKIPPED`, every preflight verdict is `READY` or `SKIPPED`, AND the "Degradations" section is empty (no `CONTEXT7_UNAVAILABLE` / `DISPATCH_ORPHANED` / `MODEL_REJECTED` / `DEGRADED_REVIEW_ACCEPTED` events) — a run cannot be reported `READY` with any degradation present, regardless of how the rest of the run went; `READY_WITH_NOTES` if EITHER (a) Codex was unavailable for one or more gates (`FAILED` codex preflight verdicts present, all claude preflights `READY`, every `SKIPPED` codex preflight backed by either `CODEX_DISABLED_BY_USER_CONSENT` (Phase 1) or `CODEX_SKIPPED_BY_USER_CONSENT` (Phases 3, 5, 7)), OR (b) one or more gates passed under the relaxed rule (final passing iteration ≥ 3, `blockers=0`) — whether or not deferred majors remain, OR (c) the "Degradations" section is non-empty and none of the `NOT_READY` conditions below apply; deferred majors, when present, are listed in the "Deferred MAJOR items" section, and the relaxed convergence is always visible in the "Reviewer verdicts" per-gate iteration counts; `NOT_READY` otherwise — specifically including a non-empty reconciliation audit (above), an all-tests `final_test_verdict` of `FAILED` (residual test failures after the fix cap — `NOT_READY` even when everything else passed; the "Test results" section carries the detail), any gate that HALTed with an active reviewer still reporting `blockers > 0`, any `INVALID_ORCHESTRATION` classification (e.g., Phase 1 codex `CODEX_UNAVAILABLE` without recorded user consent), any claude preflight that is not `READY`, or a git finalization `outcome` of `FAILED` (the intended local commit never landed). A `documentation_validation` other than `PASS`, or a git finalization `outcome` of `BLOCKED` (including the non-git and lease-conflict cases), do not by themselves force `NOT_READY` — they force at least `READY_WITH_NOTES`, per the Documentation/UAT status and Git result sections above.
    - **Usage rollup** — emit a final `## Usage rollup` section containing four parts in this order:
      1. **Grand total** (one row) — columns: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration`. Sum across every dispatch entry in `RUN_LOG.md`.
      2. **Per-phase table** — one row per phase that ran (use `phase_name` for the row label). Same columns as grand total, plus a leading `Phase` column. Include a final `TOTAL` row that matches the grand total.
