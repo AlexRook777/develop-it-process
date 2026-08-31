@@ -4544,7 +4544,10 @@ opening that prose file at all.
 # to read RUN_LOG.md -- neither hand-rolls its own block scan, so a future
 # change to the block grammar has one parser to update, not two.
 _run_log_events_json() {
-  local log="${FEATURE_FOLDER:-}/RUN_LOG.md"
+  # Optional $1 override (Task 6/P04: latest_codex_outcome is the one caller
+  # that ever reads a non-default log path, e.g. in tests) -- every other
+  # caller passes no argument and gets the usual $FEATURE_FOLDER/RUN_LOG.md.
+  local log="${1:-${FEATURE_FOLDER:-}/RUN_LOG.md}"
   [ -f "$log" ] || return 0
   "$PYTHON_BIN" - "$log" <<'PY'
 import json, re, sys
@@ -4595,6 +4598,56 @@ if current is not None:
 for rec in blocks:
     print(json.dumps(rec))
 PY
+}
+
+# Task 6 (P04): the ONE shared reader every "scan RUN_LOG.md for the latest
+# relevant event" function below is built on -- dispatch_is_running,
+# vendor_proven, context7_policy, _validate_artifact_phase_accepted, and
+# latest_codex_outcome each used to hand-roll their own line-by-line (or, for
+# vendor_proven, blank-line-split) block scanner, five slightly-different
+# grammars for the same file. All five now go through _run_log_events_json
+# (above) -- the ONLY parser -- and differ only in the jq SELECT they pass
+# here.
+#
+# Usage: _run_log_latest_event JQ_SELECT [NAME=VALUE...]
+#   JQ_SELECT: a jq boolean expression evaluated against each event object
+#     (bound to `.`); every NAME=VALUE becomes a `--arg NAME VALUE` binding
+#     the expression may reference as `$NAME`. The reserved name `_log`
+#     overrides the RUN_LOG.md path passed to _run_log_events_json instead of
+#     becoming a jq argument (latest_codex_outcome's own optional LOG
+#     parameter is the only caller that uses this).
+# RUN_LOG.md is append-only, so file order IS chronological order: this
+# prints the LAST (compact, one-line) JSON event object matching JQ_SELECT,
+# or nothing with exit 1 when no event matches -- "latest matching event
+# wins" is the one semantic every caller below needs, whether "latest" means
+# "the current answer" (dispatch_is_running, vendor_proven, context7_policy,
+# latest_codex_outcome) or merely "exists at all" (_validate_artifact_phase_
+# accepted, which only cares whether the match succeeded).
+_run_log_latest_event() {
+  local jq_select="$1"; shift
+  local log_override="" kv
+  local -a jq_args=()
+  for kv in "$@"; do
+    case "$kv" in
+      _log=*) log_override="${kv#_log=}" ;;
+      *) jq_args+=(--arg "${kv%%=*}" "${kv#*=}") ;;
+    esac
+  done
+  local hit
+  hit="$(_run_log_events_json "$log_override" | jq -c "${jq_args[@]}" "select($jq_select)" 2>/dev/null | tail -n1)"
+  [ -n "$hit" ] || return 1
+  printf '%s\n' "$hit"
+}
+
+# Usage: _run_log_latest_field JQ_SELECT FIELD [NAME=VALUE...]
+# Convenience wrapper over _run_log_latest_event: prints just one FIELD of
+# the latest matching event (`_type` recovers which event type actually won)
+# instead of the whole object. Same exit-1-on-no-match contract.
+_run_log_latest_field() {
+  local jq_select="$1" field="$2"; shift 2
+  local hit
+  hit="$(_run_log_latest_event "$jq_select" "$@")" || return 1
+  printf '%s' "$hit" | jq -r --arg f "$field" '.[$f] // empty'
 }
 
 # Append-only audit-findings ledger shared by reconcile_propositions and
@@ -6363,27 +6416,21 @@ matching `DISPATCH_COMPLETED` or `DISPATCH_NOT_LAUNCHED` yet — by scanning
 # Usage: dispatch_is_running <dispatch_id>
 # 0 (true) iff RUN_LOG.md has a DISPATCH_STARTED for this id with no later
 # DISPATCH_COMPLETED or DISPATCH_NOT_LAUNCHED for the same id.
+# Task 6 (P04): rewritten on _run_log_latest_field (the shared reader, above)
+# instead of a hand-rolled line scan. Also fixes a live bug in the old scan:
+# its `*"$id")` case pattern was an UNANCHORED SUFFIX match against the whole
+# `dispatch_id:<value>` line, so a dispatch id that happened to be a suffix
+# of another one (e.g. id "x-a01" would match a stored "p06-i00-x-a01") could
+# false-positive. `.dispatch_id==$id` below is an exact match on the parsed
+# field, never a substring/suffix comparison.
 dispatch_is_running() {
-  local id="$1" log="$FEATURE_FOLDER/RUN_LOG.md" started=no
+  local id="$1" log="$FEATURE_FOLDER/RUN_LOG.md"
   [ -f "$log" ] || return 1
-  local tag line
-  while IFS= read -r line; do
-    case "$line" in
-      "--- "*"  event=DISPATCH_STARTED") tag=DISPATCH_STARTED ;;
-      "--- "*"  event=DISPATCH_COMPLETED") tag=DISPATCH_COMPLETED ;;
-      "--- "*"  event=DISPATCH_NOT_LAUNCHED") tag=DISPATCH_NOT_LAUNCHED ;;
-      "--- "*) tag="" ;;
-      "dispatch_id:"*)
-        [ -n "$tag" ] || continue
-        case "$line" in
-          *"$id") case "$tag" in
-                    DISPATCH_STARTED) started=yes ;;
-                    DISPATCH_COMPLETED|DISPATCH_NOT_LAUNCHED) started=no ;;
-                  esac ;;
-        esac ;;
-    esac
-  done < "$log"
-  [ "$started" = yes ]
+  local type
+  type="$(_run_log_latest_field \
+    '(._type=="DISPATCH_STARTED" or ._type=="DISPATCH_COMPLETED" or ._type=="DISPATCH_NOT_LAUNCHED") and (.dispatch_id // "")==$id' \
+    _type "id=$id")" || return 1
+  [ "$type" = DISPATCH_STARTED ]
 }
 
 # A user-facing "role X is running" claim is only ever correct when
@@ -7010,31 +7057,27 @@ vendor_proven_mark() {
 # probe or publication-loss failure (`TIMED_OUT`, `TRANSIENT_TRANSPORT_ERROR`,
 # `EXITED_NO_STATUS`, `PUBLICATION_LOST`, `UNKNOWN_VENDOR_ERROR`) carries
 # none of those, so it can never revoke a prior proof.
+# Task 6 (P04): this used to be vendor_proven's own bespoke parser --
+# `blocks = text.split("\n\n")` -- the exact blank-line split
+# _run_log_events_json's own comment (above) documents as discredited: a
+# VENDOR_PROVEN/DISPATCH_COMPLETED block whose `reason:` wraps onto a second
+# line contains a blank line and would silently truncate or merge with its
+# neighbor. Rewritten on the shared _run_log_latest_field reader instead: the
+# LATEST event that is either a VENDOR_PROVEN for this vendor, a
+# MODEL_REJECTED for this vendor, or ANY event for this vendor whose own
+# `classification` field is SPEND_CEILING/PERMANENT_VENDOR_ERROR decides the
+# answer -- exactly the three-way "latest wins" the old block scan
+# implemented by hand, now expressed as one jq SELECT.
 vendor_proven() {
-  local vendor="$1" log="$FEATURE_FOLDER/RUN_LOG.md"
-  [ -f "$log" ] || { printf 'false\n'; return 0; }
-  "$PYTHON_BIN" - "$log" "$vendor" <<'PY'
-import re, sys
-path, vendor = sys.argv[1], sys.argv[2]
-text = open(path, encoding="utf-8", errors="replace").read()
-blocks = text.split("\n\n")
-state = False
-revoke_re = re.compile(r"^classification:\s*(SPEND_CEILING|PERMANENT_VENDOR_ERROR)\s*$", re.M)
-for b in blocks:
-    m = re.search(r"^---\s+[^\s]+\s+event=([^\s]+)", b, re.M)
-    if not m:
-        continue
-    event = m.group(1)
-    vline = re.search(r"^vendor:\s*([^\s]+)\s*$", b, re.M)
-    v = vline.group(1) if vline else None
-    if v != vendor:
-        continue
-    if event == "VENDOR_PROVEN":
-        state = True
-    elif event == "MODEL_REJECTED" or revoke_re.search(b):
-        state = False
-print("true" if state else "false")
-PY
+  local vendor="$1" type
+  type="$(_run_log_latest_field \
+    '(.vendor // "")==$vendor and (._type=="VENDOR_PROVEN" or ._type=="MODEL_REJECTED" or .classification=="SPEND_CEILING" or .classification=="PERMANENT_VENDOR_ERROR")' \
+    _type "vendor=$vendor")" || true
+  if [ "$type" = VENDOR_PROVEN ]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
 }
 
 # Usage: vendor_preflight_reprobe_once VENDOR MODE
@@ -7089,36 +7132,41 @@ vendor_preflight_reprobe_once() {
 # branches), or a `CODEX_SKIPPED_BY_USER_CONSENT`. Prints one of `READY`,
 # `UNAVAILABLE mode=<N>`, `SKIPPED`, or `none` (no matching entry for that
 # phase at all -- e.g. a fresh run that never reached that gate).
+# Task 6 (P04): rewritten on the shared _run_log_latest_event reader instead
+# of its own blank-line-split scanner (same discredited grammar vendor_proven
+# used to hand-roll -- see the comment there). The LOG override this function
+# has always accepted is threaded through via _run_log_latest_event's
+# reserved `_log=` binding rather than duplicated here.
 latest_codex_outcome() {
   local phase="$1" log="${2:-$FEATURE_FOLDER/RUN_LOG.md}"
   [ -f "$log" ] || { printf 'none\n'; return 0; }
-  "$PYTHON_BIN" - "$log" "$phase" <<'PY'
-import re, sys
-path, phase = sys.argv[1], sys.argv[2]
-text = open(path, encoding="utf-8", errors="replace").read()
-blocks = text.split("\n\n")
-result = "none"
-for b in blocks:
-    m = re.search(r"^---\s+[^\s]+\s+event=([^\s]+)", b, re.M)
-    if not m:
-        continue
-    event = m.group(1)
-    if event not in ("DISPATCH_COMPLETED", "CODEX_UNAVAILABLE", "CODEX_SKIPPED_BY_USER_CONSENT"):
-        continue
-    fields = dict(re.findall(r"^([a-zA-Z_]+):\s*(.*?)\s*$", b, re.M))
-    if fields.get("phase") != phase or fields.get("iteration") != "00":
-        continue
-    if event == "DISPATCH_COMPLETED":
-        if fields.get("role") != "preflight-codex":
-            continue
-        v = fields.get("verdict", "")
-        result = "READY" if v == "READY" else ("UNAVAILABLE mode=" + v.lower() if v else "none")
-    elif event == "CODEX_UNAVAILABLE":
-        result = "UNAVAILABLE mode=" + fields.get("failure_mode", "unknown")
-    else:
-        result = "SKIPPED"
-print(result)
-PY
+  local select='(._type=="DISPATCH_COMPLETED" or ._type=="CODEX_UNAVAILABLE" or ._type=="CODEX_SKIPPED_BY_USER_CONSENT")
+    and ((.phase // "")==$phase) and ((.iteration // "")=="00")
+    and (._type!="DISPATCH_COMPLETED" or (.role // "")=="preflight-codex")'
+  local hit
+  hit="$(_run_log_latest_event "$select" "phase=$phase" "_log=$log")" || true
+  if [ -z "$hit" ]; then
+    printf 'none\n'; return 0
+  fi
+  local type verdict failure_mode
+  type="$(printf '%s' "$hit" | jq -r '._type')"
+  case "$type" in
+    DISPATCH_COMPLETED)
+      verdict="$(printf '%s' "$hit" | jq -r '.verdict // ""')"
+      case "$verdict" in
+        READY) printf 'READY\n' ;;
+        "") printf 'none\n' ;;
+        *) printf 'UNAVAILABLE mode=%s\n' "$(printf '%s' "$verdict" | tr '[:upper:]' '[:lower:]')" ;;
+      esac
+      ;;
+    CODEX_UNAVAILABLE)
+      failure_mode="$(printf '%s' "$hit" | jq -r '.failure_mode // "unknown"')"
+      printf 'UNAVAILABLE mode=%s\n' "$failure_mode"
+      ;;
+    *)
+      printf 'SKIPPED\n'
+      ;;
+  esac
 }
 ```
 
@@ -7428,20 +7476,20 @@ RUN_LOG event), never assumed to still be sitting in a shell variable.
 # Phase 1's own STATUS reading -- previously the ONLY signal this function
 # consulted, which meant a later CONTEXT7_UNAVAILABLE could never downgrade
 # an already-reachable Phase 1 reading.
+# Task 6 (P04): rewritten on the shared _run_log_latest_event reader instead
+# of its own line-by-line tag/probe state machine. Fetching the LATEST event
+# whose type is either CONTEXT7_UNAVAILABLE or CONTEXT7_RESTORED as one JSON
+# object -- rather than tracking `tag`/`probe` by hand across every line --
+# also removes the need to manually reset `probe` at each new header: the
+# parser already scopes fields to their own block.
 context7_policy() {
-  local log="$FEATURE_FOLDER/RUN_LOG.md" tag="" last="" probe="" line
+  local log="$FEATURE_FOLDER/RUN_LOG.md" last="" probe="" hit=""
   if [ -f "$log" ]; then
-    while IFS= read -r line; do
-      case "$line" in
-        "--- "*"  event=CONTEXT7_UNAVAILABLE") tag=CONTEXT7_UNAVAILABLE; probe="" ;;
-        "--- "*"  event=CONTEXT7_RESTORED")    tag=CONTEXT7_RESTORED; probe="" ;;
-        "--- "*)                               tag="" ;;
-        "probe:"*)
-          [ "$tag" = CONTEXT7_RESTORED ] && probe="$(printf '%s' "${line#probe:}" \
-            | tr -d '[:space:]')" ;;
-      esac
-      case "$tag" in CONTEXT7_UNAVAILABLE|CONTEXT7_RESTORED) last="$tag" ;; esac
-    done < "$log"
+    hit="$(_run_log_latest_event '._type=="CONTEXT7_UNAVAILABLE" or ._type=="CONTEXT7_RESTORED"')" || true
+    if [ -n "$hit" ]; then
+      last="$(printf '%s' "$hit" | jq -r '._type')"
+      probe="$(printf '%s' "$hit" | jq -r '(.probe // "") | gsub("\\s";"")')"
+    fi
   fi
   case "$last" in
     CONTEXT7_UNAVAILABLE)
@@ -7656,22 +7704,16 @@ _validate_artifact_phase_accepted() {
   # Usage: _validate_artifact_phase_accepted ARTIFACT_PATH
   # True iff RUN_LOG.md carries a durable event=PHASE_ACCEPTED block whose
   # OWN artifact_path field names this exact artifact.
-  local artifact_path="$1" log="${FEATURE_FOLDER:-}/RUN_LOG.md" tag="" match=no want got
+  # Task 6 (P04): rewritten on the shared _run_log_latest_field reader
+  # instead of its own line-by-line tag scan -- "does a match exist at all"
+  # falls out of _run_log_latest_field's own exit-1-on-no-match contract, so
+  # there is no separate `match` flag to thread through by hand.
+  local artifact_path="$1" log="${FEATURE_FOLDER:-}/RUN_LOG.md" want
   [ -f "$log" ] || return 1
   want="$(printf '%s' "$artifact_path" | tr -d '[:space:]')"
-  while IFS= read -r line; do
-    case "$line" in
-      "--- "*"  event=PHASE_ACCEPTED") tag=PHASE_ACCEPTED ;;
-      "--- "*) tag="" ;;
-      "artifact_path:"*)
-        if [ "$tag" = PHASE_ACCEPTED ]; then
-          got="$(printf '%s' "${line#artifact_path:}" | tr -d '[:space:]')"
-          [ "$got" = "$want" ] && match=yes
-        fi
-        ;;
-    esac
-  done < "$log"
-  [ "$match" = yes ]
+  _run_log_latest_field \
+    '._type=="PHASE_ACCEPTED" and ((.artifact_path // "") | gsub("\\s";"")) == $want' \
+    _type "want=$want" >/dev/null
 }
 
 validate_artifact() {
