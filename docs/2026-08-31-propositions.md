@@ -264,7 +264,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P19 — Generate the Event Contract Registry like its two siblings
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (5a9b68e)
 
 **Criticality:** Medium · **Effort:** Hard
 
