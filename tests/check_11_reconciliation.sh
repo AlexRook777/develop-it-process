@@ -380,6 +380,33 @@ assert_rc 1 "$rc" "6c: reconcile_propositions fails when a halt-implying correct
 assert_eq yes "$(_t15_finding_has EVENT_CORRECTION_NOT_REFLECTED "corrected_event_id:$_t15_af_id3" && echo yes || echo no)" \
   "6c: the finding names the exact corrected event_id"
 
+# 6d: fault isolation (code review fix) -- a malformed EVENT_CORRECTED (a
+# non-numeric corrected_event_id, simulating hand-corrupted RUN_LOG data)
+# must NOT abort the single-pass jq rule and silently swallow every OTHER
+# finding queued behind it. Recorded FIRST (RUN_LOG is append-only, so file
+# order is chronological) -- the exact ordering that reproduced a real bug:
+# jq's fatal "startswith()/tonumber requires string inputs" error on this
+# record aborted the WHOLE jq invocation with zero stdout, so
+# reconcile_propositions previously reported a CLEAN audit (rc=0, no
+# findings at all) even though the well-formed violation below is real.
+_t15_reset
+record_event EVENT_CORRECTED corrected_event_id="not-a-real-event-id" \
+  replacement_classification=TRANSIENT_TRANSPORT_ERROR evidence="hand-corrupted fixture" \
+  downstream_effect=none reason="t15 malformed correction -- must not abort the pass" >/dev/null
+_t15_dispatch_pair 6 00 implementer p06-i00-implementer-a01 p06-i00-implementer \
+  FAILED PERMANENT_VENDOR_ERROR "" NO_SIDE_EFFECTS
+record_event ATTEMPT_FAILED phase=6 iteration=00 dispatch_id=p06-i00-implementer-a01 \
+  reason="t15 correction target (behind a malformed record)" phase_name=implementation \
+  role=implementer classification=PERMANENT_VENDOR_ERROR >/dev/null
+_t15_af_id4="$RECORD_EVENT_ID"
+record_event EVENT_CORRECTED corrected_event_id="$_t15_af_id4" \
+  replacement_classification=TRANSIENT_TRANSPORT_ERROR evidence="retro-classified as transient" \
+  downstream_effect=none reason="t15 correction implying an unfollowed retry, behind a malformed record" >/dev/null
+rc=0; reconcile_propositions || rc=$?
+assert_rc 1 "$rc" "6d: a malformed EVENT_CORRECTED earlier in the stream does not mask a real, later violation"
+assert_eq yes "$(_t15_finding_has EVENT_CORRECTION_NOT_REFLECTED "corrected_event_id:$_t15_af_id4" && echo yes || echo no)" \
+  "6d: the well-formed violation is still reported despite the earlier malformed record"
+
 # =============================================================================
 # 7. A lost/interrupted fulfillment (PROPOSITION_NOT_FULFILLED) -- record_
 #    event auto-fulfills every mandatory header immediately, so this

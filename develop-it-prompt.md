@@ -5055,7 +5055,12 @@ reconcile_propositions() {
   # Rule 7: a retry/continuation attempt (dispatch_id's own attempt suffix
   # >= 2) must have a causal RECOVERY_AUTHORIZED for the SAME logical
   # dispatch, recorded strictly BEFORE the retry's own DISPATCH_STARTED
-  # event_id -- never merely present somewhere in the run.
+  # event_id -- never merely present somewhere in the run. `dispatch_id //
+  # ""` before `capture(...)?` guards the same fault-isolation class as the
+  # EVENT_CORRECTED rule below: `capture` on a bare `null` (a DISPATCH_
+  # STARTED record missing its own dispatch_id field) is ALSO a fatal jq
+  # error, not a silent non-match -- a plain string that just doesn't match
+  # the regex is the only case `capture` fails open on by itself.
   local sid did logi
   while IFS=$'\t' read -r sid did logi; do
     [ -n "$sid" ] || continue
@@ -5066,8 +5071,8 @@ reconcile_propositions() {
   done < <(jq -r -s '
     (map(select(._type=="RECOVERY_AUTHORIZED"))) as $auths
     | .[] | select(._type=="DISPATCH_STARTED") as $s
-    | ($s.dispatch_id | capture("-a(?<n>[0-9]{2})$").n) as $attn
-    | select(($attn|tonumber) >= 2)
+    | ((($s.dispatch_id // "") | capture("-a(?<n>[0-9]{2})$")?).n) as $attn
+    | select($attn != null and ($attn|tonumber) >= 2)
     | select([$auths[] | select(.logical_dispatch_id == $s.logical_dispatch_id and .event_id < $s.event_id)] | length == 0)
     | [$s.event_id, $s.dispatch_id, $s.logical_dispatch_id]
     | @tsv
@@ -5092,6 +5097,18 @@ reconcile_propositions() {
   # this rule needs (the corrected dispatch's own id/mutation_state/logical
   # id, and whether a later DISPATCH_STARTED exists) is resolved by ONE jq
   # join first, so nothing here spawns jq per correction any more.
+  #
+  # Fault isolation (code review fix): `corrected_event_id // ""` and
+  # `tonumber?` guard against a malformed/missing field -- `startswith`/
+  # `tonumber` on a bare `null` or non-numeric string are FATAL jq errors,
+  # not a per-record skip, and in a single -s (slurp) pass a fatal error
+  # aborts the WHOLE invocation, silently discarding every finding for
+  # every OTHER (well-formed) record already queued behind it in the
+  # stream -- not just the one malformed record the original per-record
+  # bash loop would have `continue`d past. `tonumber?` on a non-numeric
+  # `$xid_raw` (or `""`) yields no value at all for that record, and
+  # `select($xid != null)` then drops it cleanly, same as the original's
+  # `[ -n "$xdid" ] || continue`.
   local cid xid rclass xmut xlogical later_cnt raction
   while IFS=$'\t' read -r cid xid rclass xmut xlogical later_cnt; do
     [ -n "$cid" ] || continue
@@ -5123,11 +5140,12 @@ reconcile_propositions() {
     (map(select(._type=="DISPATCH_COMPLETED"))) as $completed
     | . as $all
     | .[] | select(._type=="EVENT_CORRECTED") as $ec
-    | ($ec.corrected_event_id) as $xid_raw
+    | ($ec.corrected_event_id // "") as $xid_raw
     | select(($xid_raw | startswith("finding:")) | not)
     | ($ec.replacement_classification) as $rclass
     | select(($rclass == "PRELAUNCH_FAILED" or $rclass == "SPEND_CEILING") | not)
-    | ($xid_raw | tonumber) as $xid
+    | ($xid_raw | tonumber?) as $xid
+    | select($xid != null)
     | ([$all[] | select(.event_id == $xid) | .dispatch_id // empty] | first // empty) as $xdid
     | select($xdid != "")
     | ([$completed[] | select(.dispatch_id == $xdid) | .mutation_state // empty] | first // empty) as $xmut
