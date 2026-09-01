@@ -1267,8 +1267,82 @@ if declare -F append_followup >/dev/null; then
   rc=0; append_followup fu-03 7 "finding-01" "a real second record" implementer "none" medium deferred "ev.md" || rc=$?
   assert_rc 0 "$rc" "T14: a second, distinct legal id is accepted"
   assert_line_count 2 "$FEATURE_FOLDER/followups.jsonl" "T14: the ledger now carries two records"
+
+  # --- validate_followups (P17): pairs the ledger with a read-side
+  # validator mirroring validate_verification_records. ---
+  if declare -F validate_followups >/dev/null; then
+    rc=0; validate_followups "$FEATURE_FOLDER/followups.jsonl" >/tmp/t14-vf.out 2>&1 || rc=$?
+    assert_rc 0 "$rc" "T17: validate_followups accepts the two legal records just written"
+
+    T17_FU_BAD="$BUILD/t14-followups-bad.jsonl"
+    printf '{"id":"fu-bad","origin_phase":9}\n' > "$T17_FU_BAD"
+    rc=0; validate_followups "$T17_FU_BAD" >/dev/null 2>&1 || rc=$?
+    assert_rc 1 "$rc" "T17: validate_followups rejects a record missing required fields"
+
+    T17_FU_EMPTY="$BUILD/t14-followups-emptytext.jsonl"
+    printf '{"id":"fu-e1","origin_phase":9,"origin_finding":null,"description":"","actor":"owner","prerequisite":"none","risk":"low","status":"open","evidence":null}\n' \
+      > "$T17_FU_EMPTY"
+    rc=0; validate_followups "$T17_FU_EMPTY" >"$BUILD/t14-vf-empty.out" 2>&1 || rc=$?
+    assert_rc 1 "$rc" "T17: validate_followups rejects a required text field that is present but empty"
+    assert_contains description "$BUILD/t14-vf-empty.out" "T17: the refusal names the empty description field"
+
+    T17_FU_DUP="$BUILD/t14-followups-dup.jsonl"
+    {
+      printf '{"id":"fu-d1","origin_phase":9,"origin_finding":null,"description":"first","actor":"owner","prerequisite":"none","risk":"low","status":"open","evidence":null}\n'
+      printf '{"id":"fu-d1","origin_phase":9,"origin_finding":null,"description":"second, reusing the same id","actor":"owner","prerequisite":"none","risk":"low","status":"open","evidence":null}\n'
+    } > "$T17_FU_DUP"
+    rc=0; validate_followups "$T17_FU_DUP" >/dev/null 2>&1 || rc=$?
+    assert_rc 1 "$rc" "T17: validate_followups rejects a duplicate id even when both records are otherwise well-formed"
+
+    T17_FU_STATUS="$BUILD/t14-followups-badstatus.jsonl"
+    printf '{"id":"fu-s1","origin_phase":9,"origin_finding":null,"description":"x","actor":"owner","prerequisite":"none","risk":"low","status":"SKIPPED","evidence":null}\n' \
+      > "$T17_FU_STATUS"
+    rc=0; validate_followups "$T17_FU_STATUS" >/dev/null 2>&1 || rc=$?
+    assert_rc 1 "$rc" "T17: validate_followups rejects an illegal status value"
+  else
+    _fail "T17: validate_followups is not defined -- cannot exercise it"
+  fi
 else
   _fail "T14: append_followup is not defined -- cannot exercise it"
+fi
+
+# --- validate_proposition_log (P17): structural self-check for a CLOSED
+# process-improvement-proposition.md's own entry-header grammar -- never
+# invoked against the current run's own in-progress file (see the
+# Non-influence guarantee), exercised here directly against a standalone
+# fixture file instead. ---
+if declare -F validate_proposition_log >/dev/null; then
+  T17_PL_OK="$BUILD/t14-proplog-ok.md"
+  {
+    printf '# Process improvement propositions\n\n---\n\n'
+    printf '## 2026-08-31T12:00:00Z — phase 3 (spec-review) — kind: failure — trigger: HALT\n\n'
+    printf '**Context:** x\n\n**Proposed improvement:** y\n\n'
+    printf '## 2026-08-31T12:05:00Z — phase 9 (documentation) — kind: idea\n\n'
+    printf '**Context:** x\n\n**Proposed improvement:** y\n'
+  } > "$T17_PL_OK"
+  rc=0; validate_proposition_log "$T17_PL_OK" >"$BUILD/t14-pl-ok.out" 2>&1 || rc=$?
+  assert_rc 0 "$rc" "T17: validate_proposition_log accepts a well-formed mandatory entry plus a well-formed spontaneous entry"
+
+  T17_PL_BADTRIG="$BUILD/t14-proplog-badtrigger.md"
+  {
+    printf '# Process improvement propositions\n\n---\n\n'
+    printf '## 2026-08-31T12:00:00Z — phase 3 (spec-review) — kind: failure — trigger: NOT_A_REAL_TRIGGER\n\n'
+    printf '**Context:** x\n\n**Proposed improvement:** y\n'
+  } > "$T17_PL_BADTRIG"
+  rc=0; validate_proposition_log "$T17_PL_BADTRIG" >"$BUILD/t14-pl-badtrig.out" 2>&1 || rc=$?
+  assert_rc 1 "$rc" "T17: validate_proposition_log rejects an illegal trigger tag"
+  assert_contains trigger "$BUILD/t14-pl-badtrig.out" "T17: the refusal names the illegal trigger"
+
+  T17_PL_MISSING="$BUILD/t14-proplog-missingfield.md"
+  {
+    printf '# Process improvement propositions\n\n---\n\n'
+    printf '## phase 3 (spec-review) — kind: failure — trigger: HALT\n\n'
+    printf '**Context:** x\n\n**Proposed improvement:** y\n'
+  } > "$T17_PL_MISSING"
+  rc=0; validate_proposition_log "$T17_PL_MISSING" >/dev/null 2>&1 || rc=$?
+  assert_rc 1 "$rc" "T17: validate_proposition_log rejects an entry header missing its timestamp field"
+else
+  _fail "T17: validate_proposition_log is not defined -- cannot exercise it"
 fi
 
 # --- record_event GIT_FINALIZATION_RESULT: the documented COMMITTED and

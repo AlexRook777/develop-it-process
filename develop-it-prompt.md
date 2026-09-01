@@ -376,7 +376,7 @@ asserts every row is present with its exact value.
 | document_fixer_batch_size | 8 | Maximum assigned findings in one document-fixer batch |
 | documentation_fix_cap | 2 | Maximum documentation self-correction rounds |
 | artifact_growth_warning_pct | 10 | Per-fix net growth contributing to divergence detection |
-| divergent_round_cap | 2 | Consecutive divergent rounds before automatic fixing stops |
+| divergent_round_cap | 2 | Consecutive divergent rounds before the gate dispatches one consolidation-priority fixer batch instead of the ordinary one; a second such cap hit on the same gate HALTs instead of dispatching a third |
 | long_role_headroom_threshold_minutes | 60 | Timeout threshold requiring a just-in-time vendor liveness/headroom probe |
 | test_suite_parallel_safe | no | Whether the target project's test suite tolerates its own default parallel worker count (`yes`) or must be forced serial under the P03 test-execution lease (`no`, default) |
 | seam_globs | deploy/*;infra/*;terraform/*;*.tf;*.tfvars;migrations/*;*/migrations/*;.env*;*.env;config/*;*/clients/* | `;`-separated shell glob patterns classifying a changed file as an integration seam (deploy manifests, migration dirs, env/config files, third-party client wrappers) for the Phase 7 seam-verifier dispatch gate (P01) |
@@ -4650,6 +4650,39 @@ _run_log_latest_field() {
   printf '%s' "$hit" | jq -r --arg f "$field" '.[$f] // empty'
 }
 
+# Usage: is_retry_within_iteration PHASE ROLE ITERATION
+# Mechanizes Trigger #3's own shape test (P18 -- "Mandatory triggers" #3,
+# above): true (exit 0) iff RUN_LOG.md shows at least two DISPATCH_STARTED
+# entries for this EXACT (phase, role, iteration) triple, with at least one
+# DISPATCH_COMPLETED for that same triple carrying a classification other
+# than COMPLETED (a failed attempt) -- the exact structural definition
+# Trigger #3 documents in prose ("a second dispatch entry whose iteration:
+# field is unchanged from the immediately preceding failed dispatch in the
+# same phase: AND whose role: matches"). A phase with no iteration loop
+# always dispatches at iteration=00 for every attempt, so the exact-iteration
+# match here is already the same "role equality is the load-bearing check"
+# rule Trigger #3's prose states as a special case for those phases -- no
+# separate branch is needed. Returns false (exit 1) on anything short of
+# that shape, same boolean-exit convention as `plan_review_window_closed`
+# above -- never a printed "yes"/"no" string. Built on the shared
+# _run_log_events_json reader (Task 6/P04) -- never a second hand-rolled
+# RUN_LOG scanner. Answers ONLY the structural question; the automatic-vs-
+# user-authorised distinction Trigger #3's prose also requires stays a
+# judgment call the orchestrator makes in the entry body, never mechanized
+# here (that distinction is not recoverable from RUN_LOG's structure alone).
+is_retry_within_iteration() {
+  local phase="$1" role="$2" iteration="$3"
+  local iter_padded
+  iter_padded="$(printf '%02d' "$((10#$iteration))" 2>/dev/null)" || iter_padded="$iteration"
+  local starts failed
+  starts="$(_run_log_events_json | jq -s --arg phase "$phase" --arg role "$role" --arg iter "$iter_padded" \
+    '[.[] | select(._type=="DISPATCH_STARTED" and .phase==$phase and .role==$role and .iteration==$iter)] | length' 2>/dev/null)"
+  [ "${starts:-0}" -ge 2 ] || return 1
+  failed="$(_run_log_events_json | jq -s --arg phase "$phase" --arg role "$role" --arg iter "$iter_padded" \
+    '[.[] | select(._type=="DISPATCH_COMPLETED" and .phase==$phase and .role==$role and .iteration==$iter and .classification!="COMPLETED")] | length' 2>/dev/null)"
+  [ "${failed:-0}" -ge 1 ]
+}
+
 # Append-only audit-findings ledger shared by reconcile_propositions and
 # audit_run_state (spec §21.2/§20.11): one JSON object per finding,
 # `{"check":"<CODE>", "detail":"...", "record_ids":[...]}`. Readiness (Phase
@@ -4739,6 +4772,65 @@ append_proposition() {
 
   jq -cn --argjson event_id "$event_id" --arg fulfilled_at "$(iso_now)" \
     '{event_id:$event_id, fulfilled_at:$fulfilled_at}' >> "$pending"
+}
+
+# Structural self-check for a process-improvement-proposition.md file (P17)
+# -- pairs this append-only ledger with a validator the same way
+# validate_followups/validate_verification_records do for theirs. Parses
+# ONLY each entry's own header line (`## <ts> -- phase <N> (<phase_name>)
+# -- kind: <kind>[ -- trigger: <TYPE>]`, "Entry format" above), never the
+# free-form Context/Proposed improvement body -- a pure shape check, never a
+# RUN_LOG cross-reference (that is reconcile_propositions' own job, against
+# pending-propositions.jsonl, never this file). Requires the three fields
+# ("Entry format" above) present on every entry header, and -- when a
+# header carries a `trigger:` tag at all (mandatory entries only; spontaneous
+# and deviation entries never do, per "Entry format" above) -- that its value
+# is one of the six legal tag values the "Trigger -> kind mapping" table
+# documents for the five numbered mandatory triggers (trigger #5 alone
+# contributes two: ITERATION_CAP_REACHED and ITERATION_CAP_OVERRIDE).
+#
+# NEVER call this against the CURRENT run's own in-progress
+# process-improvement-proposition.md -- doing so would read the file during
+# the very run that is writing it, which the Non-influence guarantee above
+# forbids outright regardless of purpose. This function exists for
+# offline/maintainer validation of a CLOSED prior run's file (e.g. auditing
+# historical runs before changing the Trigger -> kind mapping table); no
+# call site in this document's live orchestration flow invokes it against
+# $FEATURE_FOLDER's own file, and none should ever be added.
+validate_proposition_log() {
+  # Usage: validate_proposition_log PROPOSITION_LOG_PATH
+  local path="$1"
+  [ -f "$path" ] || { echo "validate_proposition_log: missing file: $path" >&2; return 1; }
+  "$PYTHON_BIN" - "$path" <<'PY'
+import re, sys
+
+path = sys.argv[1]
+HEADER = re.compile(
+    r'^## (?P<ts>[^ ]+) . phase (?P<phase>[^ ]+) \((?P<phase_name>[^)]+)\) . kind: (?P<kind>[^ ]+)'
+    r'(?: . trigger: (?P<trigger>[^ ]+))?$')
+LEGAL_TRIGGERS = {"CODEX_UNAVAILABLE", "CLAUDE_FAILED", "RETRY_WITHIN_ITERATION",
+                   "HALT", "ITERATION_CAP_REACHED", "ITERATION_CAP_OVERRIDE"}
+
+errors = []
+with open(path, encoding="utf-8", errors="replace") as f:
+    lines = f.read().splitlines()
+
+for lineno, line in enumerate(lines, 1):
+    if not line.startswith("## "):
+        continue
+    m = HEADER.match(line)
+    if not m or not (m.group("ts") and m.group("phase") and m.group("kind")):
+        errors.append(f"line {lineno}: entry header missing a required field (timestamp/phase/kind): {line!r}")
+        continue
+    trigger = m.group("trigger")
+    if trigger is not None and trigger not in LEGAL_TRIGGERS:
+        errors.append(f"line {lineno}: illegal trigger tag {trigger!r} (must be one of {sorted(LEGAL_TRIGGERS)})")
+
+if errors:
+    for e in errors:
+        print(e, file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 # Event-ID proposition/event reconciliation (spec §21.2). Reads ONLY
@@ -5206,9 +5298,19 @@ audit_run_state() {
     }
   done
 
+  # Followups valid (P17): the real validate_followups cookbook function --
+  # the same structural gate validate_verification_records performs for its
+  # own ledger, catching the five required-non-empty-text fields the
+  # per-id scan below (retained for its own exact-id naming) never checks.
+  if [ -f "$FEATURE_FOLDER/followups.jsonl" ]; then
+    validate_followups "$FEATURE_FOLDER/followups.jsonl" >/dev/null 2>&1 \
+      || { _audit_finding FOLLOWUPS_MALFORMED "followups.jsonl failed structural validation" "$FEATURE_FOLDER/followups.jsonl"; rc=1; }
+  fi
+
   # Followups valid: well-formed, legal status, unique id (reuses the same
   # field list/status enum append_followup itself enforces on write; this
-  # re-validates the ledger as a whole at readiness time).
+  # re-validates the ledger as a whole at readiness time, naming the exact
+  # offending id).
   if [ -f "$FEATURE_FOLDER/followups.jsonl" ]; then
     local bad_id
     while IFS= read -r bad_id; do
@@ -8373,6 +8475,26 @@ divergence_check() {
   fi
   echo "no"
 }
+
+# Usage: divergent_round_cap_hit_before PHASE_NAME
+# P08: prints "yes" iff RUN_LOG.md already carries a DIVERGENT_ROUND_CAP_
+# REACHED event for this phase_name -- i.e. the cap the caller is ABOUT to
+# record would be the SECOND consecutive hit on this gate, and the loop must
+# HALT instead of dispatching a third consolidation batch (registry's
+# `divergent_round_cap` meaning: "before ... a second such cap hit ... HALTs
+# instead of dispatching a third"). Counts by phase_name alone, never by
+# which reviewer's findings tipped divergence_check into "yes" -- Phase 7's
+# catalog can be fed by code-reviewer-*/seam-verifier (P01) alike, and this
+# scan is deliberately blind to finding source so the stop condition counts
+# the same way regardless of it. Built on the shared _run_log_events_json
+# reader (Task 6/P04) -- never a second hand-rolled RUN_LOG scanner.
+divergent_round_cap_hit_before() {
+  local phase_name="$1"
+  local n
+  n="$(_run_log_events_json | jq -s --arg p "$phase_name" \
+    '[.[] | select(._type=="DIVERGENT_ROUND_CAP_REACHED" and .phase_name==$p)] | length' 2>/dev/null)"
+  if [ "${n:-0}" -ge 1 ]; then echo yes; else echo no; fi
+}
 ```
 
 ## Plan Task Contract (spec §19.1)
@@ -8623,8 +8745,8 @@ PY
 The single verification scalar (`verification: PASS | FAIL | PARTIAL` on the
 implementer's own STATUS — kept as the phase-level rollup) is no longer the
 only evidence. Every command a plan task declares under `verification` is
-also recorded as one per-command JSON line with exactly these seven fields
-(plus its own `verification_id`, nine keys total):
+also recorded as one per-command JSON line with exactly these nine fields
+(plus its own `verification_id`, ten keys total):
 
 ```text
 verification_id
@@ -8636,13 +8758,14 @@ evidence_path
 baseline_comparison
 reason
 followup_id
+exclusion_class: pre_existing|environment_bound|actor_bound|outside_capability|null -- required (non-null) whenever result=EXCLUDED (P15); null for every other result
 ```
 
 Rules — an empty result is never `PASS`:
 
 - `FAIL` alone enters debugging/fixing.
-- `EXCLUDED` is legal only with evidence that the command is pre-existing, environment-bound, actor-bound, or outside the change's capability. It cannot hide a new regression.
-- `NOT_RUN` names its actor/prerequisite in `reason` and becomes handoff/readiness work — never silently treated as PASS.
+- `EXCLUDED` is legal only with a non-null `exclusion_class` naming exactly one of the four enum values above — never a keyword sniffed out of free-text `reason` (P15; the retired `EXCLUSION_MARKERS` substring check no longer exists anywhere in this document). It cannot hide a new regression.
+- `NOT_RUN` names its actor/prerequisite in `reason` AND carries a non-null `followup_id` (P15) — the ledger entry that actually tracks the handoff work, not just a promise in prose — becoming handoff/readiness work, never silently treated as PASS.
 - A performance verdict (a command whose text names a benchmark/latency/throughput measurement) requires a declared `environment: controlled` and a non-null `baseline_comparison` to assert `PASS`/`FAIL`; otherwise it is advisory/inconclusive and MUST be recorded as `NOT_RUN` instead. A claimed performance fix must remeasure under the same controlled conditions before it may assert `PASS` again.
 - `environment: exclusive` (P16) declares a command that must run alone — e.g. the shared-DB integration suite P03 already forces serial. The actor about to run it takes the P03 test lease (`acquire_test_lease`/`release_test_lease`, above) around that one command and releases it immediately after; it is never co-scheduled with another `exclusive` command and never dispatched under `dispatch_parallel`, whose only live callers today are review-pair/preflight fan-outs, not verification commands — `validate_plan_tasks` (below) refuses a plan whose task graph would let two independently-schedulable tasks both declare one.
 - The debugger consumes only genuine `FAIL` records; it never mutates a deployed environment or invents evidence to convert an `EXCLUDED`/`NOT_RUN` record into `PASS`.
@@ -8658,31 +8781,43 @@ _verification_result_legal() {
   case "$1" in PASS|FAIL|EXCLUDED|NOT_RUN) return 0 ;; *) return 1 ;; esac
 }
 
+# The only four legal exclusion_class enum values (spec S19.2, P15) -- an
+# empty string (result != EXCLUDED, where the field is legitimately null) is
+# ALSO accepted here; only a non-empty, non-enum value is illegal input.
+_exclusion_class_legal() {
+  case "$1" in ""|pre_existing|environment_bound|actor_bound|outside_capability) return 0 ;; *) return 1 ;; esac
+}
+
 # Append one verification record (spec S19.2) to a verification-records.jsonl
-# file. The sole writer, so every record carries the same nine fields in the
+# file. The sole writer, so every record carries the same ten fields in the
 # same order regardless of caller, gated by the same result-legality check
 # every reader relies on.
 append_verification_record() {
   # Usage: append_verification_record RECORDS_JSONL VERIFICATION_ID COMMAND \
-  #   ENVIRONMENT RESULT EXIT_CODE EVIDENCE_PATH BASELINE_COMPARISON REASON FOLLOWUP_ID
+  #   ENVIRONMENT RESULT EXIT_CODE EVIDENCE_PATH BASELINE_COMPARISON REASON \
+  #   FOLLOWUP_ID EXCLUSION_CLASS
   local path="$1" vid="$2" command="$3" environment="$4" result="$5" \
     exit_code="${6:-}" evidence_path="${7:-}" baseline_comparison="${8:-}" \
-    reason="${9:-}" followup_id="${10:-}"
+    reason="${9:-}" followup_id="${10:-}" exclusion_class="${11:-}"
   _verification_result_legal "$result" \
     || { echo "append_verification_record: illegal result '$result' (only PASS|FAIL|EXCLUDED|NOT_RUN are legal; SKIPPED and empty are rejected)" >&2; return 1; }
+  _exclusion_class_legal "$exclusion_class" \
+    || { echo "append_verification_record: illegal exclusion_class '$exclusion_class' (only pre_existing|environment_bound|actor_bound|outside_capability, or empty, are legal)" >&2; return 1; }
   mkdir -p "$(dirname "$path")"
   jq -nc --arg vid "$vid" --arg command "$command" --arg environment "$environment" \
     --arg result "$result" --arg exit_code "$exit_code" --arg evidence_path "$evidence_path" \
     --arg baseline_comparison "$baseline_comparison" --arg reason "$reason" --arg followup_id "$followup_id" \
+    --arg exclusion_class "$exclusion_class" \
     '{verification_id:$vid, command:$command, environment:$environment, result:$result,
       exit_code:(if $exit_code=="" then null else ($exit_code|tonumber? // $exit_code) end),
       evidence_path:(if $evidence_path=="" then null else $evidence_path end),
       baseline_comparison:(if $baseline_comparison=="" then null else $baseline_comparison end),
       reason:(if $reason=="" then null else $reason end),
-      followup_id:(if $followup_id=="" then null else $followup_id end)}' >> "$path"
+      followup_id:(if $followup_id=="" then null else $followup_id end),
+      exclusion_class:(if $exclusion_class=="" then null else $exclusion_class end)}' >> "$path"
 }
 
-# Validate a verification-records.jsonl file against spec S19.2's seven
+# Validate a verification-records.jsonl file against spec S19.2's nine
 # fields and per-result rules. Prints one error per line to stderr; returns
 # non-zero if any record is invalid.
 validate_verification_records() {
@@ -8694,9 +8829,15 @@ import json, re, sys
 
 path = sys.argv[1]
 FIELDS = ("verification_id", "command", "environment", "result", "exit_code",
-          "evidence_path", "baseline_comparison", "reason", "followup_id")
+          "evidence_path", "baseline_comparison", "reason", "followup_id",
+          "exclusion_class")
 RESULTS = {"PASS", "FAIL", "EXCLUDED", "NOT_RUN"}
-EXCLUSION_MARKERS = ("pre-existing", "environment-bound", "actor-bound", "outside")
+# P15: exclusion_class is a typed enum, not a substring sniffed out of free
+# text -- the retired EXCLUSION_MARKERS keyword list ("pre-existing",
+# "environment-bound", "actor-bound", "outside") no longer exists anywhere in
+# this document; a reason like "outside the scope of this refactor" no
+# longer passes just for containing one of those words.
+EXCLUSION_CLASSES = {"pre_existing", "environment_bound", "actor_bound", "outside_capability"}
 # ponytail: keyword/tool-name matching on command text, not real semantic
 # intent detection (code review fix, low 10) -- a benchmark tool invoked
 # under a name not listed here (or wrapped in an unfamiliar script) still
@@ -8748,25 +8889,32 @@ for vid in order_id:
         continue
     reason = (r.get("reason") or "").strip()
     if result == "EXCLUDED":
-        # A reason KEYWORD alone is not evidence -- it is a claim with no
-        # artifact behind it (code review fix, medium 9). Require a real
-        # evidence_path too, so "cannot hide a new regression" is
-        # actually enforced, not merely asserted in a reason string.
-        if not any(m in reason.lower() for m in EXCLUSION_MARKERS):
-            errors.append(f"line {lineno} ({r['verification_id']}): EXCLUDED requires evidence it is pre-existing/environment-bound/actor-bound/outside the change's capability")
+        # P15: exclusion_class is the load-bearing typed field -- a bare
+        # reason string (however plausible-sounding) is a claim, never
+        # evidence. Missing/illegal values fail here regardless of what
+        # `reason` says.
+        exclusion_class = r.get("exclusion_class")
+        if exclusion_class not in EXCLUSION_CLASSES:
+            errors.append(f"line {lineno} ({r['verification_id']}): EXCLUDED requires exclusion_class to be one of pre_existing|environment_bound|actor_bound|outside_capability, got {exclusion_class!r}")
         if not r.get("evidence_path"):
-            errors.append(f"line {lineno} ({r['verification_id']}): EXCLUDED requires a non-null evidence_path -- a reason keyword alone is a claim, not evidence")
+            errors.append(f"line {lineno} ({r['verification_id']}): EXCLUDED requires a non-null evidence_path -- exclusion_class alone is a claim, not evidence")
         # A non-null path is still only a claim: nothing in it distinguishes
         # PRE-EXISTING from NEW. "cannot hide a new regression" is met only by
         # a baseline showing the check already failed this way BEFORE the
         # change. baseline_comparison is already in the schema; require it.
         # Actor- and environment-bound exclusions are exempt: no baseline can
         # exist for a check this actor/environment cannot run at all.
-        elif not any(m in reason.lower() for m in ("actor-bound", "environment-bound")):
+        elif exclusion_class not in ("actor_bound", "environment_bound"):
             if not r.get("baseline_comparison"):
-                errors.append(f"line {lineno} ({r['verification_id']}): EXCLUDED as pre-existing/outside-capability requires a non-null baseline_comparison proving the check failed the same way before this change")
-    if result == "NOT_RUN" and not reason:
-        errors.append(f"line {lineno} ({r['verification_id']}): NOT_RUN requires a named actor/prerequisite in reason")
+                errors.append(f"line {lineno} ({r['verification_id']}): EXCLUDED as pre_existing/outside_capability requires a non-null baseline_comparison proving the check failed the same way before this change")
+    if result == "NOT_RUN":
+        if not reason:
+            errors.append(f"line {lineno} ({r['verification_id']}): NOT_RUN requires a named actor/prerequisite in reason")
+        # P15: a NOT_RUN that names its blocker only in prose can evaporate
+        # with no tracked handoff work -- the ledger (followups.jsonl) is
+        # exactly where that work is supposed to live, so require the link.
+        if not r.get("followup_id"):
+            errors.append(f"line {lineno} ({r['verification_id']}): NOT_RUN requires a non-null followup_id linking it to tracked handoff work")
     if result in ("PASS", "FAIL") and PERF_RE.search(str(r.get("command", ""))):
         env = r.get("environment") or ""
         baseline = r.get("baseline_comparison")
@@ -8856,6 +9004,65 @@ append_followup() {
       description:$description, actor:$actor, prerequisite:$prerequisite, risk:$risk,
       status:$status,
       evidence:(if $evidence=="" or $evidence=="null" then null else $evidence end)}' >> "$path"
+}
+
+# Validate a followups.jsonl file against spec S20.9's eight fields and
+# per-record rules (P17) -- mirrors validate_verification_records for this
+# second append-only ledger. Re-checks the SAME field list/status enum/
+# duplicate-id rules append_followup enforces on write, PLUS the five
+# required-non-empty-text fields append_followup itself never re-validates
+# once written (a crash mid-append, hand-edit, or resume can still corrupt
+# the file after a clean write). Prints one error per line to stderr;
+# returns non-zero if any record is invalid.
+validate_followups() {
+  # Usage: validate_followups FOLLOWUPS_JSONL
+  local path="$1"
+  [ -f "$path" ] || { echo "validate_followups: missing file: $path" >&2; return 1; }
+  "$PYTHON_BIN" - "$path" <<'PY'
+import json, sys
+
+path = sys.argv[1]
+FIELDS = ("id", "origin_phase", "origin_finding", "description", "actor",
+          "prerequisite", "risk", "status", "evidence")
+STATUSES = {"open", "deferred", "accepted_risk", "resolved"}
+NULLABLE = {"origin_finding", "evidence"}
+
+errors = []
+seen_ids = {}
+with open(path) as f:
+    for lineno, line in enumerate(f, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError as e:
+            errors.append(f"line {lineno}: invalid JSON: {e}")
+            continue
+        for field in FIELDS:
+            if field not in r:
+                errors.append(f"line {lineno}: missing field {field}")
+        rid = r.get("id")
+        if rid:
+            if rid in seen_ids:
+                errors.append(f"line {lineno}: duplicate id {rid!r} (first seen at line {seen_ids[rid]}) -- the ledger is append-only, ids may not be reused")
+            else:
+                seen_ids[rid] = lineno
+        status = r.get("status")
+        if status not in STATUSES:
+            errors.append(f"line {lineno} (id={rid}): status {status!r} is not one of open|deferred|accepted_risk|resolved")
+        for field in FIELDS:
+            if field in NULLABLE or field == "status":
+                continue
+            val = r.get(field)
+            if not (isinstance(val, str) and val.strip()):
+                errors.append(f"line {lineno} (id={rid}): {field} must be non-empty text")
+
+if errors:
+    for e in errors:
+        print(e, file=sys.stderr)
+    sys.exit(1)
+PY
 }
 ```
 
@@ -9341,7 +9548,7 @@ For each iteration N (start at 1, hard cap `review_iteration_cap`):
    - `dispositions_complete "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" $FINDING_IDS` — a fixer returning `DONE` with an undispositioned assigned ID is an orchestration bug (spec §17.3's "no assigned finding may disappear"); treat it as `CLAUDE_FAILED`/Mode 4.
    - `unset FINDING_IDS` immediately afterward — this round's reviewers (re-dispatched at step 1 of the next loop) never declare `finding_ids` in their own contract; a stale non-empty `$FINDING_IDS` left over from this fixer dispatch would scope-reject them (`ROLE_SCOPE_VIOLATION`) before they ever launch.
    - Capture `bytes_after="$(wc -c < "$SPEC_PATH")"`, tally this round's new/recurring/resolved/reopened/fix-regression counts from the catalog, and call `record_convergence_signals 3 "$ITERATION" "$bytes_before" "$bytes_after" ...`.
-   - Call `divergence_check 3 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"`. On `yes:<reason>`: `record_event DIVERGENCE_DETECTED phase_name=spec-review divergence_reason=<reason> ...`; if this is the `divergent_round_cap`-th consecutive divergent round, `record_event DIVERGENT_ROUND_CAP_REACHED ...` and dispatch exactly ONE consolidation-priority `spec-fixer` batch — re-populate `FINDING_IDS="$(select_finding_batch ...)"` first, since it was unset above and `spec-fixer` requires it — (same dispatch mechanism, prioritizing deletion/replacement/contradiction-removal/provenance-repair per spec §18.3 over addressing new findings) instead of the ordinary batch above — it is still bounded and still followed by step 1's `validate_artifact` and a full re-review; do not silently return to unlimited additive fixing.
+   - Call `divergence_check 3 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"`. On `yes:<reason>`: `record_event DIVERGENCE_DETECTED phase_name=spec-review divergence_reason=<reason> ...`; if this is the `divergent_round_cap`-th consecutive divergent round, call `divergent_round_cap_hit_before spec-review` (cookbook, P08) BEFORE recording anything. On `yes` (this gate already recorded one `DIVERGENT_ROUND_CAP_REACHED` earlier this run with no gate pass in between — the second consecutive cap hit): `record_event DIVERGENT_ROUND_CAP_REACHED ...` and HALT immediately — do NOT dispatch a third consolidation batch — surfacing `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (and every prior iteration's own catalog under `$PHASE_DIR/`) plus `$SPEC_PATH` for human review; the registry's own `divergent_round_cap` meaning is "automatic fixing stops" and a second miss proves it hasn't. On `no` (the first cap hit this gate): `record_event DIVERGENT_ROUND_CAP_REACHED ...` and dispatch exactly ONE consolidation-priority `spec-fixer` batch — re-populate `FINDING_IDS="$(select_finding_batch ...)"` first, since it was unset above and `spec-fixer` requires it — (same dispatch mechanism, prioritizing deletion/replacement/contradiction-removal/provenance-repair per spec §18.3 over addressing new findings) instead of the ordinary batch above — it is still bounded and still followed by step 1's `validate_artifact` and a full re-review; do not silently return to unlimited additive fixing.
    - Increment N. Loop from step 1 — the reviewers ALWAYS run again against the fixer's new revision; there is no iteration, including the cap, at which a fixer's own STATUS substitutes for a subsequent reviewer verdict (spec §18.2).
 5. When the gate passes — `blockers=0` and (iterations 1–2: `majors=0`) or (iterations 3+: every open major dispositioned):
    - Dispatch one `claude` subprocess for role `summarizer-spec`. Inputs: `$FEATURE_FOLDER`. Outputs: `3-spec-review/spec-review-summary.md` and `3-spec-review/summarizer-status.md`. The summarizer records any deferred/accepted-risk majors (read from the final catalog) in the summary file.
@@ -9436,7 +9643,7 @@ For each iteration N (start at 1, hard cap `review_iteration_cap`):
    - `dispositions_complete "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" $FINDING_IDS`; treat a gap as Mode 4.
    - `unset FINDING_IDS` immediately afterward — the next iteration's reviewers never declare `finding_ids` and would otherwise be scope-rejected by a stale value.
    - Capture `bytes_after`, tally this round's counts, and call `record_convergence_signals 5 "$ITERATION" ...`.
-   - Call `divergence_check 5 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"` and apply the SAME divergence handling as Step 3.1 (record the event(s); at `divergent_round_cap` re-populate `FINDING_IDS` via `select_finding_batch` and dispatch one consolidation-priority `plan-fixer` batch instead of the ordinary one).
+   - Call `divergence_check 5 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"` and apply the SAME divergence handling as Step 3.1, substituting `plan-review`/`plan-fixer`/`$PLAN_PATH` (record the event(s); at `divergent_round_cap`, check `divergent_round_cap_hit_before plan-review` FIRST — on `yes`, HALT with the catalog paths instead of dispatching a third batch; on `no`, re-populate `FINDING_IDS` via `select_finding_batch` and dispatch one consolidation-priority `plan-fixer` batch instead of the ordinary one).
    - Increment N. Loop from step 1 — reviewers ALWAYS run again; no cap-adjacent fixer dispatch ever substitutes for the next reviewer round.
 5. When the gate passes:
    - Dispatch one `claude` subprocess for role `summarizer-plan`. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. The summarizer records any deferred/accepted-risk majors (from the final catalog) in the summary file.
@@ -9578,7 +9785,7 @@ Outputs (written by the implementer at the end):
 - `<feature-folder>/6-implementation/verification-records.jsonl` — one `append_verification_record` line per plan-declared verification command (spec §19.2).
 - `<feature-folder>/6-implementation/implementer-status.md` — STATUS with `verdict ∈ {DONE, DONE_WITH_EXCLUSIONS, FAILED, NEEDS_DEBUG, BLOCKED}` and `verification ∈ {PASS, FAIL, PARTIAL}`.
 
-You read only `implementer-status.md`. On `DONE` or `DONE_WITH_EXCLUSIONS` with `verification=PASS`, do NOT proceed on the implementer's word alone: call `validate_verification_records "$(status_field "$FEATURE_FOLDER/6-implementation/implementer-status.md" x_verification_records_path)"` (cookbook, spec §19.2) — the zero-token enforcement of every per-record rule the STATUS itself cannot self-certify (empty-is-never-PASS, EXCLUDED evidence, NOT_RUN reason, performance baseline). Only when that ALSO succeeds, proceed to Phase 7. A failure here is Mode 4 (malformed evidence) regardless of what the STATUS claimed — HALT and surface the printed errors; a `DONE_WITH_EXCLUSIONS` verdict whose own `EXCLUDED` records are not policy-valid must never reach Phase 7. `DONE_WITH_EXCLUSIONS` means every non-excluded required verification record passed and every `EXCLUDED` record's evidence was policy-valid; any `NOT_RUN` record is carried forward as handoff/readiness work, never silently dropped.
+You read only `implementer-status.md`. On `DONE` or `DONE_WITH_EXCLUSIONS` with `verification=PASS`, do NOT proceed on the implementer's word alone: call `validate_verification_records "$(status_field "$FEATURE_FOLDER/6-implementation/implementer-status.md" x_verification_records_path)"` (cookbook, spec §19.2) — the zero-token enforcement of every per-record rule the STATUS itself cannot self-certify (empty-is-never-PASS, EXCLUDED exclusion_class/evidence, NOT_RUN reason/followup_id, performance baseline). Only when that ALSO succeeds, proceed to Phase 7. A failure here is Mode 4 (malformed evidence) regardless of what the STATUS claimed — HALT and surface the printed errors; a `DONE_WITH_EXCLUSIONS` verdict whose own `EXCLUDED` records are not policy-valid must never reach Phase 7. `DONE_WITH_EXCLUSIONS` means every non-excluded required verification record passed and every `EXCLUDED` record's evidence was policy-valid; any `NOT_RUN` record is carried forward as handoff/readiness work, never silently dropped.
 
 ### Step 6.2 — Debugger pass and reconciliation (only if implementer reports NEEDS_DEBUG or verification != PASS)
 
@@ -9735,7 +9942,7 @@ For each iteration N (start at 1, hard cap `review_iteration_cap`):
    - `dispositions_complete "$PHASE_DIR/$ITERATION/findings-catalog.jsonl" $FINDING_IDS`; a `DONE` verdict with a gap is Mode 4/`CLAUDE_FAILED`. `PARTIAL` is continuable progress (spec §17.3) — treat exactly like an in-cap continuation, never a gate pass.
    - `unset FINDING_IDS` immediately afterward — the next iteration's reviewers (and, once this gate passes, `summarizer-code-review`/Phase 8/Phase 9's own dispatches) never declare `finding_ids` and would otherwise be scope-rejected by a stale value left over from this fixer dispatch.
    - Capture this round's byte/section counts and finding-transition tallies from the catalog and call `record_convergence_signals 7 "$ITERATION" ...`.
-   - Call `divergence_check 7 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"` and apply the SAME divergence handling as Step 3.1.
+   - Call `divergence_check 7 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"` and apply the SAME divergence handling as Step 3.1, substituting `code-review`/`implementation-fixer`/`$REVIEWED_REVISION` (including its `divergent_round_cap_hit_before code-review` HALT check — this counts cap hits by `phase_name` alone, so a divergent round whose findings came from the seam-verifier (P01) rather than either code-reviewer counts exactly the same as one that came from a reviewer).
    - Increment N. Loop from step 1 — reviewers ALWAYS run again against the fixer's new commit; the retired "final fix pass, no re-review" text no longer exists in this phase.
 5. When the gate passes:
    - Dispatch one `claude` subprocess for role `summarizer-code-review`. Outputs: `7-code-review/code-review-summary.md` and `7-code-review/summarizer-status.md`. The summarizer records any deferred/accepted-risk majors (from the final catalog) in the summary file.
@@ -9759,7 +9966,7 @@ For each round N (start at 1, hard cap at 4 — the initial run plus at most 3 f
    - If neither the script nor any test suite exists AND the plan declared no verification commands of its own, reports `verdict=SKIPPED, reason=no-tests-found`.
    - Writes the detailed per-round report `8-all-tests/NN/test-report.md`, rewrites the cumulative `8-all-tests/all-test-summary.md`, then publishes STATUS LAST.
 3. Read only the runner's own STATUS.md. `dispatch_attempt` already appended the RUN_LOG dispatch entry (`phase: 8`, `phase_name: all-tests`, `iteration: NN`, `role: all-tests-runner`).
-4. Call `validate_verification_records "8-all-tests/NN/verification-records.jsonl"` (cookbook, spec §19.2) — the zero-token enforcement of every per-record rule (empty-is-never-PASS, EXCLUDED evidence, NOT_RUN reason, controlled performance baseline) the runner's own STATUS cannot self-certify. A validation failure is Mode 4 (malformed evidence) regardless of what the runner claimed. `EXCLUDED` and `NOT_RUN` records are policy-valid evidence, never silently promoted to `PASS` — both flow through to Phase 9/Phase 11 exactly as recorded, never becoming PASS by exhausting the fix cap below.
+4. Call `validate_verification_records "8-all-tests/NN/verification-records.jsonl"` (cookbook, spec §19.2) — the zero-token enforcement of every per-record rule (empty-is-never-PASS, EXCLUDED exclusion_class/evidence, NOT_RUN reason/followup_id, controlled performance baseline) the runner's own STATUS cannot self-certify. A validation failure is Mode 4 (malformed evidence) regardless of what the runner claimed. `EXCLUDED` and `NOT_RUN` records are policy-valid evidence, never silently promoted to `PASS` — both flow through to Phase 9/Phase 11 exactly as recorded, never becoming PASS by exhausting the fix cap below.
 5. Branch on the runner's verdict:
    - **`PASS` or `SKIPPED`** → proceed to Step 8.2.
    - **A `FAIL`:** before dispatching anything, reproduce it in isolation (P10) — a deterministic, no-vendor-call step the orchestrator runs directly, exactly like the audit calls in Phase 11 below: `acquire_test_lease orchestrator-test-repro 8` (cookbook, spec-adjacent P03 — a held lease means wait-with-timeout, then HALT naming the lease path; never run concurrently with it), re-run ONLY the command(s) whose record in `8-all-tests/NN/verification-records.jsonl` this round shows `result=FAIL` — once, serialized — then `release_test_lease orchestrator-test-repro`.
@@ -9789,7 +9996,7 @@ $FEATURE_FOLDER/followups.jsonl
 
 1. Dispatch one `claude` subprocess for role `documentation-writer` (`dispatch_attempt 9 00 documentation-writer` — `mutates=yes`, so this automatically acquires the single write lease and its before/after snapshot before launch; `documentation-writer` never runs without holding it). Inputs (see the `documentation-writer` appendix's own Inputs section for the full description of each): `$FINAL_DIFF`, `$ACCEPTED_SPEC` (= `$SPEC_PATH`), `$ACCEPTED_PLAN` (= `$PLAN_PATH`), `$IMPLEMENTATION_SUMMARY` (= `6-implementation/implementation-summary.md`), `$TEST_SUMMARY` (= `8-all-tests/all-test-summary.md`), `$REVIEW_SUMMARY` (= `7-code-review/code-review-summary.md`), `$DECISIONS`, `$EXCLUSIONS`, `$FOLLOWUPS` (the current `followups.jsonl`, or empty if it does not exist yet), `$WRITE_LEASE`. This role's timeout comes from the Models table via `role_timeout`.
 2. Read only the writer's own STATUS.md. `dispatch_attempt` already appended the RUN_LOG dispatch entry (`phase: 9`, `phase_name: documentation`, `iteration: 00`, `role: documentation-writer`).
-3. **Follow-up ingestion — orchestrator-only, never the role's own write.** After the dispatch's classification is durable, read `x_followup_candidates` from the writer's STATUS (a JSON array; empty when none). For EACH candidate, call `append_followup` (cookbook, spec §20.9) with that candidate's fields to append one canonical record to `$FEATURE_FOLDER/followups.jsonl`. This is the ONLY code path that ever creates or appends to that file — `documentation-writer`'s own appendix reads `$FOLLOWUPS` as an input but never opens the file for writing.
+3. **Follow-up ingestion — orchestrator-only, never the role's own write.** After the dispatch's classification is durable, read `x_followup_candidates` from the writer's STATUS (a JSON array; empty when none). For EACH candidate, call `append_followup` (cookbook, spec §20.9) with that candidate's fields to append one canonical record to `$FEATURE_FOLDER/followups.jsonl`. This is the ONLY code path that ever creates or appends to that file — `documentation-writer`'s own appendix reads `$FOLLOWUPS` as an input but never opens the file for writing. Once every candidate has been ingested (or immediately, if there were none but the file already existed from an earlier resume), call `validate_followups "$FEATURE_FOLDER/followups.jsonl"` (cookbook, spec §20.9, P17) whenever the file exists — the same zero-token structural self-check `validate_verification_records` performs for its own ledger, catching a hand-edited or crash-mid-append corruption before Phase 10 stages the file. A failure here is Mode 4 (malformed evidence) regardless of the writer's own STATUS — HALT and surface the printed errors.
 4. Branch on the verdict:
    - **`DONE` or `PARTIAL`** → proceed to Phase 10, regardless of `documentation_validation`. A `documentation_validation` of anything other than `PASS` (a residual structural gap surviving up to `policy_value documentation_fix_cap` self-correction rounds) does not block progression — it is recorded in `documentation-validation.md` and forces the final readiness verdict to at least `READY_WITH_NOTES` (see the readiness-writer appendix), the exact same "never a silent PASS" discipline Phase 8's `EXCLUDED`/`NOT_RUN` records already follow.
    - **`BLOCKED`** (write-lease not held) is an orchestration bug — HALT with a reconciliation report, the same rule every other mutating role's no-lease `BLOCKED` case follows.
@@ -10444,7 +10651,7 @@ The orchestrator **MUST append an entry** on each of these events:
 
 1. Any `event=CODEX_UNAVAILABLE` (regardless of phase or failure_mode).
 2. Any `event=CLAUDE_FAILED`.
-3. Any retry of a dispatch within the same iteration (e.g. Mode 4 retry-once policy after a transient failure). Normal next-iteration progression of an iteration loop (spec-review, plan-review, code-review) or next-round progression of the Phase 8 all-tests loop is NOT a "retry" for this purpose — iteration number is already recorded in `RUN_LOG.md` and need not be re-logged here unless the orchestrator has a specific observation to record. The iteration-cap trigger (#5) covers the terminal case. Concretely: a "retry within iteration" is identified in `RUN_LOG.md` by a second `dispatch` entry whose `iteration:` field is unchanged from the immediately preceding failed dispatch in the same `phase:` AND whose `role:` matches that preceding failed dispatch; the completion-check uses this pair as the countable event. Phases without an iteration loop (preflight, context-discovery, plan-writing, implementation, documentation, readiness-report) only trigger this rule when the same `role:` is dispatched a second time within the same `phase:` after a failed first dispatch — the `iteration:` field, if present at all in those phases, is treated as trivially satisfied and the `role:` equality check is the load-bearing condition. **Example exclusion:** a `debugger` dispatch after a failed `implementer` dispatch in Phase 6 is NOT a retry — different roles, so trigger #3 does not fire (this is structured remediation, not a retry). A second `implementer` dispatch after a failed `implementer` dispatch in Phase 6 IS a retry and DOES fire trigger #3. Likewise, a `test-fixer` dispatch after a FAIL test round in Phase 8 is NOT a retry (different roles — structured remediation), but a second `all-tests-runner` dispatch with an unchanged `iteration:` after a failed first one IS. A second `documentation-writer` dispatch in Phase 9 after a failed first one IS a retry by the same rule (only one role exists in that phase, so the role-equality check trivially holds). Phase 10 has no dispatch at all — it is a direct orchestrator operation — so trigger #3 never applies there.
+3. Any retry of a dispatch within the same iteration (e.g. Mode 4 retry-once policy after a transient failure). Normal next-iteration progression of an iteration loop (spec-review, plan-review, code-review) or next-round progression of the Phase 8 all-tests loop is NOT a "retry" for this purpose — iteration number is already recorded in `RUN_LOG.md` and need not be re-logged here unless the orchestrator has a specific observation to record. The iteration-cap trigger (#5) covers the terminal case. Concretely: call `is_retry_within_iteration PHASE ROLE ITERATION` (cookbook, near `_run_log_latest_field` above — P18) for the dispatch about to be classified — a REAL callable gate, not prose the orchestrator re-derives from RUN_LOG text on every dispatch, the same "provable fact rather than a claim" discipline the sibling callable gates (`plan_review_window_closed`, `dispatch_is_running`, etc.) already follow. It returns true iff RUN_LOG.md shows a second `DISPATCH_STARTED` entry whose `iteration:` field is unchanged from an earlier, failed dispatch in the same `phase:` AND whose `role:` matches that earlier dispatch; the completion-check uses this pair as the countable event. Phases without an iteration loop (preflight, context-discovery, plan-writing, implementation, documentation, readiness-report) always dispatch at `iteration: 00`, so this same exact-iteration match already reduces to "the same `role:` dispatched a second time within the same `phase:` after a failed first dispatch" for them — no separate case is needed. **Example exclusion:** a `debugger` dispatch after a failed `implementer` dispatch in Phase 6 is NOT a retry — different roles, so trigger #3 does not fire (this is structured remediation, not a retry). A second `implementer` dispatch after a failed `implementer` dispatch in Phase 6 IS a retry and DOES fire trigger #3. Likewise, a `test-fixer` dispatch after a FAIL test round in Phase 8 is NOT a retry (different roles — structured remediation), but a second `all-tests-runner` dispatch with an unchanged `iteration:` after a failed first one IS. A second `documentation-writer` dispatch in Phase 9 after a failed first one IS a retry by the same rule (only one role exists in that phase, so the role-equality check trivially holds). Phase 10 has no dispatch at all — it is a direct orchestrator operation — so trigger #3 never applies there.
 
    **Say which kind of re-dispatch it was.** The shape test above is purely
    structural, so it cannot tell an *automatic* retry (the Mode-4 retry-once
@@ -10541,6 +10748,7 @@ To enforce "writing here cannot influence current execution":
 - The file content does NOT contribute to any verdict, summary, gate decision, or readiness classification.
 - The readiness-writer subagent (Phase 11) lists the file in the **Artifacts** section of `final-readiness-report.md` (so the user knows the file exists), but does NOT read its content for verdict purposes. If the file does not exist at Phase 11 (no mandatory triggers fired and no spontaneous entries were emitted), readiness-writer lists it as `process-improvement-proposition.md (absent — no observations recorded)` so its absence is visible rather than silently omitted.
 - The orchestrator MUST NOT cite the file's content in any other `RUN_LOG.md` entry, STATUS file, or user-facing message.
+- `validate_proposition_log` (cookbook, near `append_proposition` above; P17) is a structural self-check for this file's own entry-header grammar — the same "pair every append-only ledger with a validator" pattern `validate_followups`/`validate_verification_records` follow for theirs. This guarantee is exactly why it is never wired into this document's live orchestration flow against the CURRENT run's own file: the function exists for offline/maintainer validation of a CLOSED prior run's log, never a Phase 11 (or any other) call site reading `$FEATURE_FOLDER/process-improvement-proposition.md` mid-run.
 
 ### Privacy / anti-leak
 
@@ -11630,15 +11838,18 @@ VIOLATION` before you would ever be launched to do it.
      "<verification_id, e.g. task-03-cmd-01>" "<the exact command>" "<environment>" \
      "<PASS|FAIL|EXCLUDED|NOT_RUN>" "<exit code, or empty>" "<evidence path, or empty>" \
      "<baseline comparison, or empty>" "<reason, required for EXCLUDED/NOT_RUN>" \
-     "<followup_id, or empty>"
+     "<followup_id, required (non-null) for NOT_RUN, else empty>" \
+     "<exclusion_class, required for EXCLUDED: pre_existing|environment_bound|actor_bound|outside_capability, else empty>"
    ```
 
    An empty result is never `PASS`. A genuine `FAIL` is left as `FAIL` -- do not
    convert it into `EXCLUDED`/`NOT_RUN` to avoid a debugger pass. `EXCLUDED`
-   requires evidence the check is pre-existing, environment-bound,
-   actor-bound, or outside this change's capability -- never used to hide a
-   new regression. `NOT_RUN` names the blocking actor/prerequisite in
-   `reason` and becomes handoff/readiness work, not a silent pass. A
+   requires a typed `exclusion_class` (`pre_existing`, `environment_bound`,
+   `actor_bound`, or `outside_capability`) plus evidence -- never a free-text
+   `reason` alone, and never used to hide a new regression. `NOT_RUN` names
+   the blocking actor/prerequisite in `reason`, sets a non-null `followup_id`
+   linking it to tracked handoff work, and becomes handoff/readiness work,
+   not a silent pass. A
    performance command (benchmark/latency/throughput) may only assert
    `PASS`/`FAIL` under a declared `environment=controlled` with a non-null
    `baseline_comparison`; otherwise record it `NOT_RUN` (advisory/inconclusive)
@@ -11751,7 +11962,7 @@ STATUS
 
 Verdict rules (spec §19.2):
 - `DONE` requires `verification=PASS` and all plan tasks completed, with no `EXCLUDED` records at all.
-- `DONE_WITH_EXCLUSIONS` requires every non-excluded required verification record to be `PASS` and every `EXCLUDED` record's evidence to be policy-valid (pre-existing/environment-bound/actor-bound/outside-capability) -- report `verification=PASS` alongside it. Never use this verdict to hide a genuine `FAIL`; a single `FAIL` still requires `NEEDS_DEBUG`. Any `NOT_RUN` record remains visible as handoff/readiness work in the summary and does not, by itself, block this verdict.
+- `DONE_WITH_EXCLUSIONS` requires every non-excluded required verification record to be `PASS` and every `EXCLUDED` record to carry a policy-valid `exclusion_class` (pre_existing/environment_bound/actor_bound/outside_capability) plus its supporting evidence -- report `verification=PASS` alongside it. Never use this verdict to hide a genuine `FAIL`; a single `FAIL` still requires `NEEDS_DEBUG`. Any `NOT_RUN` record remains visible as handoff/readiness work in the summary and does not, by itself, block this verdict.
 - `NEEDS_DEBUG` if verification failed and you believe a debugger pass can resolve it.
 - `FAILED` if a task failed for a reason that needs human attention.
 - `BLOCKED` if a task requires user input or an unavailable resource.
@@ -12298,7 +12509,7 @@ You are a test runner invoked as a fresh subprocess by the develop-it orchestrat
    - Also run every command the accepted plan's own `## Task Contract` blocks declared under `verification` (spec §19.2), even when it duplicates a suite already covered by the script/discovery mode above — the plan's own declared commands are first-class evidence, not merely covered by the repository-wide run.
    - If the script does not exist, no test suite is discovered, AND the plan declared no verification commands of its own, the round verdict is `SKIPPED` with `reason=no-tests-found`.
    - Every command run under step 1's forced serial mode carries the serial flag; a plan-declared `environment: exclusive` verification command (P16) additionally holds the SAME test lease this step already acquired — never released and re-acquired mid-round for it, since one lease per round already covers it.
-4. For EACH command run in step 3 (the full-suite script/discovery run counts as one command; each plan-declared verification command counts as its own), call `append_verification_record` (cookbook, spec §19.2) to append one record to `$FEATURE_FOLDER/8-all-tests/$ROUND/verification-records.jsonl` — `result: PASS|FAIL|EXCLUDED|NOT_RUN` per that command's own outcome, never a single rollup standing in for every command. Round 1 starts the file fresh; a later fix round APPENDS to the SAME file (never truncates it), reusing the SAME `verification_id` for a command re-run after a fix, so the latest record supersedes the earlier one (the same Mode A/Mode B convention the implementer's own verification records already use).
+4. For EACH command run in step 3 (the full-suite script/discovery run counts as one command; each plan-declared verification command counts as its own), call `append_verification_record` (cookbook, spec §19.2) to append one record to `$FEATURE_FOLDER/8-all-tests/$ROUND/verification-records.jsonl` — `result: PASS|FAIL|EXCLUDED|NOT_RUN` per that command's own outcome, never a single rollup standing in for every command; an `EXCLUDED` result sets a policy-valid `exclusion_class` (`pre_existing|environment_bound|actor_bound|outside_capability`) plus evidence, and a `NOT_RUN` result sets a non-null `followup_id` (spec §19.2, P15). Round 1 starts the file fresh; a later fix round APPENDS to the SAME file (never truncates it), reusing the SAME `verification_id` for a command re-run after a fix, so the latest record supersedes the earlier one (the same Mode A/Mode B convention the implementer's own verification records already use).
 5. Do NOT fix anything. You only run tests and report — fixing belongs to the `test-fixer` role.
 6. Write `$FEATURE_FOLDER/8-all-tests/$ROUND/test-report.md` — the detailed per-round report: execution mode, exact commands, per-suite pass/fail counts, every failing test's name, the relevant error excerpt (assertion/traceback tail, not the full log), and step 1's forced-serial-mode determination (`policy` / `probe` / `neither`, plus the triggering signal when `probe`).
 7. Rewrite `$FEATURE_FOLDER/8-all-tests/all-test-summary.md` (full overwrite, cumulative across rounds — re-read earlier rounds' `test-report.md` and their attempt-scoped STATUS.md files) with:

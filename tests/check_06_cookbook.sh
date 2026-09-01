@@ -326,6 +326,69 @@ else
   _fail "dispatch_is_running is not defined"
 fi
 
+# --- P18: is_retry_within_iteration mechanizes Trigger #3's own shape test.
+if declare -F is_retry_within_iteration >/dev/null; then
+  _t18_dir_ff="$(mktemp -d)/artifacts"; mkdir -p "$_t18_dir_ff"
+  FEATURE_FOLDER="$_t18_dir_ff"
+  ORCHESTRATION_DIR="$_t18_dir_ff/.orchestration"
+  mkdir -p "$ORCHESTRATION_DIR"
+  : > "$_t18_dir_ff/RUN_LOG.md"
+
+  # Yes shape: a failed implementer dispatch in phase 6 iteration 01,
+  # followed by a SECOND implementer dispatch, same phase/iteration/role --
+  # the exact "retry within iteration" shape Trigger #3 documents.
+  record_event DISPATCH_STARTED phase=6 iteration=01 dispatch_id=p06-i01-implementer-a01 \
+    reason="t18 fixture start 1" phase_name=implementation role=implementer vendor=claude \
+    logical_dispatch_id=p06-i01-implementer model=claude-x \
+    status_path=/dev/null cwd=/tmp lease=none snapshot=none >/dev/null
+  record_event DISPATCH_COMPLETED phase=6 iteration=01 dispatch_id=p06-i01-implementer-a01 \
+    reason="t18 fixture: first attempt timed out" phase_name=implementation \
+    role=implementer vendor=claude appendix=implementer \
+    logical_dispatch_id=p06-i01-implementer develop_it_git_sha=deadbeef \
+    develop_it_file_sha256=abc123 develop_it_dirty=clean status_path=/dev/null \
+    verdict=INCOMPLETE_CONTINUABLE classification=TIMED_OUT exit_code=124 model=claude-x \
+    start_ms=0 end_ms=1 duration_ms=1 stdout_path=/tmp/out stderr_path=/tmp/err \
+    mutation_state=NO_SIDE_EFFECTS checkpoint_kind=none tokens_input_new=0 \
+    tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 \
+    cost_usd=n/a usage_status=ok >/dev/null
+  record_event DISPATCH_STARTED phase=6 iteration=01 dispatch_id=p06-i01-implementer-a02 \
+    reason="t18 fixture start 2 -- the retry" phase_name=implementation role=implementer vendor=claude \
+    logical_dispatch_id=p06-i01-implementer model=claude-x \
+    status_path=/dev/null cwd=/tmp lease=none snapshot=none >/dev/null
+
+  rc=0; is_retry_within_iteration 6 implementer 01 || rc=$?
+  assert_rc 0 "$rc" "T18: is_retry_within_iteration is true for a second same-phase/role/iteration dispatch after a failed first one"
+
+  # No shape 1: a DIFFERENT role's second dispatch after the SAME failure
+  # (spec's own debugger-after-implementer exclusion) is NOT a retry.
+  rc=0; is_retry_within_iteration 6 debugger 01 || rc=$?
+  assert_rc 1 "$rc" "T18: is_retry_within_iteration is false when the second dispatch is a DIFFERENT role (structured remediation, not a retry)"
+
+  # No shape 2: a single successful dispatch, no second attempt at all.
+  : > "$_t18_dir_ff/RUN_LOG.md"
+  record_event DISPATCH_STARTED phase=3 iteration=01 dispatch_id=p03-i01-spec-reviewer-claude-a01 \
+    reason="t18 fixture single start" phase_name=spec-review role=spec-reviewer-claude vendor=claude \
+    logical_dispatch_id=p03-i01-spec-reviewer-claude model=claude-x \
+    status_path=/dev/null cwd=/tmp lease=none snapshot=none >/dev/null
+  record_event DISPATCH_COMPLETED phase=3 iteration=01 dispatch_id=p03-i01-spec-reviewer-claude-a01 \
+    reason="t18 fixture: the only attempt, and it succeeded" phase_name=spec-review \
+    role=spec-reviewer-claude vendor=claude appendix=spec-reviewer-claude \
+    logical_dispatch_id=p03-i01-spec-reviewer-claude develop_it_git_sha=deadbeef \
+    develop_it_file_sha256=abc123 develop_it_dirty=clean status_path=/dev/null \
+    verdict=DONE classification=COMPLETED exit_code=0 model=claude-x \
+    start_ms=0 end_ms=1 duration_ms=1 stdout_path=/tmp/out stderr_path=/tmp/err \
+    mutation_state=NO_SIDE_EFFECTS checkpoint_kind=none tokens_input_new=0 \
+    tokens_input_cached=0 tokens_cache_write=0 tokens_output=0 tokens_reasoning=0 \
+    cost_usd=n/a usage_status=ok >/dev/null
+
+  rc=0; is_retry_within_iteration 3 spec-reviewer-claude 01 || rc=$?
+  assert_rc 1 "$rc" "T18: is_retry_within_iteration is false when there was only ONE dispatch at all (no retry to detect)"
+
+  rm -rf "$(dirname "$_t18_dir_ff")"
+else
+  _fail "is_retry_within_iteration is not defined"
+fi
+
 # --- Task 10: applicable_optional_skills is the installed ∩ relevant set ----
 if declare -F applicable_optional_skills >/dev/null; then
   assert_eq "b;c" "$(applicable_optional_skills "a;b;c" "b;c;d")" \
@@ -2952,6 +3015,35 @@ EOF
     _fail "record_convergence_signals/divergence_check are not defined"
   fi
 
+  # ---- P08: divergent_round_cap_hit_before -- the two-consecutive-cap HALT
+  # condition's own counting helper. ----------------------------------------
+  if declare -F divergent_round_cap_hit_before >/dev/null; then
+    _t8_dr_ff="$(mktemp -d)/artifacts"; mkdir -p "$_t8_dr_ff"
+    FEATURE_FOLDER="$_t8_dr_ff"
+    ORCHESTRATION_DIR="$_t8_dr_ff/.orchestration"
+    mkdir -p "$ORCHESTRATION_DIR"
+    : > "$_t8_dr_ff/RUN_LOG.md"
+
+    assert_eq no "$(divergent_round_cap_hit_before spec-review)" \
+      "T8 (P08): no prior DIVERGENT_ROUND_CAP_REACHED for this gate -> not yet a second hit"
+
+    record_event DIVERGENT_ROUND_CAP_REACHED phase=3 iteration=03 \
+      phase_name=spec-review cap_value=2 divergent_rounds=2 \
+      reason="p08 fixture: first cap hit this gate" >/dev/null
+
+    assert_eq yes "$(divergent_round_cap_hit_before spec-review)" \
+      "T8 (P08): one prior DIVERGENT_ROUND_CAP_REACHED for this gate -> the next hit would be the second (HALT)"
+
+    assert_eq no "$(divergent_round_cap_hit_before code-review)" \
+      "T8 (P08): counting is per phase_name -- a cap hit on a DIFFERENT gate does not trip this one"
+
+    rm -rf "$(dirname "$_t8_dr_ff")"
+    FEATURE_FOLDER="$T11_DIR"
+    ORCHESTRATION_DIR="$T11_DIR/.orchestration"
+  else
+    _fail "divergent_round_cap_hit_before is not defined"
+  fi
+
   # ---- validate_artifact: structural manifest gate (spec S17.1). ----------
   # Uses role_attempt_dir's OWN derivation (phase/iteration decoded from the
   # dispatch_id string, never ambient $PHASE_DIR/$ITERATION) -- deliberately
@@ -3141,7 +3233,7 @@ T12_VR="$T12_DIR/verification-records.jsonl"; rm -f "$T12_VR"
     "$T12_DIR/ev-fail.log" "" "assertion failed on line 12" ""
   append_verification_record "$T12_VR" v-excl  "pytest tests/test_legacy.py" local EXCLUDED 1 \
     "$T12_DIR/ev-excl.log" "failed identically at the implementation baseline" \
-    "pre-existing failure, unrelated to this change" ""
+    "pre-existing failure, unrelated to this change" "" pre_existing
   append_verification_record "$T12_VR" v-notrun "manual UAT in staging" staging NOT_RUN "" \
     "" "" "requires actor=owner; staging access not available to implementer" fu-01
 
@@ -3186,9 +3278,9 @@ T12_VR="$T12_DIR/verification-records.jsonl"; rm -f "$T12_VR"
 # no baseline can exist for a check this actor/environment cannot run at all.
 : > "$T12_VR_B"
 append_verification_record "$T12_VR_B" v-nb "pytest tests/test_legacy.py" local EXCLUDED 1 \
-  "$T12_DIR/ev-excl.log" "" "pre-existing failure" "" >/dev/null 2>&1 || true
+  "$T12_DIR/ev-excl.log" "" "pre-existing failure" "" pre_existing >/dev/null 2>&1 || true
 t12_nb_rc=0; t12_nb_out="$(validate_verification_records "$T12_VR_B" 2>&1)" || t12_nb_rc=$?
-assert_rc 1 "$t12_nb_rc" "T12: EXCLUDED as pre-existing without a baseline_comparison is refused"
+assert_rc 1 "$t12_nb_rc" "T12: EXCLUDED as pre_existing without a baseline_comparison is refused"
 case "$t12_nb_out" in
   *baseline_comparison*) _ok "T12: the refusal names the missing baseline_comparison" ;;
   *) _fail "T12: the refusal names the missing baseline_comparison"; note "got: $t12_nb_out" ;;
@@ -3196,21 +3288,47 @@ esac
 
 : > "$T12_VR_B"
 append_verification_record "$T12_VR_B" v-ab "pytest tests/test_gpu.py" local EXCLUDED 1 \
-  "$T12_DIR/ev-excl.log" "" "actor-bound: the owner must run this" "" >/dev/null 2>&1 || true
+  "$T12_DIR/ev-excl.log" "" "actor-bound: the owner must run this" "" actor_bound >/dev/null 2>&1 || true
 t12_ab_rc=0; validate_verification_records "$T12_VR_B" >/dev/null 2>&1 || t12_ab_rc=$?
-assert_rc 0 "$t12_ab_rc" "T12: an actor-bound EXCLUDED needs no baseline (none can exist)"
+assert_rc 0 "$t12_ab_rc" "T12: an actor_bound EXCLUDED needs no baseline (none can exist)"
+  fi
+
+  # P15: a record carrying the OLD marker vocabulary in `reason` (and even a
+  # real evidence_path/baseline_comparison) but no `exclusion_class` enum
+  # field must now FAIL -- the retired EXCLUSION_MARKERS substring check no
+  # longer grants a pass for keyword-sniffed prose alone.
+  T12_VR_MARKERSNOCLASS="$T12_DIR/verification-records-markersnoclass.jsonl"
+  printf '{"verification_id":"v-mnc","command":"pytest tests/test_legacy.py","environment":"local","result":"EXCLUDED","exit_code":1,"evidence_path":"ev.log","baseline_comparison":"baseline.json","reason":"pre-existing failure, unrelated to this change, environment-bound and actor-bound too","followup_id":null}\n' \
+    > "$T12_VR_MARKERSNOCLASS"
+  if validate_verification_records "$T12_VR_MARKERSNOCLASS" >"$T12_DIR/mnc.out" 2>&1; then
+    _fail "T12: validate_verification_records accepted an EXCLUDED record with marker vocabulary in reason but no exclusion_class enum"
+  else
+    _ok "T12: validate_verification_records rejects marker-vocabulary-but-no-enum EXCLUDED records (P15)"
+    assert_contains exclusion_class "$T12_DIR/mnc.out" "T12: the refusal names the missing exclusion_class"
   fi
 
   # Code review fix (medium 9): a reason KEYWORD alone is a claim, not
-  # evidence -- a policy-valid reason string with a NULL evidence_path must
-  # ALSO be rejected, isolating this check from the keyword check above.
+  # evidence -- a policy-valid exclusion_class with a NULL evidence_path must
+  # ALSO be rejected, isolating this check from the exclusion_class check above.
   T12_VR_NOEVID="$T12_DIR/verification-records-noevid.jsonl"
-  printf '{"verification_id":"v-ne","command":"pytest tests/new_feature.py","environment":"local","result":"EXCLUDED","exit_code":1,"evidence_path":null,"baseline_comparison":null,"reason":"pre-existing failure, unrelated to this change","followup_id":null}\n' \
+  printf '{"verification_id":"v-ne","command":"pytest tests/new_feature.py","environment":"local","result":"EXCLUDED","exit_code":1,"evidence_path":null,"baseline_comparison":null,"reason":"pre-existing failure, unrelated to this change","followup_id":null,"exclusion_class":"pre_existing"}\n' \
     > "$T12_VR_NOEVID"
   if validate_verification_records "$T12_VR_NOEVID" >/dev/null 2>&1; then
-    _fail "T12: validate_verification_records accepted an EXCLUDED record with a valid reason keyword but NO evidence_path"
+    _fail "T12: validate_verification_records accepted an EXCLUDED record with a valid exclusion_class but NO evidence_path"
   else
-    _ok "T12: validate_verification_records rejects EXCLUDED with no evidence_path even when the reason keyword is policy-valid"
+    _ok "T12: validate_verification_records rejects EXCLUDED with no evidence_path even when exclusion_class is policy-valid"
+  fi
+
+  # P15: NOT_RUN without a followup_id must be rejected -- the handoff work
+  # cannot evaporate with only a promise in `reason`.
+  T12_VR_NOTRUN_NOFU="$T12_DIR/verification-records-notrun-nofu.jsonl"
+  printf '{"verification_id":"v-nrnf","command":"manual UAT in staging","environment":"staging","result":"NOT_RUN","exit_code":null,"evidence_path":null,"baseline_comparison":null,"reason":"requires actor=owner; staging access not available to implementer","followup_id":null,"exclusion_class":null}\n' \
+    > "$T12_VR_NOTRUN_NOFU"
+  if validate_verification_records "$T12_VR_NOTRUN_NOFU" >"$T12_DIR/notrun_nofu.out" 2>&1; then
+    _fail "T12: validate_verification_records accepted a NOT_RUN record with no followup_id"
+  else
+    _ok "T12: validate_verification_records rejects NOT_RUN without a followup_id (P15)"
+    assert_contains followup_id "$T12_DIR/notrun_nofu.out" "T12: the refusal names the missing followup_id"
   fi
 
   # A performance verdict without a declared controlled environment and
@@ -3238,7 +3356,7 @@ assert_rc 0 "$t12_ab_rc" "T12: an actor-bound EXCLUDED needs no baseline (none c
   # And the negative: ordinary prose containing "above"/"table" etc. must
   # NOT be misdetected as a performance command by the widened tool list.
   T12_VR_NOTPERF="$T12_DIR/verification-records-notperf.jsonl"
-  printf '{"verification_id":"v-notperf","command":"Run the above migration against the users table","environment":"local","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n' \
+  printf '{"verification_id":"v-notperf","command":"Run the above migration against the users table","environment":"local","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null,"exclusion_class":null}\n' \
     > "$T12_VR_NOTPERF"
   if validate_verification_records "$T12_VR_NOTPERF" >/dev/null 2>&1; then
     _ok "T12: ordinary prose ('above', 'table') is not misdetected as a performance command"
@@ -3256,7 +3374,7 @@ assert_rc 0 "$t12_ab_rc" "T12: an actor-bound EXCLUDED needs no baseline (none c
   T12_VR_DEDUP="$T12_DIR/verification-records-dedup.jsonl"
   {
     printf '{"verification_id":"v-dup","command":"pytest tests/test_widget.py","environment":"local","result":"","exit_code":1,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n'
-    printf '{"verification_id":"v-dup","command":"pytest tests/test_widget.py","environment":"local","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n'
+    printf '{"verification_id":"v-dup","command":"pytest tests/test_widget.py","environment":"local","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null,"exclusion_class":null}\n'
   } > "$T12_VR_DEDUP"
   if validate_verification_records "$T12_VR_DEDUP" >"$T12_DIR/dedup.out" 2>&1; then
     _ok "T12: validate_verification_records evaluates the LATEST record per verification_id (post-debug PASS supersedes a structurally-invalid pre-debug attempt)"
@@ -3271,7 +3389,7 @@ assert_rc 0 "$t12_ab_rc" "T12: an actor-bound EXCLUDED needs no baseline (none c
   T12_VR_DEDUP2="$T12_DIR/verification-records-dedup2.jsonl"
   {
     printf '{"verification_id":"v-dup2","command":"pytest tests/test_widget.py","environment":"local","result":"EXCLUDED","exit_code":1,"evidence_path":null,"baseline_comparison":null,"reason":"meh","followup_id":null}\n'
-    printf '{"verification_id":"v-dup2","command":"pytest tests/test_widget.py","environment":"local","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null}\n'
+    printf '{"verification_id":"v-dup2","command":"pytest tests/test_widget.py","environment":"local","result":"PASS","exit_code":0,"evidence_path":null,"baseline_comparison":null,"reason":null,"followup_id":null,"exclusion_class":null}\n'
   } > "$T12_VR_DEDUP2"
   if validate_verification_records "$T12_VR_DEDUP2" >"$T12_DIR/dedup2.out" 2>&1; then
     _ok "T12: validate_verification_records supersedes a pre-debug policy-invalid EXCLUDED with a later valid PASS (dedup applies uniformly, not to one rule only)"

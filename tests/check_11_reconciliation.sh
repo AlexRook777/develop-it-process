@@ -486,7 +486,8 @@ mkdir -p "$FEATURE_FOLDER/8-all-tests/00"
 jq -cn '{verification_id:"v1", command:"pytest tests/unrelated.py", environment:"local",
   result:"EXCLUDED", exit_code:null, evidence_path:"ev.txt",
   baseline_comparison:"baseline-2026-01-01.json",
-  reason:"pre-existing failure, unrelated to this change", followup_id:null}' \
+  reason:"pre-existing failure, unrelated to this change", followup_id:null,
+  exclusion_class:"pre_existing"}' \
   > "$FEATURE_FOLDER/8-all-tests/00/verification-records.jsonl"
 rc=0; audit_run_state || rc=$?
 assert_rc 0 "$rc" "12: a valid EXCLUDED verification record produces a CLEAN audit"
@@ -501,7 +502,7 @@ _t15_clean_baseline
 mkdir -p "$FEATURE_FOLDER/8-all-tests/00"
 jq -cn '{verification_id:"v2", command:"pytest tests/test_widget.py", environment:"local",
   result:"FAIL", exit_code:1, evidence_path:null, baseline_comparison:null,
-  reason:"genuine regression", followup_id:null}' \
+  reason:"genuine regression", followup_id:null, exclusion_class:null}' \
   > "$FEATURE_FOLDER/8-all-tests/00/verification-records.jsonl"
 rc=0; audit_run_state || rc=$?
 assert_rc 1 "$rc" "12b: audit_run_state fails when a verification record's latest result is a real FAIL"
