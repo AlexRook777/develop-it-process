@@ -29,11 +29,11 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
    Either copy is a no-op if the corresponding source is absent (see "File policy for non-READY paths" in Step 1.0). Order of the two copies is irrelevant. Do not read any STATUS verdict until both copies (or their no-op equivalents) complete.
 
 6. `dispatch_parallel`/`dispatch_attempt` already appended each probe's own RUN_LOG dispatch entry (`phase: 5`, `phase_name: plan-review`, `iteration: 00`, `role: preflight-claude` or `preflight-codex`, `vendor: claude` or `codex`, `status_path:` its REAL attempt-scoped path) — read the verdict from the copied alias `5-plan-review/preflight/<vendor>-check-status.md` (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
-7. Branch on the verdicts: same procedure as Step 3.0 item 7 (the canonical per-phase preflight verdict branch, `phases/3-spec-review.md` — P21/Task 11), substituting `phase: 5`, `phase_name: plan-review`, `Phase 5` (for the sticky-within-phase `codex_available` rule and the "remainder of Phase N only" wording), and `p05-i00-preflight-*` throughout. No `DEGRADED_REVIEW_ACCEPTED` delta here — that is Phase 7 only.
+7. Branch on the verdicts: same procedure as Step 3.0 item 7 (the canonical per-phase preflight verdict branch, `phases/3-spec-review.md` — P21/Task 11), substituting `phase: 5`, `phase_name: plan-review`, `Phase 5` (for the sticky-within-phase `codex_available` rule and the "remainder of Phase N only" wording), and `p05-i00-preflight-*` throughout. No `DEGRADED_REVIEW_ACCEPTED` delta here — that is Phase 7 only. (Requires `phases/3-spec-review.md`, Read it now if not already read this turn.)
 
 The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this gate.
 
-### Step 5.1 — Iteration loop (same convergence procedure as Step 3.1, `phases/3-spec-review.md`, substituting `$PLAN_PATH`/`plan-writer`/`plan-fixer`/`plan-reviewer-*`)
+### Step 5.1 — Iteration loop (same convergence procedure as Step 3.1, `phases/3-spec-review.md`, substituting `$PLAN_PATH`/`plan-writer`/`plan-fixer`/`plan-reviewer-*`) — requires `phases/3-spec-review.md`, Read it now if not already read this turn.
 
 For each iteration N (start at 1, hard cap `review_iteration_cap`):
 

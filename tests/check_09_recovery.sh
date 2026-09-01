@@ -85,6 +85,16 @@ awk -F'\t' -v OFS='\t' -v tc="$tcol" -v lc="$lrcol" -v v=2 \
   'NR==1{print;next} { if ($1=="debugger") { $tc=v; $lc="no" }; print }' \
   "$BUILD/roles.tsv" > "$BUILD/roles-debugger-medium.tsv"
 
+# A third debugger copy for the RM02 active-lease fixture below: it needs
+# its fake attempt to still be alive across a 0.1s-poll observation window
+# (plus a handful of quick follow-on assertions) before the `timeout`
+# wrapper kills it -- the 0.02-minute/1.2s tiny registry is too tight for
+# that under CI scheduling jitter, but the 2-minute medium registry would
+# make this fixture's own `wait` at the end needlessly slow.
+awk -F'\t' -v OFS='\t' -v tc="$tcol" -v lc="$lrcol" -v v=0.15 \
+  'NR==1{print;next} { if ($1=="debugger") { $tc=v; $lc="no" }; print }' \
+  "$BUILD/roles.tsv" > "$BUILD/roles-debugger-lease.tsv"
+
 # Pristine baseline: every _drive_rm call resets the target repo back to
 # this exact HEAD/clean-tree state afterward, so one test's FAKE_MUTATION
 # side effect (a commit, an uncommitted fake-mutation.txt) can never leak
@@ -145,12 +155,12 @@ assert_present 'logical_dispatch_id: *p03-i21-spec-reviewer-claude' "$FEATURE_FO
 rm -f "$ORCHESTRATION_DIR/write-lease.json"
 : > "$FEATURE_FOLDER/RUN_LOG.md"
 rm02_marker="20.$$"
-ROLE_CONTRACTS_PATH="$BUILD/roles-debugger-tiny.tsv" \
+ROLE_CONTRACTS_PATH="$BUILD/roles-debugger-lease.tsv" \
   FAKE_MODE=complete FAKE_DELAY_SECONDS="$rm02_marker" \
   dispatch_attempt 6 22 debugger >/dev/null 2>&1 &
 rm02_pid=$!
 rm02_seen=0
-for _ in $(seq 1 50); do
+for _ in $(seq 1 100); do
   pgrep -f "sleep $rm02_marker" >/dev/null 2>&1 && { rm02_seen=1; break; }
   sleep 0.1
 done
@@ -668,13 +678,13 @@ assert_eq PRELAUNCH_FAILED "$(resume_dispatch_state p03-i39-spec-reviewer-claude
 # 3. RUNNING_OBSERVED: start exists, the child is genuinely still live.
 : > "$FEATURE_FOLDER/RUN_LOG.md"
 rm -f "$ORCHESTRATION_DIR/write-lease.json"
-resume_marker="2.$$"
+resume_marker="10.$$"
 ROLE_CONTRACTS_PATH="$BUILD/roles-debugger-medium.tsv" \
   FAKE_MODE=complete FAKE_DELAY_SECONDS="$resume_marker" \
   dispatch_attempt 6 40 debugger >/dev/null 2>&1 &
 resume_pid=$!
 resume_seen=0
-for _ in $(seq 1 50); do
+for _ in $(seq 1 100); do
   pgrep -f "sleep $resume_marker" >/dev/null 2>&1 && { resume_seen=1; break; }
   sleep 0.1
 done

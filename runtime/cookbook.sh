@@ -1020,8 +1020,9 @@ allocate_attempt() {
   # actually passes: `1` (matching the "1-preflight/" folder every consumer
   # in this document already reads from -- context7_policy, optional-skill
   # routing, readiness-writer, the folder-layout diagram). No role's own
-  # registry `phases` column ever lists `-1` (preflight-claude/preflight-codex
-  # list `1;3;5;6;7`), so the `m1` token below is defined for completeness,
+  # registry `phases` column ever lists `-1` (preflight-claude lists
+  # `1;3;5;6;7`; preflight-codex lists `1;3;5;7` -- Phase 6 never dispatches
+  # it, since P09), so the `m1` token below is defined for completeness,
   # never actually minted by a real dispatch; a `pm1-...` dispatch id
   # correctly does not appear anywhere else in this document.
   local phase=$1 iteration=$2 role=$3 iter2 rc=0

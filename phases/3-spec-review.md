@@ -115,7 +115,8 @@ You are a spec reviewer invoked as a fresh subprocess by the develop-it orchestr
 Path: $FEATURE_FOLDER/3-spec-review/$ITERATION/claude-findings.jsonl
 ```
 
-One JSON object per line, each with: `source_finding_id` (your own short local ID, e.g. `F1`), `reviewer_role: "spec-reviewer-claude"`, `vendor: "claude"`, `phase: "3"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path: "$SPEC_PATH"`, `artifact_revision` (the spec's current sha256 or git sha), `location` (a human excerpt: heading text or `"L<N>"`), `line` (the 1-based line number your finding concerns), `issue_key` (a short stable slug for the underlying issue, e.g. `"missing-non-goals"`), `summary`, `evidence` (the exact excerpt), `required_change`, `provenance: "unknown"` (the ingestion helper refines this against prior rounds), `related_finding_ids: []`.
+One JSON object per line, each with: <!-- INCLUDE-BEGIN: finding-record-schema reviewer_role=spec-reviewer-claude vendor=claude phase=3 artifact_path_spec='`artifact_path: "$SPEC_PATH"`' artifact_revision_spec='`artifact_revision`' line_spec='`line`' evidence_spec='`evidence`' -->
+<!-- INCLUDE-END -->
 
 Findings: `$FEATURE_FOLDER/3-spec-review/$ITERATION/claude-findings.jsonl` (written per step 4 above).
 

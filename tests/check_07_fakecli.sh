@@ -1079,9 +1079,15 @@ supposedly produced.
 EOF
   FAKE_MODE=complete dispatch_attempt 4 00 plan-writer >/dev/null 2>"$BUILD/t11-pw-dispatch.err"
   assert_rc 0 $? "dispatch_attempt for plan-writer succeeds against the fake CLI"
+  # This dispatch is phase 4/iteration 00, NOT the file-scope $PHASE_DIR/
+  # $ITERATION/$DISPATCH_ID fixture defaults (phase 3/iteration 1) -- derive
+  # its own real attempt directory via role_attempt_dir, same as the
+  # preflight-claude/-codex directories above (line ~320).
+  _t11_pw_dispatch_id="p04-i00-plan-writer-a01"
+  _t11_pw_attempt_dir="$(role_attempt_dir plan-writer "$_t11_pw_dispatch_id")"
   printf '{"schema_version":2,"plan_path":"%s","completed_at":"1970-01-01T00:00:00Z"}\n' \
-    "$PLAN_PATH" > "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/artifact-complete.json"
-  validate_artifact plan-writer "$DISPATCH_ID" >/dev/null \
+    "$PLAN_PATH" > "$_t11_pw_attempt_dir/artifact-complete.json"
+  validate_artifact plan-writer "$_t11_pw_dispatch_id" >/dev/null \
     && _ok "validate_artifact accepts a REAL dispatch_attempt's own STATUS.md and attempt directory" \
     || _fail "validate_artifact rejected a genuinely successful real dispatch_attempt"
 fi
