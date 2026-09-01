@@ -221,10 +221,20 @@ assert_present 'if ! bootstrap_runtime >"\$bootstrap_tmp"' "$S" \
 assert_present '^vendor_preflight_reprobe_once\(\) \{' "$S" \
   "T10 review: vendor_preflight_reprobe_once is a real cookbook function"
 assert_present 'call `vendor_preflight_reprobe_once codex' "$S" \
-  "T10 review: vendor_preflight_reprobe_once has real call sites in the per-phase preflight gates"
+  "T10 review: vendor_preflight_reprobe_once has a real call site in the per-phase preflight gate"
+# P21 (Task 11): the per-phase preflight verdict branch (item 7 of Steps
+# 3.0/5.0/7.0), including this vendor_preflight_reprobe_once call, is
+# authored ONCE in Step 3.0 as the canonical procedure; Phases 5 and 7 cite
+# it rather than repeating it (same pattern Step 3.1 already used for the
+# iteration loop). So the literal call site is wired into exactly ONE gate's
+# own prose now, and each of the other two gates must cite that canonical
+# item 7 by name instead of silently dropping the reprobe entirely.
 _reprobe_sites="$("$GREP_BIN" -c 'call `vendor_preflight_reprobe_once codex' "$S" || true)"
-assert_eq 3 "$_reprobe_sites" \
-  "T10 review: vendor_preflight_reprobe_once is wired into all three per-phase gates (3, 5, 7)"
+assert_eq 1 "$_reprobe_sites" \
+  "T10 review: vendor_preflight_reprobe_once's call site is authored once (Step 3.0's canonical verdict branch)"
+_reprobe_citations="$("$GREP_BIN" -c 'same procedure as Step 3.0 item 7' "$S" || true)"
+assert_eq 2 "$_reprobe_citations" \
+  "T21: Phases 5 and 7 each cite Step 3.0 item 7 as the canonical per-phase preflight verdict branch"
 
 # Finding 4/8: the Step 1.0 HALT-logging rule names the CURRENT gate order
 # and numbering, not the pre-Task-10 one (canary was step 2, model probe was

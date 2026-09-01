@@ -959,6 +959,34 @@ role_attempt_dir() {
     "$FEATURE_FOLDER" "$phase" "$phase_name" "$iter" "$dispatch_id"
 }
 
+# P21 (Task 11): the per-phase preflight's alias-copy step (each of Phase
+# 3/5/7's own Step X.0 item 5) was an identical ~20-line snippet five times
+# over, differing only in the phase number and destination directory. One
+# function, called once per gate.
+copy_preflight_alias() {
+  # Usage: copy_preflight_alias PHASE DEST_DIR
+  # `cp`, never `mv` -- the attempt-scoped original at $src remains the
+  # durable record (resume classification, audit_run_state, and a future
+  # reconciliation all expect every attempt directory to remain exactly as
+  # dispatch_attempt left it). `_latest_attempt_id` returning nothing (codex
+  # skipped via consent, or a prelaunch failure that never launched) is the
+  # normal non-error case -- `continue` to the next vendor, not a HALT. An
+  # `if [ -f "$src" ]`, not `[ -f … ] && cp`: as the LAST statement of a
+  # block the `&&` form returns 1 whenever the file is absent, which is the
+  # normal codex-skipped path, making a successful phase look like a
+  # failure. Either copy is a no-op if its source is absent (see "File
+  # policy for non-READY paths"); order of the two copies is irrelevant.
+  local phase="$1" dest="$2" v logical latest src
+  for v in claude codex; do
+    logical="p$(_phase_to_token "$phase")-i00-preflight-${v}"
+    latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
+    src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
+    if [ -f "$src" ]; then
+      cp "$src" "$dest/${v}-check-status.md"
+    fi
+  done
+}
+
 # The ONE place a top-level dispatch identity is minted. Sets (non-local,
 # caller-visible): PHASE_TOKEN LOGICAL_DISPATCH_ID ATTEMPT DISPATCH_ID
 # ATTEMPT_DIR STATUS_PATH STDOUT_PATH STDERR_PATH SNAPSHOT_DIR -- exactly
@@ -1098,6 +1126,7 @@ render_prompt() {
       "$PYTHON_BIN" - <<'PY'
 import os
 import re
+import shlex
 import sys
 
 process = os.environ["PROCESS_PATH"]
@@ -1116,6 +1145,54 @@ end = text.find(end_marker, start)
 if end == -1:
     sys.exit(f"render_prompt: BEGIN without END for appendix '{name}' in {process}")
 body = text[start:end + len(end_marker)]
+
+# P20 (Task 11): appendices reference document-wide-shared prose (the
+# Publish STATUS protocol, the summarizer usage-table spec, the finding-
+# record field schema) instead of repeating it 25/5/6 times over. Those
+# shared blocks live ONCE, outside any role's own BEGIN/END span, delimited
+# by <!-- SHARED-BEGIN: <block> -->/<!-- SHARED-END: <block> -->. An
+# appendix pulls one in with a single
+#   <!-- INCLUDE-BEGIN: <block> key="value" ... -->
+#   ...optional extra lines (become {{extra}})...
+#   <!-- INCLUDE-END -->
+# span; expansion happens HERE, before the plain $VAR substitution below, so
+# a dispatched role's RENDERED prompt still gets the full shared text (only
+# the document's OWN resident bytes shrink) and any $VAR the shared block
+# itself carries (e.g. $STATUS_PUBLISHER_PATH) is still resolved normally.
+_include_re = re.compile(
+    r"<!-- INCLUDE-BEGIN: ([a-z][a-z0-9_-]*)([^\n]*) -->\n(.*?)<!-- INCLUDE-END -->",
+    re.S,
+)
+
+
+def _expand_include(m):
+    block, argstr, extra = m.group(1), m.group(2), m.group(3)
+    s_begin, s_end = f"<!-- SHARED-BEGIN: {block} -->", f"<!-- SHARED-END: {block} -->"
+    s_start = text.find(s_begin)
+    if s_start == -1:
+        sys.exit(f"render_prompt: appendix '{name}' includes unknown shared block '{block}'")
+    s_stop = text.find(s_end, s_start)
+    if s_stop == -1:
+        sys.exit(f"render_prompt: SHARED-BEGIN without SHARED-END for block '{block}'")
+    shared = text[s_start + len(s_begin):s_stop].strip("\n")
+    try:
+        params = dict(tok.split("=", 1) for tok in shlex.split(argstr))
+    except ValueError:
+        sys.exit(f"render_prompt: malformed INCLUDE params in appendix '{name}': {argstr!r}")
+    params.setdefault("extra", extra.rstrip("\n"))
+    out = shared
+    for k, v in params.items():
+        out = out.replace("{{" + k + "}}", v)
+    leftover_params = sorted(set(re.findall(r"\{\{[a-z_]+\}\}", out)))
+    if leftover_params:
+        sys.exit(
+            f"render_prompt: shared block '{block}' left unresolved in appendix '{name}': "
+            + ", ".join(leftover_params)
+        )
+    return out
+
+
+body = _include_re.sub(_expand_include, body)
 
 # Only the keys the CALLER actually had set. The shell computed this list with
 # ${!k+x}, so "set but empty" is honoured and "unset" is detectable here.
@@ -4100,18 +4177,11 @@ PY
 # requirement) rather than `canon`'s realpath -e: a declared write path may
 # name a file this attempt is about to CREATE, which does not exist yet.
 #
-# Code review fix #4 (Task 9 seam, noted explicitly): this check itself is
-# correct (verified against an absolute path, `..` traversal, a symlinked
-# directory, a symlink whose PARENT escapes, and a symlinked file), but it
-# is UNREACHABLE in production today for the same reason _snapshot_capture's
-# per-artifact branch is (above): dispatch_parallel's only live call to
-# acquire_write_lease declares "." for every mutating role, and "." always
-# resolves to $REPO_ROOT itself, which trivially passes containment. Nothing
-# in this document's fixed interfaces assigns a per-role declared-path
-# registry column, so there is currently no way for a real caller to
-# declare anything narrower -- and thus no real input this check can ever
-# actually reject. A later task adding that column is what activates this
-# guard; it needs no change itself when that happens.
+# Gap (P25/Task 11, compressed -- full rationale in _snapshot_capture's own
+# comment below, same gap): verified correct, but UNREACHABLE today -- every
+# live caller declares only "." (whole repo, trivially contained). A future
+# per-role narrower-path registry column is the reactivation trigger; this
+# function needs no change when that lands.
 _write_lease_path_ok() {
   local repo="$1" p="$2" resolved
   case "$p" in /*) return 1 ;; esac
@@ -4471,25 +4541,16 @@ release_write_lease() {
 # together. Diagnostic and scoped-recovery input ONLY -- this document never
 # reads its own output back to perform an automatic rollback.
 #
-# Code review fix #3/#4 (Task 9 seam, noted explicitly rather than silently
-# incomplete): the per-artifact hash/copy branch below IS fully implemented
-# and unit-tested (tests/check_06_cookbook.sh, a real declared path), but is
-# UNREACHABLE in production today -- every live caller (dispatch_parallel's
-# lease-phase call to acquire_write_lease) declares only "." (the whole
-# repo), because no per-role narrower-path registry column exists yet (the
-# same gap `_write_lease_path_ok`'s containment check names below). HEAD
-# plus the porcelain status line still cover a "." declaration's integrity
-# need; the per-file branch activates automatically once a future task
-# starts declaring real per-role paths -- nothing here needs to change for
-# that. `declared_foreign_paths` in the write-lease JSON (acquire_write_lease,
-# above) is populated as of Task 9 (`_write_lease_foreign_paths_now`'s own
-# raw pre-acquisition status scan) -- a checkpointed continuation's
-# isolation test (`checkpoint_partial_isolated`, "Checkpoint contract"
-# below) reads it back. `declared_foreign_commits` stays an honest empty
-# `[]`: this process never holds more than one lease/writer at a time, so a
-# fresh acquisition never has another actor's commit to declare against
-# baseline_head in the first place -- not an unpopulated gap, a vocabulary
-# with nothing to say yet.
+# Gap (P25/Task 11, compressed): the per-artifact hash/copy branch below IS
+# fully implemented and unit-tested (tests/check_06_cookbook.sh), but is
+# UNREACHABLE today -- same as `_write_lease_path_ok` above, every live
+# caller declares only "." (whole repo). HEAD plus the porcelain status line
+# still cover a "." declaration's integrity need. Reactivation trigger: a
+# future per-role narrower-path registry column; nothing here needs to
+# change when that lands. `declared_foreign_paths` in the write-lease JSON
+# (acquire_write_lease, above) IS populated today (`_write_lease_foreign_
+# paths_now`) -- see that function's own comment for why `declared_foreign_
+# commits` stays `[]` rather than a second gap.
 _snapshot_capture() {
   # Usage: _snapshot_capture before|after OWNER DISPATCH_ID MANIFEST_PATH [DECLARED_PATH...]
   local stage="$1" owner="$2" dispatch_id="$3" manifest="$4"; shift 4

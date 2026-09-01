@@ -117,26 +117,43 @@ rc=0
 ( cd "$RUNTIME_DIR" && sha256sum -c manifest.sha256 ) >/dev/null 2>"$BUILD/manifest-check.err" || rc=$?
 assert_rc 0 "$rc" "the five generated-file entries validate with sha256sum -c"
 
-# --- Task 4 Step 6: every top-level appendix publishes through the ONE
-# generated publisher, exactly once, and no appendix hand-rolls its own
-# atomic-write shell or a role-local STATUS validator any more. -------------
+# --- Task 4 Step 6 (repointed by P20/Task 11): every top-level appendix
+# publishes through the ONE generated publisher, exactly once, and no
+# appendix hand-rolls its own atomic-write shell or a role-local STATUS
+# validator any more. Since P20 factored the $STATUS_PUBLISHER_PATH call out
+# of the 25 appendix bodies into the single `publish-status-protocol` shared
+# block (develop-it-prompt.md, "Appendices" section) that render_prompt
+# splices back into every rendered prompt (runtime/cookbook.sh's
+# render_prompt, INCLUDE-BEGIN/SHARED-BEGIN expansion), the SAME invariant
+# now decomposes into two resident-text checks: the shared block itself
+# calls the publisher exactly once, and every appendix pulls that shared
+# block in exactly once (never hand-rolling a second, competing call). ------
 appendix_pub_report="$(python3 - "$PROCESS_DOC" <<'PY'
 import re
 text = open(__import__("sys").argv[1]).read()
+
+shared_m = re.search(r"<!-- SHARED-BEGIN: publish-status-protocol -->(.*?)<!-- SHARED-END: publish-status-protocol -->", text, re.S)
+shared_n = shared_m.group(1).count("$STATUS_PUBLISHER_PATH") if shared_m else 0
+
 bodies = re.findall(r"<!-- BEGIN: ([a-z0-9-]+) -->(.*?)<!-- END: \1 -->", text, re.S)
 bad = []
 for role, body in bodies:
-    n = body.count("$STATUS_PUBLISHER_PATH")
-    if n != 1:
-        bad.append(f"{role}:{n}")
+    includes = body.count("<!-- INCLUDE-BEGIN: publish-status-protocol ")
+    hand_rolled = body.count("$STATUS_PUBLISHER_PATH")
+    if includes != 1 or hand_rolled != 0:
+        bad.append(f"{role}:includes={includes},hand_rolled={hand_rolled}")
+print(shared_n)
 print(",".join(bad))
 print(len(bodies))
 PY
 )"
-appendix_pub_bad="$(printf '%s\n' "$appendix_pub_report" | sed -n 1p)"
-appendix_pub_count="$(printf '%s\n' "$appendix_pub_report" | sed -n 2p)"
+appendix_pub_shared_n="$(printf '%s\n' "$appendix_pub_report" | sed -n 1p)"
+appendix_pub_bad="$(printf '%s\n' "$appendix_pub_report" | sed -n 2p)"
+appendix_pub_count="$(printf '%s\n' "$appendix_pub_report" | sed -n 3p)"
+assert_eq 1 "$appendix_pub_shared_n" \
+  "the shared publish-status-protocol block calls \$STATUS_PUBLISHER_PATH exactly once"
 assert_eq "" "$appendix_pub_bad" \
-  "every appendix calls \$STATUS_PUBLISHER_PATH exactly once (offenders: role:count)"
+  "every appendix includes the shared publish-status-protocol block exactly once and hand-rolls no call of its own (offenders: role:detail)"
 assert_eq 25 "$appendix_pub_count" "25 top-level role appendices were scanned"
 
 # The retired v1 phrasing ("write STATUS ... atomically (write .tmp then

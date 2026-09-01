@@ -1770,6 +1770,10 @@ to write out by hand.
 
 Same pattern applies to Phase 1 preflight: dispatch `preflight-claude` and `preflight-codex` in parallel, then validate both STATUS files.
 
+Cookbook functions (authored in `runtime/cookbook.sh`):
+
+- `copy_preflight_alias PHASE DEST_DIR` — P21/Task 11: copies each vendor's real attempt-scoped preflight STATUS to the fixed `DEST_DIR/<vendor>-check-status.md` alias a reader with no cookbook access (`readiness-writer`) can find without resolving an attempt id. Called once per per-phase preflight gate (Steps 1.2, 3.0, 5.0, 7.0).
+
 ### Codex reviewer modes
 
 Codex review subprocesses run in one of three modes, keyed by role. The mode is **fixed by the role**, with no user override and no auto-escalation.
@@ -2250,24 +2254,10 @@ At any point after step 8 completes (or after the consented-degradation branch i
 <!-- lint: snippet -->
 ```bash
 mkdir -p "$FEATURE_FOLDER/1-preflight/phase-1"
-for v in claude codex; do
-  logical="p01-i00-preflight-${v}"
-  latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
-  src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
-  if [ -f "$src" ]; then
-    cp "$src" "$FEATURE_FOLDER/1-preflight/phase-1/${v}-check-status.md"
-  fi
-done
-# `_latest_attempt_id` returning nothing (codex never dispatched, or a
-# prelaunch failure that consumed an attempt but never launched) is the
-# normal codex-skipped/consented-degradation path, not an error -- `continue`
-# to the next vendor rather than treating a lookup miss as a HALT-worthy
-# condition. An `if [ -f "$src" ]`, not `[ -f … ] && cp`, for the same reason
-# Task-era code already documented for the retired `mv` form: as the LAST
-# statement of a block the `&&` form returns 1 whenever the file is absent,
-# which is the normal codex-skipped path, making a successful phase look
-# like a failure.
+copy_preflight_alias 1 "$FEATURE_FOLDER/1-preflight/phase-1"
 ```
+
+(`copy_preflight_alias`, cookbook — P21/Task 11 factored this five-times-repeated copy loop into the one function every per-phase preflight gate below calls; see its own doc comment in runtime/cookbook.sh for the `continue`-not-HALT and `if`-not-`&&` rationale.)
 
 The conditional guards above handle the consented-degradation case (codex STATUS file may not exist when `codex_disabled_by_user=true` was set above, or when codex Mode 0/1/2/3/5 killed the subprocess before any STATUS write — see "File policy for non-READY paths" below). No synthetic STATUS file is fabricated for absent codex outputs; the absence plus the corresponding `CODEX_DISABLED_BY_USER_CONSENT` or `CODEX_UNAVAILABLE` event in RUN_LOG is the canonical Phase 1 codex verdict.
 
@@ -2348,29 +2338,15 @@ Before iter 01's first reviewer dispatch (the gate's **first work dispatch**, de
 
    <!-- lint: snippet -->
    ```bash
-   for v in claude codex; do
-     logical="p03-i00-preflight-${v}"
-     latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
-     src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
-     if [ -f "$src" ]; then
-       cp "$src" "$FEATURE_FOLDER/3-spec-review/preflight/${v}-check-status.md"
-     fi
-   done
-   # `cp`, never `mv` -- the attempt-scoped original at $src remains the
-   # durable record (resume classification, audit_run_state, and a future
-   # reconciliation all expect every attempt directory to remain exactly as
-   # dispatch_attempt left it). `_latest_attempt_id` returning nothing (codex
-   # skipped via consent, or a prelaunch failure that never launched) is the
-   # normal non-error case -- `continue` to the next vendor, not a HALT. An
-   # `if [ -f "$src" ]`, not `[ -f … ] && cp`: as the LAST statement of a
-   # block the `&&` form returns 1 whenever the file is absent, which is the
-   # normal codex-skipped path, making a successful phase look like a failure.
+   copy_preflight_alias 3 "$FEATURE_FOLDER/3-spec-review/preflight"
    ```
+
+   (`copy_preflight_alias`, cookbook — P21/Task 11.)
 
    Either copy is a no-op if the corresponding source is absent (see "File policy for non-READY paths" below). Order of the two copies is irrelevant. Do not read any STATUS verdict until both copies (or their no-op equivalents) complete.
 
 6. `dispatch_parallel`/`dispatch_attempt` already appended each probe's own RUN_LOG dispatch entry (`phase: 3`, `phase_name: spec-review`, `iteration: 00`, `role: preflight-claude` or `preflight-codex`, `vendor: claude` or `codex`, `status_path:` its REAL attempt-scoped path) — read the verdict from the copied alias `3-spec-review/preflight/<vendor>-check-status.md` (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
-7. Branch on the verdicts:
+7. Branch on the verdicts (P21/Task 11: this is the canonical per-phase preflight verdict branch — Phases 5 and 7 below cite it rather than repeating it, substituting their own `phase`/`phase_name`/dispatch-prefix throughout and, for Phase 7 only, adding the `DEGRADED_REVIEW_ACCEPTED` delta after the codex-degradation bullets):
    - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
    - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 3 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 3`, `phase_name: spec-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase, matching every other vendor-side failure mid-run. Proceed to step 1 of the iteration loop with `codex_available = false`.
    - **Either probe (a successfully-completed dispatch — rc=0, STATUS parses) reports `verdict=MISSING_SKILLS` or `verdict=UNCERTAIN`** — a legal semantic verdict, distinct from the Modes 0–5 subprocess failures above (spec §16.3, generalizing Phase 1 Step 1.1 step 5's own re-probe to this gate — P02): call `skills_reprobe_needed` (cookbook) for that vendor with the same three conditions Phase 1 uses — (a) `yes` iff an earlier phase in THIS run already recorded `READY` for that vendor (scan `RUN_LOG.md`); (b) `yes` iff a deterministic filesystem check shows the named skill directory/`SKILL.md` actually exists under a checked plugin root; (c) `yes` iff the STATUS file (or its sibling `.tmp.*`) shows the attempt reached publication but lost its final STATUS. An `UNCERTAIN` verdict (P12 — the probe itself could not finish scanning every configured plugin root) additionally ALWAYS triggers the re-probe regardless of those three conditions; it is never treated as an absence claim. On `true` (or on any `UNCERTAIN`), re-dispatch that ONE vendor's preflight role once more (same `dispatch_parallel` mechanism as the initial probe, a fresh attempt) and use the re-probe's verdict in place of the first. A second consecutive `MISSING_SKILLS` is accepted as real; a second consecutive `UNCERTAIN` is accepted as "still can't tell" and handled exactly like `MISSING_SKILLS` below for control-flow purposes — it is NEVER promoted to a confirmed-`MISSING` claim:
@@ -2451,36 +2427,15 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 
    <!-- lint: snippet -->
    ```bash
-   for v in claude codex; do
-     logical="p05-i00-preflight-${v}"
-     latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
-     src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
-     if [ -f "$src" ]; then
-       cp "$src" "$FEATURE_FOLDER/5-plan-review/preflight/${v}-check-status.md"
-     fi
-   done
-   # `cp`, never `mv` -- the attempt-scoped original at $src remains the
-   # durable record (resume classification, audit_run_state, and a future
-   # reconciliation all expect every attempt directory to remain exactly as
-   # dispatch_attempt left it). `_latest_attempt_id` returning nothing (codex
-   # skipped via consent, or a prelaunch failure that never launched) is the
-   # normal non-error case -- `continue` to the next vendor, not a HALT. An
-   # `if [ -f "$src" ]`, not `[ -f … ] && cp`: as the LAST statement of a
-   # block the `&&` form returns 1 whenever the file is absent, which is the
-   # normal codex-skipped path, making a successful phase look like a failure.
+   copy_preflight_alias 5 "$FEATURE_FOLDER/5-plan-review/preflight"
    ```
+
+   (`copy_preflight_alias`, cookbook — P21/Task 11.)
 
    Either copy is a no-op if the corresponding source is absent (see "File policy for non-READY paths" in Step 1.0). Order of the two copies is irrelevant. Do not read any STATUS verdict until both copies (or their no-op equivalents) complete.
 
 6. `dispatch_parallel`/`dispatch_attempt` already appended each probe's own RUN_LOG dispatch entry (`phase: 5`, `phase_name: plan-review`, `iteration: 00`, `role: preflight-claude` or `preflight-codex`, `vendor: claude` or `codex`, `status_path:` its REAL attempt-scoped path) — read the verdict from the copied alias `5-plan-review/preflight/<vendor>-check-status.md` (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
-7. Branch on the verdicts:
-   - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
-   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 5 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1; at a per-phase gate, a missing binary degrades to claude-only for the phase. Proceed to step 1 of the iteration loop with `codex_available = false`.
-   - **Either probe (a successfully-completed dispatch — rc=0, STATUS parses) reports `verdict=MISSING_SKILLS` or `verdict=UNCERTAIN`** — a legal semantic verdict, distinct from the Modes 0–5 subprocess failures above (spec §16.3, generalizing Phase 1 Step 1.1 step 5's own re-probe to this gate — P02): call `skills_reprobe_needed` (cookbook) for that vendor with the same three conditions Phase 1 uses — (a) `yes` iff an earlier phase in THIS run already recorded `READY` for that vendor (scan `RUN_LOG.md`); (b) `yes` iff a deterministic filesystem check shows the named skill directory/`SKILL.md` actually exists under a checked plugin root; (c) `yes` iff the STATUS file (or its sibling `.tmp.*`) shows the attempt reached publication but lost its final STATUS. An `UNCERTAIN` verdict (P12 — the probe itself could not finish scanning every configured plugin root) additionally ALWAYS triggers the re-probe regardless of those three conditions; it is never treated as an absence claim. On `true` (or on any `UNCERTAIN`), re-dispatch that ONE vendor's preflight role once more (same `dispatch_parallel` mechanism as the initial probe, a fresh attempt) and use the re-probe's verdict in place of the first. A second consecutive `MISSING_SKILLS` is accepted as real; a second consecutive `UNCERTAIN` is accepted as "still can't tell" and handled exactly like `MISSING_SKILLS` below for control-flow purposes — it is NEVER promoted to a confirmed-`MISSING` claim:
-     - **Claude confirmed `MISSING_SKILLS`, or claude still `UNCERTAIN` after the re-probe:** HALT — claude is required for every phase. For `MISSING_SKILLS`, print which skills are missing (`required_skills_missing` plus `x_plugin_roots_checked`) plus the Phase 1 install hint; for `UNCERTAIN`, print that claude's skill scan could not complete after one retry and surface `x_plugin_roots_checked` so the user can verify manually.
-     - **Codex confirmed `MISSING_SKILLS`, or codex still `UNCERTAIN` after the re-probe:** treat exactly like a codex probe failure (the bullet above) — set `codex_available = false` for the remainder of Phase 5 only, and append `event=CODEX_UNAVAILABLE` with `phase: 5`, `phase_name: plan-review`, `iteration: 00`, `failure_mode:` the literal string `missing_skills` or `uncertain`, and the missing-skills/uncertain detail in place of a stderr tail. Do NOT HALT — codex degrades to claude-only for the phase like every other vendor-side per-phase failure. Proceed to step 1 of the iteration loop with `codex_available = false`.
-     Both probe attempts (the original and the re-probe) stay in `RUN_LOG.md` with their raw outputs — the re-probe is a normal `dispatch_parallel`/`dispatch_attempt` call and gets its own `DISPATCH_STARTED`/`DISPATCH_COMPLETED` pair like any other attempt, so a flake remains auditable.
-   - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed).
+7. Branch on the verdicts: same procedure as Step 3.0 item 7 (the canonical per-phase preflight verdict branch — P21/Task 11), substituting `phase: 5`, `phase_name: plan-review`, `Phase 5` (for the sticky-within-phase `codex_available` rule and the "remainder of Phase N only" wording), and `p05-i00-preflight-*` throughout. No `DEGRADED_REVIEW_ACCEPTED` delta here — that is Phase 7 only.
 
 The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this gate.
 
@@ -2663,36 +2618,17 @@ Before iter 01's first reviewer dispatch (the gate's first work dispatch — see
 
    <!-- lint: snippet -->
    ```bash
-   for v in claude codex; do
-     logical="p07-i00-preflight-${v}"
-     latest="$(_latest_attempt_id "$logical" 2>/dev/null)" || continue
-     src="$(role_attempt_dir "preflight-${v}" "$latest")/STATUS.md"
-     if [ -f "$src" ]; then
-       cp "$src" "$FEATURE_FOLDER/7-code-review/preflight/${v}-check-status.md"
-     fi
-   done
-   # `cp`, never `mv` -- the attempt-scoped original at $src remains the
-   # durable record (resume classification, audit_run_state, and a future
-   # reconciliation all expect every attempt directory to remain exactly as
-   # dispatch_attempt left it). `_latest_attempt_id` returning nothing (codex
-   # skipped via consent, or a prelaunch failure that never launched) is the
-   # normal non-error case -- `continue` to the next vendor, not a HALT. An
-   # `if [ -f "$src" ]`, not `[ -f … ] && cp`: as the LAST statement of a
-   # block the `&&` form returns 1 whenever the file is absent, which is the
-   # normal codex-skipped path, making a successful phase look like a failure.
+   copy_preflight_alias 7 "$FEATURE_FOLDER/7-code-review/preflight"
    ```
+
+   (`copy_preflight_alias`, cookbook — P21/Task 11.)
 
    Either copy is a no-op if the corresponding source is absent (see "File policy for non-READY paths" in Step 1.0).
 
 6. `dispatch_parallel`/`dispatch_attempt` already appended each probe's own RUN_LOG dispatch entry (`phase: 7`, `phase_name: code-review`, `iteration: 00`, `role: preflight-claude` or `preflight-codex`, `vendor: claude` or `codex`, `status_path:` its REAL attempt-scoped path) — read the verdict from the copied alias `7-code-review/preflight/<vendor>-check-status.md` (or `verdict: none` if the probe was skipped via consent or failed without producing STATUS).
-7. Branch on the verdicts:
-   - **Claude probe fails (any mode):** HALT unconditionally. No user prompt — claude is required for every phase. Surface stderr tail and remediation per the existing claude-failure path.
-   - **Codex probe fails with any of Modes 0, 1, 2, 3, 4, or 5:** call `vendor_preflight_reprobe_once codex <N>` first (spec §16.3 -- a vendor already proven this run by an earlier substantive dispatch gets one re-probe before a cheap preflight wobble is allowed to degrade coverage; this is the real behavioural read of `vendor_proven`, not just a write-only record). On `yes`, re-dispatch `preflight-codex` ONE more time (same `dispatch_parallel` mechanism as the initial probe). If that re-probe comes back `READY`, proceed with `codex_available = true` as normal -- do NOT append `event=CODEX_UNAVAILABLE`, since codex was never actually unavailable this phase. Otherwise (the re-probe also failed, or `vendor_preflight_reprobe_once` said `no`): set `codex_available = false` for the remainder of Phase 7 only (the sticky-within-phase rule). Append `event=CODEX_UNAVAILABLE` with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `failure_mode: <N>` (the LATEST probe's mode), and the stderr tail. **Mode 0 here does NOT HALT** — the unconditional-Mode-0-HALT rule applies only at Phase 1. **Before proceeding, record the required degraded-coverage decision (spec §16.5):** append `record_event DEGRADED_REVIEW_ACCEPTED decision_id="p7-degraded-<run>" scope="phase=7;iteration=00" evidence="codex_unavailable failure_mode=<N>"` (`authority_identity: standing_process_policy` — this is a decision the process itself pre-authorizes for a single-vendor Phase 7 continuation, within the orchestrator's existing autonomy ceiling; it is never inferred ad hoc). A one-vendor Phase 7 MAY NOT proceed to the iteration loop without this event durable in `RUN_LOG.md` — this is what makes the degradation explicit rather than a silent strict PASS (the readiness writer's own rules already force `READY_WITH_NOTES` downstream; this event is what makes the ACCEPTANCE, not just the fact of degradation, auditable). Proceed to step 1 of the iteration loop with `codex_available = false`.
-   - **Either probe (a successfully-completed dispatch — rc=0, STATUS parses) reports `verdict=MISSING_SKILLS` or `verdict=UNCERTAIN`** — a legal semantic verdict, distinct from the Modes 0–5 subprocess failures above (spec §16.3, generalizing Phase 1 Step 1.1 step 5's own re-probe to this gate — P02): call `skills_reprobe_needed` (cookbook) for that vendor with the same three conditions Phase 1 uses — (a) `yes` iff an earlier phase in THIS run already recorded `READY` for that vendor (scan `RUN_LOG.md`); (b) `yes` iff a deterministic filesystem check shows the named skill directory/`SKILL.md` actually exists under a checked plugin root; (c) `yes` iff the STATUS file (or its sibling `.tmp.*`) shows the attempt reached publication but lost its final STATUS. An `UNCERTAIN` verdict (P12 — the probe itself could not finish scanning every configured plugin root) additionally ALWAYS triggers the re-probe regardless of those three conditions; it is never treated as an absence claim. On `true` (or on any `UNCERTAIN`), re-dispatch that ONE vendor's preflight role once more (same `dispatch_parallel` mechanism as the initial probe, a fresh attempt) and use the re-probe's verdict in place of the first. A second consecutive `MISSING_SKILLS` is accepted as real; a second consecutive `UNCERTAIN` is accepted as "still can't tell" and handled exactly like `MISSING_SKILLS` below for control-flow purposes — it is NEVER promoted to a confirmed-`MISSING` claim:
-     - **Claude confirmed `MISSING_SKILLS`, or claude still `UNCERTAIN` after the re-probe:** HALT — claude is required for every phase. For `MISSING_SKILLS`, print which skills are missing (`required_skills_missing` plus `x_plugin_roots_checked`) plus the Phase 1 install hint; for `UNCERTAIN`, print that claude's skill scan could not complete after one retry and surface `x_plugin_roots_checked` so the user can verify manually.
-     - **Codex confirmed `MISSING_SKILLS`, or codex still `UNCERTAIN` after the re-probe:** treat exactly like a codex probe failure (the bullet above), INCLUDING its `DEGRADED_REVIEW_ACCEPTED` requirement — set `codex_available = false` for the remainder of Phase 7 only, append `event=CODEX_UNAVAILABLE` with `phase: 7`, `phase_name: code-review`, `iteration: 00`, `failure_mode:` the literal string `missing_skills` or `uncertain`, and the missing-skills/uncertain detail in place of a stderr tail, THEN append the same `record_event DEGRADED_REVIEW_ACCEPTED decision_id="p7-degraded-<run>" scope="phase=7;iteration=00" evidence="codex_unavailable failure_mode=<missing_skills|uncertain>"` before proceeding — a one-vendor Phase 7 never proceeds without that event regardless of which codex failure caused it. Do NOT HALT. Proceed to step 1 of the iteration loop with `codex_available = false`.
-     Both probe attempts (the original and the re-probe) stay in `RUN_LOG.md` with their raw outputs — the re-probe is a normal `dispatch_parallel`/`dispatch_attempt` call and gets its own `DISPATCH_STARTED`/`DISPATCH_COMPLETED` pair like any other attempt, so a flake remains auditable.
-   - **Both probes READY (or claude READY and codex skipped via consent):** proceed to step 1 of the iteration loop. `codex_available` reflects the probe outcome (true if codex READY, false if skipped or failed). No `DEGRADED_REVIEW_ACCEPTED` is needed here — full dual-vendor coverage is not degraded.
+7. Branch on the verdicts: same procedure as Step 3.0 item 7 (the canonical per-phase preflight verdict branch — P21/Task 11), substituting `phase: 7`, `phase_name: code-review`, `Phase 7`, and `p07-i00-preflight-*` throughout, PLUS this Phase-7-only delta (spec §16.5) — a one-vendor Phase 7 additionally requires an explicit, durable acceptance of the degraded coverage that the other two gates do not:
+   - **On EITHER degradation path that lands on `codex_available = false`** — the codex-probe-failure bullet (Modes 0/1/2/3/4/5, after the re-probe rule) OR the codex-`MISSING_SKILLS`/`UNCERTAIN`-confirmed bullet (after its own re-probe rule) — append, before proceeding to step 1 of the iteration loop: `record_event DEGRADED_REVIEW_ACCEPTED decision_id="p7-degraded-<run>" scope="phase=7;iteration=00" evidence="codex_unavailable failure_mode=<N|missing_skills|uncertain>"` (`authority_identity: standing_process_policy` — this is a decision the process itself pre-authorizes for a single-vendor Phase 7 continuation, within the orchestrator's existing autonomy ceiling; it is never inferred ad hoc). A one-vendor Phase 7 MAY NOT proceed to the iteration loop without this event durable in `RUN_LOG.md` — this is what makes the degradation explicit rather than a silent strict PASS (the readiness writer's own rules already force `READY_WITH_NOTES` downstream; this event is what makes the ACCEPTANCE, not just the fact of degradation, auditable). It applies regardless of which codex failure caused the degradation.
+   - **Both probes READY (or claude READY and codex skipped via consent):** no `DEGRADED_REVIEW_ACCEPTED` is needed — full dual-vendor coverage is not degraded.
 
 The "File policy for non-READY paths" rules in Step 1.0 apply unchanged to this gate.
 
@@ -3585,6 +3521,58 @@ Partial completion: if Codex was unavailable for part of the run, the run still 
 
 Each appendix below is delimited by HTML comment markers of the form `BEGIN: <role>` / `END: <role>` (full HTML-comment syntax). The orchestrator extracts and renders each on demand using the `render_prompt` helper from the "Runtime cookbook & guardrails" section, which handles multi-line-safe variable substitution and fails loudly on anything it cannot resolve. Appendix content is never written to disk.
 
+**Shared blocks (P20, Task 11).** A handful of passages are identical, or identical apart from a few named values, across many appendices: the Publish STATUS protocol (all 25), the summarizer usage-aggregation step and usage-table format spec (the 3 iterating gate summarizers), and the finding-record field schema (the 7 reviewer/verifier roles that write JSONL findings). Each such passage is authored ONCE below, delimited by `<!-- SHARED-BEGIN: <name> -->` / `<!-- SHARED-END: <name> -->`, with `{{param}}`-style holes. An appendix pulls one in with a single
+`<!-- INCLUDE-BEGIN: <name> key=value ... -->` / `<!-- INCLUDE-END -->` span (any lines between the two become the `{{extra}}` hole). `render_prompt` (runtime/cookbook.sh) expands every such span into the shared text — substituting its `{{param}}` holes from the `key=value` pairs, or failing loudly if one is left unresolved — BEFORE the ordinary `$VAR` substitution pass, so a dispatched role's RENDERED prompt still receives the complete text every time; only the bytes resident in THIS document shrink. This is the practical variant of "parameterize `render_prompt`": since `render_prompt` extracts a single contiguous `BEGIN:`/`END:` slice per role, a shared block can only reach a role's rendered prompt by being spliced into that role's own slice at render time, never by living outside it unreferenced.
+
+<!-- SHARED-BEGIN: publish-status-protocol -->
+Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
+own validator. Compose every field below, in this order, and pipe it to the
+generated publisher exactly once -- it is the ONLY sanctioned writer:
+
+<!-- lint: snippet -->
+```bash
+$STATUS_PUBLISHER_PATH \
+  --contracts $ROLE_CONTRACTS_PATH --role {{role}} \
+  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
+  --phase {{phase}} --iteration {{iteration}} --attempt $ATTEMPT \
+  --status $PHASE_DIR/{{iteration}}/attempts/$DISPATCH_ID/STATUS.md \
+  --allowed-root $FEATURE_FOLDER <<'STATUS'
+schema_version: 2
+dispatch_id: $DISPATCH_ID
+logical_dispatch_id: $LOGICAL_DISPATCH_ID
+role: {{role}}
+phase: {{phase}}
+iteration: {{iteration}}
+attempt: $ATTEMPT
+verdict: {{verdicts}}
+reason: {{reason}}
+published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
+artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+{{extra}}
+STATUS
+```
+<!-- SHARED-END: publish-status-protocol -->
+
+<!-- SHARED-BEGIN: summarizer-usage-aggregation -->
+5. Aggregate usage (read every dispatch entry in `RUN_LOG.md` where `phase={{phase}}`):
+   - Skip entries with `usage_status=unavailable` from per-row detail tables, but count them in a footnote.
+   - For each remaining entry, read `model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`.
+   - Compute phase total (sum across all entries), per-vendor subtotal (sum split by `vendor`), and per-role × iteration detail (one row per entry).
+   - Sum `cost_usd` only across rows whose value is numeric; rows with `n/a` are excluded from the cost sum but counted in dispatch counts.
+<!-- SHARED-END: summarizer-usage-aggregation -->
+
+<!-- SHARED-BEGIN: summarizer-usage-table-format -->
+   - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
+     - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).
+     - Per-role detail: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
+     - Format numeric columns with thousands separators. Cost as `$0.81` or `n/a`. Durations as `mm Xs` or `Xs`. Right-align numeric columns in the markdown table.
+   - If any rows were skipped due to `usage_status=unavailable`, append after the detail table: `_Skipped N dispatches with unavailable telemetry._`
+<!-- SHARED-END: summarizer-usage-table-format -->
+
+<!-- SHARED-BEGIN: finding-record-schema -->
+`source_finding_id`, `reviewer_role: "{{reviewer_role}}"`, `vendor: "{{vendor}}"`, `phase: "{{phase}}"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, {{artifact_path_spec}}, {{artifact_revision_spec}}, `location`, {{line_spec}}, `issue_key`, `summary`, {{evidence_spec}}, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
+<!-- SHARED-END: finding-record-schema -->
+
 <!-- BEGIN: preflight-claude -->
 # Role: preflight-claude
 
@@ -3639,29 +3627,7 @@ Do NOT execute any other actions. Do NOT read project files. Do NOT write any fi
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role preflight-claude \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase $PHASE --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: preflight-claude
-phase: $PHASE
-iteration: 00
-attempt: $ATTEMPT
-verdict: READY | MISSING_SKILLS
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=preflight-claude phase='$PHASE' iteration=00 verdicts='READY | MISSING_SKILLS' reason='<one line, or the literal word null>' -->
 output_count: 0
 checkpoint_path: null
 context7: reachable | unreachable
@@ -3672,8 +3638,7 @@ optional_skills_absent: []
 x_plugin_roots_checked: [/path/one, /path/two, ...]
 x_missing_skills: [skill1, skill2, ...] (empty list if READY; same content as required_skills_missing, kept for back-compat)
 x_loaded_skills: [skill3, skill4, ...]
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: preflight-claude -->
@@ -3736,29 +3701,7 @@ Do NOT execute any other actions. Do NOT read project files. Do NOT run broad `f
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role preflight-codex \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase $PHASE --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: preflight-codex
-phase: $PHASE
-iteration: 00
-attempt: $ATTEMPT
-verdict: READY | MISSING_SKILLS | UNCERTAIN
-reason: <one line, or the literal word null -- required for MISSING_SKILLS and UNCERTAIN: for UNCERTAIN, state which root(s) the single-command scan did not cover and why (budget exhausted / command failed / root list empty)>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=preflight-codex phase='$PHASE' iteration=00 verdicts='READY | MISSING_SKILLS | UNCERTAIN' reason='<one line, or the literal word null -- required for MISSING_SKILLS and UNCERTAIN: for UNCERTAIN, state which root(s) the single-command scan did not cover and why (budget exhausted / command failed / root list empty)>' -->
 output_count: 0
 checkpoint_path: null
 required_skills_present: [skill1, skill2, ...]
@@ -3768,8 +3711,7 @@ optional_skills_absent: []
 x_plugin_roots_checked: [/path/one, /path/two, ...] (for UNCERTAIN: every root actually covered before the scan stopped, so the re-probe evidence check can tell what was and wasn't verified)
 x_missing_skills: [skill1, skill2, ...] (empty list if READY or UNCERTAIN; same content as required_skills_missing, kept for back-compat)
 x_loaded_skills: [skill3, skill4, ...]
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: preflight-codex -->
@@ -3815,29 +3757,7 @@ Use only read-only inspection. You do NOT load `subagent-driven-development` her
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role context-discovery \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 2 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: context-discovery
-phase: 2
-iteration: 00
-attempt: $ATTEMPT
-verdict: READY | BLOCKED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=context-discovery phase=2 iteration=00 verdicts='READY | BLOCKED' reason='<one line, or the literal word null>' -->
 output_count: 0
 checkpoint_path: null
 x_available_skills: [skill, ...]
@@ -3846,8 +3766,7 @@ x_resolved_models: <one role:model-id pair per line, exactly as supplied in $RES
 x_spec_path: <absolute>
 relevant_skills: [skill1, skill2, ...] (empty list if none are relevant)
 relevant_skills_reasons: [reason1, reason2, ...] (same order and count as relevant_skills)
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: context-discovery -->
@@ -3900,29 +3819,7 @@ Findings: `$FEATURE_FOLDER/3-spec-review/$ITERATION/claude-findings.jsonl` (writ
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role spec-reviewer-claude \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 3 --iteration $ITERATION --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: spec-reviewer-claude
-phase: 3
-iteration: $ITERATION
-attempt: $ATTEMPT
-verdict: PASS | CHANGES_REQUESTED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=spec-reviewer-claude phase=3 iteration='$ITERATION' verdicts='PASS | CHANGES_REQUESTED' reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the findings.jsonl file you wrote>
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
@@ -3930,8 +3827,7 @@ blockers: <int>
 majors: <int>
 minors: <int>
 findings: <path to the findings.jsonl file you wrote, or none>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Verdict rule: `verdict=PASS` iff `blockers=0 AND majors=0`. Otherwise `CHANGES_REQUESTED`.
 
@@ -4002,33 +3898,12 @@ If the spec references existing implementation that you cannot verify under this
 
 Report every BLOCKER and MAJOR you find; cap MINOR findings at 10; keep each finding under 150 words.
 
-Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above for the exact field list; you supply everything except `finding_id`/`normalized_location`/`normalized_issue_key`, which `ingest_findings` derives deterministically). Findings: `$FEATURE_FOLDER/3-spec-review/$ITERATION/codex-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "spec-reviewer-codex"`, `vendor: "codex"`, `phase: "3"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path: "$SPEC_PATH"`, `artifact_revision`, `location`, `line`, `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above for the exact field list; you supply everything except `finding_id`/`normalized_location`/`normalized_issue_key`, which `ingest_findings` derives deterministically). Findings: `$FEATURE_FOLDER/3-spec-review/$ITERATION/codex-findings.jsonl`. Each object: <!-- INCLUDE-BEGIN: finding-record-schema reviewer_role=spec-reviewer-codex vendor=codex phase=3 artifact_path_spec='`artifact_path: "$SPEC_PATH"`' artifact_revision_spec='`artifact_revision`' line_spec='`line`' evidence_spec='`evidence`' -->
+<!-- INCLUDE-END -->
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role spec-reviewer-codex \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 3 --iteration $ITERATION --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: spec-reviewer-codex
-phase: 3
-iteration: $ITERATION
-attempt: $ATTEMPT
-verdict: PASS | CHANGES_REQUESTED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=spec-reviewer-codex phase=3 iteration='$ITERATION' verdicts='PASS | CHANGES_REQUESTED' reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the findings file you wrote>
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
@@ -4036,8 +3911,7 @@ blockers: <int>
 majors: <int>
 minors: <int>
 findings: <path to the findings file you wrote, or none>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Verdict rule: `verdict=PASS` iff `blockers=0 AND majors=0`.
 
@@ -4106,35 +3980,12 @@ checkpoint_append "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl" "
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role spec-fixer \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 3 --iteration $ITERATION --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: spec-fixer
-phase: 3
-iteration: $ITERATION
-attempt: $ATTEMPT
-verdict: DONE | BLOCKED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=spec-fixer phase=3 iteration='$ITERATION' verdicts='DONE | BLOCKED' reason='<one line, or the literal word null>' -->
 output_count: 0
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
 changed_paths: [path, ...]
 finding_dispositions: [finding_id=<disposition>, ...]
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: spec-fixer -->
@@ -4201,35 +4052,12 @@ Prefer `context7` over web search for library docs. Skip it only for: refactorin
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role plan-writer \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 4 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: plan-writer
-phase: 4
-iteration: 00
-attempt: $ATTEMPT
-verdict: DONE | BLOCKED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=plan-writer phase=4 iteration=00 verdicts='DONE | BLOCKED' reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the plan file>
 checkpoint_path: $PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl
 x_task_count: <int>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: plan-writer -->
@@ -4272,33 +4100,12 @@ You are a plan reviewer invoked as a fresh subprocess. You have no shared contex
    - Post-implementation-only review remedy: flag any task whose only "verification" is deferring to code review or a later phase instead of an executable check now.
 3. Severity ladder: BLOCKER / MAJOR / MINOR — same definitions as the spec reviewer.
 
-Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/5-plan-review/$ITERATION/claude-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "plan-reviewer-claude"`, `vendor: "claude"`, `phase: "5"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path: "$PLAN_PATH"`, `artifact_revision`, `location`, `line`, `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/5-plan-review/$ITERATION/claude-findings.jsonl`. Each object: <!-- INCLUDE-BEGIN: finding-record-schema reviewer_role=plan-reviewer-claude vendor=claude phase=5 artifact_path_spec='`artifact_path: "$PLAN_PATH"`' artifact_revision_spec='`artifact_revision`' line_spec='`line`' evidence_spec='`evidence`' -->
+<!-- INCLUDE-END -->
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role plan-reviewer-claude \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 5 --iteration $ITERATION --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: plan-reviewer-claude
-phase: 5
-iteration: $ITERATION
-attempt: $ATTEMPT
-verdict: PASS | CHANGES_REQUESTED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=plan-reviewer-claude phase=5 iteration='$ITERATION' verdicts='PASS | CHANGES_REQUESTED' reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the findings file you wrote>
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
@@ -4306,8 +4113,7 @@ blockers: <int>
 majors: <int>
 minors: <int>
 findings: <path to the findings file you wrote, or none>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Verdict: `PASS` iff `blockers=0 AND majors=0`.
 
@@ -4384,33 +4190,12 @@ The plan must be self-contained per `superpowers:writing-plans` "no placeholders
 
 Report every BLOCKER and MAJOR you find; cap MINOR findings at 10; keep each finding under 150 words.
 
-Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/5-plan-review/$ITERATION/codex-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "plan-reviewer-codex"`, `vendor: "codex"`, `phase: "5"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path: "$PLAN_PATH"`, `artifact_revision`, `location`, `line`, `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/5-plan-review/$ITERATION/codex-findings.jsonl`. Each object: <!-- INCLUDE-BEGIN: finding-record-schema reviewer_role=plan-reviewer-codex vendor=codex phase=5 artifact_path_spec='`artifact_path: "$PLAN_PATH"`' artifact_revision_spec='`artifact_revision`' line_spec='`line`' evidence_spec='`evidence`' -->
+<!-- INCLUDE-END -->
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role plan-reviewer-codex \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 5 --iteration $ITERATION --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: plan-reviewer-codex
-phase: 5
-iteration: $ITERATION
-attempt: $ATTEMPT
-verdict: PASS | CHANGES_REQUESTED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=plan-reviewer-codex phase=5 iteration='$ITERATION' verdicts='PASS | CHANGES_REQUESTED' reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the findings file you wrote>
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
@@ -4418,8 +4203,7 @@ blockers: <int>
 majors: <int>
 minors: <int>
 findings: <path to the findings file you wrote, or none>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Verdict rule: `PASS` iff `blockers=0 AND majors=0`.
 
@@ -4488,35 +4272,12 @@ checkpoint_append "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl" "
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role plan-fixer \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 5 --iteration $ITERATION --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: plan-fixer
-phase: 5
-iteration: $ITERATION
-attempt: $ATTEMPT
-verdict: DONE | BLOCKED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=plan-fixer phase=5 iteration='$ITERATION' verdicts='DONE | BLOCKED' reason='<one line, or the literal word null>' -->
 output_count: 0
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
 changed_paths: [path, ...]
 finding_dispositions: [finding_id=<disposition>, ...]
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: plan-fixer -->
@@ -4717,29 +4478,7 @@ Then publish STATUS.
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role implementer \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 6 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: implementer
-phase: 6
-iteration: 00
-attempt: $ATTEMPT
-verdict: DONE | DONE_WITH_EXCLUSIONS | FAILED | NEEDS_DEBUG | BLOCKED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=implementer phase=6 iteration=00 verdicts='DONE | DONE_WITH_EXCLUSIONS | FAILED | NEEDS_DEBUG | BLOCKED' reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to implementation-summary.md>
 checkpoint_path: $PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl
@@ -4754,8 +4493,7 @@ x_declared_foreign_changes: [<pre-existing dirty path this attempt did not touch
 x_remaining_handoffs: [<follow-up id or short description>, ...] (or the literal word null if none)
 x_sdd_original_path: <the SDD skill's own working directory, or the literal word null>
 x_sdd_durable_path: $FEATURE_FOLDER/6-implementation/sdd/
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Verdict rules (spec §19.2):
 - `DONE` requires `verification=PASS` and all plan tasks completed, with no `EXCLUDED` records at all.
@@ -4821,37 +4559,14 @@ You may use `$IMPLEMENTATION_BASE_SHA` to constrain `git log`/`git diff` scope t
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role debugger \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 6 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: debugger
-phase: 6
-iteration: 00
-attempt: $ATTEMPT
-verdict: DONE | BLOCKED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=debugger phase=6 iteration=00 verdicts='DONE | BLOCKED' reason='<one line, or the literal word null>' -->
 output_count: 0
 checkpoint_path: null
 x_verification_spot_check: PASS | FAIL | UNKNOWN
 x_root_cause: <one line>
 x_fix_summary: <one line>
 x_new_commits: [sha, ...]
-STATUS
-```
+<!-- INCLUDE-END -->
 
 `verdict=DONE` does not promise verification passes — it promises a fix was applied. The implementer re-dispatch is the canonical verification authority.
 
@@ -4898,33 +4613,12 @@ You are a code reviewer invoked as a fresh subprocess. You have no shared contex
    - Integration & deployment surfaces: env vars, config/secret templates, deploy/IaC manifests, DB migration ordering, feature-flag wiring, third-party API contract changes touched by the diff.
 4. Severity ladder: BLOCKER / MAJOR / MINOR — same definitions.
 
-Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/7-code-review/$ITERATION/claude-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "code-reviewer-claude"`, `vendor: "claude"`, `phase: "7"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path` (repo-relative path to the SPECIFIC changed file this finding concerns — never the diff as a whole), `artifact_revision` (current `HEAD`, the reviewed commit), `location`, `line` (the line in that file), `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/7-code-review/$ITERATION/claude-findings.jsonl`. Each object: <!-- INCLUDE-BEGIN: finding-record-schema reviewer_role=code-reviewer-claude vendor=claude phase=7 artifact_path_spec='`artifact_path` (repo-relative path to the SPECIFIC changed file this finding concerns — never the diff as a whole)' artifact_revision_spec='`artifact_revision` (current `HEAD`, the reviewed commit)' line_spec='`line` (the line in that file)' evidence_spec='`evidence`' -->
+<!-- INCLUDE-END -->
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role code-reviewer-claude \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 7 --iteration $ITERATION --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: code-reviewer-claude
-phase: 7
-iteration: $ITERATION
-attempt: $ATTEMPT
-verdict: PASS | CHANGES_REQUESTED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=code-reviewer-claude phase=7 iteration='$ITERATION' verdicts='PASS | CHANGES_REQUESTED' reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the findings file you wrote>
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
@@ -4932,8 +4626,7 @@ blockers: <int>
 majors: <int>
 minors: <int>
 findings: <path to the findings file you wrote, or none>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Verdict: `PASS` iff `blockers=0 AND majors=0`.
 
@@ -5032,33 +4725,12 @@ Classify every finding into exactly one severity. Do NOT label obvious correctne
 
 Max 5 BLOCKER/MAJOR + max 5 MINOR per iteration. Each finding ≤ 150 words. Prioritise by severity and late-surfacing risk; remaining issues can be surfaced in the next iteration.
 
-Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/7-code-review/$ITERATION/codex-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "code-reviewer-codex"`, `vendor: "codex"`, `phase: "7"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path` (repo-relative path to the SPECIFIC changed file this finding concerns), `artifact_revision` (current `HEAD`), `location`, `line`, `issue_key`, `summary`, `evidence`, `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/7-code-review/$ITERATION/codex-findings.jsonl`. Each object: <!-- INCLUDE-BEGIN: finding-record-schema reviewer_role=code-reviewer-codex vendor=codex phase=7 artifact_path_spec='`artifact_path` (repo-relative path to the SPECIFIC changed file this finding concerns)' artifact_revision_spec='`artifact_revision` (current `HEAD`)' line_spec='`line`' evidence_spec='`evidence`' -->
+<!-- INCLUDE-END -->
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role code-reviewer-codex \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 7 --iteration $ITERATION --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: code-reviewer-codex
-phase: 7
-iteration: $ITERATION
-attempt: $ATTEMPT
-verdict: PASS | CHANGES_REQUESTED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=code-reviewer-codex phase=7 iteration='$ITERATION' verdicts='PASS | CHANGES_REQUESTED' reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the findings file you wrote>
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
@@ -5066,8 +4738,7 @@ blockers: <int>
 majors: <int>
 minors: <int>
 findings: <path to the findings file you wrote, or none>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Verdict rule: `PASS` iff `blockers=0 AND majors=0`.
 
@@ -5115,33 +4786,12 @@ Every seam file yields either a captured command plus its real output/exit code,
 
 Max 5 BLOCKER/MAJOR + max 5 MINOR per iteration (one finding per seam file, at most). Each finding ≤ 150 words, and each MUST carry the actual command and captured output/exit code (or the literal `UNVERIFIABLE:<reason>`) in `evidence` — a finding whose `evidence` is prose reasoning alone is a defect in this role's own output.
 
-Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/7-code-review/$ITERATION/seam-findings.jsonl`. Each object: `source_finding_id`, `reviewer_role: "seam-verifier"`, `vendor: "claude"`, `phase: "7"`, `iteration: "$ITERATION"`, `severity: "blocker"|"major"|"minor"`, `artifact_path` (the specific seam file this finding concerns), `artifact_revision` (current `HEAD`), `location`, `line`, `issue_key`, `summary`, `evidence` (the real command + output/exit code, or `UNVERIFIABLE:<reason>`), `required_change`, `provenance: "unknown"`, `related_finding_ids: []`.
+Write ONE canonical JSONL finding record per line (spec §17.2 — see "Finding record and canonical ID derivation" in the Runtime cookbook above). Findings: `$FEATURE_FOLDER/7-code-review/$ITERATION/seam-findings.jsonl`. Each object: <!-- INCLUDE-BEGIN: finding-record-schema reviewer_role=seam-verifier vendor=claude phase=7 artifact_path_spec='`artifact_path` (the specific seam file this finding concerns)' artifact_revision_spec='`artifact_revision` (current `HEAD`)' line_spec='`line`' evidence_spec='`evidence` (the real command + output/exit code, or `UNVERIFIABLE:<reason>`)' -->
+<!-- INCLUDE-END -->
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role seam-verifier \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 7 --iteration $ITERATION --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: seam-verifier
-phase: 7
-iteration: $ITERATION
-attempt: $ATTEMPT
-verdict: PASS | CHANGES_REQUESTED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=seam-verifier phase=7 iteration='$ITERATION' verdicts='PASS | CHANGES_REQUESTED' reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the findings file you wrote>
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
@@ -5149,8 +4799,7 @@ blockers: <int>
 majors: <int>
 minors: <int>
 findings: <path to the findings file you wrote, or none>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Verdict: `PASS` iff `blockers=0 AND majors=0`.
 
@@ -5217,35 +4866,12 @@ checkpoint_append "$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl" "
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role implementation-fixer \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 7 --iteration $ITERATION --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: implementation-fixer
-phase: 7
-iteration: $ITERATION
-attempt: $ATTEMPT
-verdict: DONE | PARTIAL | BLOCKED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=implementation-fixer phase=7 iteration='$ITERATION' verdicts='DONE | PARTIAL | BLOCKED' reason='<one line, or the literal word null>' -->
 output_count: 0
 checkpoint_path: $PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/progress.jsonl
 changed_paths: [path, ...]
 finding_dispositions: [finding_id=<disposition>, ...]
-STATUS
-```
+<!-- INCLUDE-END -->
 
 `verdict=DONE` requires every assigned finding to have a disposition. `PARTIAL` means some findings were fixed and progress.jsonl records exactly which.
 
@@ -5318,29 +4944,7 @@ You are a test runner invoked as a fresh subprocess by the develop-it orchestrat
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role all-tests-runner \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 8 --iteration $ROUND --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ROUND/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: all-tests-runner
-phase: 8
-iteration: $ROUND
-attempt: $ATTEMPT
-verdict: PASS | FAIL | SKIPPED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=all-tests-runner phase=8 iteration='$ROUND' verdicts='PASS | FAIL | SKIPPED' reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to $ROUND/test-report.md>
 checkpoint_path: null
@@ -5351,8 +4955,7 @@ x_tests_passed: <int>
 x_tests_failed: <int>
 x_verification_records_path: <absolute path to $ROUND/verification-records.jsonl>
 x_serial_forced_by: policy | probe | neither
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: all-tests-runner -->
@@ -5406,37 +5009,14 @@ You may use `$IMPLEMENTATION_BASE_SHA` to constrain `git log`/`git diff` scope t
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role test-fixer \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 8 --iteration $ROUND --attempt $ATTEMPT \
-  --status $PHASE_DIR/$ROUND/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: test-fixer
-phase: 8
-iteration: $ROUND
-attempt: $ATTEMPT
-verdict: DONE | BLOCKED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=test-fixer phase=8 iteration='$ROUND' verdicts='DONE | BLOCKED' reason='<one line, or the literal word null>' -->
 output_count: 0
 checkpoint_path: null
 x_fixed_tests: <int>
 x_root_causes: <one line per failure cluster, semicolon-separated>
 x_fix_summary: <one line>
 x_new_commits: [sha, ...]
-STATUS
-```
+<!-- INCLUDE-END -->
 
 `verdict=DONE` does not promise the suite passes — it promises fixes were applied. The next all-tests round is the canonical verification authority.
 
@@ -5475,11 +5055,8 @@ You are a gate summarizer invoked as a fresh subprocess. You have no shared cont
    - Residual MINOR/NIT items at the final iteration.
    - `partial_review = true` if ANY iteration was Claude-only (codex verdict absent), else `false`.
    - `codex_unavailable_reason` if any CODEX_UNAVAILABLE event applies: format `mode=<n>;iteration=<NN>` (concatenate multiple events with `|` if needed). If no event but codex verdict is missing, use `mode=unknown`.
-5. Aggregate usage (read every dispatch entry in `RUN_LOG.md` where `phase=3`):
-   - Skip entries with `usage_status=unavailable` from per-row detail tables, but count them in a footnote.
-   - For each remaining entry, read `model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`.
-   - Compute phase total (sum across all entries), per-vendor subtotal (sum split by `vendor`), and per-role × iteration detail (one row per entry).
-   - Sum `cost_usd` only across rows whose value is numeric; rows with `n/a` are excluded from the cost sum but counted in dispatch counts.
+<!-- INCLUDE-BEGIN: summarizer-usage-aggregation phase=3 -->
+<!-- INCLUDE-END -->
 6. Write the summary file at `$FEATURE_FOLDER/3-spec-review/spec-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
@@ -5487,37 +5064,12 @@ You are a gate summarizer invoked as a fresh subprocess. You have no shared cont
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), with one sentence of human-readable context per mode (e.g. "mode=5a: Codex hit a rate limit in iteration 02"; for `mode_shape: 5b` say the account hit a spend ceiling and that no retry can clear it).
    - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
-   - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
-     - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).
-     - Per-role detail: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
-     - Format numeric columns with thousands separators. Cost as `$0.81` or `n/a`. Durations as `mm Xs` or `Xs`. Right-align numeric columns in the markdown table.
-   - If any rows were skipped due to `usage_status=unavailable`, append after the detail table: `_Skipped N dispatches with unavailable telemetry._`
+<!-- INCLUDE-BEGIN: summarizer-usage-table-format -->
+<!-- INCLUDE-END -->
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role summarizer-spec \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 3 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: summarizer-spec
-phase: 3
-iteration: 00
-attempt: $ATTEMPT
-verdict: DONE
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=summarizer-spec phase=3 iteration=00 verdicts=DONE reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the summary file you wrote>
 checkpoint_path: null
@@ -5529,8 +5081,7 @@ x_relaxed_pass: true | false
 x_residual_minors: <int>
 x_partial_review: true | false
 x_codex_unavailable_reason: <mode=N;iteration=NN or empty>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: summarizer-spec -->
@@ -5567,11 +5118,8 @@ You are a gate summarizer invoked as a fresh subprocess by the develop-it orches
    - Residual MINOR/NIT items at the final iteration.
    - `partial_review = true` if any iteration was Claude-only.
    - `codex_unavailable_reason` derived from the CODEX_UNAVAILABLE events (same format as summarizer-spec).
-5. Aggregate usage (read every dispatch entry in `RUN_LOG.md` where `phase=5`):
-   - Skip entries with `usage_status=unavailable` from per-row detail tables, but count them in a footnote.
-   - For each remaining entry, read `model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`.
-   - Compute phase total (sum across all entries), per-vendor subtotal (sum split by `vendor`), and per-role × iteration detail (one row per entry).
-   - Sum `cost_usd` only across rows whose value is numeric; rows with `n/a` are excluded from the cost sum but counted in dispatch counts.
+<!-- INCLUDE-BEGIN: summarizer-usage-aggregation phase=5 -->
+<!-- INCLUDE-END -->
 6. Write the summary file at `$FEATURE_FOLDER/5-plan-review/plan-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
@@ -5579,37 +5127,12 @@ You are a gate summarizer invoked as a fresh subprocess by the develop-it orches
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
    - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
-   - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
-     - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).
-     - Per-role detail: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
-     - Format numeric columns with thousands separators. Cost as `$0.81` or `n/a`. Durations as `mm Xs` or `Xs`. Right-align numeric columns in the markdown table.
-   - If any rows were skipped due to `usage_status=unavailable`, append after the detail table: `_Skipped N dispatches with unavailable telemetry._`
+<!-- INCLUDE-BEGIN: summarizer-usage-table-format -->
+<!-- INCLUDE-END -->
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role summarizer-plan \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 5 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: summarizer-plan
-phase: 5
-iteration: 00
-attempt: $ATTEMPT
-verdict: DONE
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=summarizer-plan phase=5 iteration=00 verdicts=DONE reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the summary file you wrote>
 checkpoint_path: null
@@ -5621,8 +5144,7 @@ x_relaxed_pass: true | false
 x_residual_minors: <int>
 x_partial_review: true | false
 x_codex_unavailable_reason: <mode=N;iteration=NN or empty>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: summarizer-plan -->
@@ -5667,36 +5189,13 @@ You are a phase summarizer invoked as a fresh subprocess by the develop-it orche
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role summarizer-implementation \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 6 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: summarizer-implementation
-phase: 6
-iteration: 00
-attempt: $ATTEMPT
-verdict: DONE
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=summarizer-implementation phase=6 iteration=00 verdicts=DONE reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the summary file you wrote>
 checkpoint_path: null
 x_dispatches: <int>
 x_skipped_unavailable: <int>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: summarizer-implementation -->
@@ -5733,11 +5232,8 @@ You are a gate summarizer for the code review, invoked as a fresh subprocess by 
    - Residual MINOR/NIT items at the final iteration.
    - `partial_review = true` if any iteration was Claude-only.
    - `codex_unavailable_reason` derived from the CODEX_UNAVAILABLE events (same format as summarizer-spec).
-5. Aggregate usage (read every dispatch entry in `RUN_LOG.md` where `phase=7`):
-   - Skip entries with `usage_status=unavailable` from per-row detail tables, but count them in a footnote.
-   - For each remaining entry, read `model`, `duration_ms`, `tokens_input_new`, `tokens_input_cached`, `tokens_cache_write`, `tokens_output`, `tokens_reasoning`, `cost_usd`.
-   - Compute phase total (sum across all entries), per-vendor subtotal (sum split by `vendor`), and per-role × iteration detail (one row per entry).
-   - Sum `cost_usd` only across rows whose value is numeric; rows with `n/a` are excluded from the cost sum but counted in dispatch counts.
+<!-- INCLUDE-BEGIN: summarizer-usage-aggregation phase=7 -->
+<!-- INCLUDE-END -->
 6. Write the summary file at `$FEATURE_FOLDER/7-code-review/code-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
@@ -5746,37 +5242,12 @@ You are a gate summarizer for the code review, invoked as a fresh subprocess by 
    - `implementation_base_sha` from RUN_LOG (so readers can re-derive the reviewed diff).
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
    - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
-   - A `## Usage` section at the end with three tables in this order: **Phase total** (one row), **Per-vendor subtotal** (one row per vendor used), **Per-role × iteration detail** (one row per dispatch). Table columns:
-     - Phase total / per-vendor: `Dispatches`, `Tokens In (new)`, `Cached`, `Cache Write`, `Out`, `Reasoning`, `Cost USD`, `Duration` (mm ss).
-     - Per-role detail: `Iter`, `Role`, `Vendor`, `In (new)`, `Cached`, `Cache W`, `Out`, `Reasoning`, `Cost`, `Dur`.
-     - Format numeric columns with thousands separators. Cost as `$0.81` or `n/a`. Durations as `mm Xs` or `Xs`. Right-align numeric columns in the markdown table.
-   - If any rows were skipped due to `usage_status=unavailable`, append after the detail table: `_Skipped N dispatches with unavailable telemetry._`
+<!-- INCLUDE-BEGIN: summarizer-usage-table-format -->
+<!-- INCLUDE-END -->
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role summarizer-code-review \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 7 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: summarizer-code-review
-phase: 7
-iteration: 00
-attempt: $ATTEMPT
-verdict: DONE
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=summarizer-code-review phase=7 iteration=00 verdicts=DONE reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the summary file you wrote>
 checkpoint_path: null
@@ -5789,8 +5260,7 @@ x_residual_minors: <int>
 x_partial_review: true | false
 x_codex_unavailable_reason: <mode=N;iteration=NN or empty>
 x_implementation_base_sha: <sha or non-git>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: summarizer-code-review -->
@@ -5825,29 +5295,7 @@ You are a phase summarizer invoked as a fresh subprocess by the develop-it orche
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role summarizer-all-tests \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 8 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: summarizer-all-tests
-phase: 8
-iteration: 00
-attempt: $ATTEMPT
-verdict: DONE
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=summarizer-all-tests phase=8 iteration=00 verdicts=DONE reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to the summary file you wrote>
 checkpoint_path: null
@@ -5857,8 +5305,7 @@ x_fix_rounds: <int>
 x_residual_failures: <int>
 x_dispatches: <int>
 x_skipped_unavailable: <int>
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: summarizer-all-tests -->
@@ -5926,29 +5373,7 @@ checkpoint_append "$PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl" "$DISPATC
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role documentation-writer \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 9 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: documentation-writer
-phase: 9
-iteration: 00
-attempt: $ATTEMPT
-verdict: DONE | PARTIAL | BLOCKED
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=documentation-writer phase=9 iteration=00 verdicts='DONE | PARTIAL | BLOCKED' reason='<one line, or the literal word null>' -->
 output_count: 3
 output_01: <absolute path to uat.md>
 output_02: <absolute path to planned-vs-realized.md>
@@ -5957,8 +5382,7 @@ checkpoint_path: $PHASE_DIR/00/attempts/$DISPATCH_ID/progress.jsonl
 changed_paths: [path, ...]
 documentation_validation: PASS | PARTIAL | FAILED
 x_followup_candidates: [{"description":<str>,"actor":<str>,"prerequisite":<str>,"risk":<str>,"origin_finding":<str-or-null>}, ...] | []
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: documentation-writer -->
@@ -6056,36 +5480,13 @@ You are the final readiness reporter. You have no shared context.
 
 ## Publish STATUS
 
-Do not `cat >` or `mv` the STATUS file yourself, and do not hand-write your
-own validator. Compose every field below, in this order, and pipe it to the
-generated publisher exactly once -- it is the ONLY sanctioned writer:
-
-<!-- lint: snippet -->
-```bash
-$STATUS_PUBLISHER_PATH \
-  --contracts $ROLE_CONTRACTS_PATH --role readiness-writer \
-  --dispatch-id $DISPATCH_ID --logical-dispatch-id $LOGICAL_DISPATCH_ID \
-  --phase 11 --iteration 00 --attempt $ATTEMPT \
-  --status $PHASE_DIR/00/attempts/$DISPATCH_ID/STATUS.md \
-  --allowed-root $FEATURE_FOLDER <<'STATUS'
-schema_version: 2
-dispatch_id: $DISPATCH_ID
-logical_dispatch_id: $LOGICAL_DISPATCH_ID
-role: readiness-writer
-phase: 11
-iteration: 00
-attempt: $ATTEMPT
-verdict: DONE
-reason: <one line, or the literal word null>
-published_at: <current UTC timestamp, RFC3339, e.g. 2026-08-29T12:00:00Z>
-artifact_revision: <sha256 or git commit sha of what you produced, or the literal word null>
+<!-- INCLUDE-BEGIN: publish-status-protocol role=readiness-writer phase=11 iteration=00 verdicts=DONE reason='<one line, or the literal word null>' -->
 output_count: 1
 output_01: <absolute path to final-readiness-report.md>
 checkpoint_path: null
 x_readiness: READY | READY_WITH_NOTES | NOT_READY
 x_partial_review: true | false
-STATUS
-```
+<!-- INCLUDE-END -->
 
 Exit 0 only after the publisher exits 0.
 <!-- END: readiness-writer -->
