@@ -592,7 +592,7 @@ assert_eq yes "$(_t15_finding_has GIT_FINALIZATION_FAILED "event_id:$_t15_gfr_id
 # =============================================================================
 _t15_reset
 _t15_clean_baseline
-sed -i 's/^process_document_sha256=.*/process_document_sha256=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef/' "$RUNTIME_DIR/manifest.sha256"
+sed -i 's/^process_fileset_sha256=.*/process_fileset_sha256=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef/' "$RUNTIME_DIR/manifest.sha256"
 rc=0; audit_run_state || rc=$?
 assert_rc 1 "$rc" "15: audit_run_state fails when the runtime manifest has been tampered with"
 assert_eq yes "$(_t15_no_finding RUNTIME_MANIFEST_INVALID && echo no || echo yes)" \

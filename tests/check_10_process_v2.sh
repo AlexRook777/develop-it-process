@@ -105,9 +105,13 @@ assert_glob_count 1 "$ORCHESTRATION_DIR/quarantine/.runtime.tmp.*" \
   "the orphan was quarantined, not deleted or merged"
 assert_exists "$RUNTIME_DIR/manifest.sha256" "the rerun produced a final manifest"
 
-doc_sha="$(sha256sum "$PROCESS_DOC" | cut -d' ' -f1)"
-assert_contains "process_document_sha256=$doc_sha" "$RUNTIME_DIR/manifest.sha256" \
-  "manifest records the current process-document SHA-256"
+# Recompute the documented fileset-digest recipe independently of the
+# cookbook's own process_fileset_sha256: sha256 over the per-file sha256sum
+# lines -- the document first, then every runtime/ source file, repo-relative,
+# LC_ALL=C sorted.
+fileset_sha="$(cd "$REPO_TOP" && sha256sum -- develop-it-prompt.md runtime/cookbook.sh runtime/publish-status | sha256sum | cut -d' ' -f1)"
+assert_contains "process_fileset_sha256=$fileset_sha" "$RUNTIME_DIR/manifest.sha256" \
+  "manifest records the current process-fileset digest (document + runtime/ sources)"
 
 rc=0
 ( cd "$RUNTIME_DIR" && sha256sum -c manifest.sha256 ) >/dev/null 2>"$BUILD/manifest-check.err" || rc=$?

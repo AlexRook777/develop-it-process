@@ -112,12 +112,22 @@ if declare -F process_identity >/dev/null; then
   rm -rf "$_t10_unborn"
 
   # PROCESS_FILE_SHA256 is computed independently of git in every state
-  # (spec S16.2 step 6) -- verify it against a plain sha256sum even for the
-  # non-git case above, and again here for the untracked case.
-  expected_sha="$(sha256sum "$_t10_pi/untracked.txt" | cut -d' ' -f1)"
+  # (spec S16.2 step 6, generalized to the file set) -- recompute the
+  # documented fileset-digest recipe here independently (sha256 over the
+  # per-file sha256sum lines; this fixture repo has no runtime/, so the set
+  # is exactly the one document) and verify for the untracked case.
+  expected_sha="$( (cd "$_t10_pi" && sha256sum -- untracked.txt) | sha256sum | cut -d' ' -f1)"
   PROCESS_PATH="$_t10_pi/untracked.txt" PROCESS_REPO_ROOT="$_t10_pi" PROCESS_PATH_REL="untracked.txt" process_identity
   assert_eq "$expected_sha" "$PROCESS_FILE_SHA256" \
-    "T10 PROCESS_FILE_SHA256 matches a plain sha256sum regardless of develop_it_dirty state"
+    "T10 PROCESS_FILE_SHA256 matches the documented fileset-digest recipe regardless of develop_it_dirty state"
+  # And the set really is a SET: adding a runtime/ source file to the process
+  # repo changes the digest even though the document itself is untouched.
+  mkdir -p "$_t10_pi/runtime"
+  printf 'x\n' > "$_t10_pi/runtime/extra.sh"
+  PROCESS_PATH="$_t10_pi/untracked.txt" PROCESS_REPO_ROOT="$_t10_pi" PROCESS_PATH_REL="untracked.txt" process_identity
+  [ "$PROCESS_FILE_SHA256" != "$expected_sha" ] \
+    && _ok "T10 PROCESS_FILE_SHA256 changes when a runtime/ source file is added (document untouched)" \
+    || _fail "T10 PROCESS_FILE_SHA256 ignored a new runtime/ source file"
 
   rm -rf "$_t10_pi"
 else
@@ -1133,7 +1143,7 @@ esac
 source "$REPO_TOP/tests/lib/v2_fixtures.sh"
 init_v2_fixture
 
-# 1. Fresh extraction -> BOOTSTRAP_OK, all five generated files plus manifest.
+# 1. Fresh materialization -> BOOTSTRAP_OK, all five generated files plus manifest.
 rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
 rc=0; out="$(bootstrap_runtime 2>"$BUILD/b1.err")" || rc=$?
 assert_rc 0 "$rc" "1 fresh: bootstrap_runtime succeeds"
@@ -1148,7 +1158,7 @@ assert_rc 0 "$rc" "2 idempotent: rerun succeeds"
 assert_eq "BOOTSTRAP_REUSED" "$out" "2 idempotent: reports BOOTSTRAP_REUSED"
 assert_glob_count 0 "$ORCHESTRATION_DIR/.runtime.tmp.*" "2 idempotent: creates no staging directory"
 
-# 3. Interrupted extraction -> BOOTSTRAP_INTERRUPTED, never a usable runtime/.
+# 3. Interrupted materialization -> BOOTSTRAP_INTERRUPTED, never a usable runtime/.
 rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
 rc=0
 BOOTSTRAP_FAIL_AFTER=1 bootstrap_runtime >"$BUILD/b3.out" 2>"$BUILD/b3.err" || rc=$?
@@ -1196,7 +1206,7 @@ assert_not_exists "$tmp6" "6 race-lost-invalid: losing directory still moved out
 
 # --- Task 3 Step 6: shell-rule assertions (spec §7.2) -----------------------
 
-# The generated runtime file is bit-for-bit the extracted cookbook: it must
+# The generated runtime file is bit-for-bit runtime/cookbook.sh: it must
 # execute zero top-level commands when sourced (same probe check_01 uses).
 rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
 bootstrap_runtime >/dev/null 2>&1
@@ -1247,9 +1257,9 @@ assert_eq "" "$_phase_snippet_missing" \
 # declaration from any assignment that MASKS $? or REFERENCES a sibling
 # declared earlier in the SAME statement) -- not just the narrower
 # `local X=$(...)` shape.
-local_mask_hits=$(python3 - "$PROCESS_DOC" <<'PY'
+local_mask_hits=$(python3 - "$PROCESS_DOC" "$BUILD/cookbook.sh" <<'PY'
 import re, sys
-text = open(sys.argv[1]).read()
+text = "\n".join(open(p).read() for p in sys.argv[1:])
 hits = 0
 for m in re.finditer(r'^[ \t]*local\s+(.+)$', text, re.MULTILINE):
     decl = m.group(1)
@@ -1328,36 +1338,43 @@ assert_eq 0 "$set_e_hits" "no runtime block enables set -e (short or -o errexit 
 
 dupe_defs=""
 for fn in $(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\) \{' "$BUILD/cookbook.sh" | sed -E 's/\(\) \{$//'); do
-  fn_count=$(grep -cE "^${fn}\\(\\) \\{" "$PROCESS_DOC" || true)
+  # Exactly one definition in the authored cookbook, and ZERO copies of the
+  # body in the document (a phase snippet re-pasting a helper would drift).
+  fn_count=$(( $(grep -cE "^${fn}\\(\\) \\{" "$BUILD/cookbook.sh" || true) \
+             + $(grep -cE "^${fn}\\(\\) \\{" "$PROCESS_DOC" || true) ))
   if [ "$fn_count" -gt 1 ]; then
     dupe_defs="$dupe_defs $fn($fn_count)"
   fi
 done
 assert_eq "" "$dupe_defs" \
-  "no phase block copies a runtime helper body (every helper is defined exactly once)"
+  "no phase block copies a runtime helper body (every helper is defined exactly once, in runtime/cookbook.sh)"
 
 # --- Code review fixes: F1(a) every _bootstrap_extract_all failure path names
 # itself, and surfaces the failing command's own stderr ---------------------
 rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
 _saved_process_repo_root="$PROCESS_REPO_ROOT"
 
-# 1. Missing extractor (e.g. a checkout whose tests/ directory is absent):
-#    empty stdout/stderr was the bug -- now must be a named token, and the
-#    interpreter's own "can't open file" diagnostic must ride along.
-PROCESS_REPO_ROOT="$(mktemp -d)"   # a repo with no tests/lib/extract.py at all
+# 1. Missing runtime sources (e.g. a checkout whose runtime/ directory is
+#    absent): empty stdout/stderr was the bug class -- now must be a named
+#    token, and the failing step's own diagnostic (the shell's redirect
+#    error for the missing runtime/cookbook.sh) must ride along.
+PROCESS_REPO_ROOT="$(mktemp -d)"   # a repo with no runtime/ and no tests/lib/extract.py at all
 rc=0; out="$(bootstrap_runtime 2>"$BUILD/f1a-missing.err")" || rc=$?
 PROCESS_REPO_ROOT="$_saved_process_repo_root"
-assert_rc 1 "$rc" "F1a missing-extractor: bootstrap_runtime fails"
-assert_eq "" "$out" "F1a missing-extractor: nothing on stdout"
-assert_contains "BOOTSTRAP_IO_ERROR" "$BUILD/f1a-missing.err" "F1a missing-extractor: names itself with a token"
-[ -s "$BUILD/f1a-missing.err" ] && [ "$(wc -l < "$BUILD/f1a-missing.err")" -ge 2 ]   && _ok "F1a missing-extractor: the interpreter's own diagnostic rides along with the token"   || _fail "F1a missing-extractor: stderr is just the bare token, no underlying diagnostic: $(cat "$BUILD/f1a-missing.err")"
+assert_rc 1 "$rc" "F1a missing-source: bootstrap_runtime fails"
+assert_eq "" "$out" "F1a missing-source: nothing on stdout"
+assert_contains "BOOTSTRAP_IO_ERROR" "$BUILD/f1a-missing.err" "F1a missing-source: names itself with a token"
+[ -s "$BUILD/f1a-missing.err" ] && [ "$(wc -l < "$BUILD/f1a-missing.err")" -ge 2 ]   && _ok "F1a missing-source: the failing step's own diagnostic rides along with the token"   || _fail "F1a missing-source: stderr is just the bare token, no underlying diagnostic: $(cat "$BUILD/f1a-missing.err")"
 
-# 2. Extractor present but exits non-zero (a malformed process document, or
-#    any other extractor failure): its own stderr (a SystemExit message, a
-#    traceback, ...) must be surfaced, not swallowed into a discarded temp file.
+# 2. Registry extractor present but exits non-zero (a malformed process
+#    document, or any other extractor failure): its own stderr (a SystemExit
+#    message, a traceback, ...) must be surfaced, not swallowed into a
+#    discarded temp file. The runtime/ sources are real copies here so the
+#    bootstrap reaches the registry-extraction step at all.
 rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
 _fake_repo="$(mktemp -d)"
-mkdir -p "$_fake_repo/tests/lib"
+mkdir -p "$_fake_repo/tests/lib" "$_fake_repo/runtime"
+cp "$REPO_TOP/runtime/cookbook.sh" "$REPO_TOP/runtime/publish-status" "$_fake_repo/runtime/"
 printf '#!/usr/bin/env python3
 import sys
 sys.stderr.write("BOGUS_EXTRACTOR_FAILURE: synthetic\n")
@@ -1400,7 +1417,7 @@ tmp_f2="$ORCHESTRATION_DIR/.runtime.tmp.corrupt-before-publish"
 mkdir -p "$tmp_f2"
 _bootstrap_extract_all "$tmp_f2" >/dev/null 2>&1
 printf 'tampered
-' >> "$tmp_f2/policy.tsv"   # corrupt AFTER extraction, BEFORE publish
+' >> "$tmp_f2/policy.tsv"   # corrupt AFTER materialization, BEFORE publish
 rc=0; out="$(_bootstrap_publish "$tmp_f2" 2>"$BUILD/f2.err")" || rc=$?
 assert_rc 1 "$rc" "F2: publishing a since-corrupted staging directory fails immediately"
 assert_contains "RUNTIME_MANIFEST_INVALID" "$BUILD/f2.err" "F2: names itself"

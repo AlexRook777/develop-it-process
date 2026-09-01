@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""The develop-it STATUS publisher. Authored here (runtime/publish-status);
+bootstrap_runtime copies it verbatim to $RUNTIME_DIR/publish-status. The ONE
+program every role calls to publish its STATUS -- no appendix hand-rolls its
+own atomic-write shell (design S9.2).
+
+Validates schema-v2 STATUS content read from stdin against the role
+contract registry (--contracts) and this attempt's declared identity, then
+publishes it durably: write a sibling temp file under exclusive creation,
+fsync, os.replace onto the final path as an unconditional separate
+operation, fsync the containing directory, then reread and revalidate the
+final bytes. On any rename or reread failure the temp evidence is preserved
+(never deleted, never promoted) and the five PUBLICATION_LOST fields are
+printed to stdout (design S9.3).
+
+Usage: publish-status --contracts PATH --role ROLE --dispatch-id ID
+       --logical-dispatch-id ID --phase N --iteration NN --attempt NN
+       --status PATH --allowed-root PATH [--allowed-root PATH ...] < fields
+"""
+import argparse
+import hashlib
+import os
+import re
+import sys
+
+COMMON_HEAD = [
+    "schema_version", "dispatch_id", "logical_dispatch_id", "role", "phase",
+    "iteration", "attempt", "verdict", "reason", "published_at",
+    "artifact_revision", "output_count",
+]
+
+RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+TWO_DIGIT_RE = re.compile(r"^\d{2}$")
+SECRET_KEY_RE = re.compile(
+    r"(token|secret|credential|password|authorization|cookie)", re.IGNORECASE)
+
+
+def _parse_records(raw):
+    """Decode stdin bytes as UTF-8 and split into an ORDERED list of
+    (key, value) pairs, one per non-empty line. Raises ValueError on a
+    malformed line or a duplicate key; raises UnicodeDecodeError on invalid
+    UTF-8 (left to the caller, since that is a different failure token)."""
+    text = raw.decode("utf-8")
+    records = []
+    seen = set()
+    for line in text.splitlines():
+        if line == "":
+            continue
+        if ": " not in line:
+            raise ValueError(f"STATUS_MALFORMED_LINE:{line!r}")
+        key, value = line.split(": ", 1)
+        if key in seen:
+            raise ValueError(f"STATUS_DUPLICATE_KEY:{key}")
+        seen.add(key)
+        records.append((key, value))
+    return records
+
+
+def _role_field(contracts_path, role, field):
+    with open(contracts_path, encoding="utf-8") as f:
+        header = f.readline().rstrip("\n").split("\t")
+        if field not in header:
+            raise ValueError(f"ROLE_FIELD_UNKNOWN:{field}")
+        idx = header.index(field)
+        role_idx = header.index("role")
+        matches = []
+        for line in f:
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) > role_idx and cols[role_idx] == role:
+                matches.append(cols[idx] if len(cols) > idx else "")
+        if len(matches) != 1:
+            raise ValueError(f"ROLE_UNKNOWN_OR_DUPLICATE:{role}")
+        return matches[0]
+
+
+def _validate(records, args):
+    """Raise ValueError with a machine-readable token on the first violation.
+    Order matches the checks a caller most wants isolated in a test: missing
+    fields and duplicates first (structural), then identity, then the
+    per-role registry contract, then path containment."""
+    by_key = dict(records)
+    order = [k for k, _ in records]
+
+    for k in COMMON_HEAD + ["checkpoint_path"]:
+        if k not in by_key:
+            raise ValueError(f"STATUS_MISSING_FIELD:{k}")
+
+    # A strict digit-only check: bare int() accepts "0_0" (digit-group
+    # separators), leading/trailing whitespace, and a leading +/- sign --
+    # all of which int() would silently treat as a valid, well-formed count.
+    if not re.fullmatch(r"[0-9]+", by_key["output_count"]):
+        raise ValueError("STATUS_BAD_OUTPUT_COUNT")
+    output_count = int(by_key["output_count"])
+    output_keys = [f"output_{i:02d}" for i in range(1, output_count + 1)]
+    for k in output_keys:
+        if k not in by_key:
+            raise ValueError(f"STATUS_MISSING_OUTPUT:{k}")
+    extra_outputs = sorted(
+        k for k in by_key
+        if re.fullmatch(r"output_\d+", k) and k not in output_keys)
+    if extra_outputs:
+        raise ValueError(f"STATUS_EXTRA_OUTPUT:{extra_outputs[0]}")
+
+    expected_order = COMMON_HEAD + output_keys + ["checkpoint_path"]
+    if order[: len(expected_order)] != expected_order:
+        raise ValueError("STATUS_FIELD_ORDER")
+
+    if by_key["schema_version"] != "2":
+        raise ValueError("STATUS_BAD_SCHEMA_VERSION")
+    if by_key["dispatch_id"] != args.dispatch_id:
+        raise ValueError("STATUS_DISPATCH_ID_MISMATCH")
+    if by_key["logical_dispatch_id"] != args.logical_dispatch_id:
+        raise ValueError("STATUS_LOGICAL_DISPATCH_ID_MISMATCH")
+    if by_key["role"] != args.role:
+        raise ValueError("STATUS_ROLE_MISMATCH")
+    if by_key["phase"] != args.phase:
+        raise ValueError("STATUS_PHASE_MISMATCH")
+    if not TWO_DIGIT_RE.match(by_key["iteration"]):
+        raise ValueError("STATUS_BAD_ITERATION_FORMAT")
+    if by_key["iteration"] != args.iteration:
+        raise ValueError("STATUS_ITERATION_MISMATCH")
+    if not TWO_DIGIT_RE.match(by_key["attempt"]):
+        raise ValueError("STATUS_BAD_ATTEMPT_FORMAT")
+    if by_key["attempt"] != args.attempt:
+        raise ValueError("STATUS_ATTEMPT_MISMATCH")
+
+    allowed_verdicts = _role_field(args.contracts, args.role, "verdicts").split(";")
+    if by_key["verdict"] not in allowed_verdicts:
+        raise ValueError(f"STATUS_BAD_VERDICT:{by_key['verdict']}")
+
+    if not RFC3339_RE.match(by_key["published_at"]):
+        raise ValueError("STATUS_BAD_PUBLISHED_AT")
+
+    roots = [os.path.realpath(r) for r in args.allowed_root]
+    for k in output_keys:
+        p = by_key[k]
+        if not os.path.isabs(p):
+            raise ValueError(f"STATUS_OUTPUT_NOT_ABSOLUTE:{k}")
+        rp = os.path.realpath(p)
+        if not any(rp == r or rp.startswith(r + os.sep) for r in roots):
+            raise ValueError(f"STATUS_OUTPUT_OUTSIDE_ROOT:{k}")
+
+    cp = by_key["checkpoint_path"]
+    if cp != "null" and not os.path.isabs(cp):
+        raise ValueError("STATUS_BAD_CHECKPOINT_PATH")
+
+    required = [t for t in _role_field(args.contracts, args.role,
+                                        "required_status_fields").split(";")
+                if t not in ("common_v2", "")]
+    for token in required:
+        if token not in by_key:
+            raise ValueError(f"STATUS_MISSING_ROLE_FIELD:{token}")
+
+    known = set(expected_order) | set(required)
+    for k in order:
+        if k in known:
+            continue
+        if not k.startswith("x_"):
+            raise ValueError(f"STATUS_UNKNOWN_FIELD:{k}")
+
+
+def _redact_preview(raw):
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()[:12]
+    out_lines = []
+    for line in lines:
+        if ": " in line:
+            k, v = line.split(": ", 1)
+            if SECRET_KEY_RE.search(k):
+                v = "[REDACTED]"
+            out_lines.append(f"{k}: {v}")
+        else:
+            out_lines.append(line)
+    preview = "\\n".join(out_lines)
+    preview = "".join(c if c.isprintable() else "?" for c in preview)
+    # The spec caps this at 512 BYTES, not 512 characters -- a naive
+    # preview[:512] under-truncates for any multi-byte UTF-8 content.
+    return preview.encode("utf-8")[:512].decode("utf-8", errors="ignore")
+
+
+def _lost(tmp_path):
+    try:
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        data = b""
+    sys.stdout.write("classification=PUBLICATION_LOST\n")
+    sys.stdout.write(f"tmp_path={tmp_path}\n")
+    sys.stdout.write(f"tmp_size_bytes={len(data)}\n")
+    sys.stdout.write(f"tmp_sha256={hashlib.sha256(data).hexdigest()}\n")
+    sys.stdout.write(f"tmp_header_preview={_redact_preview(data)}\n")
+    return 1
+
+
+def _write_retry(fd, data):
+    # A single os.write(fd, data) call can return SHORT even for a regular
+    # file; looping on the return count is what makes this write actually
+    # complete instead of silently truncating (see check_06's mocked proof
+    # of this exact pattern for _bootstrap_atomic_write).
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="publish-status")
+    p.add_argument("--contracts", required=True)
+    p.add_argument("--role", required=True)
+    p.add_argument("--dispatch-id", required=True)
+    p.add_argument("--logical-dispatch-id", required=True)
+    p.add_argument("--phase", required=True)
+    p.add_argument("--iteration", required=True)
+    p.add_argument("--attempt", required=True)
+    p.add_argument("--status", required=True)
+    p.add_argument("--allowed-root", action="append", required=True)
+    args = p.parse_args(argv[1:])
+
+    dest = args.status
+    tmp = f"{dest}.tmp.{args.dispatch_id}"
+
+    if os.path.exists(dest):
+        sys.stderr.write(f"STATUS_ALREADY_EXISTS:{dest}\n")
+        return 1
+
+    raw = sys.stdin.buffer.read()
+    try:
+        records = _parse_records(raw)
+        _validate(records, args)
+    except UnicodeDecodeError:
+        sys.stderr.write("STATUS_INVALID_UTF8\n")
+        return 1
+    except ValueError as e:
+        sys.stderr.write(str(e) + "\n")
+        return 1
+
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        # A sibling temp for THIS exact dispatch id already exists: it can
+        # only be evidence of a prior lost publication. Never overwrite or
+        # delete it -- report it as the loss it already is.
+        sys.stderr.write(f"STATUS_TMP_SIBLING_EXISTS:{tmp}\n")
+        return _lost(tmp)
+    except OSError as e:
+        sys.stderr.write(f"STATUS_TMP_CREATE_FAILED:{e}\n")
+        return 1
+
+    try:
+        try:
+            if os.environ.get("PUBLISH_STATUS_FAIL_WRITE"):
+                # Test hook only (read here; production never sets it) --
+                # forcing a genuine short/failed os.write against a regular
+                # file is not reliably reproducible in a sandboxed test (see
+                # check_06's mocked proof of the retry loop itself); this
+                # mirrors the same PUBLISH_STATUS_FAIL_RENAME precedent above.
+                raise OSError("injected-test-fault")
+            _write_retry(fd, raw)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        sys.stderr.write(f"STATUS_TMP_WRITE_FAILED:{e}\n")
+        return _lost(tmp)
+
+    if os.environ.get("PUBLISH_STATUS_FAIL_RENAME"):
+        # Test hook only (read here; production never sets it) -- deterministically
+        # exercises the rename-failure path the same way BOOTSTRAP_FAIL_AFTER
+        # exercises bootstrap_runtime's interruption path.
+        sys.stderr.write("STATUS_RENAME_FAILED:injected-test-fault\n")
+        return _lost(tmp)
+    try:
+        os.replace(tmp, dest)
+    except OSError as e:
+        sys.stderr.write(f"STATUS_RENAME_FAILED:{e}\n")
+        return _lost(tmp)
+
+    dirfd = os.open(os.path.dirname(os.path.abspath(dest)) or "/", os.O_RDONLY)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+
+    if os.environ.get("PUBLISH_STATUS_CORRUPT_AFTER_RENAME"):
+        # Test hook only (read here; production never sets it) -- simulates the
+        # final path being corrupted between rename and reread.
+        with open(dest, "ab") as f:
+            f.write(b"CORRUPT\n")
+
+    try:
+        with open(dest, "rb") as f:
+            reread = f.read()
+        if not reread:
+            raise ValueError("STATUS_REREAD_EMPTY")
+        _validate(_parse_records(reread), args)
+    except Exception as e:
+        # Roll the bad final content back to a tmp-named diagnostic path: the
+        # canonical STATUS path must never be left holding invalid bytes.
+        try:
+            os.replace(dest, tmp)
+        except OSError:
+            pass
+        sys.stderr.write(f"STATUS_REREAD_INVALID:{e}\n")
+        return _lost(tmp)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

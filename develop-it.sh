@@ -47,8 +47,9 @@ REPO_ROOT="$(git -C "$(dirname "$SPEC_PATH")" rev-parse --show-toplevel 2>/dev/n
 [ "$REPO_ROOT" != "$PROCESS_REPO_ROOT" ] \
   || die "the spec and the process file must be in different repositories: $REPO_ROOT"
 
-# Preparing the environment includes proving the process document still passes
-# its own checks — a broken cookbook block fails here rather than mid-run.
+# Preparing the environment includes proving the process file set (the
+# document plus the runtime/ sources) still passes its own checks — a broken
+# cookbook helper fails here rather than mid-run.
 # Exported before the suite runs: tests/check_08_launcher.sh invokes this script,
 # and without the flag that check would re-enter this step forever.
 if [ -z "${DEVELOP_IT_SKIP_TESTS:-}" ]; then
@@ -68,12 +69,14 @@ export PROCESS_PATH REPO_ROOT SPEC_PATH FEATURE_FOLDER
 # it reaches the target.
 cd "$PROCESS_REPO_ROOT" || die "cannot cd to $PROCESS_REPO_ROOT"
 
-# The document is the prompt, verbatim. It goes in as a system-prompt file, not
-# as the positional argument: at ~280 KB it is well past the kernel's 128 KB
-# ceiling on a single argv element, and the system prompt is also the one place
-# a multi-hour run cannot lose it to context compaction. The positional argument
-# is only the trigger that submits the first turn — the same as typing "Begin"
-# into the TUI yourself.
+# The document is the prompt, verbatim (the shell helpers it indexes live in
+# runtime/, sourced by each phase shell — they are not part of the prompt).
+# It goes in as a system-prompt file, not as the positional argument: at
+# hundreds of KB it is well past the kernel's 128 KB ceiling on a single argv
+# element, and the system prompt is also the one place a multi-hour run cannot
+# lose it to context compaction. The positional argument is only the trigger
+# that submits the first turn — the same as typing "Begin" into the TUI
+# yourself.
 #
 # exec, and no -p: this hands the terminal to an interactive session with the
 # first turn already submitted. -p would print once and exit.

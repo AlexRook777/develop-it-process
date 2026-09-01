@@ -75,12 +75,12 @@ finish() {
   exit 1
 }
 
-# Source the extracted cookbook and initialise orchestration variables with
-# throwaway fixture values. Never rely on the cookbook initialising itself: it
+# Source the staged cookbook (a verbatim copy of runtime/cookbook.sh) and
+# initialise orchestration variables with throwaway fixture values. Never rely on the cookbook initialising itself: it
 # is definitions-only by design, so a top-level ${VAR:?} cannot abort this shell.
 load_cookbook() {
   python3 "$_TESTS_DIR/lib/extract.py" cookbook >/dev/null 2>&1 || {
-    _fail "cookbook not extractable"; return 1; }
+    _fail "cookbook not stageable"; return 1; }
   # shellcheck source=/dev/null
   source "$BUILD/cookbook.sh" || { _fail "cookbook.sh failed to source"; return 1; }
   return 0

@@ -9,9 +9,9 @@ assert_present '^# Universal SDLC' "$PROCESS_DOC" "process doc is readable and l
 assert_absent 'ZZZ_NEVER_PRESENT_ZZZ' "$PROCESS_DOC" "assert_absent works"
 
 if python3 lib/extract.py cookbook 2>/dev/null && [ -s "$BUILD/cookbook.sh" ]; then
-  note "cookbook extracted ($(wc -l < "$BUILD/cookbook.sh") lines)"
+  note "cookbook staged from runtime/cookbook.sh ($(wc -l < "$BUILD/cookbook.sh") lines)"
 else
-  note "cookbook not yet extractable (no lint markers) -- expected until Task 21"
+  note "cookbook not stageable -- is runtime/cookbook.sh missing?"
 fi
 
 finish

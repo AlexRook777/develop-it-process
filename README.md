@@ -1,21 +1,28 @@
 # develop-it-process
 
-`develop-it-prompt.md` is a single self-contained orchestration prompt. An
-orchestrating agent reads it and drives `claude` and `codex` CLI subprocesses
-through a phased spec -> plan -> implement -> review pipeline. The document is
-the single source of truth: there is no separate framework codebase. The
-shell helpers the orchestrator calls (`render_prompt`, `role_model`,
-`dirty_tree_check`, and the rest) live inside the document itself, in fenced
-`bash` blocks, and are never edited or maintained as standalone files.
-They ARE extracted into real files at two distinct times, for two distinct
-purposes, and neither one is a second normative copy: `./tests/run.sh`
-extracts them into `tests/.build/` to unit-test them offline; and, on every
-real run, Phase −1 extracts the SAME cookbook (plus the role-contract,
-policy, and event registries) into `$FEATURE_FOLDER/.orchestration/runtime/`
-so every subsequent phase's dispatch has real, sourceable shell functions to
-call. The document's own bytes remain the only place this logic is authored
-or reviewed — both extractions are generated, disposable derivatives, never
-committed (see "Recovery and resume" below).
+`develop-it-prompt.md` is the orchestration prompt. An orchestrating agent
+reads it and drives `claude` and `codex` CLI subprocesses through a phased
+spec -> plan -> implement -> review pipeline. **This repository — not the
+lone document — is the source of truth**, and it splits cleanly in two:
+
+- `develop-it-prompt.md` holds everything the orchestrator reasons from —
+  the phase procedures, the role-contract/policy/event registries (as
+  Markdown tables it alone authors), the role appendices, and a compact
+  per-section FUNCTION INDEX of every shell helper it may call.
+- `runtime/` holds the executable logic those index entries name:
+  `runtime/cookbook.sh` (every shell helper — `render_prompt`, `role_model`,
+  `dirty_tree_check`, and the rest — definitions-only, directly authored and
+  reviewed here) and `runtime/publish-status` (the STATUS publisher program).
+
+Every phase shell `source`s `runtime/cookbook.sh`, and its
+`bootstrap_runtime` materializes a per-run copy — verbatim `runtime/` files
+plus the registries extracted from the document's tables — into
+`$FEATURE_FOLDER/.orchestration/runtime/`, covered by a `manifest.sha256`
+keyed to the whole process file set (document + `runtime/` sources), so a
+mid-run edit to any of them invalidates the run's materialized runtime
+rather than silently drifting. `./tests/run.sh` stages the same files into
+`tests/.build/` to unit-test them offline; both copies are disposable
+derivatives, never committed (see "Recovery and resume" below).
 
 ## The pipeline
 
@@ -30,7 +37,7 @@ The phases run in this order:
 - **Phase −1 (folder `1-preflight/`) — Preflight.** Zero-token gates: local
   CLI canary (are `claude`/`codex`/`jq`/`git`/... on PATH), the target repo's
   dirty-tree check, process-identity/gitignore validation, generated-runtime
-  extraction and verification, then a Superpowers skill probe and a model
+  materialization and verification, then a Superpowers skill probe and a model
   probe per vendor that verifies every pinned model id is accepted before any
   billable work starts. A missing/unavailable Codex at this phase HALTs
   (Mode 0) or degrades only after explicit recorded user consent (Modes 1–5)
@@ -172,9 +179,9 @@ there, and this process provides no compatibility reader for a schema-v1
 
 Exit codes follow the standard convention: 0 PASS, 1 FAIL, 77 SKIP. A SKIP is
 never counted as a pass — `run.sh` reports skipped checks separately from
-passing ones. `shellcheck` is a test-time prerequisite (it lints the extracted
-cookbook helpers); without it, `check_01_lint.sh` still runs its syntax checks
-and reports SKIP rather than a false PASS.
+passing ones. `shellcheck` is a test-time prerequisite (it lints
+`runtime/cookbook.sh`); without it, `check_01_lint.sh` still runs its syntax
+checks and reports SKIP rather than a false PASS.
 
 ## Requirements
 

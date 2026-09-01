@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Check 1: every fenced bash block is lint-classified; cookbook blocks lint clean.
+# Check 1: every fenced document bash block is lint-classified (snippets), and
+# the authored runtime/cookbook.sh + runtime/publish-status lint clean.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 source lib/assert.sh
@@ -13,7 +14,7 @@ else
 fi
 
 # 2. Syntax-check everything.
-python3 lib/extract.py cookbook >/dev/null 2>&1 || { _fail "cookbook not extractable"; finish; }
+python3 lib/extract.py cookbook >/dev/null 2>&1 || { _fail "cookbook not stageable from runtime/cookbook.sh"; finish; }
 python3 lib/extract.py snippets
 snippets_extract_rc=$?
 if [ "$snippets_extract_rc" -ne 0 ]; then
@@ -27,10 +28,10 @@ publisher_err="$BUILD/publisher.err"
 python3 lib/extract.py publisher >/dev/null 2>"$publisher_err"
 publisher_rc=$?
 if [ "$publisher_rc" -ne 0 ]; then
-  _fail "publisher block not extractable (rc=$publisher_rc)"
+  _fail "publisher not stageable from runtime/publish-status (rc=$publisher_rc)"
   note "$(cat "$publisher_err")"
 else
-  _ok "exactly one publisher block extracts cleanly"
+  _ok "the publisher stages cleanly from runtime/publish-status"
   python3 -m py_compile "$BUILD/publish-status" \
     && _ok "publish-status compiles with python3 -m py_compile" \
     || _fail "publish-status has a Python syntax error"
