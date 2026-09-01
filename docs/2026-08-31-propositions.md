@@ -6,6 +6,8 @@ Method: full-document analysis by five parallel investigation agents (contract &
 
 Ratings: Criticality **Critical/High/Medium/Low** (same definitions as the R-series), Effort **Easy/Moderate/Hard**.
 
+> **Execution status (2026-09-01):** ALL propositions executed on branch `improvements-2026-08-31` (df481ce..a669397, 33 commits, offline suite green 12/0/1 at every task boundary; never pushed). Each proposition's Status line below names its commit. P00: stages 1–2 implemented (resident core 861KB → 236KB, −73%); stage 3 delivered as `docs/p00-stage-3-suborchestration-design.md` — it changes live dispatch behavior the offline suite cannot verify, so it needs the pilot run the note specifies before coding. Every task was implemented by a fresh subagent, reviewed by an independent reviewer, and fix-looped until clean; a final whole-branch review judged the branch mergeable.
+
 ---
 
 ## P00 — Split the monolith: phase packs loaded on demand, cookbook out of context, per-phase suborchestration
