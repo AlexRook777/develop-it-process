@@ -303,7 +303,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P22 — Consolidate duplicated cookbook plumbing (six small single-source fixes)
 
-**Status:** 🟨 items 1, 2, 6 implemented (e534b81); items 3–5 pending
+**Status:** ✅ implemented (items 1/2/6: e534b81; items 3/4/5: b012f73)
 
 **Criticality:** Medium · **Effort:** Easy–Moderate (independent items)
 
@@ -319,7 +319,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P23 — Kill the O(n²) checkpoint write path and the per-record jq loops
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (b012f73)
 
 **Criticality:** Medium · **Effort:** Moderate
 
