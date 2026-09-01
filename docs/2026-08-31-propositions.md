@@ -276,7 +276,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P20 — Template-factor the role appendices (~1,200 duplicated lines)
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (2758a0a)
 
 **Criticality:** Medium · **Effort:** Moderate
 
@@ -291,7 +291,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P21 — Deduplicate the per-phase procedural prose (alias-copy ×5, verdict-branch ×3)
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (2758a0a)
 
 **Criticality:** Medium · **Effort:** Moderate
 
@@ -343,7 +343,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P25 — Compress "intentionally unreachable" justification prose
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (2758a0a)
 
 **Criticality:** Low · **Effort:** Easy
 
