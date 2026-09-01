@@ -10,7 +10,7 @@ Ratings: Criticality **Critical/High/Medium/Low** (same definitions as the R-ser
 
 ## P00 — Split the monolith: phase packs loaded on demand, cookbook out of context, per-phase suborchestration
 
-**Status:** 🟨 stage 1 implemented (bc6ea39): cookbook+publisher evicted to runtime/, doc 861KB→505KB (−41%), fileset identity digest. Stages 2–3 (phase packs, suborchestration) pending
+**Status:** ✅ stages 1–2 implemented (bc6ea39, 2e16b12): resident core 861KB→236KB (−73%), cookbook+publisher in runtime/, 11 phase packs loaded on demand. Stage 3 delivered as a design note (docs/p00-stage-3-suborchestration-design.md) — it changes live dispatch behavior the offline suite cannot verify, so it needs the pilot run the note specifies before coding
 
 **Criticality:** High (owner-raised: prompt size) · **Effort:** Hard — but stageable, and each stage pays for itself
 
