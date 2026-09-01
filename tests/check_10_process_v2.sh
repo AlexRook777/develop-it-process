@@ -743,6 +743,113 @@ else
   _fail "checkpoint_append took ${_t9_lock_elapsed_ms}ms while the global log.lock was held -- looks like shared-lock contention"
 fi
 
+# --- Task 9 P23(a): the checkpoint cursor sidecar (progress.jsonl.cursor)
+# is an O(1)-subprocess optimization standing in for a full
+# checkpoint_resume_state re-scan on every append; it must be trusted ONLY
+# while it still describes the CURRENT file byte-for-byte (its own
+# recorded byte_offset/sha256), and fall back to the real full scan on ANY
+# doubt. This proves the fallback actually engages -- not just that it
+# exists -- by making a STALE cursor observably dangerous if it were ever
+# trusted: a real record lands in the file through a path the cursor never
+# saw (simulating "some other write reached this file"), so the cursor on
+# disk still describes the shorter, one-line file. A broken trust check
+# that skipped the byte_offset/sha256 comparison would still think
+# last=1 and let the next checkpoint_append silently claim sequence=2 a
+# SECOND time (file corruption: two records both claiming sequence=2,
+# breaking the contiguous-sequence invariant resume-time validation relies
+# on) instead of detecting the file moved and correctly refusing the
+# collision. -----------------------------------------------------------
+rm -f "$T9_PROGRESS" "$T9_PROGRESS.cursor"
+rc=0
+checkpoint_append "$T9_PROGRESS" "$T9_DISPATCH_ID" implementer \
+  sequence=1 unit_type=task unit_id=task-01 state=completed \
+  artifact_path="" artifact_sha256="" commit_sha="" verification=PASS next_unit=task-02 || rc=$?
+assert_rc 0 "$rc" "T9 cursor: first append succeeds and writes a cursor sidecar"
+assert_exists "$T9_PROGRESS.cursor" "T9 cursor: the sidecar was actually written"
+_t9_cursor_after_first="$(cat "$T9_PROGRESS.cursor")"
+
+# A real second record reaches the file WITHOUT going through
+# checkpoint_append (so its own cursor-refresh never runs) -- the sidecar
+# on disk is now genuinely stale: it still describes the one-line file.
+write_fake_checkpoint "$T9_PROGRESS" "$T9_DISPATCH_ID" 2 completed task-02 "" "" "" task-03
+assert_eq "$_t9_cursor_after_first" "$(cat "$T9_PROGRESS.cursor")" \
+  "T9 cursor: the sidecar itself is untouched by the direct write -- it is now genuinely stale"
+
+rc=0
+checkpoint_append "$T9_PROGRESS" "$T9_DISPATCH_ID" implementer \
+  sequence=2 unit_type=task unit_id=task-02-again state=completed \
+  artifact_path="" artifact_sha256="" commit_sha="" verification=PASS next_unit=task-03 \
+  2>"$BUILD/t9-cursor-stale.err" || rc=$?
+assert_rc 1 "$rc" \
+  "T9 cursor: a stale cursor (file byte-appended behind its back) falls back to a full scan, which correctly refuses the resulting sequence collision"
+assert_contains "CHECKPOINT_SEQUENCE_NOT_INCREASING" "$BUILD/t9-cursor-stale.err" \
+  "T9 cursor: the refusal is the real sequence-collision reason -- not a crash, and not a silently-accepted duplicate"
+assert_eq 2 "$(wc -l < "$T9_PROGRESS" | tr -d ' ')" \
+  "T9 cursor: the refused append left the file at exactly the 2 real records -- no silent corruption"
+
+# The fallback is not just refusing everything: the CORRECT next sequence
+# (3, the real last-plus-one a full scan discovers) is still accepted.
+rc=0
+checkpoint_append "$T9_PROGRESS" "$T9_DISPATCH_ID" implementer \
+  sequence=3 unit_type=task unit_id=task-03 state=completed \
+  artifact_path="" artifact_sha256="" commit_sha="" verification=PASS next_unit=task-04 || rc=$?
+assert_rc 0 "$rc" \
+  "T9 cursor: once the stale cursor forces a real full scan, the CORRECT next sequence is still accepted"
+assert_eq 3 "$(wc -l < "$T9_PROGRESS" | tr -d ' ')" "T9 cursor: the correctly-appended third record landed"
+
+# A tampered (not merely stale) cursor -- its own sha256 rewritten to a
+# value that no longer matches the file it claims to describe -- must be
+# rejected the same way, even though its byte_offset still happens to
+# equal the real file size.
+_t9_tamper_size="$(wc -c < "$T9_PROGRESS" | tr -d ' ')"
+jq -cn --argjson bo "$_t9_tamper_size" \
+  '{dispatch_id:"'"$T9_DISPATCH_ID"'", byte_offset:$bo, sha256:"0000000000000000000000000000000000000000000000000000000000000000"}' \
+  > "$T9_PROGRESS.cursor"
+rc=0
+checkpoint_append "$T9_PROGRESS" "$T9_DISPATCH_ID" implementer \
+  sequence=4 unit_type=task unit_id=task-04 state=completed \
+  artifact_path="" artifact_sha256="" commit_sha="" verification=PASS next_unit=task-05 || rc=$?
+assert_rc 0 "$rc" \
+  "T9 cursor: a tampered sha256 (offset still matches) also falls back to a full scan, and the real next sequence still succeeds"
+assert_eq 4 "$(wc -l < "$T9_PROGRESS" | tr -d ' ')" "T9 cursor: the fourth record landed via the full-scan fallback"
+
+# --- Task 9 P23(a), the sharpest discriminator: a stale cursor MASKING a
+# corruption only a full scan can see. checkpoint_append's own "last
+# sequence" is always re-read fresh off the file's real trailing record
+# (never trusted directly off the cursor's own fields) -- so an ordinary
+# stale/tampered cursor self-heals via that re-read even if the trust gate
+# were broken, which is why the two blocks above alone would NOT actually
+# catch a broken byte_offset/sha256 comparison. This one does: a SEQUENCE
+# GAP written behind the cursor's back is invisible to a bare `tail -n1`
+# read (the gapped line still parses and still carries a plausible-looking
+# `sequence` field) but is exactly what checkpoint_resume_state's full scan
+# exists to catch. If the trust gate ever let a stale cursor through
+# without comparing byte_offset/sha256 against the real file, this would
+# regress to accepting new records on top of an already-corrupt,
+# discontinuous chain instead of refusing outright. ------------------------
+rm -f "$T9_PROGRESS" "$T9_PROGRESS.cursor"
+rc=0
+checkpoint_append "$T9_PROGRESS" "$T9_DISPATCH_ID" implementer \
+  sequence=1 unit_type=task unit_id=task-01 state=completed \
+  artifact_path="" artifact_sha256="" commit_sha="" verification=PASS next_unit=task-02 || rc=$?
+assert_rc 0 "$rc" "T9 cursor gap: first append succeeds and writes a cursor sidecar"
+
+# A gapped record (sequence=5, not 2) lands directly, bypassing
+# checkpoint_append and its cursor refresh -- the sidecar stays stale.
+write_fake_checkpoint "$T9_PROGRESS" "$T9_DISPATCH_ID" 5 completed task-05 "" "" "" task-06
+
+rc=0
+checkpoint_append "$T9_PROGRESS" "$T9_DISPATCH_ID" implementer \
+  sequence=6 unit_type=task unit_id=task-06 state=completed \
+  artifact_path="" artifact_sha256="" commit_sha="" verification=PASS next_unit=task-07 \
+  2>"$BUILD/t9-cursor-gap.err" || rc=$?
+assert_rc 1 "$rc" \
+  "T9 cursor gap: the stale cursor is detected (byte_offset/sha256 mismatch), forcing a real full scan that finds the sequence gap and refuses -- a broken trust gate would instead have read sequence=5 straight off the last line and accepted this as a plausible sequence=6 continuation"
+assert_contains "CHECKPOINT_APPEND_NEEDS_RECONCILIATION" "$BUILD/t9-cursor-gap.err" \
+  "T9 cursor gap: the refusal is the real reconciliation reason, naming the actual gap the full scan found"
+assert_eq 2 "$(wc -l < "$T9_PROGRESS" | tr -d ' ')" \
+  "T9 cursor gap: nothing was appended on top of the already-corrupt chain"
+
 # --- nit fixes: whitespace-only file, a sequence GAP, and an unreachable
 # (but real) commit object each get their own dedicated coverage. ----------
 rm -f "$T9_PROGRESS"

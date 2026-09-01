@@ -1835,6 +1835,21 @@ next_unused_attempt() {
   printf '%d\n' $((max + 1))
 }
 
+# Phase<->token mapping, shared by allocate_attempt (forward) and
+# role_attempt_dir (inverse) so the two directions can never drift apart.
+# Token domain: `m1` for the reserved preflight phase -1, else a zero-padded
+# two-digit decimal.
+_phase_to_token() {
+  # Usage: _phase_to_token PHASE
+  local phase="$1"
+  if [ "$phase" = -1 ]; then printf m1; else printf '%02d' "$phase"; fi
+}
+_token_to_phase() {
+  # Usage: _token_to_phase TOKEN
+  local token="$1"
+  if [ "$token" = m1 ]; then printf -- '-1'; else printf '%d' "$((10#$token))"; fi
+}
+
 # Rebuilds the attempt directory purely from the dispatch id's own
 # p<token>-i<NN>-... prefix (plus $FEATURE_FOLDER) -- never from a separate
 # global, so it can never drift from the identity allocate_attempt just
@@ -1849,7 +1864,7 @@ role_attempt_dir() {
   iter="$(printf '%s\n' "$dispatch_id" | "$GREP_BIN" -oE -- '-i[0-9]{2}-' | head -1 | tr -d 'i-')"
   [ -n "$token" ] && [ -n "$iter" ] \
     || { echo "ATTEMPT_DIR_BAD_DISPATCH_ID:$dispatch_id" >&2; return 1; }
-  if [ "$token" = m1 ]; then phase=-1; else phase=$((10#$token)); fi
+  phase="$(_token_to_phase "$token")"
   phase_name="$(_phase_name "$phase")" || return 1
   printf '%s/%s-%s/%s/attempts/%s\n' \
     "$FEATURE_FOLDER" "$phase" "$phase_name" "$iter" "$dispatch_id"
@@ -1877,7 +1892,7 @@ allocate_attempt() {
   # never actually minted by a real dispatch; a `pm1-...` dispatch id
   # correctly does not appear anywhere else in this document.
   local phase=$1 iteration=$2 role=$3 iter2 rc=0
-  PHASE_TOKEN=$([ "$phase" = -1 ] && printf m1 || printf '%02d' "$phase")
+  PHASE_TOKEN="$(_phase_to_token "$phase")"
   LOGICAL_DISPATCH_ID="p${PHASE_TOKEN}-i$(printf '%02d' "$iteration")-$role"
   iter2="$(printf '%02d' "$iteration")"
 
@@ -2275,6 +2290,54 @@ _spend_ceiling_pattern() {
   printf '%s' 'spend limit|monthly spend|usage limit reached|credit balance is too low|billing|quota exceeded|contact your organization administrator|insufficient_quota'
 }
 
+# The timeout/background/negative-PID-kill dance every vendor subprocess site
+# below needs -- factored out of what used to be four hand-duplicated copies
+# (the probe and the substantive launch, times claude and codex). Backgrounds
+# `timeout --kill-after=KILL_AFTER DEADLINE CMD...`, `wait`s for it, and then
+# sends exactly one SIGKILL to the whole process group by negative PID as a
+# post-mortem sweep -- never STOP/CONT/TERM, and never while the wrapper is
+# still live: this fires strictly AFTER `wait` returns, so it can never be
+# mistaken for extending a live deadline. This host's `timeout` (uutils
+# coreutils) leaves a grandchild the monitored process itself forked alive
+# after a --kill-after escalation, even though all three processes share one
+# process group -- confirmed empirically on this host, not assumed from
+# either implementation's docs. GNU coreutils' own `cleanup()` signals the
+# whole group, so this gap may not reproduce there; the sweep is unconditional
+# defense-in-depth regardless of which `timeout` is on PATH, and is a
+# harmless no-op when nothing survives.
+#
+# CD_DIR, when non-empty, is `cd`'d into first -- failing with the same
+# INVOKE_VENDOR_BAD_REPO_ROOT/exit-96 shape every claude call site needs
+# (codex passes CD_DIR empty; it takes `-C` itself instead). Any NAME=VALUE
+# arguments before the mandatory `--` are `export`ed into the subshell first,
+# reproducing each call site's own command-scoped env-var prefix exactly
+# (a bash builtin, so no extra process enters the timeout->CMD chain). CMD's
+# stdin is whatever this function's own stdin already is -- callers redirect
+# at the call site (`< file` or `<<< "text"`), exactly like every original
+# call site redirected its own inline `timeout` invocation.
+_launch_vendor_subprocess() {
+  # Usage: _launch_vendor_subprocess CD_DIR KILL_AFTER DEADLINE OUT ERR [NAME=VALUE]... -- CMD...
+  local cd_dir="$1" kill_after="$2" deadline="$3" out="$4" err="$5"
+  shift 5
+  local -a envs=()
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
+  shift
+  local tpid trc kv
+  ( if [ -n "$cd_dir" ]; then
+      cd "$cd_dir" || { echo "INVOKE_VENDOR_BAD_REPO_ROOT:$cd_dir" >&2; exit 96; }
+    fi
+    # shellcheck disable=SC2163  # intentional: $kv IS the "NAME=VALUE" pair
+    for kv in ${envs[@]+"${envs[@]}"}; do export "$kv"; done
+    timeout --kill-after="$kill_after" "$deadline" "$@" \
+      1> "$out" 2> "$err" &
+    tpid=$!
+    wait "$tpid"; trc=$?
+    kill -KILL -- "-$tpid" 2>/dev/null
+    exit "$trc"
+  )
+  return $?
+}
+
 # One minimal, cheap liveness call proving the vendor CLI currently responds
 # and is not mid a spend/quota refusal. This is the ONLY vendor spend before
 # the registry timeout/spend gates below. It proves ONLY current liveness --
@@ -2292,35 +2355,25 @@ _vendor_headroom_probe() {
   # here; the CALLER (invoke_vendor) owns cleanup once that event is recorded.
   local role="$1" vendor="$2" attempt_out="$3" attempt_err="$4"
   local probe_out="${attempt_out}.headroom-probe" probe_err="${attempt_err}.headroom-probe"
-  local model effort tpid rc
+  local model effort rc
   : > "$probe_out"; : > "$probe_err"
   model="$(role_contract_field "$role" model)" || return 1
   case "$vendor" in
     claude)
-      ( cd "$REPO_ROOT" || { echo "INVOKE_VENDOR_BAD_REPO_ROOT:$REPO_ROOT" >&2; exit 96; }
-        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 \
-          timeout --kill-after=10s 30s \
-          claude --model "$model" -p --output-format=json \
-                 --dangerously-skip-permissions - \
-          <<< "ping" 1> "$probe_out" 2> "$probe_err" &
-        tpid=$!
-        wait "$tpid"; trc=$?
-        kill -KILL -- "-$tpid" 2>/dev/null
-        exit "$trc"
-      )
+      _launch_vendor_subprocess "$REPO_ROOT" 10s 30s "$probe_out" "$probe_err" \
+        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 -- \
+        claude --model "$model" -p --output-format=json \
+               --dangerously-skip-permissions - \
+        <<< "ping"
       rc=$?
       ;;
     codex)
       effort="$(role_contract_field "$role" effort)" || return 1
-      ( timeout --kill-after=10s 30s \
-          codex -a never -m "$model" -c model_reasoning_effort="$effort" \
-            exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json - \
-          <<< "ping" 1> "$probe_out" 2> "$probe_err" &
-        tpid=$!
-        wait "$tpid"; trc=$?
-        kill -KILL -- "-$tpid" 2>/dev/null
-        exit "$trc"
-      )
+      _launch_vendor_subprocess "" 10s 30s "$probe_out" "$probe_err" \
+        -- \
+        codex -a never -m "$model" -c model_reasoning_effort="$effort" \
+          exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json - \
+        <<< "ping"
       rc=$?
       ;;
     *) return 1 ;;
@@ -2342,20 +2395,9 @@ _vendor_headroom_probe() {
 
 # The single registry-driven launch point. Rejects an unknown vendor BEFORE
 # any subprocess launches (a PRELAUNCH_FAILED-shaped defect, never a vendor
-# outage). Applies the registry timeout with `timeout --kill-after`.
-#
-# This host's `timeout` (uutils coreutils) leaves a grandchild the monitored
-# process itself forked alive after a --kill-after escalation, even though all
-# three processes share one process group -- confirmed empirically on this
-# host, not assumed from either implementation's docs. GNU coreutils' own
-# `cleanup()` signals the whole group, so this gap may not reproduce there;
-# the sweep below is unconditional defense-in-depth regardless of which
-# `timeout` is on PATH, and is a harmless no-op when nothing survives. Each
-# branch backgrounds `timeout` itself, `wait`s for it, and then sends exactly
-# one SIGKILL to the whole group by negative PID as a post-mortem sweep --
-# never STOP/CONT/TERM, and never while the wrapper is still live: this fires
-# strictly AFTER `wait` returns, so it can never be mistaken for extending a
-# live deadline.
+# outage). Applies the registry timeout with `timeout --kill-after`, via the
+# SAME `_launch_vendor_subprocess` helper the headroom probe above uses --
+# see its own comment for the --kill-after process-group dance this reuses.
 invoke_vendor() {
   # Usage: invoke_vendor <role> <prompt_file> <stdout_path> <stderr_path>
   # EXTRA_VENDOR_ARGS (optional, ambient, claude-only): a bash array the
@@ -2451,43 +2493,31 @@ invoke_vendor() {
   # function's own shell or its caller, so it cannot mask that defect class.
   case "$vendor" in
     claude)
-      ( cd "$REPO_ROOT" || { echo "INVOKE_VENDOR_BAD_REPO_ROOT:$REPO_ROOT" >&2; exit 96; }
+      _launch_vendor_subprocess "$REPO_ROOT" "$grace" "$deadline" "$out" "$err" \
         DISPATCH_ID="${DISPATCH_ID:-}" LOGICAL_DISPATCH_ID="${LOGICAL_DISPATCH_ID:-}" \
         ATTEMPT="${ATTEMPT:-}" STATUS_PATH="${STATUS_PATH:-}" REPO_ROOT="${REPO_ROOT:-}" \
-        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 \
-          timeout --kill-after="$grace" "$deadline" \
-          claude --model "$model" -p --output-format=json \
-                 --dangerously-skip-permissions \
-                 ${EXTRA_VENDOR_ARGS[@]+"${EXTRA_VENDOR_ARGS[@]}"} - \
-          < "$prompt_file" 1> "$out" 2> "$err" &
-        tpid=$!
-        wait "$tpid"; trc=$?
-        kill -KILL -- "-$tpid" 2>/dev/null
-        exit "$trc"
-      )
+        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 -- \
+        claude --model "$model" -p --output-format=json \
+               --dangerously-skip-permissions \
+               ${EXTRA_VENDOR_ARGS[@]+"${EXTRA_VENDOR_ARGS[@]}"} - \
+        < "$prompt_file"
       rc=$?
       ;;
     codex)
       local effort add_dir=()
       effort="$(role_contract_field "$role" effort)" || return 96
       [ -n "${FEATURE_FOLDER_OUTSIDE_REPO:-}" ] && add_dir=(--add-dir "$FEATURE_FOLDER")
-      # shellcheck disable=SC2097,SC2098  # intentional: REPO_ROOT already
-      # holds this value in the outer shell too, so `-C "$REPO_ROOT"` below
-      # resolves identically either way; the prefix only additionally exports
-      # it into the forked vendor subprocess's own environment (for the fake
-      # CLI's FAKE_MUTATION side effect -- see tests/fakebin/codex).
-      ( DISPATCH_ID="${DISPATCH_ID:-}" LOGICAL_DISPATCH_ID="${LOGICAL_DISPATCH_ID:-}" \
-        ATTEMPT="${ATTEMPT:-}" STATUS_PATH="${STATUS_PATH:-}" REPO_ROOT="${REPO_ROOT:-}" \
-          timeout --kill-after="$grace" "$deadline" \
-          codex -a never -m "$model" -c model_reasoning_effort="$effort" \
-            exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json \
-            ${add_dir[@]+"${add_dir[@]}"} - \
-            < "$prompt_file" 1> "$out" 2> "$err" &
-        tpid=$!
-        wait "$tpid"; trc=$?
-        kill -KILL -- "-$tpid" 2>/dev/null
-        exit "$trc"
-      )
+      # REPO_ROOT is passed through as an exported NAME=VALUE below purely for
+      # the forked vendor subprocess's own environment (the fake CLI's
+      # FAKE_MUTATION side effect -- see tests/fakebin/codex); `-C "$REPO_ROOT"`
+      # in the command itself resolves identically either way.
+      _launch_vendor_subprocess "" "$grace" "$deadline" "$out" "$err" \
+        DISPATCH_ID="${DISPATCH_ID:-}" LOGICAL_DISPATCH_ID="${LOGICAL_DISPATCH_ID:-}" \
+        ATTEMPT="${ATTEMPT:-}" STATUS_PATH="${STATUS_PATH:-}" REPO_ROOT="${REPO_ROOT:-}" -- \
+        codex -a never -m "$model" -c model_reasoning_effort="$effort" \
+          exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json \
+          ${add_dir[@]+"${add_dir[@]}"} - \
+        < "$prompt_file"
       rc=$?
       ;;
   esac
@@ -4914,23 +4944,61 @@ reconcile_propositions() {
   local events; events="$(mktemp "$orch/.tmp.reconcile-events.XXXXXX")"
   _run_log_events_json > "$events" 2>/dev/null || true
 
-  # Rule 1/2: every mandatory RUN_LOG event <-> exactly one header.
-  local id t cnt
-  while IFS=$'\t' read -r id t; do
+  # Task 9 perf fix: every rule below used to spawn its own `jq` call PER
+  # matching event/header row (O(events) or O(headers) subprocesses each) --
+  # rewritten so each rule is exactly one `jq` invocation that joins the
+  # whole $events/$pending arrays itself and emits one TSV row per finding
+  # (or per row needing a bash-side decision); bash then only loops over
+  # jq's OWN output, never over source data. The one registry lookup no
+  # rule can safely move into jq (_event_proposition_required, a TSV-backed
+  # role/event-contract lookup) is done ONCE per DISTINCT event _type seen
+  # in $events -- never once per event -- and the resulting allow-list is
+  # handed into every rule's jq program as `--argjson mandatory`.
+  local -a mandatory_types=()
+  local one_type
+  while IFS= read -r one_type; do
+    [ -n "$one_type" ] || continue
+    [ "$(_event_proposition_required "$one_type")" = yes ] && mandatory_types+=("$one_type")
+  done < <(jq -r '._type' "$events" 2>/dev/null | sort -u)
+  local mandatory_json
+  mandatory_json="$(printf '%s\n' "${mandatory_types[@]+"${mandatory_types[@]}"}" | jq -R . | jq -s -c .)"
+
+  # Rule 1/2/5: every mandatory RUN_LOG event <-> exactly one header, and
+  # exactly one fulfillment record (append_proposition's own durable proof
+  # a real entry was written) -- zero fulfillments is an incomplete (stale)
+  # proposition, e.g. an EVENT_CORRECTED whose own correction was never
+  # actually written up; more than one of either is duplicate coverage.
+  local id t hc fc
+  while IFS=$'\t' read -r id t hc fc; do
     [ -n "$id" ] || continue
-    [ "$(_event_proposition_required "$t")" = yes ] || continue
-    cnt="$(jq -c --argjson id "$id" 'select(.event_id==$id and has("trigger"))' \
-      "$pending" 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "${cnt:-0}" -eq 0 ]; then
+    if [ "${hc:-0}" -eq 0 ]; then
       _audit_finding MANDATORY_EVENT_WITHOUT_HEADER \
         "mandatory RUN_LOG event=$t has no proposition header" "event_id:$id"
       rc=1
-    elif [ "$cnt" -gt 1 ]; then
+    elif [ "$hc" -gt 1 ]; then
       _audit_finding DUPLICATE_PROPOSITION_HEADER \
-        "mandatory RUN_LOG event=$t has $cnt proposition headers, expected exactly one" "event_id:$id"
+        "mandatory RUN_LOG event=$t has $hc proposition headers, expected exactly one" "event_id:$id"
       rc=1
     fi
-  done < <(jq -r '[.event_id, ._type] | @tsv' "$events" 2>/dev/null)
+    if [ "${fc:-0}" -eq 0 ]; then
+      _audit_finding PROPOSITION_NOT_FULFILLED \
+        "mandatory RUN_LOG event=$t has a pending header but no fulfilled proposition entry" "event_id:$id"
+      rc=1
+    elif [ "$fc" -gt 1 ]; then
+      _audit_finding DUPLICATE_PROPOSITION_COVERAGE \
+        "mandatory RUN_LOG event=$t was fulfilled by more than one proposition entry" "event_id:$id"
+      rc=1
+    fi
+  done < <(jq -r -s --argjson pending "$(jq -c -s '.' "$pending" 2>/dev/null || echo '[]')" \
+      --argjson mandatory "$mandatory_json" '
+    .[] as $e
+    | select($mandatory | index($e._type) != null)
+    | ($pending | map(select(.event_id == $e.event_id))) as $hdrs
+    | [$e.event_id, $e._type,
+       ([$hdrs[] | select(has("trigger"))] | length),
+       ([$hdrs[] | select(has("fulfilled_at"))] | length)]
+    | @tsv
+  ' "$events" 2>/dev/null)
 
   # Rule 3/4/6: every header names a REAL mandatory event with a matching
   # trigger -- a header whose trigger claims a launched vendor failure
@@ -4938,87 +5006,72 @@ reconcile_propositions() {
   # DISPATCH_NOT_LAUNCHED (a prelaunch defect that never launched anything)
   # is the specific mislabeling spec §21.2 names; any OTHER trigger/type
   # disagreement (e.g. a stale header left over from an EVENT_CORRECTED
-  # reclassification) is the generic mismatch case.
-  local row trig real_type
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    id="$(printf '%s' "$row" | jq -r '.event_id')"
-    trig="$(printf '%s' "$row" | jq -r '.trigger')"
-    real_type="$(jq -r --argjson id "$id" 'select(.event_id==$id) | ._type' \
-      "$events" 2>/dev/null | head -n1)"
-    if [ -z "$real_type" ]; then
-      _audit_finding PROPOSITION_HEADER_WITHOUT_EVENT \
-        "proposition header names event_id RUN_LOG never recorded" "event_id:$id"
-      rc=1; continue
-    fi
-    # The specific prelaunch-mislabeling case (checked BEFORE the generic
-    # "not mandatory" rejection below): DISPATCH_NOT_LAUNCHED is legitimately
-    # proposition_required=no, so a header naming one would otherwise be
-    # swallowed by that generic branch -- but a header that ALSO claims a
-    # launched vendor failure (ATTEMPT_FAILED) for that exact event_id is a
-    # real, distinct violation spec §21.2 names, not merely "not mandatory".
-    if [ "$trig" = ATTEMPT_FAILED ] && [ "$real_type" = DISPATCH_NOT_LAUNCHED ]; then
-      _audit_finding PRELAUNCH_MISLABELED_AS_VENDOR_FAILURE \
-        "proposition claims a launched vendor failure (ATTEMPT_FAILED) for event_id=$id, which RUN_LOG records as DISPATCH_NOT_LAUNCHED" \
-        "event_id:$id"
-      rc=1; continue
-    fi
-    if [ "$(_event_proposition_required "$real_type")" != yes ]; then
-      _audit_finding PROPOSITION_HEADER_WITHOUT_EVENT \
-        "proposition header names event_id=$id whose RUN_LOG type ($real_type) is not proposition_required" \
-        "event_id:$id"
-      rc=1; continue
-    fi
-    if [ "$trig" != "$real_type" ]; then
-      _audit_finding PROPOSITION_HEADER_TRIGGER_MISMATCH \
-        "proposition header trigger ($trig) does not match event_id=$id's own recorded type ($real_type)" \
-        "event_id:$id"
-      rc=1
-    fi
-  done < <(jq -c 'select(has("trigger"))' "$pending" 2>/dev/null)
-
-  # Rule 5 (duplicate coverage) + stale correction: every mandatory event
-  # must have EXACTLY ONE fulfillment record (append_proposition's own
-  # durable proof a real entry was written) -- zero is an incomplete
-  # (stale) proposition, e.g. an EVENT_CORRECTED whose own correction was
-  # never actually written up; more than one is duplicate coverage.
-  while IFS=$'\t' read -r id t; do
+  # reclassification) is the generic mismatch case. jq itself resolves each
+  # header's real event type (joined against $events by event_id) and
+  # picks exactly one of the four outcomes below -- the SAME branch order
+  # as the original per-row bash chain (each header contributes at most one
+  # finding), so bash only has to route the finding, never decide it.
+  local check trig real_type
+  while IFS=$'\t' read -r id check trig real_type; do
     [ -n "$id" ] || continue
-    [ "$(_event_proposition_required "$t")" = yes ] || continue
-    cnt="$(jq -c --argjson id "$id" 'select(.event_id==$id and has("fulfilled_at"))' \
-      "$pending" 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "${cnt:-0}" -eq 0 ]; then
-      _audit_finding PROPOSITION_NOT_FULFILLED \
-        "mandatory RUN_LOG event=$t has a pending header but no fulfilled proposition entry" "event_id:$id"
-      rc=1
-    elif [ "$cnt" -gt 1 ]; then
-      _audit_finding DUPLICATE_PROPOSITION_COVERAGE \
-        "mandatory RUN_LOG event=$t was fulfilled by more than one proposition entry" "event_id:$id"
-      rc=1
-    fi
-  done < <(jq -r '[.event_id, ._type] | @tsv' "$events" 2>/dev/null)
+    case "$check" in
+      PROPOSITION_HEADER_WITHOUT_EVENT)
+        if [ -z "$real_type" ]; then
+          _audit_finding PROPOSITION_HEADER_WITHOUT_EVENT \
+            "proposition header names event_id RUN_LOG never recorded" "event_id:$id"
+        else
+          _audit_finding PROPOSITION_HEADER_WITHOUT_EVENT \
+            "proposition header names event_id=$id whose RUN_LOG type ($real_type) is not proposition_required" \
+            "event_id:$id"
+        fi
+        rc=1 ;;
+      PRELAUNCH_MISLABELED_AS_VENDOR_FAILURE)
+        _audit_finding PRELAUNCH_MISLABELED_AS_VENDOR_FAILURE \
+          "proposition claims a launched vendor failure (ATTEMPT_FAILED) for event_id=$id, which RUN_LOG records as DISPATCH_NOT_LAUNCHED" \
+          "event_id:$id"
+        rc=1 ;;
+      PROPOSITION_HEADER_TRIGGER_MISMATCH)
+        _audit_finding PROPOSITION_HEADER_TRIGGER_MISMATCH \
+          "proposition header trigger ($trig) does not match event_id=$id's own recorded type ($real_type)" \
+          "event_id:$id"
+        rc=1 ;;
+    esac
+  done < <(jq -r -s --slurpfile events "$events" --argjson mandatory "$mandatory_json" '
+    .[] | select(has("trigger")) as $h
+    | ($events | map(select(.event_id == $h.event_id)) | .[0]._type // "") as $real_type
+    | if ($real_type == "") then
+        [$h.event_id, "PROPOSITION_HEADER_WITHOUT_EVENT", $h.trigger, $real_type]
+      elif ($h.trigger == "ATTEMPT_FAILED" and $real_type == "DISPATCH_NOT_LAUNCHED") then
+        [$h.event_id, "PRELAUNCH_MISLABELED_AS_VENDOR_FAILURE", $h.trigger, $real_type]
+      elif ($mandatory | index($real_type) == null) then
+        [$h.event_id, "PROPOSITION_HEADER_WITHOUT_EVENT", $h.trigger, $real_type]
+      elif ($h.trigger != $real_type) then
+        [$h.event_id, "PROPOSITION_HEADER_TRIGGER_MISMATCH", $h.trigger, $real_type]
+      else empty
+      end
+    | @tsv
+  ' "$pending" 2>/dev/null)
 
   # Rule 7: a retry/continuation attempt (dispatch_id's own attempt suffix
   # >= 2) must have a causal RECOVERY_AUTHORIZED for the SAME logical
   # dispatch, recorded strictly BEFORE the retry's own DISPATCH_STARTED
   # event_id -- never merely present somewhere in the run.
-  local sid did logi attn auth_hit
+  local sid did logi
   while IFS=$'\t' read -r sid did logi; do
     [ -n "$sid" ] || continue
-    attn="$(printf '%s' "$did" | "$GREP_BIN" -oE -- '-a[0-9]{2}$' | tr -d 'a-')"
-    [ -n "$attn" ] || continue
-    [ "$((10#$attn))" -ge 2 ] || continue
-    auth_hit="$(jq -r --arg logi "$logi" --argjson sid "$sid" \
-      'select(._type=="RECOVERY_AUTHORIZED" and .logical_dispatch_id==$logi and (.event_id < $sid)) | .event_id' \
-      "$events" 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "${auth_hit:-0}" -eq 0 ]; then
-      _audit_finding RETRY_WITHOUT_RECOVERY_AUTHORIZED \
-        "dispatch_id=$did is a continuation attempt with no causal RECOVERY_AUTHORIZED for logical_dispatch_id=$logi" \
-        "event_id:$sid" "dispatch_id:$did"
-      rc=1
-    fi
-  done < <(jq -r 'select(._type=="DISPATCH_STARTED") | [.event_id, .dispatch_id, .logical_dispatch_id] | @tsv' \
-    "$events" 2>/dev/null)
+    _audit_finding RETRY_WITHOUT_RECOVERY_AUTHORIZED \
+      "dispatch_id=$did is a continuation attempt with no causal RECOVERY_AUTHORIZED for logical_dispatch_id=$logi" \
+      "event_id:$sid" "dispatch_id:$did"
+    rc=1
+  done < <(jq -r -s '
+    (map(select(._type=="RECOVERY_AUTHORIZED"))) as $auths
+    | .[] | select(._type=="DISPATCH_STARTED") as $s
+    | ($s.dispatch_id | capture("-a(?<n>[0-9]{2})$").n) as $attn
+    | select(($attn|tonumber) >= 2)
+    | select([$auths[] | select(.logical_dispatch_id == $s.logical_dispatch_id and .event_id < $s.event_id)] | length == 0)
+    | [$s.event_id, $s.dispatch_id, $s.logical_dispatch_id]
+    | @tsv
+  ' "$events" 2>/dev/null)
 
   # §21.2 case 6: "an event correction not reflected in the final
   # classification" -- EVENT_CORRECTED.replacement_classification must
@@ -5034,26 +5087,17 @@ reconcile_propositions() {
   # never trigger -- corrections reclassifying to either are skipped here
   # (a correction that drastic needs human review, not automated
   # recomputation), never silently mis-evaluated as some OTHER action.
-  local ec_row cid xid rclass xdid xlogical xmut raction later_cnt
-  while IFS= read -r ec_row; do
-    [ -n "$ec_row" ] || continue
-    cid="$(printf '%s' "$ec_row" | jq -r '.event_id')"
-    xid="$(printf '%s' "$ec_row" | jq -r '.corrected_event_id')"
-    rclass="$(printf '%s' "$ec_row" | jq -r '.replacement_classification')"
-    # A finding-scoped correction (corrected_event_id="finding:<id>", spec
-    # §17.2 -- ingest_findings' own collision path) has no attempt
-    # classification to reconcile against at all.
-    case "$xid" in finding:*) continue ;; esac
-    case "$rclass" in PRELAUNCH_FAILED|SPEND_CEILING) continue ;; esac
-    xdid="$(jq -r --argjson id "$xid" 'select(.event_id==$id) | .dispatch_id // empty'       "$events" 2>/dev/null | head -n1)"
-    [ -n "$xdid" ] || continue
-    xmut="$(jq -r --arg d "$xdid"       'select(._type=="DISPATCH_COMPLETED" and .dispatch_id==$d) | .mutation_state // empty'       "$events" 2>/dev/null | head -n1)"
-    [ -n "$xmut" ] || continue
-    xlogical="${xdid%-a[0-9][0-9]}"
+  # recovery_action is real bash business logic (a state matrix), not a jq
+  # expression -- it stays a per-record call below -- but every OTHER field
+  # this rule needs (the corrected dispatch's own id/mutation_state/logical
+  # id, and whether a later DISPATCH_STARTED exists) is resolved by ONE jq
+  # join first, so nothing here spawns jq per correction any more.
+  local cid xid rclass xmut xlogical later_cnt raction
+  while IFS=$'\t' read -r cid xid rclass xmut xlogical later_cnt; do
+    [ -n "$cid" ] || continue
     recovery_action "$rclass" "$xmut" "$xlogical" >/dev/null 2>&1
     raction="$RECOVERY_ACTION"
     [ -n "$raction" ] || continue
-    later_cnt="$(jq -r --arg logi "$xlogical" --argjson cid "$cid"       'select(._type=="DISPATCH_STARTED" and .logical_dispatch_id==$logi and (.event_id > $cid)) | .event_id'       "$events" 2>/dev/null | wc -l | tr -d ' ')"
     case "$raction" in
       CONTINUE_WITHIN_CAP|TRANSIENT_RETRY|RETRY_PUBLICATION|CORRECT_AND_RETRY| \
       RECONCILE_THEN_CONTINUE_IF_ISOLATED|RECONCILE_THEN_CONTINUE_IF_SAFE)
@@ -5075,28 +5119,47 @@ reconcile_propositions() {
         fi
         ;;
     esac
-  done < <(jq -c 'select(._type=="EVENT_CORRECTED")' "$events" 2>/dev/null)
+  done < <(jq -r -s '
+    (map(select(._type=="DISPATCH_COMPLETED"))) as $completed
+    | . as $all
+    | .[] | select(._type=="EVENT_CORRECTED") as $ec
+    | ($ec.corrected_event_id) as $xid_raw
+    | select(($xid_raw | startswith("finding:")) | not)
+    | ($ec.replacement_classification) as $rclass
+    | select(($rclass == "PRELAUNCH_FAILED" or $rclass == "SPEND_CEILING") | not)
+    | ($xid_raw | tonumber) as $xid
+    | ([$all[] | select(.event_id == $xid) | .dispatch_id // empty] | first // empty) as $xdid
+    | select($xdid != "")
+    | ([$completed[] | select(.dispatch_id == $xdid) | .mutation_state // empty] | first // empty) as $xmut
+    | select($xmut != "")
+    | ($xdid | sub("-a[0-9][0-9]$"; "")) as $xlogical
+    | ([$all[] | select(._type=="DISPATCH_STARTED" and .logical_dispatch_id==$xlogical and .event_id > $ec.event_id)] | length) as $later_cnt
+    | [$ec.event_id, $xid, $rclass, $xmut, $xlogical, $later_cnt]
+    | @tsv
+  ' "$events" 2>/dev/null)
 
   # Rule 8: exactly one completion block (DISPATCH_COMPLETED or
   # DISPATCH_NOT_LAUNCHED) per dispatch id that ever started.
-  local started_ids d_id
-  started_ids="$(jq -r 'select(._type=="DISPATCH_STARTED" and .dispatch_id!="") | .dispatch_id' \
-    "$events" 2>/dev/null | sort -u)"
-  while IFS= read -r d_id; do
+  local d_id cnt
+  while IFS=$'\t' read -r d_id cnt; do
     [ -n "$d_id" ] || continue
-    cnt="$(jq -r --arg d "$d_id" \
-      'select((._type=="DISPATCH_COMPLETED" or ._type=="DISPATCH_NOT_LAUNCHED") and .dispatch_id==$d) | .event_id' \
-      "$events" 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "${cnt:-0}" -eq 0 ]; then
+    if [ "$cnt" -eq 0 ]; then
       _audit_finding DISPATCH_COMPLETION_MISSING \
         "dispatch_id=$d_id started but has no completion record" "dispatch_id:$d_id"
-      rc=1
-    elif [ "$cnt" -gt 1 ]; then
+    else
       _audit_finding DISPATCH_COMPLETION_DUPLICATE \
         "dispatch_id=$d_id has $cnt completion records, expected exactly one" "dispatch_id:$d_id"
-      rc=1
     fi
-  done <<<"$started_ids"
+    rc=1
+  done < <(jq -r -s '
+    (map(select(._type=="DISPATCH_STARTED" and .dispatch_id != "") | .dispatch_id) | unique) as $started
+    | (map(select(._type=="DISPATCH_COMPLETED" or ._type=="DISPATCH_NOT_LAUNCHED"))) as $completions
+    | $started[] as $d
+    | ([$completions[] | select(.dispatch_id == $d)] | length) as $cnt
+    | select($cnt != 1)
+    | [$d, $cnt]
+    | @tsv
+  ' "$events" 2>/dev/null)
 
   rm -f "$events"
   return "$rc"
@@ -5130,21 +5193,22 @@ audit_run_state() {
   # event_ids (MINOR fix, Task 15 round 2): "count:N" alone named neither
   # the sha values nor which dispatches disagreed -- Step 5 requires the
   # conflicting record IDs, not just a tally.
-  local sha_count distinct_shas one_sha conflict_ids
+  # Task 9 perf fix: the conflict set is every DISPATCH_COMPLETED with a
+  # non-empty sha (that is exactly what the old per-distinct-sha loop's
+  # union worked out to, one jq spawn per distinct value) -- one jq call
+  # gets there directly.
+  local sha_count distinct_shas cid
+  local -a conflict_ids
   distinct_shas="$(jq -r 'select(._type=="DISPATCH_COMPLETED") | .develop_it_file_sha256 // empty' \
     "$events" 2>/dev/null | sed '/^$/d' | sort -u)"
   sha_count="$(printf '%s\n' "$distinct_shas" | sed '/^$/d' | wc -l | tr -d ' ')"
   if [ "${sha_count:-0}" -gt 1 ]; then
     conflict_ids=()
-    while IFS= read -r one_sha; do
-      [ -n "$one_sha" ] || continue
-      while IFS= read -r cid; do
-        [ -n "$cid" ] || continue
-        conflict_ids+=("event_id:$cid")
-      done < <(jq -r --arg sha "$one_sha" \
-        'select(._type=="DISPATCH_COMPLETED" and .develop_it_file_sha256==$sha) | .event_id' \
-        "$events" 2>/dev/null)
-    done <<<"$distinct_shas"
+    while IFS= read -r cid; do
+      [ -n "$cid" ] || continue
+      conflict_ids+=("event_id:$cid")
+    done < <(jq -r 'select(._type=="DISPATCH_COMPLETED" and (.develop_it_file_sha256 // "") != "") | .event_id' \
+      "$events" 2>/dev/null)
     _audit_finding PROCESS_IDENTITY_MISMATCH \
       "more than one develop_it_file_sha256 recorded across this run's dispatches ($sha_count distinct values)" \
       "${conflict_ids[@]}"
@@ -5218,13 +5282,15 @@ audit_run_state() {
   # mutating attempt whose own declared snapshot manifest vanished, is
   # exactly the kind of "RUN_LOG says X exists, the filesystem disagrees"
   # split this clause exists to catch.
-  local cp_row cp_id cp_kind cp_status cp_dir cp_path
-  while IFS= read -r cp_row; do
-    [ -n "$cp_row" ] || continue
-    cp_id="$(printf '%s' "$cp_row" | jq -r '.event_id')"
-    cp_kind="$(printf '%s' "$cp_row" | jq -r '.checkpoint_kind // empty')"
+  # Task 9 perf fix: field extraction (event_id/checkpoint_kind/status_path)
+  # is now ONE upstream jq pass emitting TSV rows -- the per-row `jq empty
+  # "$cp_path"` call that follows is irreducible (it validates the actual
+  # progress.jsonl FILE's own bytes, external to $events, one real file per
+  # checkpointed dispatch), not the events x rules pattern this task targets.
+  local cp_id cp_kind cp_status cp_dir cp_path
+  while IFS=$'\t' read -r cp_id cp_kind cp_status; do
+    [ -n "$cp_id" ] || continue
     case "$cp_kind" in ""|none) continue ;; esac
-    cp_status="$(printf '%s' "$cp_row" | jq -r '.status_path // empty')"
     [ -n "$cp_status" ] || continue
     cp_dir="$(dirname "$cp_status")"
     cp_path="$cp_dir/progress.jsonl"
@@ -5239,13 +5305,12 @@ audit_run_state() {
         "event_id:$cp_id"
       rc=1
     fi
-  done < <(jq -c 'select(._type=="DISPATCH_COMPLETED")' "$events" 2>/dev/null)
+  done < <(jq -r 'select(._type=="DISPATCH_COMPLETED") |
+    [.event_id, (.checkpoint_kind // ""), (.status_path // "")] | @tsv' "$events" 2>/dev/null)
 
-  local snap_row snap_id snap_path
-  while IFS= read -r snap_row; do
-    [ -n "$snap_row" ] || continue
-    snap_id="$(printf '%s' "$snap_row" | jq -r '.event_id')"
-    snap_path="$(printf '%s' "$snap_row" | jq -r '.snapshot // empty')"
+  local snap_id snap_path
+  while IFS=$'\t' read -r snap_id snap_path; do
+    [ -n "$snap_id" ] || continue
     case "$snap_path" in ""|none) continue ;; esac
     [ -f "$snap_path" ] || {
       _audit_finding SNAPSHOT_MISSING \
@@ -5253,7 +5318,8 @@ audit_run_state() {
         "event_id:$snap_id"
       rc=1
     }
-  done < <(jq -c 'select(._type=="DISPATCH_STARTED")' "$events" 2>/dev/null)
+  done < <(jq -r 'select(._type=="DISPATCH_STARTED") |
+    [.event_id, (.snapshot // "")] | @tsv' "$events" 2>/dev/null)
 
   # Every explicit PHASE_ACCEPTED decision's own artifact_revision matches
   # the STATUS the accepted dispatch actually published. This is the ONE
@@ -5264,16 +5330,13 @@ audit_run_state() {
   # explicitly. status_path is read straight off the accepted dispatch's
   # OWN durable DISPATCH_COMPLETED event -- never re-derived from a role
   # name this event does not carry.
-  local pa_row pid pdid parev stat_path stat_rev
-  while IFS= read -r pa_row; do
-    [ -n "$pa_row" ] || continue
-    pid="$(printf '%s' "$pa_row" | jq -r '.event_id')"
-    pdid="$(printf '%s' "$pa_row" | jq -r '.dispatch_id // empty')"
-    parev="$(printf '%s' "$pa_row" | jq -r '.artifact_revision // empty')"
-    [ -n "$pdid" ] && [ -n "$parev" ] || continue
-    stat_path="$(jq -r --arg d "$pdid" \
-      'select(._type=="DISPATCH_COMPLETED" and .dispatch_id==$d) | .status_path // empty' \
-      "$events" 2>/dev/null | head -n1)"
+  # Task 9 perf fix: the per-row extraction AND the status_path cross-
+  # reference (originally its own jq spawn per PHASE_ACCEPTED row) are now
+  # one upstream jq join over $events; only `status_field` (a real STATUS-
+  # file parse, external to $events) remains per row.
+  local pid pdid parev stat_path stat_rev
+  while IFS=$'\t' read -r pid pdid parev stat_path; do
+    [ -n "$pid" ] || continue
     # spec §20.11's "every accepted output EXISTS" leg (MAJOR fix, Task 15
     # round 2): a missing status_path field or a status_path whose file was
     # deleted/never written is itself the violation -- silently `continue`-
@@ -5292,7 +5355,16 @@ audit_run_state() {
         "event_id:$pid" "dispatch_id:$pdid"
       rc=1
     fi
-  done < <(jq -c 'select(._type=="PHASE_ACCEPTED")' "$events" 2>/dev/null)
+  done < <(jq -r -s '
+    (map(select(._type=="DISPATCH_COMPLETED"))) as $completed
+    | .[] | select(._type=="PHASE_ACCEPTED") as $pa
+    | ($pa.dispatch_id // "") as $pdid
+    | ($pa.artifact_revision // "") as $parev
+    | select($pdid != "" and $parev != "")
+    | ([$completed[] | select(.dispatch_id == $pdid) | .status_path // ""] | first // "") as $stat_path
+    | [$pa.event_id, $pdid, $parev, $stat_path]
+    | @tsv
+  ' "$events" 2>/dev/null)
 
   # Review caps respected (spec §20.11), as its OWN check (code review fix,
   # Task 15 round 2): the BLOCKING_FINDING_UNRESOLVED scan below only
@@ -5304,20 +5376,26 @@ audit_run_state() {
   # HALT (the gate stopped instead of silently continuing) -- one of the
   # two is the durable trail spec §18.2's "no unreviewed final fix, no
   # silent cap bypass" discipline requires.
-  local cap_row cap_id cap_phase override_cnt halt_cnt
-  while IFS= read -r cap_row; do
-    [ -n "$cap_row" ] || continue
-    cap_id="$(printf '%s' "$cap_row" | jq -r '.event_id')"
-    cap_phase="$(printf '%s' "$cap_row" | jq -r '.phase_name // empty')"
-    override_cnt="$(jq -r --arg p "$cap_phase" --argjson id "$cap_id"       'select(._type=="ITERATION_CAP_OVERRIDE" and .phase_name==$p and (.event_id > $id)) | .event_id'       "$events" 2>/dev/null | wc -l | tr -d ' ')"
-    halt_cnt="$(jq -r --argjson id "$cap_id"       'select(._type=="HALT" and (.event_id > $id)) | .event_id'       "$events" 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "${override_cnt:-0}" -eq 0 ] && [ "${halt_cnt:-0}" -eq 0 ]; then
-      _audit_finding REVIEW_CAP_NOT_RESPECTED \
-        "event_id=$cap_id reached the review_iteration_cap for phase_name=$cap_phase with neither a later ITERATION_CAP_OVERRIDE nor a later HALT" \
-        "event_id:$cap_id"
-      rc=1
-    fi
-  done < <(jq -c 'select(._type=="ITERATION_CAP_REACHED")' "$events" 2>/dev/null)
+  # Task 9 perf fix: one jq pass computes both later-override/later-HALT
+  # counts per ITERATION_CAP_REACHED event (previously two jq spawns PER
+  # row) and emits only the rows that actually violate the rule.
+  local cap_id cap_phase
+  while IFS=$'\t' read -r cap_id cap_phase; do
+    [ -n "$cap_id" ] || continue
+    _audit_finding REVIEW_CAP_NOT_RESPECTED \
+      "event_id=$cap_id reached the review_iteration_cap for phase_name=$cap_phase with neither a later ITERATION_CAP_OVERRIDE nor a later HALT" \
+      "event_id:$cap_id"
+    rc=1
+  done < <(jq -r -s '
+    . as $all
+    | .[] | select(._type=="ITERATION_CAP_REACHED") as $cap
+    | ($cap.phase_name // "") as $phase
+    | ([$all[] | select(._type=="ITERATION_CAP_OVERRIDE" and .phase_name==$phase and .event_id > $cap.event_id)] | length) as $ov
+    | ([$all[] | select(._type=="HALT" and .event_id > $cap.event_id)] | length) as $ha
+    | select($ov == 0 and $ha == 0)
+    | [$cap.event_id, $phase]
+    | @tsv
+  ' "$events" 2>/dev/null)
 
   # Blocking findings resolved by a later review -- the LAST iteration
   # directory of each review gate.
@@ -5629,6 +5707,27 @@ _write_lease_recovery_state() {
 # capture: they are never "foreign", they are this process's own
 # bookkeeping.
 #
+# _is_orchestration_bookkeeping_path is the shared predicate for that
+# allow-list, reused verbatim by checkpoint_partial_isolated below --
+# _mutation_dirty's own copy is deliberately left as its own local closure
+# (see its comment): refactoring it carries real regression risk for a
+# property this pair is the only other consumer of.
+_is_orchestration_bookkeeping_path() {
+  # Usage: _is_orchestration_bookkeeping_path PATH FF_REL ORCH_REL
+  local path="$1" ff_rel="$2" orch_rel="$3"
+  case "$path" in
+    "$ff_rel/RUN_LOG.md"|"$ff_rel/full_log.md") return 0 ;;
+    # Task 15 round 2 fix: record_event's auto-fulfilled proposition ledger
+    # is never a role's own mutation -- same orchestrator-bookkeeping
+    # exclusion _mutation_dirty's own copy needs.
+    "$ff_rel/process-improvement-proposition.md") return 0 ;;
+    "$orch_rel"|"$orch_rel"/*) return 0 ;;
+    "$ff_rel/transcripts"|"$ff_rel/transcripts"/*) return 0 ;;
+    "$ff_rel"/*/attempts/*) return 0 ;;
+  esac
+  return 1
+}
+
 # Usage: _write_lease_foreign_paths_now DISPATCH_ID
 _write_lease_foreign_paths_now() {
   local dispatch_id="${1:-}" attempt_num logical carry_file
@@ -5649,16 +5748,7 @@ _write_lease_foreign_paths_now() {
   local entry status path out=()
   while IFS= read -r -d '' entry; do
     status="${entry:0:2}"; path="${entry:3}"
-    case "$path" in
-      "$ff_rel/RUN_LOG.md"|"$ff_rel/full_log.md") continue ;;
-      # Task 15 round 2 fix: same orchestrator-bookkeeping exclusion as
-      # _mutation_dirty/checkpoint_partial_isolated -- never declare
-      # record_event's own auto-fulfilled proposition ledger as foreign dirt.
-      "$ff_rel/process-improvement-proposition.md") continue ;;
-      "$orch_rel"|"$orch_rel"/*) continue ;;
-      "$ff_rel/transcripts"|"$ff_rel/transcripts"/*) continue ;;
-      "$ff_rel"/*/attempts/*) continue ;;
-    esac
+    _is_orchestration_bookkeeping_path "$path" "$ff_rel" "$orch_rel" && continue
     out+=("$path")
     case "$status" in R*|C*) IFS= read -r -d '' _ || true ;; esac
   done < <(git -C "${REPO_ROOT:-}" status --porcelain=v1 --untracked-files=all -z 2>/dev/null)
@@ -6096,6 +6186,30 @@ the durable mirror path (`x_sdd_durable_path`) as `x_`-namespaced fields.
 # per-file lock, reusing the existing `ln` primitive rather than inventing
 # a second one.
 #
+# Task 9 performance fix: a full `checkpoint_resume_state` re-scan on EVERY
+# append is O(n) per call (a `git cat-file`/`git merge-base` per commit-
+# bearing record, a `sha256sum` per artifact record) -- O(n^2) subprocess
+# spawns by the end of an n-record run. `PROGRESS_PATH.cursor` is a sidecar
+# written after every successful append recording {dispatch_id, byte_offset,
+# sha256} for the file AS OF that append. On the next append, trust it ONLY
+# when: the cursor's own dispatch_id matches this call's, the file's CURRENT
+# size equals the recorded byte_offset exactly, AND the file's CURRENT
+# sha256 equals the recorded one -- i.e. the file is byte-for-byte what it
+# was the instant we last fully validated it (checkpoint_append is the SOLE
+# writer of this file, so "unchanged bytes" means "still exactly as valid as
+# it was"). That is the entire integrity signal: two O(1)-subprocess checks
+# (`wc -c`, one `sha256sum`) standing in for the O(n) re-validation. The
+# cursor's own numeric fields are never trusted directly for "what is the
+# last sequence" -- that is always re-read fresh off the file's OWN trailing
+# record once the hash check passes, so a cursor whose sha256/byte_offset
+# happen to still match but whose OTHER fields were hand-edited can't lie
+# about the sequence. ANY mismatch (missing cursor, wrong dispatch_id, size
+# mismatch, hash mismatch, an unparseable cursor, an unparseable trailing
+# record) drops straight through to the original full-scan path below --
+# never a partial trust, never a best-effort guess. Resume-time validation
+# (`checkpoint_resume_state`, called directly by recovery/reconstruction
+# code) is untouched by any of this and always re-scans the whole file.
+#
 # Usage: checkpoint_append PROGRESS_PATH DISPATCH_ID ROLE KEY=VALUE...
 # Required KEY=VALUE fields: sequence, unit_type, unit_id, state,
 # artifact_path, artifact_sha256, commit_sha, verification, next_unit.
@@ -6124,25 +6238,55 @@ checkpoint_append() {
   _run_log_lock_acquire "$lockfile" || return 1
   local last=0
   if [ -f "$progress_path" ]; then
-    # Run checkpoint_resume_state inside a SUBSHELL (command substitution),
-    # not directly: it sets the CHECKPOINT_* globals, and this is only an
-    # INTERNAL lookup of "what sequence/state is this file at", not the
-    # caller's own resume-state call -- calling it directly would clobber
-    # whatever a caller (e.g. recovery_action, just before deciding to
-    # continue) already had in those same globals (code review fix: latent
-    # today since every real call site is a role subprocess with nothing
-    # else reading them, but real the moment an orchestrator-side caller
-    # runs both in one shell). A subshell's own variable assignments never
-    # escape it, so this reads the two values it needs off stdout instead.
-    local _resume_line _resume_state _resume_seq _resume_reason
-    _resume_line="$(checkpoint_resume_state "$progress_path" "$dispatch_id"       && printf '%s	%s	%s' "$CHECKPOINT_STATE" "$CHECKPOINT_LAST_SEQUENCE" "$CHECKPOINT_BAD_REASON")"
-    IFS=$'	' read -r _resume_state _resume_seq _resume_reason <<<"$_resume_line"
-    if [ "$_resume_state" = NEEDS_RECONCILIATION ]; then
-      _run_log_lock_release "$lockfile"
-      echo "CHECKPOINT_APPEND_NEEDS_RECONCILIATION:$_resume_reason" >&2
-      return 1
+    local cursor_path="$progress_path.cursor" cursor_trusted=0
+    if [ -f "$cursor_path" ]; then
+      local cur_dispatch cur_offset cur_stored_sha cur_size
+      cur_dispatch="$(jq -r '.dispatch_id // empty' "$cursor_path" 2>/dev/null)"
+      cur_offset="$(jq -r '.byte_offset // empty' "$cursor_path" 2>/dev/null)"
+      cur_stored_sha="$(jq -r '.sha256 // empty' "$cursor_path" 2>/dev/null)"
+      cur_size="$(wc -c < "$progress_path" 2>/dev/null | tr -d ' ')"
+      if [ "$cur_dispatch" = "$dispatch_id" ] && [ -n "$cur_offset" ] \
+         && [ "$cur_offset" = "$cur_size" ] && [ -n "$cur_stored_sha" ]; then
+        local cur_real_sha
+        cur_real_sha="$(sha256sum "$progress_path" 2>/dev/null | cut -d' ' -f1)"
+        [ -n "$cur_real_sha" ] && [ "$cur_real_sha" = "$cur_stored_sha" ] && cursor_trusted=1
+      fi
     fi
-    last="${_resume_seq:-0}"
+    if [ "$cursor_trusted" -eq 1 ]; then
+      # The cursor's own hash checked out: the file is byte-identical to the
+      # instant it was last fully validated (VALID by construction -- see
+      # comment above), so it's still VALID now. The last sequence is still
+      # re-derived fresh from the file's OWN trailing record, never trusted
+      # off the cursor's own (separately editable) fields.
+      local _cur_last_line _cur_last_seq
+      _cur_last_line="$(tail -n 1 "$progress_path" 2>/dev/null)"
+      _cur_last_seq="$(printf '%s' "$_cur_last_line" | jq -r '.sequence // empty' 2>/dev/null)"
+      case "$_cur_last_seq" in
+        ''|*[!0-9]*) cursor_trusted=0 ;;
+        *) last="$_cur_last_seq" ;;
+      esac
+    fi
+    if [ "$cursor_trusted" -ne 1 ]; then
+      # Run checkpoint_resume_state inside a SUBSHELL (command substitution),
+      # not directly: it sets the CHECKPOINT_* globals, and this is only an
+      # INTERNAL lookup of "what sequence/state is this file at", not the
+      # caller's own resume-state call -- calling it directly would clobber
+      # whatever a caller (e.g. recovery_action, just before deciding to
+      # continue) already had in those same globals (code review fix: latent
+      # today since every real call site is a role subprocess with nothing
+      # else reading them, but real the moment an orchestrator-side caller
+      # runs both in one shell). A subshell's own variable assignments never
+      # escape it, so this reads the two values it needs off stdout instead.
+      local _resume_line _resume_state _resume_seq _resume_reason
+      _resume_line="$(checkpoint_resume_state "$progress_path" "$dispatch_id"         && printf '%s	%s	%s' "$CHECKPOINT_STATE" "$CHECKPOINT_LAST_SEQUENCE" "$CHECKPOINT_BAD_REASON")"
+      IFS=$'	' read -r _resume_state _resume_seq _resume_reason <<<"$_resume_line"
+      if [ "$_resume_state" = NEEDS_RECONCILIATION ]; then
+        _run_log_lock_release "$lockfile"
+        echo "CHECKPOINT_APPEND_NEEDS_RECONCILIATION:$_resume_reason" >&2
+        return 1
+      fi
+      last="${_resume_seq:-0}"
+    fi
   fi
   if [ "${f[sequence]}" -ne $((last + 1)) ]; then
     _run_log_lock_release "$lockfile"
@@ -6175,6 +6319,20 @@ checkpoint_append() {
   fi
   printf '%s\n' "$record" >> "$progress_path"
   _bootstrap_fsync_path "$progress_path" 2>/dev/null || true
+  # Refresh the cursor unconditionally -- whether THIS call trusted a prior
+  # cursor or fell back to a full scan, the file is now freshly known-VALID,
+  # so every append self-heals the sidecar for the next one. Best-effort: a
+  # failure to write it costs a future full scan, never correctness (the
+  # trust check above fails closed on a missing/stale cursor either way).
+  local new_size new_sha
+  new_size="$(wc -c < "$progress_path" 2>/dev/null | tr -d ' ')"
+  new_sha="$(sha256sum "$progress_path" 2>/dev/null | cut -d' ' -f1)"
+  if [ -n "$new_size" ] && [ -n "$new_sha" ]; then
+    jq -cn --arg dispatch_id "$dispatch_id" --argjson byte_offset "$new_size" \
+      --arg sha256 "$new_sha" \
+      '{dispatch_id:$dispatch_id, byte_offset:$byte_offset, sha256:$sha256}' \
+      > "$progress_path.cursor" 2>/dev/null || true
+  fi
   _run_log_lock_release "$lockfile"
 }
 
@@ -6332,10 +6490,11 @@ checkpoint_resume_state() {
 # "declared foreign changes" -- `_write_lease_foreign_paths_now`'s own
 # capture, above), or the fixed orchestration-bookkeeping allow-list
 # (RUN_LOG.md/full_log.md/$ORCHESTRATION_DIR/transcripts//attempts/
-# subtrees -- the SAME paths `_mutation_dirty`, above, exempts; duplicated
-# here as four short case arms rather than extracted into a shared helper,
-# since refactoring `_mutation_dirty` itself carries real regression risk
-# for a property this is the only other caller of).
+# subtrees -- the SAME paths `_mutation_dirty`, above, exempts, via the
+# shared `_is_orchestration_bookkeeping_path` predicate `_write_lease_
+# foreign_paths_now` also uses; `_mutation_dirty`'s own copy is left as its
+# own local closure, since refactoring it carries real regression risk for
+# a property this pair is the only other consumer of).
 checkpoint_partial_isolated() {
   # Usage: checkpoint_partial_isolated [LEASE_FILE]
   local lease_file="${1:-${ORCHESTRATION_DIR:-}/write-lease.json}"
@@ -6368,17 +6527,7 @@ checkpoint_partial_isolated() {
   local entry status path f is_ok
   while IFS= read -r -d '' entry; do
     status="${entry:0:2}"; path="${entry:3}"
-    case "$path" in
-      "$ff_rel/RUN_LOG.md"|"$ff_rel/full_log.md") continue ;;
-      # Task 15 round 2 fix: the SAME orchestrator-bookkeeping exclusion
-      # _mutation_dirty's own copy of this list needed (record_event's
-      # auto-fulfilled process-improvement-proposition.md is never a role's
-      # own mutation, here either).
-      "$ff_rel/process-improvement-proposition.md") continue ;;
-      "$orch_rel"|"$orch_rel"/*) continue ;;
-      "$ff_rel/transcripts"|"$ff_rel/transcripts"/*) continue ;;
-      "$ff_rel"/*/attempts/*) continue ;;
-    esac
+    _is_orchestration_bookkeeping_path "$path" "$ff_rel" "$orch_rel" && continue
     is_ok=0
     [ -n "$own_rel" ] && [ "$path" = "$own_rel" ] && is_ok=1
     for f in "${foreign[@]}"; do [ "$f" = "$path" ] && is_ok=1 && break; done
