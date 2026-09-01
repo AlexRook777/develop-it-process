@@ -129,7 +129,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P08 — Make `divergent_round_cap` mean what it says (or say what it does)
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (9317d86)
 
 **Criticality:** Medium · **Effort:** Easy–Moderate
 
@@ -216,7 +216,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P15 — Harden verification-record semantics: typed exclusions, linked NOT_RUNs
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (9317d86)
 
 **Criticality:** Medium · **Effort:** Moderate
 
@@ -240,7 +240,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P17 — Pair every append-only ledger with a validator (followups, proposition log)
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (9317d86) — validate_proposition_log is offline/maintainer tooling: the Non-influence guarantee forbids a live Phase 11 read of the run\'s own proposition file
 
 **Criticality:** Medium · **Effort:** Easy–Moderate
 
@@ -252,7 +252,7 @@ Both probe attempts stay in `RUN_LOG.md` with raw outputs so a flake remains aud
 
 ## P18 — Mechanize the "retry within iteration" trigger classification
 
-**Status:** ⬜ pending
+**Status:** ✅ implemented (9317d86)
 
 **Criticality:** Medium · **Effort:** Moderate
 
