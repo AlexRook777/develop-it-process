@@ -3,12 +3,20 @@
 `develop-it-prompt.md` is the orchestration prompt. An orchestrating agent
 reads it and drives `claude` and `codex` CLI subprocesses through a phased
 spec -> plan -> implement -> review pipeline. **This repository — not the
-lone document — is the source of truth**, and it splits cleanly in two:
+lone document — is the source of truth**, and it splits cleanly in three:
 
-- `develop-it-prompt.md` holds everything the orchestrator reasons from —
-  the phase procedures, the role-contract/policy/event registries (as
-  Markdown tables it alone authors), the role appendices, and a compact
-  per-section FUNCTION INDEX of every shell helper it may call.
+- `develop-it-prompt.md` (the CORE, the only file passed as the system
+  prompt) holds everything the orchestrator reasons from on every turn —
+  the orchestration contract, the role-contract/policy/event registries (as
+  Markdown tables it alone authors), the shared appendix blocks, the
+  failure/recovery rules, a per-phase roadmap, and a compact per-section
+  FUNCTION INDEX of every shell helper it may call.
+- `phases/*.md` — one PACK per phase, holding that phase's normative
+  orchestration steps and the role appendices it dispatches. Packs are
+  loaded on demand: before starting phase N the orchestrator Reads that
+  phase's pack end to end (a hard rule in the core contract; a resumed
+  phase re-Reads its pack). `render_prompt` discovers appendices across
+  the core plus the packs deterministically — no role→file registry.
 - `runtime/` holds the executable logic those index entries name:
   `runtime/cookbook.sh` (every shell helper — `render_prompt`, `role_model`,
   `dirty_tree_check`, and the rest — definitions-only, directly authored and
@@ -18,11 +26,12 @@ Every phase shell `source`s `runtime/cookbook.sh`, and its
 `bootstrap_runtime` materializes a per-run copy — verbatim `runtime/` files
 plus the registries extracted from the document's tables — into
 `$FEATURE_FOLDER/.orchestration/runtime/`, covered by a `manifest.sha256`
-keyed to the whole process file set (document + `runtime/` sources), so a
-mid-run edit to any of them invalidates the run's materialized runtime
-rather than silently drifting. `./tests/run.sh` stages the same files into
-`tests/.build/` to unit-test them offline; both copies are disposable
-derivatives, never committed (see "Recovery and resume" below).
+keyed to the whole process file set (document + `runtime/` sources +
+`phases/*.md` packs), so a mid-run edit to any of them invalidates the run's
+materialized runtime rather than silently drifting. `./tests/run.sh` stages
+the same files into `tests/.build/` to unit-test them offline; both copies
+are disposable derivatives, never committed (see "Recovery and resume"
+below).
 
 ## The pipeline
 
@@ -115,9 +124,12 @@ The short version — hand `./develop-it.sh` a design file and it does the rest:
 One argument, no flags. It derives every run parameter from that path and exports
 them, runs `./tests/run.sh` as part of preparing the environment, and hands the
 terminal to an interactive Claude Code session whose system prompt is
-`develop-it-prompt.md` itself, passed verbatim. The launcher writes no prompt of
-its own — every rule, including resume-vs-fresh, the branch, and the
-codex-consent question, is the document's. See `RUNBOOK.md` §Quick start.
+`develop-it-prompt.md` itself (the core document only), passed verbatim. The
+per-phase packs under `phases/` are never part of the system prompt — the
+orchestrator Reads each one on demand at the start of its phase. The launcher
+writes no prompt of its own — every rule, including resume-vs-fresh, the
+branch, and the codex-consent question, is the document's. See `RUNBOOK.md`
+§Quick start.
 
 The long version, and what the launcher is doing under the hood:
 

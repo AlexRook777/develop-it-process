@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Extract registries/snippets from the process doc; stage the runtime files.
+"""Extract registries/snippets from the process document set (the core doc
+plus the phases/*.md packs — registries live in the core only); stage the
+runtime files.
 
 Block classification: a fenced ```bash or ```python block is classified by the
 nearest preceding HTML comment of the form <!-- lint: snippet --> (the only
@@ -49,42 +51,52 @@ def _dedent(line, indent):
     return line
 
 
+def doc_files():
+    """The process document SET (Task 12 / P00 stage 2): the core document
+    first, then every sibling phases/*.md pack in sorted order."""
+    packs = sorted((DOC.parent / "phases").glob("*.md"))
+    return [DOC, *packs]
+
+
 def blocks():
-    """Yield (kind, language, start_line, [body_lines]) for every fenced bash
-    or python block.
+    """Yield (kind, language, location, [body_lines]) for every fenced bash
+    or python block across the whole document set (core + phase packs).
+    `location` is "<file-stem>-<line>" -- unique across the set, and usable
+    directly as a snippet file stem.
 
     A fence may be indented (e.g. nested inside a numbered list item). The
     indent of the OPENING fence is captured and stripped from every body line,
     and the block only closes on a fence at that SAME indent -- a fence at a
     different indent is body content, not the terminator.
     """
-    lines = DOC.read_text().splitlines()
-    i = 0
-    while i < len(lines):
-        m_open = FENCE_OPEN.match(lines[i])
-        if m_open:
-            indent, language = m_open.group(1), m_open.group(2)
-            # Walk upward past blank lines looking for a lint marker.
-            kind = "unmarked"
-            j = i - 1
-            while j >= 0 and lines[j].strip() == "":
-                j -= 1
-            if j >= 0:
-                m = MARKER.match(lines[j])
-                if m:
-                    kind = m.group(1)
-            body, k = [], i + 1
-            while k < len(lines):
-                m_close = FENCE_CLOSE.match(lines[k])
-                if m_close and m_close.group(1) == indent:
-                    break
-                body.append(lines[k])
-                k += 1
-            body = [_dedent(b, indent) for b in body]
-            yield kind, language, i + 1, body
-            i = k + 1
-        else:
-            i += 1
+    for path in doc_files():
+        lines = path.read_text().splitlines()
+        i = 0
+        while i < len(lines):
+            m_open = FENCE_OPEN.match(lines[i])
+            if m_open:
+                indent, language = m_open.group(1), m_open.group(2)
+                # Walk upward past blank lines looking for a lint marker.
+                kind = "unmarked"
+                j = i - 1
+                while j >= 0 and lines[j].strip() == "":
+                    j -= 1
+                if j >= 0:
+                    m = MARKER.match(lines[j])
+                    if m:
+                        kind = m.group(1)
+                body, k = [], i + 1
+                while k < len(lines):
+                    m_close = FENCE_CLOSE.match(lines[k])
+                    if m_close and m_close.group(1) == indent:
+                        break
+                    body.append(lines[k])
+                    k += 1
+                body = [_dedent(b, indent) for b in body]
+                yield kind, language, f"{path.stem}-{i + 1:04d}", body
+                i = k + 1
+            else:
+                i += 1
 
 
 def cmd_cookbook():
@@ -122,10 +134,10 @@ def cmd_snippets():
     d.mkdir(parents=True, exist_ok=True)
     for f in d.glob("*.sh"):
         f.unlink()
-    for kind, language, line, body in blocks():
+    for kind, language, location, body in blocks():
         if kind != "snippet" or language != "bash":
             continue
-        (d / f"{line:04d}.sh").write_text(SNIPPET_PREAMBLE + "\n".join(body) + "\n")
+        (d / f"{location}.sh").write_text(SNIPPET_PREAMBLE + "\n".join(body) + "\n")
     return 0
 
 

@@ -9,15 +9,17 @@ source lib/assert.sh
 D="$PROCESS_DOC"
 
 # Task 10 (P00): the cookbook and publisher are authored at runtime/, not in
-# the document -- the document keeps prose, registries, appendices, snippets,
-# and a function index. Contract assertions therefore run against the SOURCE
-# SET $S: the document plus both runtime/ files, concatenated document-first
-# (so document-structure slicing keeps working on $S unchanged). Assertions
-# that are specifically about the DOCUMENT's own remaining content use $D;
-# ones about the authored cookbook alone use $CB.
+# the document -- the document keeps prose, registries, and a function index.
+# Task 12 (P00 stage 2): the per-phase orchestration steps and role appendices
+# live in phases/*.md packs. Contract assertions therefore run against the
+# SOURCE SET $S: the core document, then the packs (via $PROCESS_FULL, core
+# first in numeric phase order so document-structure slicing keeps working),
+# then both runtime/ files. Assertions that are specifically about the CORE
+# document's own resident content use $D; ones about the authored cookbook
+# alone use $CB.
 CB="$REPO_TOP/runtime/cookbook.sh"
 S="$BUILD/process-source.cat"
-cat "$D" "$CB" "$REPO_TOP/runtime/publish-status" > "$S"
+cat "$PROCESS_FULL" "$CB" "$REPO_TOP/runtime/publish-status" > "$S"
 
 # --- Task 5: stale model ids ---
 assert_absent 'claude-opus-4-8'   "$S" "T5: no claude-opus-4-8"
@@ -710,8 +712,10 @@ _t15_phase11_range="$(python3 - "$S" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
 m1 = re.search(r"^## Phase 11 —", text, re.M)
-m2 = re.search(r"^## Failure handling", text, re.M)
-print(text[m1.end():m2.start()] if m1 and m2 else "")
+# Task 12: Phase 11 lives in phases/11-readiness.md (concatenated after the
+# core in $S); its own prose ends at the pack's appendix section heading.
+m2 = re.search(r"^## Role appendices dispatched by this phase", text[m1.end():], re.M) if m1 else None
+print(text[m1.end():m1.end() + m2.start()] if m1 and m2 else "")
 PY
 )"
 [ -n "$_t15_phase11_range" ] || _fail "T15: could not isolate Phase 11's own prose range"

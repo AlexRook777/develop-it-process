@@ -137,9 +137,10 @@ validate_roots() {
 }
 
 # ---- Process-fileset identity (logged in every dispatch entry) --------------
-# The process "file" is a SET (spec S16.2, generalized): the document itself
-# plus every file directly under $PROCESS_REPO_ROOT/runtime/ (this file and
-# the publish-status source; runtime/ is flat by design). All fields describe
+# The process "file" is a SET (spec S16.2, generalized): the document itself,
+# every file directly under $PROCESS_REPO_ROOT/runtime/ (this file and
+# the publish-status source; runtime/ is flat by design), and every phase
+# pack $PROCESS_REPO_ROOT/phases/*.md (P00 stage 2). All fields describe
 # THAT set, so every git call targets PROCESS_REPO_ROOT. A bare `git` call
 # would report the target project instead.
 #
@@ -162,15 +163,30 @@ validate_roots() {
 
 # The set, one repo-relative path per line: the document first (its
 # PROCESS_PATH_REL, falling back to stripping the PROCESS_REPO_ROOT prefix),
-# then every file directly under runtime/ in LC_ALL=C sorted order. A missing
-# runtime/ directory (a test fixture repo) yields a one-member set -- the
-# digest below stays deterministic either way.
+# then every file directly under runtime/ plus every phases/*.md pack (P00
+# stage 2), in one LC_ALL=C sorted list. Missing runtime/ or phases/
+# directories (a test fixture repo) simply contribute nothing -- the digest
+# below stays deterministic either way.
+#
+# The on-disk globs are UNIONED with `git ls-files` over the same directories
+# (Task 12, closing Task 10's deferred minor): a TRACKED member deleted from
+# the worktree would otherwise vanish from the set entirely, and the identity
+# would silently report a clean, smaller set instead of dirty. Via the union
+# the deleted member stays a member: still tracked (so not `untracked`), and
+# `git diff HEAD` over it reports the deletion -- develop_it_dirty=yes.
+# sha256sum's error for the missing file is suppressed as documented below.
 process_fileset_files() {
   printf '%s\n' "${PROCESS_PATH_REL:-${PROCESS_PATH#"$PROCESS_REPO_ROOT"/}}"
   local f
-  for f in "$PROCESS_REPO_ROOT"/runtime/*; do
-    [ -f "$f" ] && printf 'runtime/%s\n' "${f##*/}"
-  done | LC_ALL=C sort
+  {
+    for f in "$PROCESS_REPO_ROOT"/runtime/*; do
+      [ -f "$f" ] && printf 'runtime/%s\n' "${f##*/}"
+    done
+    for f in "$PROCESS_REPO_ROOT"/phases/*.md; do
+      [ -f "$f" ] && printf 'phases/%s\n' "${f##*/}"
+    done
+    git -C "$PROCESS_REPO_ROOT" ls-files -- 'runtime/*' 'phases/*.md' 2>/dev/null
+  } | LC_ALL=C sort -u
 }
 
 # The deterministic set digest: sha256 over the concatenated per-file
@@ -1095,6 +1111,21 @@ render_keys() {
     APPLICABLE_OPTIONAL_SKILLS
 }
 
+# The process DOCUMENT SET for appendix/shared-block discovery (P00 stage 2):
+# the core document first, then every phase pack ($PROCESS_PATH's own sibling
+# phases/*.md) in LC_ALL=C sorted order -- deterministic, no role->file
+# registry. A repo with no phases/ directory (a test fixture) yields the
+# one-file set, so single-file callers keep working unchanged.
+_process_docs() {
+  printf '%s\n' "$PROCESS_PATH"
+  local d f
+  d="$(dirname "$PROCESS_PATH")/phases"
+  [ -d "$d" ] || return 0
+  for f in "$d"/*.md; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done | LC_ALL=C sort
+}
+
 render_prompt() {
   # Usage: render_prompt <appendix-name>
   #        render_prompt --check <role>   -- see render_prompt_check below.
@@ -1121,7 +1152,7 @@ render_prompt() {
     fi
   done
 
-  env APPENDIX="$appendix" PROCESS_PATH="$PROCESS_PATH" \
+  env APPENDIX="$appendix" PROCESS_FILES="$(_process_docs)" \
       SET_KEYS="${set_keys[*]}" ${envargs[@]+"${envargs[@]}"} \
       "$PYTHON_BIN" - <<'PY'
 import os
@@ -1129,22 +1160,37 @@ import re
 import shlex
 import sys
 
-process = os.environ["PROCESS_PATH"]
 name = os.environ["APPENDIX"]
 
-text = open(process).read()
-start_marker = f"<!-- BEGIN: {name} -->"
-end_marker = f"<!-- END: {name} -->"
+# The document SET (P00 stage 2): core document first, then the LC_ALL=C
+# sorted phase packs -- assembled by _process_docs in the calling shell. A
+# marker found in MORE THAN ONE file is a process-definition defect and
+# fails loudly; the first (and only) file carrying it wins deterministically.
+files = [f for f in os.environ["PROCESS_FILES"].split("\n") if f]
+texts = [(f, open(f).read()) for f in files]
 
-start = text.find(start_marker)
-if start == -1:
-    sys.exit(f"render_prompt: no BEGIN marker for appendix '{name}' in {process}")
-# Search for the END marker AFTER start -- searching from 0 could match an
-# earlier appendix's END and silently truncate or invert the body.
-end = text.find(end_marker, start)
-if end == -1:
-    sys.exit(f"render_prompt: BEGIN without END for appendix '{name}' in {process}")
-body = text[start:end + len(end_marker)]
+
+def find_span(begin_marker, end_marker, what):
+    hits = [(f, t) for f, t in texts if begin_marker in t]
+    if not hits:
+        return None, None
+    if len(hits) > 1:
+        sys.exit(f"render_prompt: duplicate marker for {what} across process files: "
+                 + ", ".join(f for f, _ in hits))
+    f, t = hits[0]
+    start = t.find(begin_marker)
+    # Search for the END marker AFTER start -- searching from 0 could match an
+    # earlier appendix's END and silently truncate or invert the body.
+    end = t.find(end_marker, start)
+    if end == -1:
+        sys.exit(f"render_prompt: BEGIN without END for {what} in {f}")
+    return f, t[start:end + len(end_marker)]
+
+
+src, body = find_span(f"<!-- BEGIN: {name} -->", f"<!-- END: {name} -->",
+                      f"appendix '{name}'")
+if body is None:
+    sys.exit(f"render_prompt: no BEGIN marker for appendix '{name}' in {' '.join(files)}")
 
 # P20 (Task 11): appendices reference document-wide-shared prose (the
 # Publish STATUS protocol, the summarizer usage-table spec, the finding-
@@ -1168,13 +1214,12 @@ _include_re = re.compile(
 def _expand_include(m):
     block, argstr, extra = m.group(1), m.group(2), m.group(3)
     s_begin, s_end = f"<!-- SHARED-BEGIN: {block} -->", f"<!-- SHARED-END: {block} -->"
-    s_start = text.find(s_begin)
-    if s_start == -1:
+    # Shared blocks are authored in the CORE document, but discovery scans the
+    # same whole document set as appendix discovery (duplicates fail loudly).
+    _, span = find_span(s_begin, s_end, f"shared block '{block}'")
+    if span is None:
         sys.exit(f"render_prompt: appendix '{name}' includes unknown shared block '{block}'")
-    s_stop = text.find(s_end, s_start)
-    if s_stop == -1:
-        sys.exit(f"render_prompt: SHARED-BEGIN without SHARED-END for block '{block}'")
-    shared = text[s_start + len(s_begin):s_stop].strip("\n")
+    shared = span[len(s_begin):-len(s_end)].strip("\n")
     try:
         params = dict(tok.split("=", 1) for tok in shlex.split(argstr))
     except ValueError:
@@ -1568,9 +1613,19 @@ invoke_vendor() {
 
 appendix_exists() {
   # Usage: appendix_exists <role>
-  local role="$1"
-  "$GREP_BIN" -qF -- "<!-- BEGIN: ${role} -->" "$PROCESS_PATH" 2>/dev/null || return 1
-  "$GREP_BIN" -qF -- "<!-- END: ${role} -->" "$PROCESS_PATH" 2>/dev/null || return 1
+  # Scans the whole document set (core + phase packs, see _process_docs).
+  # A marker duplicated across files is a process-definition defect: fail
+  # loudly rather than let render_prompt's own duplicate check fire later.
+  local role="$1" begins
+  local -a docs
+  mapfile -t docs < <(_process_docs)
+  begins="$("$GREP_BIN" -lF -- "<!-- BEGIN: ${role} -->" "${docs[@]}" 2>/dev/null | wc -l)"
+  if [ "$begins" -gt 1 ]; then
+    echo "appendix_exists: duplicate BEGIN marker for '${role}' across process files" >&2
+    return 1
+  fi
+  [ "$begins" -eq 1 ] || return 1
+  "$GREP_BIN" -qF -- "<!-- END: ${role} -->" "${docs[@]}" 2>/dev/null || return 1
   return 0
 }
 

@@ -9,6 +9,20 @@ PROCESS_DOC="${PROCESS_DOC:-$REPO_TOP/develop-it-prompt.md}"
 BUILD="${BUILD:-$_TESTS_DIR/.build}"
 mkdir -p "$BUILD"
 
+# Task 12 (P00 stage 2): the process document is a SET -- the core document
+# plus the per-phase packs phases/*.md. PROCESS_FULL is the concatenation,
+# core first then the packs in NUMERIC phase order (so `^## Phase N —`
+# headings appear in phase order and range-slicing checks keep working).
+# Checks that assert on phase-step or appendix CONTENT read $PROCESS_FULL;
+# checks about the core document's own resident text keep using $PROCESS_DOC.
+PROCESS_FULL="$BUILD/process-full.md"
+{
+  cat "$PROCESS_DOC"
+  for _pk in 1 2 3 4 5 6 7 8 9 10 11; do
+    cat "$REPO_TOP/phases/$_pk-"*.md 2>/dev/null
+  done
+} > "$PROCESS_FULL"
+
 _FAILURES=0
 
 note() { printf '    %s\n' "$*"; }

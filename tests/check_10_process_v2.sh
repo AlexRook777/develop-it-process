@@ -107,11 +107,14 @@ assert_exists "$RUNTIME_DIR/manifest.sha256" "the rerun produced a final manifes
 
 # Recompute the documented fileset-digest recipe independently of the
 # cookbook's own process_fileset_sha256: sha256 over the per-file sha256sum
-# lines -- the document first, then every runtime/ source file, repo-relative,
-# LC_ALL=C sorted.
-fileset_sha="$(cd "$REPO_TOP" && sha256sum -- develop-it-prompt.md runtime/cookbook.sh runtime/publish-status | sha256sum | cut -d' ' -f1)"
+# lines -- the document first, then every runtime/ source file AND every
+# phases/*.md pack (Task 12), repo-relative, LC_ALL=C sorted.
+fileset_sha="$(cd "$REPO_TOP" \
+  && sha256sum -- develop-it-prompt.md \
+       $(printf '%s\n' phases/*.md runtime/* | LC_ALL=C sort) \
+  | sha256sum | cut -d' ' -f1)"
 assert_contains "process_fileset_sha256=$fileset_sha" "$RUNTIME_DIR/manifest.sha256" \
-  "manifest records the current process-fileset digest (document + runtime/ sources)"
+  "manifest records the current process-fileset digest (document + runtime/ + phases/ sources)"
 
 rc=0
 ( cd "$RUNTIME_DIR" && sha256sum -c manifest.sha256 ) >/dev/null 2>"$BUILD/manifest-check.err" || rc=$?
@@ -128,7 +131,7 @@ assert_rc 0 "$rc" "the five generated-file entries validate with sha256sum -c"
 # now decomposes into two resident-text checks: the shared block itself
 # calls the publisher exactly once, and every appendix pulls that shared
 # block in exactly once (never hand-rolling a second, competing call). ------
-appendix_pub_report="$(python3 - "$PROCESS_DOC" <<'PY'
+appendix_pub_report="$(python3 - "$PROCESS_FULL" <<'PY'
 import re
 text = open(__import__("sys").argv[1]).read()
 
@@ -159,7 +162,7 @@ assert_eq 25 "$appendix_pub_count" "25 top-level role appendices were scanned"
 # The retired v1 phrasing ("write STATUS ... atomically (write .tmp then
 # rename)") must be gone from every appendix -- a hand-rolled atomic-write
 # shell is exactly what Step 6 replaces with the one-command publisher.
-retired_phrase=$(grep -c 'write `\.tmp` then rename' "$PROCESS_DOC" || true)
+retired_phrase=$(grep -c 'write `\.tmp` then rename' "$PROCESS_FULL" || true)
 assert_eq 0 "$retired_phrase" "no appendix still instructs its own .tmp-then-rename STATUS write"
 
 # No appendix may hand-write its own STATUS file directly (a role-local
@@ -174,14 +177,14 @@ assert_eq 0 "$retired_phrase" "no appendix still instructs its own .tmp-then-ren
 #       common field/section name) so this cannot fire on the publisher's own
 #       "do not hand-write your own validator" sentence or on read-only prose
 #       like "the STATUS file" / "publish STATUS".
-direct_status_write=$(grep -cE '^[[:space:]]*(cat[[:space:]]*>|mv[[:space:]])[^`]*STATUS' "$PROCESS_DOC" || true)
-prose_status_write=$(python3 "$REPO_TOP/tests/lib/scan_status_write_prose.py" "$PROCESS_DOC")
+direct_status_write=$(grep -cE '^[[:space:]]*(cat[[:space:]]*>|mv[[:space:]])[^`]*STATUS' "$PROCESS_FULL" || true)
+prose_status_write=$(python3 "$REPO_TOP/tests/lib/scan_status_write_prose.py" "$PROCESS_FULL")
 assert_eq 0 "$direct_status_write" "no appendix writes or renames a STATUS file directly (cat >/mv)"
 assert_eq 0 "$prose_status_write" "no appendix prose instructs writing/rewriting a *-status.md file directly"
 
 # impl-worker is the one documented exception (status_template=none, child-only
 # contract) -- it must have no top-level appendix at all.
-implworker_appendix=$(grep -c -- '<!-- BEGIN: impl-worker -->' "$PROCESS_DOC" || true)
+implworker_appendix=$(grep -c -- '<!-- BEGIN: impl-worker -->' "$PROCESS_FULL" || true)
 assert_eq 0 "$implworker_appendix" "impl-worker has no appendix (status_template=none, child-only)"
 
 # Every dispatched role's STATUS path template names an attempt ID.
@@ -207,7 +210,7 @@ assert_eq "" "$status_paths_missing_attempt" \
 # appendices previously hardcoded output_count: 0, so the publisher's
 # contiguity/absolute-path/realpath-containment validation (the core safety
 # property Step 4 built) was never exercised by a single real role.
-output_decl_problems="$(python3 "$REPO_TOP/tests/lib/check_output_declarations.py" "$PROCESS_DOC" "$BUILD/roles-t4.tsv" || true)"
+output_decl_problems="$(python3 "$REPO_TOP/tests/lib/check_output_declarations.py" "$PROCESS_FULL" "$BUILD/roles-t4.tsv" || true)"
 assert_eq "" "$output_decl_problems" \
   "every appendix's output_count/output_NN agrees with its registry outputs cell"
 
@@ -216,7 +219,7 @@ assert_eq "" "$output_decl_problems" \
 # durability notes, etc.) while converting its STATUS write to one-command
 # publication -- an earlier pass replaced whole `## Output` sections and lost
 # ~54 lines of contract this way.
-appendix_content_missing="$(python3 "$REPO_TOP/tests/lib/check_appendix_content.py" "$PROCESS_DOC" || true)"
+appendix_content_missing="$(python3 "$REPO_TOP/tests/lib/check_appendix_content.py" "$PROCESS_FULL" || true)"
 assert_eq "" "$appendix_content_missing" \
   "every restored appendix still carries its non-STATUS role contract (verdict rules / findings format / progress.jsonl notes)"
 
@@ -1103,7 +1106,7 @@ assert_eq 0 "$(_t10_dispatch_calls "$T10_ARGVS")" \
 # real call site INSIDE that range specifically -- scrubbing the phase
 # prose now drops the phase's own count to zero, which the range-scoped
 # check catches even though the cookbook definition/comments are untouched.
-_t11_range_report="$(python3 - "$PROCESS_DOC" <<'PY'
+_t11_range_report="$(python3 - "$PROCESS_FULL" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
 
@@ -1137,7 +1140,7 @@ done <<< "$_t11_range_report"
 # document region than the phase-loop prose above -- never called by the
 # orchestrator directly.
 for _t11_fixer in spec-fixer plan-fixer implementation-fixer; do
-  _t11_appendix="$(python3 - "$PROCESS_DOC" "$_t11_fixer" <<'PY'
+  _t11_appendix="$(python3 - "$PROCESS_FULL" "$_t11_fixer" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
 role = sys.argv[2]
@@ -1154,13 +1157,13 @@ done
 # Phase 7 must dispatch implementation-fixer, never implementer, to fix code
 # review findings -- exactly one occurrence of the retired dispatch phrase
 # (zero, really) and at least one of the new one.
-_t11_implfixer_dispatch="$("$GREP_BIN" -c 'Dispatch one `claude` subprocess for role `implementation-fixer`' "$PROCESS_DOC" || true)"
+_t11_implfixer_dispatch="$("$GREP_BIN" -c 'Dispatch one `claude` subprocess for role `implementation-fixer`' "$PROCESS_FULL" || true)"
 assert_eq 1 "${_t11_implfixer_dispatch:-0}" \
   "T11: Phase 7 dispatches implementation-fixer for code-review fixes exactly once"
 
 # review_iteration_cap is the ONLY hard cap named across all three gates --
 # the tenth iteration is allowed, an eleventh is not (spec S18.1/Step9 proof).
-_t11_cap_mentions="$("$GREP_BIN" -c 'hard cap `review_iteration_cap`' "$PROCESS_DOC" || true)"
+_t11_cap_mentions="$("$GREP_BIN" -c 'hard cap `review_iteration_cap`' "$PROCESS_FULL" || true)"
 assert_eq 3 "${_t11_cap_mentions:-0}" \
   "T11: all three review gates (3, 5, 7) bound their iteration loop by the SAME review_iteration_cap policy, not a hardcoded 10"
 # NOTE (code review round 2, item 9 -- accepted, not fixed): this only
@@ -1177,7 +1180,7 @@ assert_contains '| review_iteration_cap | 10 |' "$PROCESS_DOC" \
 
 # The last successful gate action before each downstream phase is the
 # reviewer-verified acceptance, never a fixer's own STATUS (Step9 proof).
-_t11_last_action_mentions="$("$GREP_BIN" -c 'is this reviewer-verified acceptance' "$PROCESS_DOC" || true)"
+_t11_last_action_mentions="$("$GREP_BIN" -c 'is this reviewer-verified acceptance' "$PROCESS_FULL" || true)"
 assert_eq 3 "${_t11_last_action_mentions:-0}" \
   "T11: all three gates document that the last successful action is reviewer acceptance, never the fixer's own STATUS"
 
@@ -1187,7 +1190,7 @@ assert_eq 3 "${_t11_last_action_mentions:-0}" \
 # Real call-site counting, scoped to each phase's own prose range -- the same
 # defense used for Task 11's functions above, so a phase that merely defines
 # these helpers without ever calling them still fails.
-_t12_range_report="$(python3 - "$PROCESS_DOC" <<'PY'
+_t12_range_report="$(python3 - "$PROCESS_FULL" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
 
@@ -1220,7 +1223,7 @@ done <<< "$_t12_range_report"
 
 # Once Phase 6 starts, later plan-review requests are marked STALE without a
 # vendor call -- exactly one dispatch-free code path may do this.
-_t12_stale_mentions="$(grep -c 'PLAN_REVIEW_STALE' "$PROCESS_DOC" || true)"
+_t12_stale_mentions="$(grep -c 'PLAN_REVIEW_STALE' "$PROCESS_FULL" || true)"
 [ "${_t12_stale_mentions:-0}" -ge 2 ] \
   && _ok "T12: PLAN_REVIEW_STALE is both registered and used in Phase 5 prose" \
   || _fail "T12: PLAN_REVIEW_STALE has fewer than 2 mentions (registry row + real call site)"
@@ -1274,7 +1277,7 @@ fi
 # append_verification_record's real call site is the implementer appendix
 # (both Mode A and Mode B) -- the write side of spec S19.2, a different
 # document region than the Phase 6 prose counted above.
-_t12_impl_appendix="$(python3 - "$PROCESS_DOC" <<'INNERPY'
+_t12_impl_appendix="$(python3 - "$PROCESS_FULL" <<'INNERPY'
 import re, sys
 text = open(sys.argv[1]).read()
 m = re.search(r"<!-- BEGIN: implementer -->(.*?)<!-- END: implementer -->", text, re.S)
@@ -1352,7 +1355,7 @@ done <<<"$_t14_canon_table"
 # 8, 9, 10, 11 -- catches a reorder/duplication mistake a plain grep-presence
 # check (check_05_contract.sh) cannot, since presence alone says nothing
 # about ORDER.
-_t14_phase_positions="$(python3 - "$PROCESS_DOC" <<'PY'
+_t14_phase_positions="$(python3 - "$PROCESS_FULL" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
 for n in (8, 9, 10, 11):

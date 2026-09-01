@@ -5,8 +5,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 source lib/assert.sh
 
-begins="$("$GREP_BIN" -oP '^<!-- BEGIN: \K[a-z0-9-]+(?= -->$)' "$PROCESS_DOC" | sort)"
-ends="$("$GREP_BIN"   -oP '^<!-- END: \K[a-z0-9-]+(?= -->$)'   "$PROCESS_DOC" | sort)"
+begins="$("$GREP_BIN" -oP '^<!-- BEGIN: \K[a-z0-9-]+(?= -->$)' "$PROCESS_FULL" | sort)"
+ends="$("$GREP_BIN"   -oP '^<!-- END: \K[a-z0-9-]+(?= -->$)'   "$PROCESS_FULL" | sort)"
 
 assert_eq "$begins" "$ends" "every BEGIN marker has a matching END marker"
 
@@ -19,12 +19,12 @@ missing=""
 while IFS= read -r name; do
   [ -n "$name" ] || continue
   printf '%s\n' "$begins" | "$GREP_BIN" -qxF "$name" || missing="$missing $name"
-done < <("$GREP_BIN" -oP '(?<=`)(?:preflight|spec|plan|code|context|summarizer|readiness|all-tests|test|finishing)[a-z0-9-]*(?=` appendix)' "$PROCESS_DOC" | sort -u)
+done < <("$GREP_BIN" -oP '(?<=`)(?:preflight|spec|plan|code|context|summarizer|readiness|all-tests|test|finishing)[a-z0-9-]*(?=` appendix)' "$PROCESS_FULL" | sort -u)
 assert_eq "" "$missing" "every appendix name referenced in prose has a marker pair"
 
 # The Phase-7 bug class: an appendix name assembled from a variable cannot be
 # statically resolved, and no value of $phase yields 'code-reviewer-claude'.
-constructed="$("$GREP_BIN" -nE '(render_prompt|extract_appendix) +"?\$\{' "$PROCESS_DOC")"
+constructed="$("$GREP_BIN" -nE '(render_prompt|extract_appendix) +"?\$\{' "$PROCESS_FULL")"
 if [ -z "$constructed" ]; then
   _ok "no appendix name is constructed from a variable"
 else
@@ -64,7 +64,7 @@ while IFS= read -r role; do
               "Checkpoint kind:checkpoint_kind:APPENDIX_CONTRACT_DRIFT" \
               "Phases:phases:APPENDIX_CONTRACT_DRIFT"; do
     key="${spec%%:*}"; rest="${spec#*:}"; column="${rest%%:*}"; token="${rest#*:}"
-    msg="$(contract_drift "$PROCESS_DOC" "$BUILD/roles.tsv" "$role" "$key" "$column" "$token")" \
+    msg="$(contract_drift "$PROCESS_FULL" "$BUILD/roles.tsv" "$role" "$key" "$column" "$token")" \
       || drift="$drift
   $msg"
   done
@@ -74,7 +74,7 @@ assert_eq "" "$drift" "every appendix contract declaration matches its registry 
 # --- Task 13: impl-worker (child-only, phases=child) never gets a top-level
 # appendix marker of its own -- it has no independent dispatch identity, so
 # a `BEGIN: impl-worker` marker would be an orphan nothing ever renders.
-assert_absent 'BEGIN: impl-worker' "$PROCESS_DOC" \
+assert_absent 'BEGIN: impl-worker' "$PROCESS_FULL" \
   "T13: impl-worker (child-only role) has no top-level appendix marker"
 
 # --- Task 14: the phase renumbering must move BOTH the registry row and the
@@ -82,7 +82,7 @@ assert_absent 'BEGIN: impl-worker' "$PROCESS_DOC" \
 # above only proves they agree with EACH OTHER, not that they hold the
 # CORRECT target number. A stale pair (both still "10") would pass the drift
 # loop but must fail here.
-readiness_body="$(python3 - "$PROCESS_DOC" <<'PY'
+readiness_body="$(python3 - "$PROCESS_FULL" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
 m = re.search(r"<!-- BEGIN: readiness-writer -->(.*?)<!-- END: readiness-writer -->", text, re.S)
@@ -94,7 +94,7 @@ case "$readiness_body" in
   *) _fail "T14: readiness-writer's own appendix does NOT declare Phases: 11" ;;
 esac
 
-doc_writer_body="$(python3 - "$PROCESS_DOC" <<'PY'
+doc_writer_body="$(python3 - "$PROCESS_FULL" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
 m = re.search(r"<!-- BEGIN: documentation-writer -->(.*?)<!-- END: documentation-writer -->", text, re.S)

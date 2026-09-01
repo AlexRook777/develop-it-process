@@ -8,7 +8,7 @@ source lib/assert.sh
 ALLOW_UNSUBSTITUTED="PROCESS_PATH REPO_ROOT PROCESS_REPO_ROOT"
 
 # 1. Collect every $VAR appearing between BEGIN/END marker pairs.
-used="$(python3 - "$PROCESS_DOC" <<'PY' | sort -u
+used="$(python3 - "$PROCESS_FULL" <<'PY' | sort -u
 import re, sys
 text = open(sys.argv[1]).read()
 bodies = re.findall(r"^<!-- BEGIN: [a-z0-9-]+ -->$(.*?)^<!-- END: [a-z0-9-]+ -->$",
@@ -63,7 +63,7 @@ done
 # appendix's own $VARs against its own required_inputs/optional_inputs cell.
 python3 "$REPO_TOP/tests/lib/extract.py" roles > "$BUILD/roles-varcov.tsv"
 registry_var_problems="$(python3 "$REPO_TOP/tests/lib/check_registry_var_coverage.py" \
-  "$PROCESS_DOC" "$BUILD/roles-varcov.tsv" || true)"
+  "$PROCESS_FULL" "$BUILD/roles-varcov.tsv" || true)"
 assert_eq "" "$registry_var_problems" \
   "every appendix only references \$VARs its OWN registry row declares (plus mechanical plumbing)"
 

@@ -130,6 +130,35 @@ if declare -F process_identity >/dev/null; then
     || _fail "T10 PROCESS_FILE_SHA256 ignored a new runtime/ source file"
 
   rm -rf "$_t10_pi"
+
+  # --- Task 12: (a) phases/*.md packs are set members; (b) Task 10's deferred
+  # minor is closed -- a TRACKED member DELETED from the worktree counts as
+  # dirty (the ls-files union keeps it in the set), never a silently smaller
+  # clean set. Separate throwaway repo so the digest fixtures above keep
+  # their own "no runtime/" premise.
+  _t12_del="$(mktemp -d)"
+  git -C "$_t12_del" init -q
+  mkdir -p "$_t12_del/runtime" "$_t12_del/phases"
+  printf 'doc\n' > "$_t12_del/doc.md"
+  printf 'lib\n' > "$_t12_del/runtime/lib.sh"
+  printf 'pack\n' > "$_t12_del/phases/1-preflight.md"
+  ( cd "$_t12_del" && git add -A \
+    && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null
+  PROCESS_PATH="$_t12_del/doc.md" PROCESS_REPO_ROOT="$_t12_del" PROCESS_PATH_REL="doc.md" process_identity
+  assert_eq no "$PROCESS_DIRTY" "T12: intact doc+runtime/+phases/ set reports develop_it_dirty=no"
+  _t12_intact_sha="$PROCESS_FILE_SHA256"
+  printf 'pack v2\n' > "$_t12_del/phases/1-preflight.md"
+  PROCESS_PATH="$_t12_del/doc.md" PROCESS_REPO_ROOT="$_t12_del" PROCESS_PATH_REL="doc.md" process_identity
+  assert_eq yes "$PROCESS_DIRTY" "T12: an edited phases/*.md pack makes the set dirty (packs ARE members)"
+  [ "$PROCESS_FILE_SHA256" != "$_t12_intact_sha" ] \
+    && _ok "T12: editing a pack changes PROCESS_FILE_SHA256 (same digest recipe over the extended set)" \
+    || _fail "T12: PROCESS_FILE_SHA256 ignored a pack edit"
+  ( cd "$_t12_del" && git checkout -q -- phases/1-preflight.md )
+  rm "$_t12_del/phases/1-preflight.md"
+  PROCESS_PATH="$_t12_del/doc.md" PROCESS_REPO_ROOT="$_t12_del" PROCESS_PATH_REL="doc.md" process_identity
+  assert_eq yes "$PROCESS_DIRTY" \
+    "T12: a tracked-but-DELETED set member counts as dirty (Task 10 deferred minor closed)"
+  rm -rf "$_t12_del"
 else
   _fail "process_identity is not defined (Task 10 four-state coverage)"
 fi
@@ -613,7 +642,7 @@ if declare -F render_prompt >/dev/null; then
   # THE regression: no appendix may render with an unresolved variable. This one
   # assertion covers every appendix and every key at once.
   unresolved=""
-  for a in $(/usr/bin/grep -oP '^<!-- BEGIN: \K[a-z0-9-]+' "$PROCESS_DOC"); do
+  for a in $(/usr/bin/grep -oP '^<!-- BEGIN: \K[a-z0-9-]+' "$PROCESS_FULL"); do
     out="$(render_prompt "$a" 2>&1)" || { unresolved="$unresolved $a(rc)"; continue; }
     case "$out" in
       *'$'[A-Z][A-Z]*) unresolved="$unresolved $a" ;;
@@ -750,9 +779,9 @@ EOF
   # (a Python f-string and a grep -qF pattern) contain the literal text
   # "<!-- BEGIN: " but are not real markers and are indented/embedded, not at
   # the start of the line.
-  verdict_rows="$(python3 "$_TESTS_DIR/lib/verdicts.py" "$PROCESS_DOC")"
+  verdict_rows="$(python3 "$_TESTS_DIR/lib/verdicts.py" "$PROCESS_FULL")"
   verdict_row_count="$(printf '%s\n' "$verdict_rows" | "$GREP_BIN" -c . || true)"
-  begin_marker_count="$("$GREP_BIN" -c '^<!-- BEGIN: ' "$PROCESS_DOC" || true)"
+  begin_marker_count="$("$GREP_BIN" -c '^<!-- BEGIN: ' "$PROCESS_FULL" || true)"
   assert_eq "$begin_marker_count" "$verdict_row_count" \
     "every appendix has a verdict row (none silently dropped by verdicts.py)"
 
@@ -987,7 +1016,10 @@ esac
 # Drives the SAME `contract_drift` helper check_02_markers.sh's real,
 # suite-wide (currently-passing) contract check uses -- not a reimplemented
 # comparison that would keep passing if that real detector were deleted.
-cp "$PROCESS_DOC" "$NEG/verdict-drift.md"
+# Task 12: spec-fixer's appendix lives in the phases/3-spec-review.md pack;
+# tamper a throwaway copy of THAT file (contract_drift reads whatever single
+# marker-bearing file it is handed).
+cp "$REPO_TOP/phases/3-spec-review.md" "$NEG/verdict-drift.md"
 python3 - "$NEG/verdict-drift.md" <<'PY'
 import re, sys
 path = sys.argv[1]
@@ -1032,8 +1064,14 @@ case "$err" in
 esac
 
 # 7. One unresolved appendix variable -> RENDER_VARIABLE_UNRESOLVED.
-cp "$PROCESS_DOC" "$NEG/unresolved-var.md"
-python3 - "$NEG/unresolved-var.md" <<'PY'
+# Task 12: render_prompt discovers appendices across the document SET (the
+# core at $PROCESS_PATH plus its sibling phases/*.md packs), so the tampered
+# copy must be a full docset: core copy + pack copies, with the tampering
+# applied inside the pack that carries spec-reviewer-claude.
+mkdir -p "$NEG/docset/phases"
+cp "$PROCESS_DOC" "$NEG/docset/develop-it-prompt.md"
+cp "$REPO_TOP"/phases/*.md "$NEG/docset/phases/"
+python3 - "$NEG/docset/phases/3-spec-review.md" <<'PY'
 import re, sys
 path = sys.argv[1]
 text = open(path).read()
@@ -1046,7 +1084,7 @@ open(path, "w").write(text)
 PY
 # Same subshell hazard as case 5 -- assert in the main shell.
 _saved_process_path="$PROCESS_PATH"
-PROCESS_PATH="$NEG/unresolved-var.md"
+PROCESS_PATH="$NEG/docset/develop-it-prompt.md"
 err7="$(render_prompt --check spec-reviewer-claude 2>&1 >/dev/null)"
 PROCESS_PATH="$_saved_process_path"
 case "$err7" in
@@ -1257,7 +1295,7 @@ assert_eq "" "$_phase_snippet_missing" \
 # declaration from any assignment that MASKS $? or REFERENCES a sibling
 # declared earlier in the SAME statement) -- not just the narrower
 # `local X=$(...)` shape.
-local_mask_hits=$(python3 - "$PROCESS_DOC" "$BUILD/cookbook.sh" <<'PY'
+local_mask_hits=$(python3 - "$PROCESS_FULL" "$BUILD/cookbook.sh" <<'PY'
 import re, sys
 text = "\n".join(open(p).read() for p in sys.argv[1:])
 hits = 0
@@ -1341,7 +1379,7 @@ for fn in $(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\) \{' "$BUILD/cookbook.sh" | sed
   # Exactly one definition in the authored cookbook, and ZERO copies of the
   # body in the document (a phase snippet re-pasting a helper would drift).
   fn_count=$(( $(grep -cE "^${fn}\\(\\) \\{" "$BUILD/cookbook.sh" || true) \
-             + $(grep -cE "^${fn}\\(\\) \\{" "$PROCESS_DOC" || true) ))
+             + $(grep -cE "^${fn}\\(\\) \\{" "$PROCESS_FULL" || true) ))
   if [ "$fn_count" -gt 1 ]; then
     dupe_defs="$dupe_defs $fn($fn_count)"
   fi

@@ -1310,7 +1310,7 @@ fi
 # after the Phase 10 body was deleted from the document; extraction failure
 # (a missing command) is itself asserted, not silently tolerated.
 T14_PHASE10_BODY="$BUILD/t14-phase10-body.txt"
-python3 - "$PROCESS_DOC" > "$T14_PHASE10_BODY" <<'PY'
+python3 - "$PROCESS_FULL" > "$T14_PHASE10_BODY" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
 m1 = re.search(r"^## Phase 10 —", text, re.M)

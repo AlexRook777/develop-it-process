@@ -25,8 +25,13 @@ It does three things: derives `REPO_ROOT`, `FEATURE_FOLDER`, and `PROCESS_PATH`
 from that one path and exports them; runs `./tests/run.sh` so a broken cookbook
 helper (`runtime/cookbook.sh`) fails at launch rather than mid-run (`DEVELOP_IT_SKIP_TESTS=1` skips that);
 and hands the terminal to an **interactive** Claude Code session whose system
-prompt is `develop-it-prompt.md` itself, verbatim — the same TUI as launching by
-hand. See Step 5 for the exact command.
+prompt is `develop-it-prompt.md` itself (the CORE document only), verbatim —
+the same TUI as launching by hand. The per-phase packs under `phases/` are
+not part of the system prompt: the orchestrator Reads each phase's pack end
+to end before starting that phase (a hard rule in the core's orchestration
+contract), and a resumed phase re-Reads its pack in its fresh session-turn,
+the same way every other durable input is reconstructed. See Step 5 for the
+exact command.
 
 The script writes no prompt of its own, and does nothing else on purpose. It does
 **not** re-check binaries, the dirty tree, or the gitignore guard: Phase −1 Step
@@ -160,16 +165,17 @@ claude --model opus --add-dir "$REPO_ROOT" --dangerously-skip-permissions
 
 ## Step 5 — The kickoff prompt
 
-There isn't one. `develop-it.sh` passes `develop-it-prompt.md` itself, verbatim,
-as the session's system prompt:
+There isn't one. `develop-it.sh` passes `develop-it-prompt.md` itself (the core
+document only — never the `phases/*.md` packs, which the orchestrator Reads on
+demand), verbatim, as the session's system prompt:
 
 ```bash
 claude --model opus --add-dir "$REPO_ROOT" --dangerously-skip-permissions \
        --append-system-prompt-file "$PROCESS_PATH" Begin.
 ```
 
-- **`--append-system-prompt-file`, not a positional prompt.** The document is
-  ~280 KB, past the kernel's 128 KB ceiling on a single argv element, so it
+- **`--append-system-prompt-file`, not a positional prompt.** The core document
+  is ~230 KB, past the kernel's 128 KB ceiling on a single argv element, so it
   cannot be an argument. The system prompt is also the one place a multi-hour
   run cannot lose it to context compaction. It *appends*, so Claude Code's own
   tool instructions stay intact.
@@ -274,6 +280,11 @@ resumes from its own last durable checkpoint instead of restarting, up to
 above for the full list).
 
 Resume does not re-prompt for codex consent — the original consent stands.
+
+A resumed phase re-Reads its own `phases/*.md` pack end to end before its
+next step, exactly like a fresh phase start: pack content is a durable input
+reconstructed in the fresh session, never something carried in memory
+(consistent with the fresh-shell / durable-input reconstruction rule).
 
 ### Operator checklist — what to inspect for each failure class
 
