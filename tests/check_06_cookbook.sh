@@ -1983,6 +1983,38 @@ else
   _fail "_event_proposition_required is not defined"
 fi
 
+# --- P19 code review fix: event_contract_field's pre-bootstrap last-resort
+# table (_event_contract_field_preboot) must agree with the registry for
+# BOTH columns on all five rows it hand-carries, exercised with RUNTIME_DIR
+# unset AND the extractor itself unreachable (forcing past fallback 1 into
+# fallback 2) -- an earlier draft hardcoded proposition_required="no" for
+# all five, silently wrong for HALT (registry says yes), with nothing to
+# catch it. Registry values are read from "$BUILD/events.tsv" captured
+# above, BEFORE the extractor is made unreachable below.
+if declare -F event_contract_field >/dev/null; then
+  _t19_preboot_rows="HALT PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE LOCAL_CLI_CANARIES_PASSED TARGET_DIRTY_TREE_GATE_PASSED PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED"
+  _t19_fake_repo="$(mktemp -d)"   # no tests/lib/extract.py at all -- forces fallback 2
+  _t19_mismatch=""
+  for _t19_row in $_t19_preboot_rows; do
+    _t19_reg_fields="$(awk -F'\t' -v k="$_t19_row" -v c="$_t8_fields_col" \
+      '$1==k{print $c}' "$BUILD/events.tsv")"
+    _t19_reg_prop="$(awk -F'\t' -v k="$_t19_row" -v c="$_t15_prop_col" \
+      '$1==k{print $c}' "$BUILD/events.tsv")"
+    _t19_got_fields="$(RUNTIME_DIR="" PROCESS_REPO_ROOT="$_t19_fake_repo" \
+      event_contract_field "$_t19_row" required_fields 2>/dev/null)"
+    _t19_got_prop="$(RUNTIME_DIR="" PROCESS_REPO_ROOT="$_t19_fake_repo" \
+      event_contract_field "$_t19_row" proposition_required 2>/dev/null)"
+    if [ "$_t19_got_fields" != "$_t19_reg_fields" ] || [ "$_t19_got_prop" != "$_t19_reg_prop" ]; then
+      _t19_mismatch="$_t19_mismatch $_t19_row(fields:[$_t19_got_fields]!=[$_t19_reg_fields],prop:[$_t19_got_prop]!=[$_t19_reg_prop])"
+    fi
+  done
+  rm -rf "$_t19_fake_repo"
+  assert_eq "" "$_t19_mismatch" \
+    "P19: event_contract_field's pre-bootstrap last-resort table agrees with the registry (both columns) for all five gate rows when RUNTIME_DIR is unset and the extractor is unreachable"
+else
+  _fail "event_contract_field is not defined"
+fi
+
 # --- Task 15: record_event writes a pending-propositions.jsonl header ONLY
 # for a proposition_required=yes type, and never for a =no type -- the real
 # call site inside record_event itself, not a grep against its definition.

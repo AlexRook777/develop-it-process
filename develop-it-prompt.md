@@ -4300,24 +4300,31 @@ event_contract_field() {
 # $RUNTIME_DIR/events.tsv AND a live extractor invocation are unavailable --
 # exactly the five rows the gate-1-through-4/HALT call sites need (spec
 # §16.1), each value copied verbatim from the Event Contract Registry
-# above; every other type is a process-definition bug in this state
-# (record_event called with no working registry source at all) and fails
-# loudly rather than guessing. `proposition_required` is hardcoded `no` for
-# all five because the registry marks all five `no` -- there is nothing
-# left to look up for that column here.
+# above (BOTH columns -- HALT alone is `proposition_required=yes`, the
+# other four are `no`; this is NOT a uniform "no", a code-review-caught bug
+# in an earlier draft that would have silently dropped HALT's spec-mandated
+# §21.1 proposition-ledger header during a corrupted/partial checkout);
+# every other type is a process-definition bug in this state (record_event
+# called with no working registry source at all) and fails loudly rather
+# than guessing.
 _event_contract_field_preboot() {
-  local event_type=$1 field=$2 required_fields
+  local event_type=$1 field=$2 required_fields proposition_required
   case "$event_type" in
-    HALT)                                     required_fields="" ;;
-    PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE)         required_fields="run_log_state" ;;
-    LOCAL_CLI_CANARIES_PASSED)                 required_fields="codex_present" ;;
-    TARGET_DIRTY_TREE_GATE_PASSED)             required_fields="" ;;
-    PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED)  required_fields="develop_it_dirty;develop_it_dirty_reason" ;;
+    HALT)
+      required_fields=""; proposition_required="yes" ;;
+    PATHS_AND_NEW_RUN_SCHEMA_ELIGIBLE)
+      required_fields="run_log_state"; proposition_required="no" ;;
+    LOCAL_CLI_CANARIES_PASSED)
+      required_fields="codex_present"; proposition_required="no" ;;
+    TARGET_DIRTY_TREE_GATE_PASSED)
+      required_fields=""; proposition_required="no" ;;
+    PROCESS_IDENTITY_AND_GITIGNORE_VALIDATED)
+      required_fields="develop_it_dirty;develop_it_dirty_reason"; proposition_required="no" ;;
     *) printf 'EVENT_REGISTRY_MISSING:%s\n' "$event_type" >&2; return 1 ;;
   esac
   case "$field" in
     required_fields)      printf '%s\n' "$required_fields" ;;
-    proposition_required) printf '%s\n' "no" ;;
+    proposition_required) printf '%s\n' "$proposition_required" ;;
     *) printf 'EVENT_FIELD_UNKNOWN:%s\n' "$field" >&2; return 1 ;;
   esac
 }
