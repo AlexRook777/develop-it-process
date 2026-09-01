@@ -1133,12 +1133,12 @@ esac
 source "$REPO_TOP/tests/lib/v2_fixtures.sh"
 init_v2_fixture
 
-# 1. Fresh extraction -> BOOTSTRAP_OK, all four generated files plus manifest.
+# 1. Fresh extraction -> BOOTSTRAP_OK, all five generated files plus manifest.
 rm -rf "$ORCHESTRATION_DIR"; mkdir -p "$ORCHESTRATION_DIR"
 rc=0; out="$(bootstrap_runtime 2>"$BUILD/b1.err")" || rc=$?
 assert_rc 0 "$rc" "1 fresh: bootstrap_runtime succeeds"
 assert_eq "BOOTSTRAP_OK" "$out" "1 fresh: reports BOOTSTRAP_OK"
-for f in develop-it-runtime.sh role-contracts.tsv policy.tsv publish-status manifest.sha256; do
+for f in develop-it-runtime.sh role-contracts.tsv policy.tsv events.tsv publish-status manifest.sha256; do
   assert_exists "$RUNTIME_DIR/$f" "1 fresh: writes $f"
 done
 
@@ -1882,6 +1882,7 @@ fi
 init_v2_fixture
 mkdir -p "$RUNTIME_DIR"
 python3 "$REPO_TOP/tests/lib/extract.py" policies > "$RUNTIME_DIR/policy.tsv"
+python3 "$REPO_TOP/tests/lib/extract.py" events > "$RUNTIME_DIR/events.tsv"
 
 # --- context7_policy: full spec S15.5 latest-event-wins precedence (code
 # review fix #6 -- out of Task 8's own steps, but a genuine behaviour

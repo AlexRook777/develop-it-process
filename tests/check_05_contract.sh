@@ -499,8 +499,14 @@ assert_present 'A role never writes this file' "$D" \
 # call site, directly in Phase 10's own prose.
 assert_present '\| GIT_FINALIZATION_RESULT \| base_sha;final_sha;staged_paths;commit_sha;push_performed;outcome \|' "$D" \
   "T14: GIT_FINALIZATION_RESULT's registry row carries all six spec fields"
-assert_present 'GIT_FINALIZATION_RESULT\)     printf .%s.*"base_sha;final_sha;staged_paths;commit_sha;push_performed;outcome"' "$D" \
-  "T14: event_required_fields's GIT_FINALIZATION_RESULT case matches the registry row exactly"
+# Task 8/P19: event_required_fields no longer hand-duplicates a per-type case
+# line to cross-check against this row -- it is a thin TSV lookup
+# (event_contract_field) reading the SAME table this row lives in, so a
+# GIT_FINALIZATION_RESULT/registry mismatch is now structurally impossible
+# rather than merely caught by a bidirectional test. Assert the delegation
+# shape instead of a literal case-line match.
+assert_present 'event_contract_field "\$1" required_fields' "$D" \
+  "T14/P19: event_required_fields is a thin event_contract_field lookup, not a hand-duplicated case"
 assert_present 'record_event GIT_FINALIZATION_RESULT reason=\$REASON base_sha=\$BASE_SHA' "$D" \
   "T14: Phase 10's own prose has a real record_event GIT_FINALIZATION_RESULT call site, with reason set on EVERY branch (record_event refuses an empty reason)"
 

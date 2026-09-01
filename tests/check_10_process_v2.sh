@@ -111,7 +111,7 @@ assert_contains "process_document_sha256=$doc_sha" "$RUNTIME_DIR/manifest.sha256
 
 rc=0
 ( cd "$RUNTIME_DIR" && sha256sum -c manifest.sha256 ) >/dev/null 2>"$BUILD/manifest-check.err" || rc=$?
-assert_rc 0 "$rc" "the four generated-file entries validate with sha256sum -c"
+assert_rc 0 "$rc" "the five generated-file entries validate with sha256sum -c"
 
 # --- Task 4 Step 6: every top-level appendix publishes through the ONE
 # generated publisher, exactly once, and no appendix hand-rolls its own
