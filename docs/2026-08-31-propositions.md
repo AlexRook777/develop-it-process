@@ -10,7 +10,7 @@ Ratings: Criticality **Critical/High/Medium/Low** (same definitions as the R-ser
 
 ## P00 — Split the monolith: phase packs loaded on demand, cookbook out of context, per-phase suborchestration
 
-**Status:** ⬜ pending
+**Status:** 🟨 stage 1 implemented (bc6ea39): cookbook+publisher evicted to runtime/, doc 861KB→505KB (−41%), fileset identity digest. Stages 2–3 (phase packs, suborchestration) pending
 
 **Criticality:** High (owner-raised: prompt size) · **Effort:** Hard — but stageable, and each stage pays for itself
 
