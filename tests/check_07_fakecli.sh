@@ -82,6 +82,8 @@ ATTEMPT=01
 STATUS_PUBLISHER_PATH="$FEATURE_FOLDER/../.orchestration/runtime/publish-status"
 CONTINUATION_PATH=""
 DECLARED_FOREIGN_CHANGES=""
+VALIDATOR_ERRORS=""
+CONSOLIDATION_PRIORITY=""
 RUNTIME_DIR="$FEATURE_FOLDER/.orchestration/runtime"
 APPLICABLE_OPTIONAL_SKILLS=""
 MODE=A
@@ -1064,14 +1066,14 @@ if declare -F validate_artifact >/dev/null; then
   rm -f "$ORCHESTRATION_DIR/write-lease.json"
   PLAN_PATH="$FEATURE_FOLDER/real-plan.md"
   cat > "$PLAN_PATH" <<'EOF'
-# Goal
+# Global Constraints
 
 Ship the thing end to end, with enough real prose here that the manifest's
 minimum non-whitespace byte count is comfortably exceeded, covering the
 goal, approach, and acceptance bar this fixture's plan-writer dispatch
 supposedly produced.
 
-# File Structure and Responsibilities
+# File Structure
 
 | Path | Action | Responsibility |
 |---|---|---|

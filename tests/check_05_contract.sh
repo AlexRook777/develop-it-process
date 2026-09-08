@@ -857,12 +857,19 @@ PY
 assert_eq "MATCH" "$_t16_finding_id_formula" \
   "T16: finding_id's own formula is EXACTLY the three documented arguments -- no line-number ingredient inserted"
 
-# 5. unreviewed final fixer acceptance. (T11 above already retires the old
-# "final fix pass, no re-review" shortcut phrase; this pins the affirmative
-# replacement rule -- a fixer's own STATUS never substitutes for a subsequent
-# reviewer verdict, at any iteration including the cap.)
-assert_present "there is no iteration, including the cap, at which a fixer's own STATUS substitutes for a subsequent reviewer verdict" "$S" \
-  "T16: a fixer's own STATUS never substitutes for a subsequent reviewer verdict, at any iteration"
+# 5. unreviewed final fixer acceptance. The invariant is now TIER-SCOPED, by
+# owner decision: through iteration 2 no fix is ever unreviewed, while at
+# iteration 3+ with zero open blockers exactly ONE majors-only fixer batch may
+# close the gate without re-review (that bound is what makes the relaxed tier
+# terminate instead of regenerating review surface with every additive fix).
+# Pin both halves, so neither the strict-tier guarantee nor the boundedness of
+# the exception can quietly erode.
+assert_present "Through iteration 2 no fix is ever unreviewed" "$S" \
+  "T16: the strict tier still guarantees every fix is re-reviewed"
+assert_present "exactly ONE" "$S" \
+  "T16: the relaxed tier's unreviewed final fix is bounded to a single batch"
+assert_present "A BLOCKER never gets that exception at any iteration" "$S" \
+  "T16: a BLOCKER is never covered by the unreviewed-final-fix exception"
 
 # 6. unbounded retry/review language. Every retry/review loop in this
 # document is bounded by a named policy cap; no prose authorizes retrying or

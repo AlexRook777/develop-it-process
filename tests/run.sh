@@ -11,6 +11,12 @@ LIVE=no
 pass=0 fail=0 skipped=0 failed_names=()
 
 for check in check_*.sh; do
+  # check_08_launcher plants tests/check_88_gatefail_probe.sh so this very glob
+  # picks it up, and removes it in an EXIT trap. An interrupted run (SIGKILL)
+  # skips that trap, so the NEXT run globs a phantom check that check_08 then
+  # deletes underneath it -- reported as a bogus suite failure. The glob is
+  # expanded once, up front; re-check existence at use.
+  [ -f "$check" ] || continue
   is_live=0
   case "$check" in
     check_90_*) is_live=1 ;;

@@ -43,7 +43,7 @@ For each iteration N (start at 1, hard cap `review_iteration_cap`):
    - **Codex subprocess (dispatched if and only if `codex_available = true`):** dispatch one `codex` subprocess for role `plan-reviewer-codex`. Its real STATUS: `codex_status="$(role_attempt_dir plan-reviewer-codex "$(_latest_attempt_id p05-i$ITERATION-plan-reviewer-codex)")/STATUS.md"`. Findings: `5-plan-review/$ITERATION/codex-findings.jsonl`. Model, effort, and timeout are resolved per-role from the Models table by `dispatch_parallel`. If `codex_available = false`, the `CODEX_UNAVAILABLE` event was already appended in Step 5.0 — do not dispatch and do not log a new event here.
    Run both as background processes (`& rp=$!`) and wait for both before reading any verdict file.
 3. Read only verdict files, then `ingest_findings plan-reviewer-claude "$claude_status" "5-plan-review/$ITERATION/claude-findings.jsonl"` and, when active, the codex counterpart — both merge into `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (derived from each STATUS_FILE's own attempt directory, never a phase-relative alias).
-4. Apply the iteration-dependent gate against the catalog counts — **iterations 1–2:** re-dispatch when `blockers + majors > 0`; **iterations 3 and up:** re-dispatch when `blockers > 0` OR any open major still lacks a disposition:
+4. Apply the iteration-dependent gate against the catalog counts — **iterations 1–2:** run this step when `blockers + majors > 0`, and always loop back to step 1 for a full re-review afterwards; **iterations 3 and up:** `blockers = 0` alone passes the gate, so run this step only when `blockers > 0` (full fix→re-review loop, as in iterations 1–2) or when majors remain and no final batch has run yet at this tier — in that one case dispatch the final batch below and then go straight to step 5 (gate passed), WITHOUT looping back to step 1:
    - Call `reconstruct_checkpoint_state 5 "$ITERATION"` first (plan-fixer is checkpointed, "Checkpoint contract and resumable continuation", core document) so `$CONTINUATION_PATH`/`$DECLARED_FOREIGN_CHANGES` reflect this exact iteration's own prior attempt, if any, before rendering the appendix.
    - `FINDING_IDS="$(select_finding_batch "$PHASE_DIR/$ITERATION/findings-catalog.jsonl")"` — the SAME path the plan-fixer appendix itself reads.
    - Dispatch one `claude` subprocess for role `plan-fixer`. Inputs: `$PLAN_PATH`, `$FINDING_IDS`. The fixer calls `record_finding_disposition` for every assigned ID. This role's timeout comes from the Models table via `role_timeout`.
@@ -51,12 +51,12 @@ For each iteration N (start at 1, hard cap `review_iteration_cap`):
    - `unset FINDING_IDS` immediately afterward — the next iteration's reviewers never declare `finding_ids` and would otherwise be scope-rejected by a stale value.
    - Capture `bytes_after`, tally this round's counts, and call `record_convergence_signals 5 "$ITERATION" ...`.
    - Call `divergence_check 5 "$ITERATION" "$PHASE_DIR/$ITERATION/findings-catalog.jsonl"` and apply the SAME divergence handling as Step 3.1 (`phases/3-spec-review.md`), substituting `plan-review`/`plan-fixer`/`$PLAN_PATH` (record the event(s); at `divergent_round_cap`, check `divergent_round_cap_hit_before plan-review` FIRST — on `yes`, HALT with the catalog paths instead of dispatching a third batch; on `no`, re-populate `FINDING_IDS` via `select_finding_batch` and dispatch one consolidation-priority `plan-fixer` batch instead of the ordinary one).
-   - Increment N. Loop from step 1 — reviewers ALWAYS run again; no cap-adjacent fixer dispatch ever substitutes for the next reviewer round.
+   - **Iterations 1–2 only:** increment N and loop from step 1 — reviewers ALWAYS run again in the strict tier. **Iterations 3 and up:** loop back to step 1 only if this round's trigger was a BLOCKER; if it was majors-only, this was the single authorized unreviewed final fix — record every still-open major in `followups.jsonl` via `append_followup`, then go to step 5 and pass the gate.
 5. When the gate passes:
    - Dispatch one `claude` subprocess for role `summarizer-plan`. Outputs: `5-plan-review/plan-review-summary.md` and `5-plan-review/summarizer-status.md`. The summarizer records any deferred/accepted-risk majors (from the final catalog) in the summary file.
    - You read only `summarizer-status.md`. On `DONE`, proceed to Phase 6. The last successful gate action before Phase 6 is this reviewer-verified acceptance, never the fixer's own STATUS.
 
-If iteration cap (`review_iteration_cap`) trips with any active reviewer still reporting an open BLOCKER, HALT and surface to user. A cap reached with `blockers=0` and every remaining major already dispositioned is NOT a HALT — it passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`). An undispositioned major at the cap HALTs like a blocker.
+If iteration cap (`review_iteration_cap`) trips with any active reviewer still reporting an open BLOCKER, HALT and surface to user. A cap reached with `blockers=0` is NOT a HALT however many majors remain — it passes per the relaxed gate (and sets the readiness verdict to `READY_WITH_NOTES`), with residual majors recorded in the gate summary and `followups.jsonl`.
 
 ## Role appendices dispatched by this phase
 
@@ -218,7 +218,7 @@ You are a plan patcher invoked as a fresh subprocess. You have no shared context
 ## Role contract
 
 - Required inputs: `feature_folder;iteration;plan_path;finding_ids`
-- Optional inputs: `continuation_path;declared_foreign_changes`
+- Optional inputs: `continuation_path;declared_foreign_changes;validator_errors;consolidation_priority`
 - Outputs: `status;progress.jsonl`
 - Allowed verdicts: `DONE;BLOCKED`
 - Required status fields: `common_v2;changed_paths;finding_dispositions`
@@ -233,12 +233,15 @@ You are a plan patcher invoked as a fresh subprocess. You have no shared context
 - `$FINDING_IDS` — the specific canonical finding identifiers assigned to you this iteration (space-separated, never the full findings catalog)
 - `$CONTINUATION_PATH` — absolute path to a prior, still-partial attempt's own `progress.jsonl` (only set when you are a continuation; empty otherwise)
 - `$DECLARED_FOREIGN_CHANGES` — space-separated pre-existing dirty paths the current write lease already declared as not yours (optional; only meaningful alongside `$CONTINUATION_PATH`)
+- `$VALIDATOR_ERRORS` — mechanical output from a structural validator (`validate_artifact` / `validate_plan_tasks`) that REJECTED a previous attempt's edit of this same artifact (empty on a first attempt). This is deterministic tool output, not review feedback: when it is non-empty, repairing exactly what it names is your FIRST duty, ahead of your assigned findings, and a `DONE` verdict is a lie until the named defect is gone. Do not re-litigate whether the validator is right; it is the gate that decides whether this artifact may reach a reviewer at all.
+- `$CONSOLIDATION_PRIORITY` — `yes` when this gate has hit `divergent_round_cap` and this is its ONE bounded consolidation pass; empty otherwise. When `yes`, invert your usual priority: **delete, replace, merge and de-contradict existing text rather than adding any**. Do not introduce new specification, new gates, new tasks or new prose; resolve each assigned finding by removing or simplifying whatever made it possible, and prefer one deletion that closes several findings over several additions that close one each. The gate is growing without converging, and another additive pass is exactly what must not happen.
 
 You are assigned at most `document_fixer_batch_size` finding IDs at a time.
 
 ## Behavior
 
 1. If `$CONTINUATION_PATH` is set, read it first: resume from its last recorded `next_unit`, reconcile at most the one dirty (`state: partial`) finding using `$DECLARED_FOREIGN_CHANGES`, and never re-patch a finding its records already mark disposed.
+1a. If `$VALIDATOR_ERRORS` is non-empty, fix every defect it names in the plan BEFORE touching your assigned findings, then re-run BOTH `validate_plan_tasks "$PLAN_PATH"` and `validate_artifact plan-fixer "$DISPATCH_ID"` to confirm they now pass. A previous attempt already broke this plan's structure (most often the `## Task Contract` JSON block); repeating its edits without repairing that first only reproduces the rejection.
 2. Read ONLY the findings named in `$FINDING_IDS` from `$PHASE_DIR/$ITERATION/findings-catalog.jsonl` (`jq --arg id ... 'select(.finding_id==$id)'`), and `$PLAN_PATH`.
 3. Patch the plan in place to address every BLOCKER and MAJOR among your assigned IDs — prefer simplifying, replacing, or deleting redundant text over appending another rule (spec §18.4).
 4. Address assigned MINOR findings opportunistically; otherwise dispose them `already_satisfied`.
@@ -319,10 +322,10 @@ You are a gate summarizer invoked as a fresh subprocess by the develop-it orches
 6. Write the summary file at `$FEATURE_FOLDER/5-plan-review/plan-review-summary.md` with:
    - Iteration count.
    - Findings counts table per iteration.
-   - Deferred MAJOR list — MAJOR findings still open (from the final catalog) at the passing iteration, each carrying an explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>` disposition (spec §17.3). Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`, every open major dispositioned); empty for a strict pass. For each deferred major, record its finding_id, source reviewer, location, disposition, and one-line summary. These majors WERE re-reviewed — the fixer's dispositioning dispatch was followed by another full reviewer round per spec §18.2; note that in the list.
+   - Residual MAJOR list — MAJOR findings still open in the final catalog at the passing iteration, whether or not dispositioned (spec §17.3). Non-empty ONLY when the gate passed under the relaxed rule (final iteration ≥ 3, `blockers=0`); empty for a strict pass. For each, record its finding_id, source reviewer, location, disposition (or `none`), and one-line summary. State whether the relaxed tier's single final fixer batch ran and whether it was re-reviewed — at iterations 3+ that majors-only fix closes the gate WITHOUT a further reviewer round, so say which rather than claiming re-review.
    - Residual MINOR/NIT list.
    - `partial_review` flag and `codex_unavailable_reason` (if any), one human-readable sentence per mode.
-   - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record deferred majors separately, only when present.
+   - Final verdict (`PASS`) and final iteration number. Note whether the pass was strict (converged by iteration 2) or relaxed (final iteration ≥ 3); record residual majors separately, only when present.
 <!-- INCLUDE-BEGIN: summarizer-usage-table-format -->
 <!-- INCLUDE-END -->
 

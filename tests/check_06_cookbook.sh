@@ -625,6 +625,8 @@ if declare -F render_prompt >/dev/null; then
   STATUS_PUBLISHER_PATH=/tmp/ff/.orchestration/runtime/publish-status
   CONTINUATION_PATH=""
   DECLARED_FOREIGN_CHANGES=""
+  VALIDATOR_ERRORS=""
+  CONSOLIDATION_PRIORITY=""
   APPLICABLE_OPTIONAL_SKILLS=""
   RUNTIME_DIR="$FEATURE_FOLDER/.orchestration/runtime"
   MODE=A
@@ -1142,7 +1144,12 @@ esac
   plan_path="$FEATURE_FOLDER/plan.md"; : > "$plan_path"
   printf 'verdict: DONE\nplan_path: %s\n' "$plan_path" > "$FEATURE_FOLDER/4-plan-writing/plan-status.md"
   printf 'verdict: DONE\nverification: PASS\n' > "$FEATURE_FOLDER/6-implementation/implementer-status.md"
-  printf 'implementation_base_sha: cafef00d\n\n' > "$FEATURE_FOLDER/RUN_LOG.md"
+  # A REAL IMPLEMENTATION_BASELINE event block, not a bare `implementation_base_sha:`
+  # line. The old fixture encoded the very bug F17 fixed: the event writes the SHA as
+  # `base_sha`, so a reader looking for `implementation_base_sha` found nothing and
+  # silently fell back to `non-git`. Reconstruction now reads the LATEST
+  # IMPLEMENTATION_BASELINE's `base_sha`, so the fixture must produce one.
+  printf -- '--- 1970-01-01T00:00:00Z  event=IMPLEMENTATION_BASELINE\nevent_id:                 1\nprocess_schema_version:   2\nphase:                    6\nphase_name:               implementation\niteration:                00\ndispatch_id:              \ncaused_by_event_id:       \nauthority:                process\nreason:                   baseline captured\nbase_sha:                 cafef00d\nuncommitted_changes:      no\n\n' > "$FEATURE_FOLDER/RUN_LOG.md"
 
   init_orchestration_vars 7 >/dev/null 2>&1
   rc=$?
@@ -3145,13 +3152,13 @@ EOF
     mkdir -p "$_t11_pw_dir"
     PLAN_PATH="$T11_DIR/plan.md"
     cat > "$PLAN_PATH" <<'EOF'
-# Goal
+# Global Constraints
 
 Ship the thing end to end, with enough real prose here that the manifest's
 minimum non-whitespace byte count is comfortably exceeded by a wide margin,
 covering the goal, the approach, and the acceptance bar for this fixture.
 
-# File Structure and Responsibilities
+# File Structure
 
 | Path | Action | Responsibility |
 |---|---|---|
@@ -3171,7 +3178,7 @@ EOF
     # file that ALSO fails headings/marker would still correctly return 1,
     # but would prove nothing about the size check specifically.
     rc=0
-    printf '# Goal\n# File Structure and Responsibilities\n' > "$T11_DIR/plan-tiny.md"
+    printf '# Global Constraints\n# File Structure\n' > "$T11_DIR/plan-tiny.md"
     _t11_pw_dir2="$FEATURE_FOLDER/4-plan-writing/00/attempts/p04-i00-plan-writer-a02"
     mkdir -p "$_t11_pw_dir2"
     PLAN_PATH="$T11_DIR/plan-tiny.md"
@@ -3186,16 +3193,17 @@ EOF
 
     rc=0
     PLAN_PATH="$T11_DIR/plan-nostatus.md"
-    printf '# Goal\n\nFile Structure and Responsibilities present too.\n' > "$PLAN_PATH"
+    printf '# Global Constraints\n\nFile Structure present too.\n' > "$PLAN_PATH"
     validate_artifact plan-writer p04-i00-nonexistent-a01 >/dev/null 2>"$BUILD/t11-va-nostatus.err" || rc=$?
     assert_rc 1 "$rc" "validate_artifact refuses without a matching successful STATUS -- size/marker alone never authorizes review"
     assert_contains "VALIDATE_ARTIFACT_NO_STATUS" "$BUILD/t11-va-nostatus.err" "the missing-STATUS refusal names itself"
 
-    # ---- CODE REVIEW FIX (Minor 11a): "## Non-Goals" must NOT satisfy a
-    # required "Goal" heading -- the check is heading-anchored, never a
-    # bare substring match anywhere in the file. -----------------------
+    # ---- CODE REVIEW FIX (Minor 11a): a heading that merely CONTAINS the
+    # required text ("## Non-Global Constraints") must NOT satisfy it -- the
+    # check is heading-anchored on the heading's first words, never a bare
+    # substring match anywhere in the file. --------------------------------
     rc=0
-    printf '# Non-Goals\n\nWe are explicitly not doing X, Y, or Z in this iteration -- those are out of scope on purpose and documented here so nobody re-proposes them later without a fresh discussion.\n\n# File Structure and Responsibilities\n\n| Path | Action |\n|---|---|\n| foo.py | Modify |\n' \
+    printf '# Non-Global Constraints\n\nWe are explicitly not doing X, Y, or Z in this iteration -- those are out of scope on purpose and documented here so nobody re-proposes them later without a fresh discussion.\n\n# File Structure\n\n| Path | Action |\n|---|---|\n| foo.py | Modify |\n' \
       > "$T11_DIR/plan-nongoal.md"
     _t11_pw_dir3="$FEATURE_FOLDER/4-plan-writing/00/attempts/p04-i00-plan-writer-a03"
     mkdir -p "$_t11_pw_dir3"
@@ -3207,8 +3215,8 @@ reason: null
 artifact_revision: %s
 '       "$(sha256sum "$PLAN_PATH" | awk '{print $1}')" > "$_t11_pw_dir3/STATUS.md"
     validate_artifact plan-writer p04-i00-plan-writer-a03 >/dev/null 2>"$BUILD/t11-va-nongoal.err" || rc=$?
-    assert_rc 1 "$rc" "Minor11a regression: '## Non-Goals' does NOT satisfy a required 'Goal' heading"
-    assert_contains "VALIDATE_ARTIFACT_MISSING_HEADING:Goal" "$BUILD/t11-va-nongoal.err"       "the heading-anchored rejection specifically names the missing 'Goal' heading"
+    assert_rc 1 "$rc" "Minor11a regression: '## Non-Global Constraints' does NOT satisfy a required 'Global Constraints' heading"
+    assert_contains "VALIDATE_ARTIFACT_MISSING_HEADING:Global Constraints" "$BUILD/t11-va-nongoal.err"       "the heading-anchored rejection specifically names the missing 'Global Constraints' heading"
   fi
 else
   _fail "ingest_findings/validate_artifact are not defined"

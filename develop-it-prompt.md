@@ -98,7 +98,7 @@ For every step that produces or modifies an artifact:
 
 3. The subagent writes its artifact and a short `STATUS.md` to a pre-agreed path inside the feature folder. STATUS.md is written LAST and atomically (the subagent writes `STATUS.md.tmp` and renames).
 4. You read ONLY `STATUS.md` (and, for the final readiness writer, the per-phase summary files referenced by STATUS.md). You do not open the artifact, the findings file, or the transcripts. The only exception is surfacing a transcript path to the user when a failure halts the run.
-5. Branch on the verdict. For review gates this follows the **iteration-dependent gate** (see "Review-gate severity policy"): through iteration 2, any `blockers + majors > 0` re-dispatches the relevant bounded fixer subagent with a batch of canonical finding IDs (`select_finding_batch`) as input; from iteration 3 onward, `blockers > 0` OR any open major still lacking an explicit disposition re-dispatches the fix→re-review loop — every fixer dispatch, at every iteration including the cap, is followed by another full reviewer round via `ingest_findings` before the gate can pass (spec §18.2's "no unreviewed final fix"; the retired one-shot unreviewed fix no longer exists anywhere in this document). If `BLOCKED`, halt and surface to the user.
+5. Branch on the verdict. For review gates this follows the **iteration-dependent gate** (see "Review-gate severity policy"): through iteration 2, any `blockers + majors > 0` re-dispatches the relevant bounded fixer subagent with a batch of canonical finding IDs (`select_finding_batch`) as input; from iteration 3 onward, only `blockers > 0` re-dispatches the fix→re-review loop — majors there are handled by exactly ONE final fixer batch that closes the gate without re-review, and any major still open afterwards is recorded in the gate summary and `followups.jsonl` rather than blocking. If `BLOCKED`, halt and surface to the user.
 6. `dispatch_attempt`/`dispatch_parallel` append the `RUN_LOG.md` block for you — one `DISPATCH_STARTED` plus `DISPATCH_COMPLETED` pair per attempt (see **Resumability** below for the full grammar — blocks are separated by blank lines and start with `--- <ISO-timestamp>  event=<NAME>`; the grammar's block shapes are exhaustive — never hand-compose abbreviated entries). Every completion block includes the nine usage-telemetry fields produced by `parse_usage`, which the dispatch helper calls internally immediately after the subprocess returns. On parse failure it returns `usage_status=unavailable` with zeros; those are written into the block unchanged — telemetry parsing failure NEVER blocks dispatch logging. Do not call `parse_usage` or append a RUN_LOG block by hand at a phase step.
 
    ```
@@ -170,7 +170,7 @@ for one phase. What remains forbidden is combining two numbered phases into one 
 Every reviewer subagent classifies each finding into exactly one severity:
 
 - **BLOCKER** — correctness or safety defect. Always blocks the gate, at every iteration.
-- **MAJOR** — missing requirement, internal contradiction, ambiguity that would cause an implementer to guess, or risk that surfaces late if not fixed now. Blocks the gate through iteration 2; from iteration 3 onward it no longer by itself triggers another round PROVIDED it carries an explicit disposition (below) — it is never silently dropped.
+- **MAJOR** — missing requirement, internal contradiction, ambiguity that would cause an implementer to guess, or risk that surfaces late if not fixed now. Blocks the gate through iteration 2. From iteration 3 onward a MAJOR never blocks the gate: it is addressed by the single final fixer batch and/or recorded in the gate summary and the follow-up ledger — it is never silently dropped.
 - **MINOR / NIT** — wording, formatting, micro-improvement, style preference, optional enhancement. Gate is permitted to pass with these recorded but unaddressed, at any iteration.
 
 **Iteration-dependent gate (spec §18.1).** Review gates run one gate-loop
@@ -178,12 +178,14 @@ controller (Runtime cookbook's `ingest_findings`/`select_finding_batch`/
 `record_finding_disposition`/`dispositions_complete`, plus
 `validate_artifact` before every review dispatch) with a hard cap of
 `review_iteration_cap` iterations and a pass threshold that relaxes after
-the 2nd iteration. **No iteration ever authorizes an unreviewed final fix
-(spec §18.2)**: every fixer dispatch, at any iteration including the last
-one the cap allows, is followed by another structural validation and
-another full reviewer round before the gate can be declared passed — the
-retired "final fix pass, no re-review" shortcut never appears again in this
-document.
+the 2nd iteration. **Through iteration 2 no fix is ever unreviewed**: every
+fixer dispatch in the strict tier is followed by another structural
+validation and another full reviewer round before the gate can be declared
+passed. **From iteration 3 onward, with zero open blockers, exactly ONE
+final fixer batch may close the gate without re-review** — the single,
+deliberately bounded exception, owner-authorized, and the reason the
+relaxed tier terminates instead of regenerating review surface with every
+additive fix. A BLOCKER never gets that exception at any iteration.
 
 - **Iterations 1–2 (strict gate):** the gate passes only when the
   post-`ingest_findings` catalog shows zero open/reopened BLOCKER and zero
@@ -194,15 +196,18 @@ document.
   `dispositions_complete` confirms every assigned ID has a disposition,
   `validate_artifact` re-validates the new revision, and all active
   reviewers are re-dispatched against it.
-- **Iterations 3 and up (relaxed gate):** the gate passes when zero open/
-  reopened BLOCKER findings remain AND every open MAJOR finding carries an
-  explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>`
-  disposition (never silently ignored, never merely "addressed" without a
-  disposition record) — regardless of how many such majors remain. Any
-  BLOCKER, or any MAJOR with no disposition yet, re-dispatches the fixer
-  with the next bounded batch and then, unconditionally, re-dispatches all
-  active reviewers — the same loop as iterations 1–2, never a special
-  unreviewed exit. `record_convergence_signals` runs after every cycle and
+- **Iterations 3 and up (relaxed gate):** **zero open/reopened BLOCKER
+  findings is the ONLY pass requirement.** MAJOR findings do not block at
+  this tier, dispositioned or not. Concretely: on reaching iteration 3 with
+  zero blockers, if any open majors remain, `select_finding_batch` picks one
+  final bounded batch, the appropriate fixer (spec-fixer / plan-fixer /
+  implementation-fixer) is dispatched once against it, and **the gate then
+  passes without a further reviewer round** — this final fix is the one
+  authorized unreviewed fix in the whole process. Every major still open
+  afterwards (unbatched, or left `blocked` by that fixer) is recorded in the
+  gate summary and appended to `followups.jsonl`, never dropped. A BLOCKER,
+  by contrast, always re-dispatches the fix→re-review loop exactly as in
+  iterations 1–2. `record_convergence_signals` runs after every cycle and
   `divergence_check` may redirect the loop into the one bounded
   consolidation pass described under "Convergence signals and divergence"
   in Phase 3's iteration loop (`phases/3-spec-review.md`).
@@ -220,7 +225,7 @@ You read `STATUS.md` for each reviewer subprocess. STATUS.md must declare both a
 
 Reviewer appendices in this file instruct reviewers to use this severity ladder explicitly and to refuse to label an obvious correctness issue as MINOR. Reviewers always report majors honestly — their own `PASS` verdict still requires `blockers=0 AND majors=0`; the relaxation lives ONLY in the orchestrator's gate decision and the readiness verdict, never in a reviewer's self-assessment.
 
-A gate that passes in the relaxed tier (final passing iteration ≥ 3) forces the final readiness verdict to `READY_WITH_NOTES` — whether or not any deferred majors remain — never a silent `READY`. Deferred majors, when present, are listed in the readiness report; a clean relaxed pass (`majors=0`) still earns `READY_WITH_NOTES` on the strength of the extended convergence alone.
+A gate that passes in the relaxed tier (final passing iteration ≥ 3) forces the final readiness verdict to `READY_WITH_NOTES` — whether or not any majors remain — never a silent `READY`. Residual majors, when present, are listed in the readiness report; a clean relaxed pass (`majors=0`) still earns `READY_WITH_NOTES` on the strength of the extended convergence alone, and a relaxed pass whose final fixer batch went unreviewed always does.
 
 ## Role Contract Registry
 
@@ -289,19 +294,19 @@ this account and is used for the cheap `preflight-codex` probe;
 | context-discovery | claude | claude-sonnet-5 | — | 30 | no | no | no | feature_folder;resolved_models | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | READY;BLOCKED | common_v2;relevant_skills;relevant_skills_reasons | none | 2 |
 | spec-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
 | spec-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 3 |
-| spec-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;spec_path;finding_ids | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2;changed_paths;finding_dispositions | document-fixer | 3 |
+| spec-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;spec_path;finding_ids | continuation_path;declared_foreign_changes;validator_errors;consolidation_priority | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2;changed_paths;finding_dispositions | document-fixer | 3 |
 | plan-writer | claude | claude-opus-5 | — | 120 | yes | yes | no | feature_folder;spec_path;context7_policy | continuation_path;declared_foreign_changes;applicable_optional_skills | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;plan_path;progress.jsonl | DONE;BLOCKED | common_v2 | plan | 4 |
 | plan-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
 | plan-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;plan_path;spec_path | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 5 |
-| plan-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;plan_path;finding_ids | continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2;changed_paths;finding_dispositions | document-fixer | 5 |
+| plan-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;iteration;plan_path;finding_ids | continuation_path;declared_foreign_changes;validator_errors;consolidation_priority | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;progress.jsonl | DONE;BLOCKED | common_v2;changed_paths;finding_dispositions | document-fixer | 5 |
 | implementer | claude | claude-opus-5 | — | 300 | yes | yes | yes | feature_folder;plan_path;spec_path;implementation_base_sha;context7_policy;mode | debugger_status_path;continuation_path;continuation_prior_classification;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | implementation_summary;status | DONE;DONE_WITH_EXCLUSIONS;FAILED;NEEDS_DEBUG;BLOCKED | common_v2;verification | implementation | 6 |
 | impl-worker | claude | claude-sonnet-5 | — | 300 | yes | yes | no | task_brief | context7_policy | none | changed_paths | none | none | implementation | child |
 | debugger | claude | claude-opus-5 | — | 60 | yes | yes | no | feature_folder;plan_path;implementation_summary_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 6 |
 | code-reviewer-claude | claude | claude-opus-5 | — | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
 | code-reviewer-codex | codex | gpt-5.6-sol | high | 60 | no | yes | no | feature_folder;iteration;spec_path;plan_path;implementation_base_sha | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
 | seam-verifier | claude | claude-opus-5 | — | 30 | no | no | no | feature_folder;iteration;spec_path;seam_files | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | verdict;findings | PASS;CHANGES_REQUESTED | common_v2;blockers;majors;minors;findings | review | 7 |
-| implementation-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | accepted_plan;reviewed_revision;finding_ids;iteration;write_lease | implementation_base_sha;run_log;relevant_artifacts;continuation_path;declared_foreign_changes | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | changed_paths;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;finding_dispositions | implementation | 7 |
-| all-tests-runner | claude | claude-sonnet-5 | — | 60 | yes | yes | no | feature_folder;repo_root;round | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;test_report | PASS;FAIL;SKIPPED | common_v2 | none | 8 |
+| implementation-fixer | claude | claude-opus-5 | — | 60 | yes | yes | no | accepted_plan;reviewed_revision;finding_ids;iteration;write_lease | implementation_base_sha;run_log;relevant_artifacts;continuation_path;declared_foreign_changes;validator_errors;consolidation_priority | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | changed_paths;progress.jsonl | DONE;PARTIAL;BLOCKED | common_v2;changed_paths;finding_dispositions | implementation | 7 |
+| all-tests-runner | claude | claude-sonnet-5 | — | 180 | yes | yes | no | feature_folder;repo_root;round | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status;test_report | PASS;FAIL;SKIPPED | common_v2 | none | 8 |
 | test-fixer | claude | claude-sonnet-5 | — | 60 | yes | yes | no | feature_folder;plan_path;round;test_report_path;implementation_base_sha;context7_policy | — | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | status | DONE;BLOCKED | common_v2 | none | 8 |
 | summarizer-spec | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 3 |
 | summarizer-plan | claude | claude-sonnet-5 | — | 20 | no | no | no | feature_folder | run_log | `$PHASE_DIR/$ITERATION/attempts/$DISPATCH_ID/STATUS.md` | summary;status | DONE | common_v2 | none | 5 |
@@ -339,7 +344,7 @@ currently only `plan-writer`, written at
 
 | Role | Output variable | Min bytes | Required headings | Forbidden markers | Revision calc | Requires complete marker |
 |---|---|---:|---|---|---|---|
-| plan-writer | PLAN_PATH | 200 | Goal;File Structure and Responsibilities | TBD;\<placeholder\>;TODO: fill in | sha256 | yes |
+| plan-writer | PLAN_PATH | 200 | Global Constraints;File Structure | TBD;\<placeholder\>;TODO: fill in | sha256 | yes |
 | spec-fixer | SPEC_PATH | 100 |  | ...(truncated);\<!-- TRUNCATED --\> | sha256 | no |
 | plan-fixer | PLAN_PATH | 200 |  | ...(truncated);\<!-- TRUNCATED --\> | sha256 | no |
 | implementer | IMPLEMENTATION_SUMMARY_PATH | 100 |  | ...(truncated);\<!-- TRUNCATED --\> | git_sha | no |
@@ -389,7 +394,7 @@ asserts every row is present with its exact value.
 | divergent_round_cap | 2 | Consecutive divergent rounds before the gate dispatches one consolidation-priority fixer batch instead of the ordinary one; a second such cap hit on the same gate HALTs instead of dispatching a third |
 | long_role_headroom_threshold_minutes | 60 | Timeout threshold requiring a just-in-time vendor liveness/headroom probe |
 | test_suite_parallel_safe | no | Whether the target project's test suite tolerates its own default parallel worker count (`yes`) or must be forced serial under the P03 test-execution lease (`no`, default) |
-| seam_globs | deploy/*;infra/*;terraform/*;*.tf;*.tfvars;migrations/*;*/migrations/*;.env*;*.env;config/*;*/clients/* | `;`-separated shell glob patterns classifying a changed file as an integration seam (deploy manifests, migration dirs, env/config files, third-party client wrappers) for the Phase 7 seam-verifier dispatch gate (P01) |
+| seam_globs | deploy/*;*/deploy/*;infra/*;*/infra/*;terraform/*;*/terraform/*;*.tf;*.tfvars;serverless*.y*ml;*/serverless*.y*ml;template.y*ml;*/template.y*ml;docker-compose*.y*ml;*/docker-compose*.y*ml;Dockerfile*;*/Dockerfile*;migrations/*;*/migrations/*;.env*;*.env;config/*;*/config/*;*/clients/*;*_clients/* | `;`-separated shell glob patterns classifying a changed file as an integration seam (deploy manifests, migration dirs, env/config files, third-party client wrappers) for the Phase 7 seam-verifier dispatch gate (P01). Every directory pattern carries a depth-agnostic `*/` twin: the original root-anchored-only list matched NOTHING in a real monorepo-style layout — observed live, a change that modified `backend/serverless.yml` and `backend/ubs_clients/<vendor>/*` produced 62 changed files and 0 seam matches, skipping the seam verifier on precisely the deploy-manifest and third-party-wrapper change it exists to catch. Serverless/SAM/Docker manifests are named explicitly for the same reason, and `*_clients/*` catches the common `<prefix>_clients/` package convention that `*/clients/*` misses |
 
 Resolve a single policy value with the cookbook helper below — never by
 re-reading this table with ad hoc `grep`/`awk`, which would drift from the
@@ -2249,7 +2254,7 @@ The "Codex subprocess" column below applies AT A PER-PHASE GATE THAT DISPATCHES 
 
 ### Iteration cap
 
-Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of `review_iteration_cap` (currently 10) fix→re-review iterations with a pass threshold that relaxes after iteration 2 (see "Review-gate severity policy"). Through iteration 2, any active reviewer reporting `blockers > 0` OR `majors > 0` triggers another round. From iteration 3 onward, a BLOCKER always triggers another round, and a MAJOR triggers another round only until it carries an explicit `deferred:<followup_id>` or `accepted_risk:<decision_id>` disposition — once every open major is dispositioned, the gate passes with those majors carried as deferred/accepted-risk in the readiness report. Every fixer dispatch, at any iteration including the cap, is followed by another full reviewer round (spec §18.2); there is no iteration at which a fixer's own STATUS substitutes for that round. After the cap with any active reviewer still reporting `blockers > 0`, HALT and surface residual findings paths plus the artifact path. The user decides: override (accept and proceed) or take the work back. A gate that reaches iteration 3 or beyond (including the cap) with `blockers = 0` and every open major already dispositioned passes the gate and sets the readiness verdict to `READY_WITH_NOTES`.
+Each review gate (Phase 3, Phase 5, Phase 7) has a hard cap of `review_iteration_cap` (currently 10) fix→re-review iterations with a pass threshold that relaxes after iteration 2 (see "Review-gate severity policy"). Through iteration 2, any active reviewer reporting `blockers > 0` OR `majors > 0` triggers another round, and every fixer dispatch in that tier is followed by another full reviewer round. From iteration 3 onward only a BLOCKER triggers another round; majors get exactly ONE final fixer batch which closes the gate without re-review, and any major still open afterwards is recorded in the gate summary and `followups.jsonl`. After the cap with any active reviewer still reporting `blockers > 0`, HALT and surface residual findings paths plus the artifact path. The user decides: override (accept and proceed) or take the work back. A gate that reaches iteration 3 or beyond (including the cap) with `blockers = 0` passes the gate — majors never HALT it — and sets the readiness verdict to `READY_WITH_NOTES`.
 
 ### Resumability
 
@@ -2811,13 +2816,13 @@ This Develop-It SDLC step is complete only when ALL of the following hold:
 - Per-phase preflight passed for every phase in {3, 5, 7}: `<phase-dir>/preflight/claude-check-status.md` is `READY`, AND the readiness writer's classification for that phase's codex slot is `READY`, `SKIPPED` (matching `event=CODEX_SKIPPED_BY_USER_CONSENT` for `(phase=<P>, iteration=00)`), or `FAILED` (matching `event=CODEX_UNAVAILABLE` for `(phase=<P>, iteration=00)`, OR a present codex STATUS file with `verdict: FAILED` / non-`READY` — Mode 4 malformed STATUS may legitimately remain). Only an `INVALID_ORCHESTRATION` classification blocks completion. `FAILED` codex per-phase verdicts surface in the readiness report's `partial_review` / `codex_unavailable_reason` notes but do not gate completion. Unlike Phase 1, per-phase gates do not require user consent for codex degradation; the per-phase preflight model trades that prompt for fast automatic degradation since the user has already opted into the run.
 - Phase 6 preflight passed (P09 — Phase 6 dispatches no codex probe at all): `6-implementation/preflight/claude-check-status.md` is `READY`. There is no `(phase=6, vendor=codex)` classification to satisfy — no `6-implementation/preflight/codex-check-status.md` is ever written and none is expected; Step 6.−1's `latest_codex_outcome` note is informational prose, not a completion input.
 - Phase 2 context discovery passed (`2-context-discovery/status.md` = `READY`).
-- Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `3-spec-review/spec-review-summary.md` exists.
+- Spec review gate passed under the iteration-dependent rule (`blockers=0` from all active reviewers, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (`blockers=0` alone; residual majors recorded in the gate summary and `followups.jsonl`, never blocking)); `3-spec-review/spec-review-summary.md` exists.
 - Implementation plan was written by the `plan-writer` subagent (`4-plan-writing/plan-status.md` = `DONE`).
-- Plan review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `5-plan-review/plan-review-summary.md` exists.
+- Plan review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (`blockers=0` alone; residual majors recorded in the gate summary and `followups.jsonl`, never blocking)); `5-plan-review/plan-review-summary.md` exists.
 - Implementer subagent completed Phase 6 (`6-implementation/implementer-status.md` = `DONE` or `DONE_WITH_EXCLUSIONS`, `verification=PASS`); `6-implementation/implementation-summary.md` exists.
 - No-secret checks ran (delegated to implementer/debugger; recorded in implementation summary) when the feature touches credentials, config, notebooks, examples, generated artifacts, or deployment files.
 - Credential-dependent checks ran or were safely skipped per the plan.
-- Code review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (any remaining open majors explicitly dispositioned deferred/accepted-risk after their own reviewed round)); `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
+- Code review gate passed under the iteration-dependent rule (`blockers=0`, with `majors=0` for a strict pass at iterations 1–2, or a relaxed pass at iterations 3–10 (`blockers=0` alone; residual majors recorded in the gate summary and `followups.jsonl`, never blocking)); `7-code-review/code-review-summary.md` exists. (Or the gate was overridden by explicit user instruction recorded in RUN_LOG.)
 - Phase 8 all-tests completed: `8-all-tests/summarizer-status.md` = `DONE` and `8-all-tests/all-test-summary.md` exists. A `final_test_verdict` of `FAILED` (residual failures after the 3-fix-round cap) does NOT block completion — the run completes with the detailed residual-failure record in the summary and the readiness verdict forced to `NOT_READY`. `SKIPPED` (`no-tests-found`) does not block.
 - Phase 9 documentation and handoff completed: `documentation-writer`'s STATUS is `DONE` or `PARTIAL` (a `BLOCKED` verdict — write-lease not held — is an orchestration bug and does not complete); `9-documentation/uat.md`, `9-documentation/planned-vs-realized.md`, and `9-documentation/documentation-validation.md` exist. A `documentation_validation` of anything other than `PASS` does NOT block completion — the residual gap is recorded and the readiness verdict is forced to at least `READY_WITH_NOTES`.
 - Phase 10 local git finalization recorded exactly one `event=GIT_FINALIZATION_RESULT` in `RUN_LOG.md` with `outcome ∈ {COMMITTED, NO_CHANGES, BLOCKED, FAILED}`. No push, PR, merge, or remote configuration was ever performed (`push_performed: no` always).

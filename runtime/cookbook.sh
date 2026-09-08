@@ -281,9 +281,15 @@ _reconstruct_accepted_spec() {
 # recorded it directly in plan-status.md's own `plan_path:` field, so read it
 # from there rather than guessing a filename convention.
 _reconstruct_accepted_plan() {
-  local st="$FEATURE_FOLDER/4-plan-writing/plan-status.md"
-  [ -f "$st" ] || { echo "PRELAUNCH_FAILED:accepted_plan" >&2; return 1; }
+  local st
+  PLAN_PATH=""
+  st="$(_resolve_status_path "$FEATURE_FOLDER/4-plan-writing/plan-status.md" \
+    "$FEATURE_FOLDER/4-plan-writing/00/attempts/p04-i00-plan-writer-a*/STATUS.md")" \
+    || { echo "PRELAUNCH_FAILED:accepted_plan" >&2; return 1; }
+  # plan-writer records the plan under `plan_path` in a pre-v2 alias, or under
+  # `output_01` in its attempt STATUS -- accept either.
   PLAN_PATH="$(status_field "$st" plan_path)"
+  [ -n "$PLAN_PATH" ] || PLAN_PATH="$(status_field "$st" output_01)"
   [ -n "$PLAN_PATH" ] && [ -f "$PLAN_PATH" ] \
     || { echo "PRELAUNCH_FAILED:accepted_plan" >&2; return 1; }
   # shellcheck disable=SC2034  # consumed by the calling phase shell (spec §6.3 "plan revision")
@@ -294,11 +300,36 @@ _reconstruct_accepted_plan() {
 # before Phase 6 started (recorded in RUN_LOG, per "Step 6.0 — Capture
 # implementation baseline"); the final SHA is simply current HEAD, valid the
 # instant a later phase's fresh shell asks for it.
+# A single optional argument `tolerant` makes an absent baseline a no-op
+# instead of PRELAUNCH_FAILED. Phase 6 needs that: the same phase-6 init runs
+# BEFORE Step 6.0 (which is what creates the baseline) and again at Step 6.1
+# (where the implementer requires it), so a hard failure at the first call
+# would make the phase unrunnable.
 _reconstruct_implementation_baseline() {
-  local st="$FEATURE_FOLDER/6-implementation/implementer-status.md"
-  [ -f "$st" ] || { echo "PRELAUNCH_FAILED:implementation_baseline" >&2; return 1; }
-  IMPLEMENTATION_BASE_SHA="$(status_field "$FEATURE_FOLDER/RUN_LOG.md" implementation_base_sha)"
-  [ -n "$IMPLEMENTATION_BASE_SHA" ] || IMPLEMENTATION_BASE_SHA=non-git
+  local tolerant="${1:-}"
+  # Three defects fixed here, all silent:
+  #  1. It gated on 6-implementation/implementer-status.md -- another fixed
+  #     alias schema v2 never writes (the implementer publishes to its attempt
+  #     path), so every phase needing the baseline failed prelaunch.
+  #  2. It read the SHA with the key `implementation_base_sha`, but the
+  #     IMPLEMENTATION_BASELINE event writes `base_sha`. The lookup returned
+  #     empty and fell through to `non-git`, which would silently strip diff
+  #     scope from Phase 7's reviewers and stop Phase 10 committing at all --
+  #     in a perfectly normal git repo.
+  #  3. status_field on RUN_LOG.md takes the FIRST match; the documented
+  #     consumer rule is the LATEST IMPLEMENTATION_BASELINE (a resumed run has
+  #     more than one). Use the shared latest-event reader.
+  local st
+  st="$(_resolve_status_path "$FEATURE_FOLDER/6-implementation/implementer-status.md" \
+    "$FEATURE_FOLDER/6-implementation/00/attempts/p06-i00-implementer-a*/STATUS.md")" || st=""
+  IMPLEMENTATION_BASE_SHA="$(_run_log_latest_field '._type=="IMPLEMENTATION_BASELINE"' base_sha 2>/dev/null)"     || IMPLEMENTATION_BASE_SHA=""
+  if [ -z "$IMPLEMENTATION_BASE_SHA" ]; then
+    [ "$tolerant" = tolerant ] && return 0
+    echo "PRELAUNCH_FAILED:implementation_baseline" >&2; return 1
+  fi
+  if [ -z "$st" ] && [ "$tolerant" != tolerant ]; then
+    echo "PRELAUNCH_FAILED:implementation_baseline" >&2; return 1
+  fi
   # shellcheck disable=SC2034  # consumed by the calling phase shell / a future task's finalization
   IMPLEMENTATION_FINAL_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo non-git)"
 }
@@ -354,8 +385,21 @@ reconstruct_durable_inputs() {
   # is needed: recomputation is cheap and keeps this in sync with either
   # source ever being corrected). Absent before Phase 2 completes, which is
   # fine -- Phase 4 (plan-writer) is the first real consumer.
-  local _relevant_skills
-  _relevant_skills="$(status_field "$FEATURE_FOLDER/2-context-discovery/status.md" relevant_skills 2>/dev/null \
+  # The fixed 2-context-discovery/status.md path is a pre-schema-v2 leftover:
+  # context-discovery now publishes to its ATTEMPT path only (output_count 0),
+  # so the fixed name never appears and this read silently yielded an empty
+  # relevant set -- which made APPLICABLE_OPTIONAL_SKILLS empty for Phase 4
+  # onward with no error anywhere. Keep the fixed path as the primary (an
+  # older run's alias still resolves) and fall back to the newest attempt's
+  # own STATUS. Lexical glob order is attempt order (a01 < a02 < ... < a99),
+  # so the last match is the highest attempt. Deliberately NOT role_attempt_
+  # dir: that needs $ROLE_CONTRACTS_PATH, which bootstrap_runtime only sets
+  # AFTER this function runs.
+  local _relevant_skills _p2_status
+  _p2_status="$(_resolve_status_path "$FEATURE_FOLDER/2-context-discovery/status.md" \
+    "$FEATURE_FOLDER/2-context-discovery/00/attempts/p02-i00-context-discovery-a*/STATUS.md")" \
+    || _p2_status=""
+  _relevant_skills="$(status_field "$_p2_status" relevant_skills 2>/dev/null \
     | tr -d '[]' | sed -E 's/,[[:space:]]*/;/g')"
   # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
   APPLICABLE_OPTIONAL_SKILLS="$(applicable_optional_skills "$OPTIONAL_SKILLS" "$_relevant_skills" 2>/dev/null)"
@@ -380,11 +424,50 @@ reconstruct_durable_inputs() {
   # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
   CONTINUATION_PATH=""
   DECLARED_FOREIGN_CHANGES=""
+  # Mechanical validator output (validate_artifact / validate_plan_tasks) for a
+  # fixer to repair. Empty by default: only a re-dispatch that follows a FAILED
+  # structural validation sets it. Without this channel a fixer that breaks the
+  # artifact's own structure can only be retried blind -- observed live, where a
+  # plan-fixer broke the plan's Task Contract block and a full-length retry
+  # reproduced the identical error because nothing told it what was rejected.
+  # Declared OPTIONAL inputs still have to be SET for render_prompt's
+  # `${!k+x}` set-ness test; "optional" means "may be empty", not "may be
+  # undefined". Nothing populated these two, so implementation-fixer failed
+  # prelaunch with RENDER_VARIABLE_UNRESOLVED on its own declared optionals.
+  # RUN_LOG always exists for a live run; RELEVANT_ARTIFACTS is genuinely
+  # empty unless a phase step narrows it.
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  RUN_LOG="$FEATURE_FOLDER/RUN_LOG.md"
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  RELEVANT_ARTIFACTS=""
+  # documentation-writer's own declared optional -- same set-ness rule.
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  DOCS_INVENTORY=""
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  VALIDATOR_ERRORS=""
+  # Set to `yes` ONLY by a gate that has hit divergent_round_cap, to dispatch
+  # the one bounded consolidation pass the divergence rules prescribe. Without
+  # it that pass was unrepresentable: the packs told the orchestrator to
+  # dispatch a "consolidation-priority" batch, but no role contract could carry
+  # the distinction, so it was indistinguishable from an ordinary batch --
+  # which is what a diverging gate must NOT do again.
+  # shellcheck disable=SC2034  # consumed via render_keys()/render_prompt's ${!k} indirection
+  CONSOLIDATION_PRIORITY=""
 
   case "$phase" in
     4) _reconstruct_accepted_spec || return 1 ;;
-    6) _reconstruct_accepted_spec || return 1
+    # Phase 5 (plan review) was missing from this map entirely: plan-reviewer-
+    # claude/-codex and plan-fixer all declare spec_path/plan_path as required
+    # inputs, but nothing derived them and this function still returned 0 --
+    # so the gate's first dispatch failed render validation instead of failing
+    # here with a named contract.
+    5) _reconstruct_accepted_spec || return 1
        _reconstruct_accepted_plan || return 1 ;;
+    6) _reconstruct_accepted_spec || return 1
+       _reconstruct_accepted_plan || return 1
+       # tolerant: Step 6.0 has not written the baseline yet on the first
+       # phase-6 shell, but Step 6.1's implementer declares it required.
+       _reconstruct_implementation_baseline tolerant || return 1 ;;
     7) _reconstruct_accepted_spec || return 1
        _reconstruct_accepted_plan || return 1
        _reconstruct_implementation_baseline || return 1 ;;
@@ -504,20 +587,31 @@ _bootstrap_manifest_names() {
 # determines the generated registry bytes -- lists EXACTLY the five
 # generated-file entries (never fewer, never extra), every listed file
 # exists with the right permissions, and `sha256sum -c` validates all five.
+# A second argument (any non-empty value) skips ONLY the two process-identity
+# comparisons, leaving every integrity check in force. That distinguishes the
+# two very different reasons this can fail: STALE (the process file set or the
+# extractor changed since this runtime was generated -- regenerate) versus
+# CORRUPT (the generated files no longer match their own recorded hashes,
+# names, or permissions -- HALT). Conflating them meant any edit to the
+# process file set mid-run bricked every later phase with
+# RUNTIME_MANIFEST_INVALID until an operator manually removed the runtime.
 _bootstrap_verify_manifest() {
-  local dir="$1" manifest fileset_sha recorded_sha extractor_sha recorded_extractor_sha names entries f mode
+  local dir="$1" skip_identity="${2:-}"
+  local manifest fileset_sha recorded_sha extractor_sha recorded_extractor_sha names entries f mode
   manifest="$dir/manifest.sha256"
   [ -f "$manifest" ] || return 1
-  fileset_sha="$(process_fileset_sha256)"
-  recorded_sha="$("$GREP_BIN" -m1 '^process_fileset_sha256=' "$manifest" | cut -d'=' -f2)"
-  [ -n "$recorded_sha" ] || return 1
-  [ "$recorded_sha" = "$fileset_sha" ] || return 1
+  if [ -z "$skip_identity" ]; then
+    fileset_sha="$(process_fileset_sha256)"
+    recorded_sha="$("$GREP_BIN" -m1 '^process_fileset_sha256=' "$manifest" | cut -d'=' -f2)"
+    [ -n "$recorded_sha" ] || return 1
+    [ "$recorded_sha" = "$fileset_sha" ] || return 1
 
-  extractor_sha="$(sha256sum "$PROCESS_REPO_ROOT/tests/lib/extract.py" 2>/dev/null | cut -d' ' -f1)"
-  recorded_extractor_sha="$("$GREP_BIN" -m1 '^extractor_sha256=' "$manifest" | cut -d'=' -f2)"
-  [ -n "$extractor_sha" ] || return 1
-  [ -n "$recorded_extractor_sha" ] || return 1
-  [ "$recorded_extractor_sha" = "$extractor_sha" ] || return 1
+    extractor_sha="$(sha256sum "$PROCESS_REPO_ROOT/tests/lib/extract.py" 2>/dev/null | cut -d' ' -f1)"
+    recorded_extractor_sha="$("$GREP_BIN" -m1 '^extractor_sha256=' "$manifest" | cut -d'=' -f2)"
+    [ -n "$extractor_sha" ] || return 1
+    [ -n "$recorded_extractor_sha" ] || return 1
+    [ "$recorded_extractor_sha" = "$extractor_sha" ] || return 1
+  fi
 
   names="$("$GREP_BIN" -E '^[0-9a-f]{64}  .+$' "$manifest" | sed -E 's/^[0-9a-f]{64}  //' | sort)"
   entries="$(_bootstrap_manifest_names | sort)"
@@ -687,6 +781,19 @@ _bootstrap_sweep_orphans() {
 bootstrap_runtime() {
   ORCHESTRATION_DIR="$FEATURE_FOLDER/.orchestration"
   RUNTIME_DIR="$ORCHESTRATION_DIR/runtime"
+  # The two mechanical-plumbing render keys (render_keys(), and every
+  # appendix's own publish-status call) name files this function publishes,
+  # so they are set HERE rather than left for each phase block to remember:
+  # nothing else in the process assigned them, so every single dispatch
+  # failed render validation with RENDER_VARIABLE_UNRESOLVED:ROLE_CONTRACTS_
+  # PATH,STATUS_PUBLISHER_PATH. Only the offline suite ever set them, by hand,
+  # per check -- which is why the gap survived.
+  # Fill only when the caller has not supplied its own: a unit test points
+  # ROLE_CONTRACTS_PATH at a small fixture registry and then bootstraps, and
+  # overwriting that turns every role in the fixture into "unknown role".
+  # shellcheck disable=SC2034  # both are consumed via render_keys()/${!k} indirection
+  [ -n "${ROLE_CONTRACTS_PATH:-}" ] || ROLE_CONTRACTS_PATH="$RUNTIME_DIR/role-contracts.tsv"
+  [ -n "${STATUS_PUBLISHER_PATH:-}" ] || STATUS_PUBLISHER_PATH="$RUNTIME_DIR/publish-status"
   local quarantine attempt tmp
   quarantine="$ORCHESTRATION_DIR/quarantine"
 
@@ -708,8 +815,22 @@ bootstrap_runtime() {
       echo BOOTSTRAP_REUSED
       return 0
     fi
-    echo "RUNTIME_MANIFEST_INVALID:$RUNTIME_DIR" >&2
-    return 1
+    # Not current. Integrity intact => merely STALE: the process file set
+    # changed since this runtime was generated, which is exactly what a
+    # mid-run process fix looks like. Retire it to quarantine (evidence is
+    # kept, never deleted) and fall through to a fresh materialization below.
+    # Integrity broken => genuinely corrupt: fail closed as before.
+    if _bootstrap_verify_manifest "$RUNTIME_DIR" skip_identity; then
+      if mv "$RUNTIME_DIR" "$quarantine/runtime.stale.$$.$RANDOM"; then
+        echo "BOOTSTRAP_STALE_REGENERATED:$RUNTIME_DIR" >&2
+      else
+        echo "BOOTSTRAP_IO_ERROR:$RUNTIME_DIR" >&2
+        return 1
+      fi
+    else
+      echo "RUNTIME_MANIFEST_INVALID:$RUNTIME_DIR" >&2
+      return 1
+    fi
   fi
 
   # 2. No final runtime yet: any .runtime.tmp.* OLDER than the freshness
@@ -1109,7 +1230,7 @@ render_keys() {
     PHASE PHASE_DIR DISPATCH_ID LOGICAL_DISPATCH_ID ATTEMPT ROLE_CONTRACTS_PATH \
     STATUS_PUBLISHER_PATH CONTINUATION_PATH DECLARED_FOREIGN_CHANGES RUNTIME_DIR \
     MODE CONTINUATION_PRIOR_CLASSIFICATION \
-    APPLICABLE_OPTIONAL_SKILLS
+    APPLICABLE_OPTIONAL_SKILLS VALIDATOR_ERRORS CONSOLIDATION_PRIORITY
 }
 
 # The process DOCUMENT SET for appendix/shared-block discovery (P00 stage 2):
@@ -1416,8 +1537,15 @@ _launch_vendor_subprocess() {
     fi
     # shellcheck disable=SC2163  # intentional: $kv IS the "NAME=VALUE" pair
     for kv in ${envs[@]+"${envs[@]}"}; do export "$kv"; done
+    # 0<&0 is load-bearing, not a no-op: bash redirects a BACKGROUND job's
+    # stdin to /dev/null in a non-interactive shell unless the command carries
+    # an explicit stdin redirection. Without it every vendor launched here got
+    # an EMPTY prompt (claude answered "what would you like to work on?";
+    # codex exited "No prompt provided via stdin") while the caller's own
+    # `< "$prompt_file"` looked perfectly correct. Invisible to the offline
+    # suite, whose fake CLIs never read stdin.
     timeout --kill-after="$kill_after" "$deadline" "$@" \
-      1> "$out" 2> "$err" &
+      0<&0 1> "$out" 2> "$err" &
     tpid=$!
     wait "$tpid"; trc=$?
     kill -KILL -- "-$tpid" 2>/dev/null
@@ -1446,39 +1574,59 @@ _vendor_headroom_probe() {
   local model effort rc
   : > "$probe_out"; : > "$probe_err"
   model="$(role_contract_field "$role" model)" || return 1
+  # The prompt must forbid work explicitly. A bare "ping" handed to a
+  # reasoning model together with a workspace is a TASK, not a greeting:
+  # observed live, codex explored the repo, spent 51k input tokens, and
+  # outran the probe's own deadline -- turning a "cheap liveness call" into
+  # the most expensive and least reliable step of a review gate. read-only
+  # sandbox and low effort for the same reason: a liveness check needs
+  # neither write access nor deep reasoning.
+  local probe_prompt='Reply with exactly one word: pong. Do not read any file, do not run any command, do not explore the workspace.'
   case "$vendor" in
     claude)
-      _launch_vendor_subprocess "$REPO_ROOT" 10s 30s "$probe_out" "$probe_err" \
+      _launch_vendor_subprocess "$REPO_ROOT" 10s 60s "$probe_out" "$probe_err" \
         CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 -- \
         claude --model "$model" -p --output-format=json \
                --dangerously-skip-permissions - \
-        <<< "ping"
+        <<< "$probe_prompt"
       rc=$?
       ;;
     codex)
       effort="$(role_contract_field "$role" effort)" || return 1
-      _launch_vendor_subprocess "" 10s 30s "$probe_out" "$probe_err" \
+      _launch_vendor_subprocess "" 10s 60s "$probe_out" "$probe_err" \
         -- \
-        codex -a never -m "$model" -c model_reasoning_effort="$effort" \
-          exec -C "$REPO_ROOT" -s workspace-write --skip-git-repo-check --json - \
-        <<< "ping"
+        codex -a never -m "$model" -c model_reasoning_effort=low \
+          exec -C "$REPO_ROOT" -s read-only --skip-git-repo-check --json - \
+        <<< "$probe_prompt"
       rc=$?
       ;;
     *) return 1 ;;
   esac
-  # A non-zero probe (missing binary, the probe's own timeout, a transport
-  # error) is not proof of liveness -- refuse, same as an explicit signature.
-  [ "$rc" -eq 0 ] || return 1
-  # Same 5b ceiling vocabulary as "Mode 5 has two shapes" in Failure handling
-  # below -- a probe refusal and a substantive-dispatch ceiling are the same
-  # account-level condition, so they must be recognised by the same words.
+  # Ceiling FIRST, ahead of the exit code: a spend/quota refusal is an
+  # account-level condition and stays authoritative however the process
+  # exited. Same 5b vocabulary as "Mode 5 has two shapes" in Failure
+  # handling -- a probe refusal and a substantive-dispatch ceiling are the
+  # same condition and must be recognised by the same words.
   if "$GREP_BIN" -qiE \
       "$(_spend_ceiling_pattern)" \
       "$probe_out" "$probe_err" 2>/dev/null
   then
     return 1
   fi
-  return 0
+  [ "$rc" -eq 0 ] && return 0
+  # rc != 0, no ceiling. A vendor that produced a COMPLETED turn proved the
+  # exact thing this probe asks -- that it currently responds -- so killing
+  # the gate because the CLI was slow to exit afterwards refuses a live
+  # vendor on the probe's own deadline. Accept only that evidence, and only
+  # for the deadline exit codes; every other non-zero exit stays a refusal,
+  # since an inconclusive probe proves nothing.
+  case "$rc" in
+    124|137)
+      "$GREP_BIN" -qE '"type"[[:space:]]*:[[:space:]]*"turn\.completed"|"subtype"[[:space:]]*:[[:space:]]*"success"' \
+        "$probe_out" 2>/dev/null && return 0
+      ;;
+  esac
+  return 1
 }
 
 # The single registry-driven launch point. Rejects an unknown vendor BEFORE
@@ -1922,9 +2070,21 @@ _dispatch_launch_attempt() {
   # attempt whose own pre/post comparison became impossible -- either way,
   # this is the one non-terminal signal that must never pass silently.
   if [ "$mutation_state" = INTEGRITY_UNKNOWN ]; then
+    # Name the offending paths. Without them the event is unactionable: the
+    # signal is STICKY -- once any role leaves a stray file in the target repo,
+    # every LATER read-only dispatch's own pre/post comparison also reports
+    # INTEGRITY_UNKNOWN and gets recorded as the lease_owner, so `lease_owner`
+    # alone attributes the change to whoever ran next rather than whoever made
+    # it. Observed live: a read-only plan-reviewer wrote backend/e.py, and the
+    # following summarizer and preflight dispatches were both blamed for it.
+    # `porcelain_offenders` is the same allow-list-aware reader dirty_tree_check
+    # uses, so orchestration artifacts inside $FEATURE_FOLDER never appear here.
+    local integrity_paths
+    integrity_paths="$(porcelain_offenders "$REPO_ROOT" /dev/null 2>/dev/null \
+      | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')"
     record_event ARTIFACT_INTEGRITY_BLOCKED lease_owner="$role" dispatch_id="$d_id" \
       phase="$phase" iteration="$(printf '%02d' "$iteration")" \
-      reason="unexplained repository change (mutation_state=INTEGRITY_UNKNOWN)" \
+      reason="unexplained repository change (mutation_state=INTEGRITY_UNKNOWN); offending paths: ${integrity_paths:-<none visible>}" \
       >/dev/null 2>&1 || true
   fi
 
@@ -2366,6 +2526,21 @@ classify_attempt() {
   if [ -n "$refusal" ]; then
     CLASSIFY_ATTEMPT_RESULT=PRELAUNCH_FAILED
     CLASSIFY_ATTEMPT_REASON="ORCHESTRATION_REFUSAL:${refusal:0:200}"
+    return 0
+  fi
+
+  # The document's "Distinguish orchestration bugs from vendor failures" rule,
+  # mechanized. A local CLI usage error (bad option order, unknown flag, a
+  # prompt the launcher never actually delivered) is an ORCHESTRATION defect,
+  # so it must land in PRELAUNCH_FAILED/RM01 (correct once, retry) and never
+  # in UNKNOWN_VENDOR_ERROR/RM10, whose row forbids any automatic retry.
+  # Evaluated here, ahead of the vendor-liveness signatures below, for the
+  # same reason the refusal check above is: it is not an outage.
+  if printf '%s' "$(tail -n 40 "$err" 2>/dev/null)" | "$GREP_BIN" -qiE \
+    'unexpected argument|unrecognized argument|unknown option|^Usage:|required arguments were not provided|no prompt provided via stdin'
+  then
+    CLASSIFY_ATTEMPT_RESULT=PRELAUNCH_FAILED
+    CLASSIFY_ATTEMPT_REASON="LOCAL_CLI_USAGE_ERROR:rc=$rc"
     return 0
   fi
 
@@ -6109,7 +6284,13 @@ _artifact_manifest_field() {
   case "$1:$2" in
     plan-writer:output_var)                  echo PLAN_PATH ;;
     plan-writer:min_bytes)                    echo 200 ;;
-    plan-writer:required_headings)            echo "Goal;File Structure and Responsibilities" ;;
+    # These must name headings `superpowers:writing-plans` actually prescribes.
+    # The previous pair ("Goal;File Structure and Responsibilities") named
+    # neither: the skill defines Goal as a BOLD INLINE FIELD (`**Goal:**`) in
+    # the plan header, not a heading, and its section is `## File Structure`.
+    # So this gate rejected every plan the skill can produce, before any
+    # reviewer was dispatched.
+    plan-writer:required_headings)            echo "Global Constraints;File Structure" ;;
     plan-writer:forbidden_markers)            echo 'TBD;<placeholder>;TODO: fill in' ;;
     plan-writer:revision_calc)                echo sha256 ;;
     plan-writer:requires_complete_marker)     echo yes ;;
@@ -6713,12 +6894,19 @@ record_convergence_signals() {
     growth_pct=$(( ((after - before) * 100) / before ))
   fi
   local phase_name; phase_name="$(_phase_name "$phase")" || return 1
+  # Derive PHASE_DIR when the caller has not set it. This function already
+  # takes `phase` as an argument and resolves phase_name from it, so requiring
+  # an AMBIENT $PHASE_DIR too made it fail with a bare "unbound variable" in
+  # any shell that had not happened to set one -- an avoidable dependency for
+  # a value it can compute itself, and the same "<n>-<phase_name>" form
+  # _dispatch_prelaunch uses.
+  local phase_dir="${PHASE_DIR:-$FEATURE_FOLDER/$phase-$phase_name}"
   record_event CONVERGENCE_RECORDED phase="$phase" iteration="$iteration" \
     phase_name="$phase_name" growth_pct="$growth_pct" new_count="$new_c" \
     recurring_count="$recurring" resolved_count="$resolved" reopened_count="$reopened" \
     fix_regression_count="$fix_regression" net_open_blockers_majors="$net_open" \
     reason="review/fix cycle convergence signals" >/dev/null || return 1
-  mkdir -p "$PHASE_DIR"
+  mkdir -p "$phase_dir"
   jq -cn --arg iteration "$iteration" --argjson growth_pct "$growth_pct" \
     --argjson new_count "$new_c" --argjson recurring_count "$recurring" \
     --argjson resolved_count "$resolved" --argjson reopened_count "$reopened" \
@@ -6726,7 +6914,7 @@ record_convergence_signals() {
     '{iteration:$iteration, growth_pct:$growth_pct, new_count:$new_count,
       recurring_count:$recurring_count, resolved_count:$resolved_count,
       reopened_count:$reopened_count, fix_regression_count:$fix_regression_count,
-      net_open:$net_open}' >> "$PHASE_DIR/convergence.jsonl"
+      net_open:$net_open}' >> "$phase_dir/convergence.jsonl"
 }
 
 # Usage: divergence_check PHASE ITERATION CATALOG_PATH
@@ -6739,7 +6927,12 @@ record_convergence_signals() {
 # per-round diff if that approximation ever proves too coarse).
 divergence_check() {
   local phase="$1" iteration="$2" catalog="$3"
-  local ledger="$PHASE_DIR/convergence.jsonl"
+  # Same ambient-dependency fix as record_convergence_signals: derive the
+  # phase directory from the `phase` argument rather than requiring a
+  # pre-set $PHASE_DIR, so the two halves of the convergence pair agree on
+  # where the ledger lives no matter which shell calls them.
+  local dc_phase_name; dc_phase_name="$(_phase_name "$phase")" || return 1
+  local ledger="${PHASE_DIR:-$FEATURE_FOLDER/$phase-$dc_phase_name}/convergence.jsonl"
   local threshold; threshold="$(policy_value artifact_growth_warning_pct)" || return 1
   local iter_num
   iter_num=$((10#$iteration))
@@ -6776,6 +6969,22 @@ divergence_check() {
     fi
     if [ "$reopened1" -gt "$resolved1" ] && [ "$reopened2" -gt "$resolved2" ]; then
       echo "yes:fixer_reopens_more_than_resolved"; return 0
+    fi
+    # CUMULATIVE growth. The per-round percentage test above goes blind exactly
+    # when the artifact is largest and each addition costs the most: observed
+    # live, a plan grew 236KB -> 438KB (+86%) over six rounds while the
+    # per-round figures were 21, 9, 7, 5, 10 -- never two consecutive above the
+    # threshold -- so `growth_without_reduction` could not fire even as every
+    # round's fresh reviewers kept finding new blockers in the newly added
+    # text. Compound every recorded round's growth and compare against a
+    # multiple of the same policy threshold, with the same
+    # "and open count is not falling" guard the per-round test uses.
+    local cum_exceeds
+    cum_exceeds="$(jq -s --argjson t "$threshold" '
+      (reduce .[].growth_pct as $g (1; . * (1 + ($g / 100))) - 1) * 100 >= ($t * 3)
+    ' "$ledger" 2>/dev/null)"
+    if [ "$cum_exceeds" = true ] && [ "$net2" -ge "$net1" ]; then
+      echo "yes:cumulative_growth_without_reduction"; return 0
     fi
   fi
   echo "no"
@@ -7294,11 +7503,38 @@ plan_review_stale_gate() {
 # accepted (the gate's own summarizer reports DONE) and whose open blocking
 # finding count, across every plan-review iteration's own findings catalog,
 # is zero.
+# Resolve a role's STATUS path, preferring a fixed phase-local alias and
+# falling back to the newest matching attempt-scoped STATUS.
+#
+# Schema v2 publishes every role's STATUS to its ATTEMPT directory only. Several
+# fixed phase-local aliases predate that and are now written by nothing --
+# `2-context-discovery/status.md`, `4-plan-writing/plan-status.md`,
+# `5-plan-review/summarizer-status.md` -- and each one that a reader still
+# consults failed independently in the first live run (silently for the first,
+# as a hard PRELAUNCH_FAILED for the second, as a false "plan not ready" for the
+# third). Prefer the alias, so an older run's real alias still resolves, then
+# fall back to the attempt. Lexical glob order is attempt order (a01 < a02 <
+# ... < a99), so the LAST match is the highest attempt. Deliberately not
+# role_attempt_dir: callers include ones that run before $ROLE_CONTRACTS_PATH
+# exists.
+# Prints the resolved path, or nothing (rc 1) when neither exists.
+_resolve_status_path() {
+  # Usage: _resolve_status_path <fixed-alias-path> <attempts-glob>
+  local alias_path="$1" glob="$2" cand found=""
+  if [ -f "$alias_path" ]; then printf '%s\n' "$alias_path"; return 0; fi
+  for cand in $glob; do
+    [ -f "$cand" ] && found="$cand"
+  done
+  [ -n "$found" ] || return 1
+  printf '%s\n' "$found"
+}
+
 plan_ready_for_implementation() {
   # Usage: plan_ready_for_implementation
-  local status="$FEATURE_FOLDER/5-plan-review/summarizer-status.md"
-  [ -f "$status" ] \
-    || { echo "plan not ready: no plan-review summarizer status (5-plan-review/summarizer-status.md)" >&2; return 1; }
+  local status
+  status="$(_resolve_status_path "$FEATURE_FOLDER/5-plan-review/summarizer-status.md" \
+    "$FEATURE_FOLDER/5-plan-review/00/attempts/p05-i00-summarizer-plan-a*/STATUS.md")" \
+    || { echo "plan not ready: no plan-review summarizer status (no 5-plan-review/summarizer-status.md alias and no summarizer-plan attempt STATUS)" >&2; return 1; }
   local verdict
   verdict="$(status_field "$status" verdict)"
   [ "$verdict" = DONE ] \
@@ -7384,6 +7620,17 @@ seam_verifier_dispatch_files() {
   local -a hits=()
   for file in "$@"; do
     [ -n "$file" ] || continue
+    # A TEST for a seam is not a seam. The seam-verifier performs live checks
+    # (run the migration, validate the deploy template, hit the sandbox
+    # endpoint) and carries a small findings budget; a client wrapper's unit
+    # tests are neither executable-as-a-seam nor deployable, so matching them
+    # only spends that budget. Observed live: broadening the globs to catch a
+    # real `backend/serverless.yml` also pulled in 10 `tests/<pkg>_clients/*`
+    # files. Excluded here rather than in seam_globs because `case` globs
+    # cannot express negation.
+    case "$file" in
+      */tests/*|tests/*|*/test_*|test_*|*_test.py|*.test.*|*/spec/*|spec/*) continue ;;
+    esac
     for pattern in "${pats[@]}"; do
       [ -n "$pattern" ] || continue
       # shellcheck disable=SC2254  # intentional glob match against the

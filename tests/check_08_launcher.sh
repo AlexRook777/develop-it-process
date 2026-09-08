@@ -52,8 +52,13 @@ ENV_LOG="$FIX/env.log"
 launch() {
   : > "$ARGV_LOG"
   : > "$ENV_LOG"
+  # </dev/null is required, not cosmetic: the launcher ends in `exec claude`
+  # and the fake claude drains stdin, so inheriting a caller's stdin that never
+  # reaches EOF (a pty, or any harness keeping the pipe open) hangs this check
+  # indefinitely. The pty assertion below guards its own call site the same
+  # way; this one was simply missed.
   PATH="$REPO_TOP/tests/fakebin:$PATH" FAKE_ARGV_LOG="$ARGV_LOG" FAKE_ENV_LOG="$ENV_LOG" \
-    DEVELOP_IT_SKIP_TESTS=1 "$LAUNCHER" "$@" >/dev/null 2>"$FIX/err.txt"
+    DEVELOP_IT_SKIP_TESTS=1 "$LAUNCHER" "$@" >/dev/null 2>"$FIX/err.txt" </dev/null
 }
 
 launch "$SPEC"
@@ -204,8 +209,11 @@ else
   printf '#!/usr/bin/env bash\nexit 1\n' > "$GATE_PROBE"
   chmod +x "$GATE_PROBE"
   : > "$ARGV_LOG"
+  # env -u: this block's own comment says "launch WITHOUT the skip flag", but
+  # an inherited DEVELOP_IT_SKIP_TESTS made the launcher skip its checks, so
+  # the assertion below tested nothing and the launch reached the fake claude.
   PATH="$REPO_TOP/tests/fakebin:$PATH" FAKE_ARGV_LOG="$ARGV_LOG" \
-    "$LAUNCHER" "$SPEC" >/dev/null 2>"$FIX/err.txt"
+    env -u DEVELOP_IT_SKIP_TESTS "$LAUNCHER" "$SPEC" >/dev/null 2>"$FIX/err.txt" </dev/null
   rc=$?
   rm -f "$GATE_PROBE"
   assert_rc 1 $rc "a failing check blocks the launch"

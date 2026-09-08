@@ -53,7 +53,11 @@ REPO_ROOT="$(git -C "$(dirname "$SPEC_PATH")" rev-parse --show-toplevel 2>/dev/n
 # own checks — a broken cookbook helper fails here rather than mid-run.
 # Exported before the suite runs: tests/check_08_launcher.sh invokes this script,
 # and without the flag that check would re-enter this step forever.
-if [ -z "${DEVELOP_IT_SKIP_TESTS:-}" ]; then
+# Set-ness, not emptiness: an explicitly empty DEVELOP_IT_SKIP_TESTS= used to
+# re-enable the suite here, and check_08_launcher invokes this script -- which
+# re-ran the suite, which re-invoked this script, unboundedly. Any value,
+# including empty, now means "skip".
+if [ -z "${DEVELOP_IT_SKIP_TESTS+x}" ]; then
   export DEVELOP_IT_SKIP_TESTS=1
   "$PROCESS_REPO_ROOT/tests/run.sh" >&2 \
     || die "pre-launch checks failed; fix them, or re-run with DEVELOP_IT_SKIP_TESTS=1"
